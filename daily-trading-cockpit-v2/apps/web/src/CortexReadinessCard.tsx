@@ -100,7 +100,7 @@ function Bar({ pct, color }: { pct: number; color: string }) {
   );
 }
 
-export function CortexReadinessCard() {
+export function CortexReadinessCard({ grouped = false }: { grouped?: boolean } = {}) {
   const [data, setData] = useState<ReadinessResponse | null>(null);
   const [testnetDirect, setTestnetDirect] = useState<Readiness | null>(null);
   const [unreachable, setUnreachable] = useState(false);
@@ -138,7 +138,7 @@ export function CortexReadinessCard() {
 
   if (!data) {
     return (
-      <section style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, marginBottom: 18, padding: 16, color: C.dim }}>
+      <section style={{ background: C.card, border: grouped ? 'none' : `1px solid ${C.border}`, borderRadius: grouped ? 0 : 10, marginBottom: grouped ? 0 : 18, padding: 16, color: C.dim }}>
         Kesiapan CORTEX: loading…
       </section>
     );
@@ -158,7 +158,7 @@ export function CortexReadinessCard() {
   const da = rf.decisionAlpha;
 
   return (
-    <section style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, overflow: 'hidden', marginBottom: 18 }}>
+    <section style={{ background: C.card, border: grouped ? 'none' : `1px solid ${C.border}`, borderRadius: grouped ? 0 : 10, overflow: 'hidden', marginBottom: grouped ? 0 : 18 }}>
       <header style={{ padding: '12px 16px', borderBottom: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
         <div>
           <h2 style={{ margin: 0, fontSize: 16, color: C.text }}>Kesiapan CORTEX</h2>

@@ -69,6 +69,7 @@ export interface SingleSymbolFreshSignal {
 }
 
 export interface SingleSymbolExitContext {
+  symbol: string;
   direction: "LONG" | "SHORT";
   entryPrice: number;
   stopPrice: number;
@@ -611,6 +612,10 @@ export interface SingleSymbolLaneExecutorOptions {
    *  fabricated/unknown number. A throwing callback never interrupts this executor's own
    *  settlement bookkeeping — see notifyPositionClosed(). */
   onPositionClosed?: (netUsd: number) => void;
+  /** Finalized-close detail hook. This runs only after the exchange close has
+   * settled and the position is persisted, so a failed close attempt can never
+   * accidentally start a re-entry cooldown. */
+  onPositionClosedDetail?: (event: { symbol: string; direction: "LONG" | "SHORT"; reason: string; netUsd: number }) => void;
 }
 
 /** Store never capped closed/aborted positions, growing forever. Keeps every OPEN position
@@ -694,6 +699,7 @@ export class SingleSymbolLaneExecutor {
   private readonly tryClaimEntrySymbol: (symbol: string) => boolean;
   private readonly releaseEntrySymbol: (symbol: string) => void;
   private readonly onPositionClosed: (netUsd: number) => void;
+  private readonly onPositionClosedDetail: (event: { symbol: string; direction: "LONG" | "SHORT"; reason: string; netUsd: number }) => void;
   private ticking = false;
   /** 2026-07-11 real-money audit fix: closePosition()'s `pos.exitOrderId !== null` reentry guard
    *  is TOCTOU-vulnerable — exitOrderId isn't set until AFTER the awaited cancelAlgoOrder/placeOrder
@@ -745,14 +751,20 @@ export class SingleSymbolLaneExecutor {
     this.tryClaimEntrySymbol = opts.tryClaimEntrySymbol ?? (() => true);
     this.releaseEntrySymbol = opts.releaseEntrySymbol ?? (() => {});
     this.onPositionClosed = opts.onPositionClosed ?? (() => {});
+    this.onPositionClosedDetail = opts.onPositionClosedDetail ?? (() => {});
   }
 
   /** Best-effort fan-out of a finalized close to onPositionClosed — never let a throwing callback
    *  interrupt this executor's own settlement bookkeeping (same fail-open posture as
    *  live-execution-engine.ts's onKillSwitchEngaged callback). */
-  private notifyPositionClosed(netUsd: number): void {
+  private notifyPositionClosed(pos: SingleSymbolPosition, reason: string, netUsd: number): void {
     try {
       this.onPositionClosed(netUsd);
+    } catch {
+      // best-effort — the position is already fully settled and persisted regardless
+    }
+    try {
+      this.onPositionClosedDetail({ symbol: pos.symbol, direction: pos.direction, reason, netUsd });
     } catch {
       // best-effort — the position is already fully settled and persisted regardless
     }
@@ -1447,7 +1459,7 @@ export class SingleSymbolLaneExecutor {
     // 2026-07-19 real-money audit fix: feed the account-wide consecutive-loss kill-switch counter
     // (see onPositionClosed's doc comment) — every full close, stop-triggered or policy-decided,
     // must reach it, not just the legacy mirror pipeline's own applyRealizedToLedger.
-    this.notifyPositionClosed(netUsd);
+    this.notifyPositionClosed(pos, "INITIAL_STOP", netUsd);
     // CORTEX real-USDT attribution (2026-07-21, report-only, fail-safe — see its doc comment).
     this.recordCortexRealAttribution(pos);
     // Dense R-path close handoff (2026-07-22, report-only, fail-safe — see its doc comment).
@@ -1521,6 +1533,7 @@ export class SingleSymbolLaneExecutor {
 
       const msHeld = new Date(this.nowIso()).getTime() - new Date(pos.openedAt).getTime();
       const exitContext = {
+        symbol: pos.symbol,
         direction: pos.direction,
         entryPrice: pos.entryPrice,
         stopPrice: pos.stopPrice,
@@ -1712,7 +1725,7 @@ export class SingleSymbolLaneExecutor {
       this.store.save();
       // 2026-07-19 real-money audit fix: see settleIfStopTriggered's identical call — this covers
       // every OTHER close path (policy exit, manual close, orderly kill-switch wind-down).
-      this.notifyPositionClosed(netUsd);
+      this.notifyPositionClosed(pos, reason, netUsd);
       // CORTEX real-USDT attribution (2026-07-21, report-only, fail-safe — see its doc comment).
       this.recordCortexRealAttribution(pos);
       // Dense R-path close handoff (2026-07-22, report-only, fail-safe — see its doc comment).

@@ -1388,8 +1388,8 @@ export default function NeuralMindmap() {
 
       {error && (
         <div className="neural-error">
-          <strong>Telemetry link interrupted</strong>
-          <span>{error}. The last known state remains visible.</span>
+          <strong>DATA TERAKHIR — telemetry terputus</strong>
+          <span>{error}. Angka dan alert yang masih terlihat di bawah bukan data live; jangan gunakan untuk entry atau keputusan arah sampai telemetry pulih.</span>
         </div>
       )}
 

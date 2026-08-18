@@ -407,6 +407,9 @@ export interface CrossSectionalLeg {
   exitPrice: number | null;
   /** Fraction of total basket capital assigned to this leg. Missing means legacy equal-weight. */
   weight?: number | null;
+  /** Frozen rank inputs make later sizing evaluation auditable without reconstructing old scans. */
+  scoreAtOpen?: number;
+  volatilityAtOpen?: number | null;
 }
 
 export interface CrossSectionalRegimeContext {
@@ -440,7 +443,7 @@ export interface CrossSectionalObservation {
   regimeClassAtOpen?: CrossSectionalRegimeClass | null;
   longCapitalWeight?: number | null;
   shortCapitalWeight?: number | null;
-  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | null;
+  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL" | null;
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
   /** The R-denominator FROZEN at open (fraction). CORTEX #218 divides realized netReturn by THIS to get
@@ -490,7 +493,7 @@ interface CrossSectionalBasketOpts {
   maxPerCluster?: number;
   longCapitalWeight?: number;
   shortCapitalWeight?: number;
-  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY";
+  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL";
   volBySymbol?: Record<string, number>;
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
@@ -540,12 +543,31 @@ function scoreGapFor(longLeg: ScoredSymbol[], shortLeg: ScoredSymbol[]): number 
 function weightedLegs(
   legs: ScoredSymbol[],
   sideCapital: number,
-  opts: { weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY"; volBySymbol?: Record<string, number> },
+  opts: { weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL"; volBySymbol?: Record<string, number> },
 ): CrossSectionalLeg[] {
   if (legs.length === 0) return [];
   const equalWeight = sideCapital / legs.length;
   if (opts.weightingModel !== "BETA_VOL_PROXY") {
-    return legs.map((s) => ({ symbol: s.symbol, entryPrice: s.price, exitPrice: null, weight: equalWeight }));
+    if (opts.weightingModel !== "CAPPED_INVERSE_VOL") {
+      return legs.map((s) => ({ symbol: s.symbol, entryPrice: s.price, exitPrice: null, weight: equalWeight, scoreAtOpen: s.score, volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? null }));
+    }
+    // Inverse-vol within each side, but clip to 0.75–1.25x equal sizing before normalizing.
+    // Risk parity must not become a hidden concentration trade in the calmest constituent.
+    const raw = legs.map((s) => {
+      const vol = opts.volBySymbol?.[s.symbol];
+      return Number.isFinite(vol) && vol! > 0 ? 1 / vol! : 1;
+    });
+    const rawMean = raw.reduce((a, b) => a + b, 0) / raw.length || 1;
+    const clipped = raw.map((value) => Math.max(0.75, Math.min(1.25, value / rawMean)));
+    const denom = clipped.reduce((a, b) => a + b, 0) || legs.length;
+    return legs.map((s, i) => ({
+      symbol: s.symbol,
+      entryPrice: s.price,
+      exitPrice: null,
+      weight: sideCapital * clipped[i]! / denom,
+      scoreAtOpen: s.score,
+      volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? null,
+    }));
   }
   const raw = legs.map((s) => {
     const vol = opts.volBySymbol?.[s.symbol];
@@ -557,6 +579,8 @@ function weightedLegs(
     entryPrice: s.price,
     exitPrice: null,
     weight: sideCapital * raw[i]! / denom,
+    scoreAtOpen: s.score,
+    volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? null,
   }));
 }
 
@@ -781,6 +805,25 @@ export interface AdaptiveSymbolFilters {
   };
 }
 
+/**
+ * Freeze the adaptive symbol filters at the operator's configured lists — no promotion, no demotion.
+ * Default OFF.
+ *
+ * WHY (2026-08-12): the demotion machinery judges a symbol on the per-leg returns recorded in the
+ * store's CLOSED baskets, and after a configuration change those closed baskets belong to the OLD
+ * configuration. Widening the pool and switching to a 36-bar lookback, then letting 24-bar leg
+ * history demote symbols out of it, applies the old rules' verdict to the new rules' universe — the
+ * short side went from 17 eligible symbols to 6 within one cycle, quietly rebuilding the narrow
+ * pool the widening exists to remove. Freezing lets a changed configuration be measured as
+ * configured; unfreeze once its own closed baskets dominate the store.
+ *
+ * Deliberately NOT a way to escape the operator lists: the frozen result is exactly the configured
+ * env allow/blocklists, so this can only ever widen back to what the operator already approved.
+ */
+export function isCrossSectionalAdaptiveDemotionFrozen(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_ADAPTIVE_DEMOTION_FROZEN === "1";
+}
+
 export function deriveAdaptiveSymbolFilters(
   store: CrossSectionalStore,
   opts: {
@@ -801,6 +844,22 @@ export function deriveAdaptiveSymbolFilters(
 ): AdaptiveSymbolFilters {
   const minLegSamples = opts.minLegSamples ?? 3;
   const minEligiblePerSide = opts.minEligiblePerSide ?? CROSS_SECTIONAL_K;
+  if (isCrossSectionalAdaptiveDemotionFrozen()) {
+    return {
+      longAllowlist: [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST].sort(),
+      shortAllowlist: [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST].sort(),
+      longBlocklist: [],
+      shortBlocklist: [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST].sort(),
+      provenance: {
+        closedBaskets: 0, minLegSamples, promotedLong: [], promotedShort: [],
+        demotedLong: [], demotedShort: [],
+        minEligiblePerSide,
+        minEligiblePerSideLong: opts.minEligiblePerSideLong ?? minEligiblePerSide,
+        minEligiblePerSideShort: opts.minEligiblePerSideShort ?? minEligiblePerSide,
+        longFloorApplied: false, shortFloorApplied: false,
+      },
+    };
+  }
   const minEligiblePerSideLong = opts.minEligiblePerSideLong ?? minEligiblePerSide;
   const minEligiblePerSideShort = opts.minEligiblePerSideShort ?? minEligiblePerSide;
   const perf = new Map<string, { longN: number; longSum: number; shortN: number; shortSum: number }>();
@@ -929,18 +988,20 @@ export function getCrossSectionalFilteredExecutionFilters(
 
 export function buildFilteredCrossSectionalBasket(
   scored: ScoredSymbol[],
-  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
-    Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap">>,
+  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
+    Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap">>,
 ): CrossSectionalObservation | null {
   return buildCrossSectionalBasket(scored, {
     ...opts,
     signal: opts.signal ?? CROSS_SECTIONAL_FILTERED_SIGNAL,
     variant: "FILTERED",
     longAllowlist: opts.longAllowlist ?? CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
+    longBlocklist: opts.longBlocklist,
     shortAllowlist: opts.shortAllowlist ?? CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
     shortBlocklist: opts.shortBlocklist ?? CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
     minScoreGap: opts.minScoreGap ?? CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
     maxPerCluster: opts.maxPerCluster ?? CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER,
+    weightingModel: opts.weightingModel ?? "CAPPED_INVERSE_VOL",
   });
 }
 
@@ -1233,6 +1294,8 @@ export async function runCrossSectionalCycle(opts: {
    *  CROSS_SECTIONAL_REGIME_SKEW_ENABLED=1 to tilt the FILTERED (executed) basket's leg counts
    *  toward the regime-favored side. Omit/null -> unskewed 3/3-style symmetry, same as before. */
   axisScore?: number | null;
+  /** Execution-owned blocks for losing same-symbol/same-side open exposure. */
+  filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
 }): Promise<CrossSectionalCycleResult> {
   const result: CrossSectionalCycleResult = { opened: 0, resolved: 0, expired: 0 };
   const nowIso = new Date(opts.now).toISOString();
@@ -1322,6 +1385,14 @@ export async function runCrossSectionalCycle(opts: {
     // side means "no eligible candidates this cycle": skip the basket, same fail-closed convention
     // buildCrossSectionalBasket already uses when a side cannot fill k legs.
     const liquidityStarved = crossSectionalLiquidityStarved(longAllow, shortAllow, liquid);
+    let dynamicBlocks: { longBlocklist: string[]; shortBlocklist: string[] } = { longBlocklist: [], shortBlocklist: [] };
+    try {
+      dynamicBlocks = await opts.filteredEntryBlocks?.() ?? dynamicBlocks;
+    } catch {
+      // If current marks cannot be read, fail closed for FILTERED rather than emitting a signal
+      // which might duplicate a losing open leg before the executor gets a second chance to stop it.
+      dynamicBlocks = { longBlocklist: [...longAllow], shortBlocklist: [...shortAllow] };
+    }
     const basket = liquidityStarved ? null : buildFilteredCrossSectionalBasket(scored, {
       k: CROSS_SECTIONAL_K,
       longK: skew?.longK,
@@ -1331,8 +1402,10 @@ export async function runCrossSectionalCycle(opts: {
       horizonMs: CROSS_SECTIONAL_HORIZON_MS,
       regimeContext,
       longAllowlist: longAllow,
+      longBlocklist: new Set(dynamicBlocks.longBlocklist),
       shortAllowlist: shortAllow,
-      shortBlocklist: new Set(adaptive.shortBlocklist),
+      shortBlocklist: new Set([...adaptive.shortBlocklist, ...dynamicBlocks.shortBlocklist]),
+      volBySymbol,
     });
     if (basket) {
       opts.store.add(basket);
@@ -1390,6 +1463,7 @@ export async function runCrossSectionalCycleGuarded(opts: {
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   regimeContext?: CrossSectionalRegimeContext | null;
   axisScore?: number | null;
+  filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
 }): Promise<CrossSectionalCycleResult | null> {
   if (cycleRunning) return null;
   cycleRunning = true;
@@ -1527,6 +1601,20 @@ export function buildCrossSectionalReport(
     byRegime,
     exits,
   };
+}
+
+/**
+ * Single cutoff source for every cross-sectional consumer.  Testnet deployments set
+ * CROSS_SECTIONAL_REPORT_START_AT to the beginning of the active evidence era; reports,
+ * Cortex summaries, and entry gates must all use this same boundary so historical closes
+ * cannot affect the current deployment's admission decision.
+ */
+export function getCrossSectionalReportSinceMs(
+  env: NodeJS.ProcessEnv = process.env,
+): number | undefined {
+  const configured = env.CROSS_SECTIONAL_REPORT_START_AT ?? null;
+  const parsed = configured ? Date.parse(configured) : NaN;
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 export function isCrossSectionalEdgeDisabled(env: NodeJS.ProcessEnv = process.env): boolean {

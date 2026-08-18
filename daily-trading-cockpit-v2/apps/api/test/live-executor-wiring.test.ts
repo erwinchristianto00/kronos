@@ -7,6 +7,7 @@ import {
   maxClusterPositionsAcrossLanes,
   isNewExecutorLaneAllowed,
   isTestnetCrossSectionalHorizonLaneAllowed,
+  isTestnetCrossSectionalHorizonSourceAllowed,
   rollingNetEntryHealth,
   type LiveExecutorGateEngine,
 } from "../src/lib/live-executor-wiring.js";
@@ -90,6 +91,18 @@ describe("testnet cross-sectional horizon rollout lock", () => {
   it("does not change mainnet or an unlocked testnet", () => {
     expect(isTestnetCrossSectionalHorizonLaneAllowed("mainnet", "REGIME_COMPOSITE_CONFIRMATION_LONG", locked)).toBe(true);
     expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", "REGIME_COMPOSITE_CONFIRMATION_LONG", {})).toBe(true);
+  });
+
+  it("allows only explicitly configured experimental lane symbols", () => {
+    const env = {
+      TESTNET_ONLY_CROSS_SECTIONAL_HORIZON: "1",
+      TESTNET_CROSS_SECTIONAL_EXTRA_LANES: "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK",
+      TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS: "XRPUSDT,WLDUSDT",
+    } as NodeJS.ProcessEnv;
+    expect(isTestnetCrossSectionalHorizonSourceAllowed("testnet", "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK", "XRPUSDT", env)).toBe(true);
+    expect(isTestnetCrossSectionalHorizonSourceAllowed("testnet", "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK", "WLDUSDT", env)).toBe(true);
+    expect(isTestnetCrossSectionalHorizonSourceAllowed("testnet", "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK", "ADAUSDT", env)).toBe(false);
+    expect(isTestnetCrossSectionalHorizonSourceAllowed("testnet", "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE", "XRPUSDT", env)).toBe(false);
   });
 });
 

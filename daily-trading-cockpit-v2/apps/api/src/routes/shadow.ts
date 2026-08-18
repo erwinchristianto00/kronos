@@ -368,6 +368,7 @@ import {
 } from "../lib/current-guard-variant-matrix.js";
 import {
   getCrossSectionalStore,
+  getCrossSectionalReportSinceMs,
   runCrossSectionalCycleGuarded,
   buildCrossSectionalReport,
   getCrossSectionalFilteredConfig,
@@ -482,6 +483,8 @@ export async function registerShadowRoutes(
     /** Lazy getter for the live-execution engine (created after this registration). Used READ-ONLY
      *  (sync getStatus, no I/O) to compute the order-reconciliation readiness gate. */
     liveEngineGetter?: () => { getStatus: () => unknown } | null;
+    /** Dynamic testnet-only blocks from open losing Cross-sectional legs. */
+    crossSectionalReentryBlocksGetter?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
     /** Lazy getter for the four-brain shadow tick's metrics aggregator (created after this
      *  registration, inside app.ts's `if (!isTest)` block, on instances that even construct it).
      *  null on any instance where four-brain shadow mode has never enabled (fail-open — see the
@@ -920,9 +923,7 @@ export async function registerShadowRoutes(
     // Testnet can deliberately start a fresh evidence era without deleting the older store. The
     // cutoff is configured per deployment via CROSS_SECTIONAL_REPORT_START_AT; absent/invalid means
     // the historical report behavior remains unchanged (important for mainnet and local research).
-    const configuredReportStartAt = process.env.CROSS_SECTIONAL_REPORT_START_AT ?? null;
-    const parsedReportStartMs = configuredReportStartAt ? Date.parse(configuredReportStartAt) : NaN;
-    const reportSinceMs = Number.isFinite(parsedReportStartMs) ? parsedReportStartMs : undefined;
+    const reportSinceMs = getCrossSectionalReportSinceMs();
     const reportStartAt = reportSinceMs === undefined ? null : new Date(reportSinceMs).toISOString();
     const inReportEra = (o: { openedAtMs: number }): boolean => reportSinceMs === undefined || o.openedAtMs >= reportSinceMs;
     const slim = (o: {
@@ -2879,6 +2880,7 @@ export async function registerShadowRoutes(
             now: Date.now(),
             regimeContext: crossSectionalRegimeContext,
             axisScore,
+            filteredEntryBlocks: opts.crossSectionalReentryBlocksGetter,
             // spotSymbolForCandles: 1000x-multiplier futures contracts (1000PEPEUSDT, …) have no
             // spot pair under that name — fetch the bare spot symbol instead. Returns are price
             // RATIOS, so the 1000x scaling cancels; the rest of the pipeline (scoring, allowlist

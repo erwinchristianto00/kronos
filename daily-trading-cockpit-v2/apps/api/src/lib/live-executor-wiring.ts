@@ -17,6 +17,19 @@ export interface LiveExecutorGateEngine {
 
 export const TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV = "TESTNET_ONLY_CROSS_SECTIONAL_HORIZON";
 export const CROSS_SECTIONAL_HORIZON_LANE_ID = "CROSS_SECTIONAL_MARKET_NEUTRAL";
+export const TESTNET_CROSS_SECTIONAL_EXTRA_LANES_ENV = "TESTNET_CROSS_SECTIONAL_EXTRA_LANES";
+export const TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS_ENV = "TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS";
+
+function csvSet(value: string | undefined): ReadonlySet<string> {
+  return new Set((value ?? "").split(",").map((part) => part.trim().toUpperCase()).filter(Boolean));
+}
+
+function laneMatchesAllowlist(laneId: string | null | undefined, allowlist: ReadonlySet<string>): boolean {
+  if (!laneId) return false;
+  const normalized = laneId.trim().toUpperCase();
+  const variantId = normalized.split(":").pop() ?? normalized;
+  return allowlist.has(normalized) || allowlist.has(variantId);
+}
 
 /** Testnet rollout switch: only the FILTERED cross-sectional horizon executor may open new risk. */
 export function isTestnetCrossSectionalHorizonLaneAllowed(
@@ -24,7 +37,27 @@ export function isTestnetCrossSectionalHorizonLaneAllowed(
   laneId: string | null | undefined,
   envVars: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return env !== "testnet" || envVars[TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV] !== "1" || laneId === CROSS_SECTIONAL_HORIZON_LANE_ID;
+  if (env !== "testnet" || envVars[TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV] !== "1") return true;
+  if (laneId === CROSS_SECTIONAL_HORIZON_LANE_ID) return true;
+  return laneMatchesAllowlist(laneId, csvSet(envVars[TESTNET_CROSS_SECTIONAL_EXTRA_LANES_ENV]));
+}
+
+/**
+ * Symbol-level companion to the testnet horizon lock. Extra lanes remain fail-closed unless
+ * BOTH the lane and the symbol are explicitly allowlisted. This keeps an experimental testnet
+ * rollout such as CG_MFE_GIVEBACK/XRP+WLD from opening the rest of that lane's universe.
+ */
+export function isTestnetCrossSectionalHorizonSourceAllowed(
+  env: "testnet" | "mainnet" | null,
+  laneId: string | null | undefined,
+  symbol: string | null | undefined,
+  envVars: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (env !== "testnet" || envVars[TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV] !== "1") return true;
+  if (laneId === CROSS_SECTIONAL_HORIZON_LANE_ID) return true;
+  if (!isTestnetCrossSectionalHorizonLaneAllowed(env, laneId, envVars)) return false;
+  const normalizedSymbol = symbol?.trim().toUpperCase();
+  return Boolean(normalizedSymbol && csvSet(envVars[TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS_ENV]).has(normalizedSymbol));
 }
 
 /**

@@ -29,6 +29,8 @@ import {
   roundDownToStep,
   roundStopToSafeSide,
   roundUpToStep,
+  mfeGivebackSignalBlockReason,
+  mfeResponsiveReversalConfirmed,
   shouldCapPyramidAdd,
   symbolBookNetAvgR,
   symbolPriorityTier,
@@ -4876,6 +4878,57 @@ describe("shouldCapPyramidAdd (2026-07-08, real MAX_HOLD_CUT loss evidence)", ()
 
   it("treats a missing sourcePaperOrders/maxFavorableR as zero (never caps a fresh intent)", () => {
     expect(shouldCapPyramidAdd({ sourcePaperOrders: undefined, maxFavorableR: undefined }, 3, 0.15)).toBe(false);
+  });
+});
+
+describe("mfeGivebackSignalBlockReason", () => {
+  const shortDirection = "SHORT" as const;
+  const paperWith = (provenance: PaperOrder["provenance"]): Pick<PaperOrder, "provenance"> => ({ provenance });
+
+  it("blocks a WAIT or conflicting observation from opening or adding to an MFE short", () => {
+    expect(mfeGivebackSignalBlockReason(shortDirection, [paperWith({ sourceStatus: "WAIT" } as PaperOrder["provenance"])]))
+      .toBe("mfe_signal_wait");
+    expect(mfeGivebackSignalBlockReason(shortDirection, [paperWith({ sourceConflict: true } as PaperOrder["provenance"])]))
+      .toBe("mfe_signal_source_conflict");
+    expect(mfeGivebackSignalBlockReason(shortDirection, [paperWith({ directionConflict: true } as PaperOrder["provenance"])]))
+      .toBe("mfe_signal_direction_conflict");
+    expect(mfeGivebackSignalBlockReason(shortDirection, [paperWith({ kronosBias: "LONG" } as PaperOrder["provenance"])]))
+      .toBe("mfe_signal_kronos_opposes");
+  });
+
+  it("allows an add when the newest MFE observation remains tradeable and aligned", () => {
+    expect(mfeGivebackSignalBlockReason(shortDirection, [paperWith({
+      sourceStatus: "TRADE_NOW",
+      sourceConflict: false,
+      directionConflict: false,
+      kronosBias: "SHORT",
+    } as PaperOrder["provenance"])])).toBeNull();
+  });
+});
+
+describe("mfeResponsiveReversalConfirmed", () => {
+  const observation = (id: string, createdAt: string, overrides: Partial<PaperOrder["provenance"]> = {}) => ({
+    sourceObservationId: id,
+    createdAt,
+    provenance: { sourceStatus: "WAIT", kronosBias: "LONG", whaleSignal: "BULLISH", ...overrides } as PaperOrder["provenance"],
+  });
+
+  it("requires two separate post-entry observations, not duplicate lane rows", () => {
+    expect(mfeResponsiveReversalConfirmed("SHORT", [
+      observation("scan-2", "2099-01-02T00:10:00.000Z"),
+      observation("scan-2", "2099-01-02T00:10:00.000Z"),
+    ])).toBe(false);
+    expect(mfeResponsiveReversalConfirmed("SHORT", [
+      observation("scan-2", "2099-01-02T00:10:00.000Z"),
+      observation("scan-1", "2099-01-02T00:05:00.000Z"),
+    ])).toBe(true);
+  });
+
+  it("does not close on a mixed or stale reversal signal", () => {
+    expect(mfeResponsiveReversalConfirmed("SHORT", [
+      observation("scan-2", "2099-01-02T00:10:00.000Z", { whaleSignal: "NEUTRAL" }),
+      observation("scan-1", "2099-01-02T00:05:00.000Z"),
+    ])).toBe(false);
   });
 });
 

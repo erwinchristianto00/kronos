@@ -80,7 +80,7 @@ import {
   isDirectionalTechnicalSignalFresh,
   type SymbolVolatilityCacheStore,
 } from "./directional-symbol-sizing.js";
-import { isTestnetCrossSectionalHorizonLaneAllowed } from "./live-executor-wiring.js";
+import { isTestnetCrossSectionalHorizonSourceAllowed } from "./live-executor-wiring.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
 
@@ -917,6 +917,10 @@ interface LiveExecutionState {
   newEntriesPaused: boolean;
   newEntriesPausedAt: string | null;
   newEntriesPauseReason: string | null;
+  /** Symbol → re-entry time after a responsive MFE reversal exit. */
+  mfeReversalReentryBlockedUntil: Record<string, string>;
+  /** Symbol → last responsive MFE reversal exit. Limits fee-churn exits to one per 2h. */
+  mfeReversalLastExitAt: Record<string, string>;
 }
 
 export interface LiveNewEntryGateDecision {
@@ -1009,6 +1013,8 @@ export class LiveExecutionStore {
       newEntriesPaused: false,
       newEntriesPausedAt: null,
       newEntriesPauseReason: null,
+      mfeReversalReentryBlockedUntil: {},
+      mfeReversalLastExitAt: {},
     };
   }
 
@@ -1790,6 +1796,59 @@ export function shouldCapPyramidAdd(
 ): boolean {
   const addCount = intent.sourcePaperOrders?.length ?? 0;
   return addCount >= freeAddLimit && (intent.maxFavorableR ?? 0) < minFavorableR;
+}
+
+/**
+ * MFE-giveback is an exit experiment, not permission to enter or average into a
+ * thesis that the newest scanner observation has already withdrawn. A
+ * WAIT/conflict or an opposing Kronos bias blocks NEW MFE exposure; existing
+ * positions keep their exchange-side stop/TP and lifecycle management.
+ */
+export function mfeGivebackSignalBlockReason(
+  direction: "LONG" | "SHORT",
+  papers: readonly Pick<PaperOrder, "provenance">[],
+): string | null {
+  for (const paper of papers) {
+    const provenance = paper.provenance;
+    if (provenance?.sourceStatus?.trim().toUpperCase() === "WAIT") return "mfe_signal_wait";
+    if (provenance?.sourceConflict === true) return "mfe_signal_source_conflict";
+    if (provenance?.directionConflict === true) return "mfe_signal_direction_conflict";
+
+    const kronosBias = provenance?.kronosBias?.trim().toUpperCase();
+    if ((kronosBias === "LONG" || kronosBias === "SHORT") && kronosBias !== direction) {
+      return "mfe_signal_kronos_opposes";
+    }
+  }
+  return null;
+}
+
+export const MFE_REVERSAL_CONFIRMATIONS_REQUIRED = 2;
+export const MFE_REVERSAL_REENTRY_COOLDOWN_MS = 15 * 60 * 1000;
+export const MFE_REVERSAL_EXIT_COOLDOWN_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * A responsive MFE exit is allowed only after two separate NEW observations
+ * agree that the open direction has been invalidated: the scanner is WAIT and
+ * both Kronos and whale point the other way. Two lane variants emitted from the
+ * same observation count once, so duplication cannot manufacture confirmation.
+ */
+export function mfeResponsiveReversalConfirmed(
+  direction: "LONG" | "SHORT",
+  papers: readonly Pick<PaperOrder, "sourceObservationId" | "createdAt" | "provenance">[],
+): boolean {
+  const opposite = direction === "LONG" ? "SHORT" : "LONG";
+  const oppositeWhale = direction === "LONG" ? "BEARISH" : "BULLISH";
+  const newestByObservation = new Map<string, Pick<PaperOrder, "sourceObservationId" | "createdAt" | "provenance">>();
+  for (const paper of [...papers].sort((a, b) => b.createdAt.localeCompare(a.createdAt))) {
+    if (!newestByObservation.has(paper.sourceObservationId)) newestByObservation.set(paper.sourceObservationId, paper);
+  }
+  const confirmations = [...newestByObservation.values()].slice(0, MFE_REVERSAL_CONFIRMATIONS_REQUIRED);
+  return confirmations.length === MFE_REVERSAL_CONFIRMATIONS_REQUIRED && confirmations.every((paper) => {
+    const provenance = paper.provenance;
+    return provenance?.sourceStatus?.trim().toUpperCase() === "WAIT" &&
+      provenance.kronosBias?.trim().toUpperCase() === opposite &&
+      provenance.whaleSignal?.trim().toUpperCase() === oppositeWhale;
+  });
 }
 
 /**
@@ -2754,6 +2813,11 @@ export class LiveExecutionEngine {
     period?: string | null;
     anchor?: string | null;
     regime?: string | null;
+    /** Optional narrow cohort. Empty means the complete, auditable live ledger. */
+    laneIds?: readonly string[] | null;
+    symbols?: readonly string[] | null;
+    /** Optional lower bound for an explicit deployment cohort, in addition to the selected view. */
+    since?: string | null;
   } = {}): LiveLanePerformanceSeriesReport {
     const view = normalizePerformanceView(options.view);
     const period = normalizePerformancePeriod(options.period);
@@ -2766,6 +2830,12 @@ export class LiveExecutionEngine {
       anchor: options.anchor,
       nowMs: safeNowMs,
     });
+    const requestedSinceMs = options.since ? Date.parse(options.since) : Number.NaN;
+    const cohortSinceMs = Number.isFinite(requestedSinceMs)
+      ? Math.max(window.sinceMs, requestedSinceMs)
+      : window.sinceMs;
+    const requestedLaneIds = new Set((options.laneIds ?? []).map((laneId) => laneId.trim()).filter(Boolean));
+    const requestedSymbols = new Set((options.symbols ?? []).map((symbol) => symbol.trim().toUpperCase()).filter(Boolean));
     const bucketStarts = window.bucketStartsMs.map((bucketMs) => new Date(bucketMs).toISOString());
 
     const paperById = this.paperOrderById();
@@ -2784,7 +2854,8 @@ export class LiveExecutionEngine {
       if (intent.realizedPnlUsd === null) continue;
       const closedAt = intent.closedAt ?? intent.updatedAt;
       const closedMs = new Date(closedAt).getTime();
-      if (!Number.isFinite(closedMs) || closedMs < window.sinceMs || closedMs >= window.untilMs) continue;
+      if (!Number.isFinite(closedMs) || closedMs < cohortSinceMs || closedMs >= window.untilMs) continue;
+      if (requestedSymbols.size > 0 && !requestedSymbols.has(intent.symbol.toUpperCase())) continue;
 
       const bucketStartMs = window.bucketForMs(closedMs);
       if (bucketStartMs === null) continue;
@@ -2809,6 +2880,7 @@ export class LiveExecutionEngine {
       }
 
       for (const [laneId, laneSources] of sourcesByLane) {
+        if (requestedLaneIds.size > 0 && !requestedLaneIds.has(laneId)) continue;
         const laneQty = laneSources.reduce((sum, source) => sum + source.qty, 0);
         const share = totalQty > 0 ? laneQty / totalQty : 1 / Math.max(sourcesByLane.size, 1);
         const representative = laneSources[0]!;
@@ -2895,7 +2967,7 @@ export class LiveExecutionEngine {
       periodLabel: window.periodLabel,
       bucketLabel: viewConfig.bucketLabel,
       bucketMs: window.bucketMs,
-      since: new Date(window.sinceMs).toISOString(),
+      since: new Date(cohortSinceMs).toISOString(),
       until: new Date(window.untilMs).toISOString(),
       anchor: window.anchor,
       regimeFilter,
@@ -3539,6 +3611,12 @@ export class LiveExecutionEngine {
           const liveBreakeven = await this.maybeCloseLiveBreakevenLaneAfterCost(intent, pos, amt, shareFrac);
           if (liveBreakeven.changed) dirty = true;
           if (liveBreakeven.closed) continue;
+        }
+
+        if (pos && intent.state === "OPEN") {
+          const reversal = await this.maybeCloseMfeResponsiveReversal(intent, amt);
+          if (reversal.changed) dirty = true;
+          if (reversal.closed) continue;
         }
 
         if (
@@ -4466,6 +4544,65 @@ export class LiveExecutionEngine {
     return { changed: true, closed: true };
   }
 
+  private isCgmfeGivebackIntent(intent: LiveIntent): boolean {
+    return this.intentExitRule(intent) === "mfe_giveback" && this.intentSources(intent).some((source) =>
+      source.laneId === "CG_MFE_GIVEBACK" || source.laneId.endsWith(":CG_MFE_GIVEBACK"),
+    );
+  }
+
+  private async maybeCloseMfeResponsiveReversal(intent: LiveIntent, amt: number): Promise<{ changed: boolean; closed: boolean }> {
+    if (!this.isCgmfeGivebackIntent(intent)) return { changed: false, closed: false };
+    const st = this.store.getState();
+    const nowMs = Date.parse(this.nowIso());
+    const lastExitMs = Date.parse(st.mfeReversalLastExitAt[intent.symbol] ?? "");
+    if (Number.isFinite(lastExitMs) && nowMs - lastExitMs < MFE_REVERSAL_EXIT_COOLDOWN_MS) return { changed: false, closed: false };
+
+    const openedAtMs = Date.parse(intent.createdAt);
+    const postEntryMfeObservations = this.paperStore.all.filter((paper) =>
+      paper.symbol === intent.symbol &&
+      this.paperExitRule(paper) === "mfe_giveback" &&
+      (paper.selectedLaneId === "CG_MFE_GIVEBACK" || paper.selectedLaneId.endsWith(":CG_MFE_GIVEBACK")) &&
+      Number.isFinite(Date.parse(paper.createdAt)) && Date.parse(paper.createdAt) > openedAtMs,
+    );
+    if (!mfeResponsiveReversalConfirmed(intent.direction, postEntryMfeObservations)) return { changed: false, closed: false };
+
+    try {
+      if (intent.stopOrderId !== null) await this.client.cancelAlgoOrder(intent.stopOrderId);
+      if (intent.tp1OrderId !== null) await this.client.cancelOrder(intent.symbol, intent.tp1OrderId);
+      if (intent.beStopOrderId !== null) await this.client.cancelAlgoOrder(intent.beStopOrderId);
+    } catch {
+      // The reduce-only close below is the safety action; exit-order cleanup is best-effort.
+    }
+    const flat = await this.client.placeOrder({
+      symbol: intent.symbol,
+      side: amt > 0 ? "SELL" : "BUY",
+      type: "MARKET",
+      quantity: Math.abs(amt),
+      reduceOnly: true,
+      newClientOrderId: `dtc-${intent.paperOrderId.slice(-18)}-rev`,
+    });
+    try {
+      await this.client.cancelAllOrders(intent.symbol);
+      await this.client.cancelAllAlgoOrders(intent.symbol);
+    } catch {
+      // best-effort after the reduce-only close
+    }
+    const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
+    const net = settled?.netUsd ?? null;
+    intent.realizedPnlUsd = net;
+    intent.feesUsd = settled?.feesUsd ?? null;
+    intent.feeSource = settled?.feeSource ?? undefined;
+    intent.state = "CLOSED";
+    intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
+    intent.updatedAt = this.nowIso();
+    intent.closeReason = "MFE_RESPONSIVE_REVERSAL_EXIT";
+    this.applyRealizedToLedger(net);
+    st.mfeReversalLastExitAt[intent.symbol] = intent.closedAt;
+    st.mfeReversalReentryBlockedUntil[intent.symbol] = new Date(nowMs + MFE_REVERSAL_REENTRY_COOLDOWN_MS).toISOString();
+    return { changed: true, closed: true };
+  }
+
   private async manageMfeGiveback(intent: LiveIntent, pos: FuturesPosition, amt: number): Promise<{ changed: boolean; closed: boolean }> {
     const entry = intent.filledEntryPrice ?? intent.plannedEntryPrice;
     const risk = Math.abs(entry - intent.stopLossPrice);
@@ -5290,7 +5427,7 @@ export class LiveExecutionEngine {
    *  plain allow-list (null = all lanes, [] = pause all new mirrors). Matches
    *  selectedLaneId as full id or variant suffix. */
   private laneAllowedForMirror(paper: PaperOrder): boolean {
-    if (!isTestnetCrossSectionalHorizonLaneAllowed(this.config.env, paper.selectedLaneId)) return false;
+    if (!isTestnetCrossSectionalHorizonSourceAllowed(this.config.env, paper.selectedLaneId, paper.symbol)) return false;
     // LIVE_MIRROR_ALL_PAPER is parsed as testnet-only. Collection mode mirrors
     // every fresh diagnostic source so lane selection cannot starve CORTEX data.
     if (this.config.mirrorAllPaperOrders) return true;
@@ -5305,7 +5442,7 @@ export class LiveExecutionEngine {
    *  Status, dedup, stop/TP geometry, entry quality, cluster caps and every risk check below remain
    *  unchanged. Returning null from paperLaneGate preserves the legacy source rules exactly. */
   private paperSourceEligibleForMirror(paper: PaperOrder, nowIso: string): boolean {
-    if (!isTestnetCrossSectionalHorizonLaneAllowed(this.config.env, paper.selectedLaneId)) return false;
+    if (!isTestnetCrossSectionalHorizonSourceAllowed(this.config.env, paper.selectedLaneId, paper.symbol)) return false;
     // Testnet collection is broader than orchestration. Still require a fresh
     // source, but do not let an old unified-recipe verdict suppress it.
     if (this.config.mirrorAllPaperOrders) return this.isFreshPaperOrder(paper, nowIso);
@@ -5409,8 +5546,8 @@ export class LiveExecutionEngine {
 
   /** Admission-only manual override. A paper signal must still be fresh and carry valid geometry;
    * this merely bypasses maturity/book/regime policy after the operator selected that directional lane. */
-  isManualEntryAllowedForPaper(paper: Pick<PaperOrder, "selectedLaneId" | "direction">): boolean {
-    if (!isTestnetCrossSectionalHorizonLaneAllowed(this.config.env, paper.selectedLaneId)) return false;
+  isManualEntryAllowedForPaper(paper: Pick<PaperOrder, "selectedLaneId" | "direction" | "symbol">): boolean {
+    if (!isTestnetCrossSectionalHorizonSourceAllowed(this.config.env, paper.selectedLaneId, paper.symbol)) return false;
     const decision = this.manualEntryDecision;
     return this.isManualDirectionalEntryEnabled() &&
       decision?.directionalBias === paper.direction &&
@@ -5624,7 +5761,7 @@ export class LiveExecutionEngine {
     sourceEnv?: string | null;
     idempotencyKey?: string | null;
   }): Promise<{ ok: boolean; reason: string | null; intent?: LiveIntent }> {
-    if (!isTestnetCrossSectionalHorizonLaneAllowed(this.config.env, req.sourceLaneId)) {
+    if (!isTestnetCrossSectionalHorizonSourceAllowed(this.config.env, req.sourceLaneId, req.symbol)) {
       return { ok: false, reason: "testnet is locked to the cross-sectional horizon lane" };
     }
     const idempotencyKey =
@@ -6067,6 +6204,21 @@ export class LiveExecutionEngine {
           for (const paper of papers) latchReason(paper.paperOrderId, "entry_regime_isolated_open_intent");
         }
         continue;
+      }
+      const isMfeGiveback = oppositeIntent
+        ? this.intentExitRule(oppositeIntent) === "mfe_giveback"
+        : lanePapers.some((paper) => this.paperExitRule(paper) === "mfe_giveback");
+      if (isMfeGiveback) {
+        const reentryBlockedUntilMs = Date.parse(st.mfeReversalReentryBlockedUntil[first.symbol] ?? "");
+        if (!oppositeIntent && Number.isFinite(reentryBlockedUntilMs) && nowMs < reentryBlockedUntilMs) {
+          for (const paper of lanePapers) latchReason(paper.paperOrderId, "mfe_reversal_reentry_cooldown");
+          continue;
+        }
+        const blockReason = mfeGivebackSignalBlockReason(oppositeIntent?.direction ?? first.direction, lanePapers);
+        if (blockReason !== null) {
+          for (const paper of lanePapers) latchReason(paper.paperOrderId, blockReason);
+          continue;
+        }
       }
 
       const filters = await this.getFilters(first.symbol);

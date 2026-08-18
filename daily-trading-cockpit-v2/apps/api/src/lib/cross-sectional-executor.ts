@@ -135,6 +135,44 @@ export function applyEntryHealthBypass(
   };
 }
 
+/**
+ * Does the exchange's NET position on this symbol contradict the basket leg we just opened?
+ *
+ * Binance nets per symbol across the whole account, so two lanes taking opposite sides of the same
+ * symbol do not produce two positions — they cancel, and each lane's book keeps claiming a position
+ * that the exchange no longer separately holds. On 2026-08-14 the directional lane opened ETHUSDT
+ * SHORT 0.013 and this executor then opened ETHUSDT LONG 0.011 into it; the exchange carried the
+ * -0.002 remainder, both books claimed their full size, and the engine force-disarmed every tick on
+ * an orphan it could attribute to neither. The basket only found out hours later, at close time,
+ * when its reduce-only exit came back -2022.
+ *
+ * The existing guards all sit on the CLOSE path (the -2022 stale-book reconcile above, and
+ * retryOrphanedLegFlattens). Nothing checked the OPEN, which is where the collision is created and
+ * where it is still cheap to undo.
+ *
+ * The test: after opening, the exchange's signed net for this symbol must be at least what THIS leg
+ * put there, minus whatever KNOWN sibling basket legs hold on the opposite side (a sibling holding
+ * the other side is a legitimate, designed-for case — see siblingOppositeUnexitedQty). Anything
+ * further against us is an unknown external holder, which is exactly the blind spot: this executor
+ * can see its sibling baskets but not the single-symbol/directional lanes sharing the account.
+ *
+ * More net in our favour than expected is NOT a conflict — another lane holding the SAME side is
+ * harmless to us; it neither hides our exposure nor makes our close create opposite exposure.
+ */
+export function basketLegNettingConflict(
+  leg: { side: "LONG" | "SHORT"; qty: number },
+  exchangeNetQty: number,
+  siblingOppositeQty: number,
+  tolerance = 1e-9,
+): boolean {
+  if (!(leg.qty > 0) || !Number.isFinite(exchangeNetQty)) return false;
+  const opposite = Number.isFinite(siblingOppositeQty) ? Math.max(0, siblingOppositeQty) : 0;
+  const ownContribution = Math.max(0, leg.qty - opposite);
+  return leg.side === "LONG"
+    ? exchangeNetQty < ownContribution - tolerance
+    : exchangeNetQty > -ownContribution + tolerance;
+}
+
 const LEG_USD = () => {
   const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "");
   return Number.isFinite(n) && n > 0 ? n : 25;
@@ -182,6 +220,34 @@ const MAX_SIGNAL_AGE_MS = () =>
  */
 const MAX_OPEN_BASKETS = () =>
   Math.max(1, Math.floor(Number(process.env.CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS) || 1));
+/** Prevent repeated persistent-momentum names from silently becoming one concentrated position. */
+export function isCrossSectionalOverlapGuardEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_OVERLAP_GUARD_ENABLED === "1";
+}
+const MAX_OVERLAPPING_SYMBOLS = () => Math.max(0, Math.floor(Number(process.env.CROSS_SECTIONAL_MAX_OVERLAPPING_SYMBOLS) || 1));
+const MAX_OVERLAPPING_SYMBOLS_PER_SIDE = () => Math.max(0, Math.floor(Number(process.env.CROSS_SECTIONAL_MAX_OVERLAPPING_SYMBOLS_PER_SIDE) || 1));
+const OVERLAP_MIN_SCORE_DELTA = () => Math.max(0, Number(process.env.CROSS_SECTIONAL_OVERLAP_MIN_SCORE_DELTA) || 0);
+/** Repeating a winner is a continuation trade, not permission to chase a weak residual rank. */
+const OVERLAP_MIN_ABS_SCORE = () => Math.max(0, Number(process.env.CROSS_SECTIONAL_OVERLAP_MIN_ABS_SCORE) || 0);
+/**
+ * A repeated leg may move only a bounded amount against its desired entry from the original
+ * basket entry. The bound is volatility-aware, with a small floor for quiet symbols. This makes
+ * "normal/underpriced" concrete: a long may be at or below the old entry, but cannot be chased
+ * materially above it; inverse logic applies to a short.
+ */
+const OVERLAP_MAX_ADVERSE_EXTENSION_VOL = () => Math.max(0, Number(process.env.CROSS_SECTIONAL_OVERLAP_MAX_ADVERSE_EXTENSION_VOL) || 0);
+const OVERLAP_MIN_ADVERSE_EXTENSION_PCT = () => Math.max(0, Number(process.env.CROSS_SECTIONAL_OVERLAP_MIN_ADVERSE_EXTENSION_PCT) || 0);
+/** Also reject a market order if the mark has already run away from the fresh signal snapshot. */
+const OVERLAP_MAX_SIGNAL_DRIFT_VOL = () => Math.max(0, Number(process.env.CROSS_SECTIONAL_OVERLAP_MAX_SIGNAL_DRIFT_VOL) || 0);
+const OVERLAP_MIN_SIGNAL_DRIFT_PCT = () => Math.max(0, Number(process.env.CROSS_SECTIONAL_OVERLAP_MIN_SIGNAL_DRIFT_PCT) || 0);
+/** Testnet opt-in: do not add the same symbol+side while its existing basket exposure is losing. */
+export function isCrossSectionalLossReentryGuardEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_LOSS_REENTRY_GUARD_ENABLED === "1";
+}
+const REENTRY_ESTIMATED_CLOSE_COST_PCT = () => {
+  const n = Number(process.env.CROSS_SECTIONAL_REENTRY_ESTIMATED_CLOSE_COST_PCT ?? process.env.LIVE_ESTIMATED_CLOSE_COST_PCT ?? "");
+  return Number.isFinite(n) && n >= 0 ? n : 0.0022;
+};
 /** Store never capped closed/aborted baskets, growing forever. Keeps every OPEN basket
  *  unconditionally and caps settled (CLOSED/ABORTED) ones to the newest N by openedAt. */
 const MAX_STORED_BASKETS = () =>
@@ -231,6 +297,11 @@ export interface ExecutorLeg {
   exitOrderId: string | null;
   /** Same caveat as entryPriceConfirmed, for the exit fill. Null while still open. */
   exitPriceConfirmed: boolean | null;
+  /** Frozen selection metadata, copied from the source signal for diversity checks and cohort audit. */
+  signalWeight?: number | null;
+  scoreAtOpen?: number | null;
+  volatilityAtOpen?: number | null;
+  targetNotionalUsd?: number | null;
 }
 
 /**
@@ -335,6 +406,97 @@ export function closedBasketRealizedBreakdown(
   return out.sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime());
 }
 
+export type FormationEvaluationMetric = {
+  model: "EQUAL_NOTIONAL" | "CAPPED_INVERSE_VOL" | "CAPPED_INVERSE_VOL_SCORE_TILT";
+  samples: number;
+  meanNetReturnPct: number | null;
+  winRatePct: number | null;
+  worstNetReturnPct: number | null;
+};
+
+/**
+ * Closed-basket counterfactuals for sizing only. Constituents and actual fills stay fixed, so this
+ * never claims to prove a different symbol-selection rule. The evaluation is report-only: no
+ * automatic live switch is made from a small cohort.
+ */
+export function evaluateCrossSectionalFormationCohort(baskets: readonly ExecutorBasket[]): {
+  activationClosedBaskets: number;
+  closedBaskets: number;
+  status: "COLLECTING" | "EVALUATING";
+  autoSwitch: false;
+  metrics: FormationEvaluationMetric[];
+} {
+  // Only count baskets captured after this evaluator's metadata was introduced. Older closes stay
+  // in the ledger, but cannot honestly be used for a volatility/score counterfactual.
+  const closed = baskets.filter((basket) => basket.status === "CLOSED" && basket.legs.every((leg) =>
+    leg.exitPrice !== null && leg.entryPrice > 0 && Number.isFinite(leg.volatilityAtOpen) && leg.volatilityAtOpen! > 0 && Number.isFinite(leg.scoreAtOpen),
+  ));
+  const models: FormationEvaluationMetric["model"][] = ["EQUAL_NOTIONAL", "CAPPED_INVERSE_VOL", "CAPPED_INVERSE_VOL_SCORE_TILT"];
+  const perModel = new Map<FormationEvaluationMetric["model"], number[]>();
+  for (const model of models) perModel.set(model, []);
+  for (const basket of closed) {
+    const bySide: Array<["LONG" | "SHORT", ExecutorLeg[]]> = [
+      ["LONG", basket.legs.filter((leg) => leg.side === "LONG")],
+      ["SHORT", basket.legs.filter((leg) => leg.side === "SHORT")],
+    ];
+    if (bySide.some(([, legs]) => legs.length === 0)) continue;
+    const entryNotional = basket.legs.reduce((sum, leg) => sum + leg.entryPrice * leg.qty, 0);
+    const feeRate = entryNotional > 0 && Number.isFinite(basket.feeEstimateUsd) ? basket.feeEstimateUsd! / entryNotional : 0;
+    for (const model of models) {
+      let net = -feeRate;
+      let usable = true;
+      for (const [side, legs] of bySide) {
+        let raw: number[];
+        if (model === "EQUAL_NOTIONAL") raw = legs.map(() => 1);
+        else {
+          raw = legs.map((leg) => Number.isFinite(leg.volatilityAtOpen) && leg.volatilityAtOpen! > 0 ? 1 / leg.volatilityAtOpen! : NaN);
+          if (raw.some((value) => !Number.isFinite(value))) { usable = false; break; }
+          const rawMean = raw.reduce((sum, value) => sum + value, 0) / raw.length || 1;
+          raw = raw.map((value) => Math.max(0.75, Math.min(1.25, value / rawMean)));
+          if (model === "CAPPED_INVERSE_VOL_SCORE_TILT") {
+            const scores = legs.map((leg) => leg.scoreAtOpen);
+            if (scores.some((score) => !Number.isFinite(score))) { usable = false; break; }
+            const low = Math.min(...scores as number[]);
+            const high = Math.max(...scores as number[]);
+            raw = raw.map((value, index) => {
+              const rank = high > low
+                ? (side === "LONG" ? ((scores[index]! - low) / (high - low)) : ((high - scores[index]!) / (high - low)))
+                : 0.5;
+              return value * (0.9 + 0.2 * rank);
+            });
+          }
+        }
+        const denom = raw.reduce((sum, value) => sum + value, 0);
+        if (!(denom > 0)) { usable = false; break; }
+        for (let index = 0; index < legs.length; index++) {
+          const leg = legs[index]!;
+          const grossReturn = side === "LONG"
+            ? (leg.exitPrice! - leg.entryPrice) / leg.entryPrice
+            : (leg.entryPrice - leg.exitPrice!) / leg.entryPrice;
+          net += 0.5 * raw[index]! / denom * grossReturn;
+        }
+      }
+      if (usable) perModel.get(model)!.push(net * 100);
+    }
+  }
+  return {
+    activationClosedBaskets: 8,
+    closedBaskets: closed.length,
+    status: closed.length >= 8 ? "EVALUATING" : "COLLECTING",
+    autoSwitch: false,
+    metrics: models.map((model) => {
+      const returns = perModel.get(model)!;
+      return {
+        model,
+        samples: returns.length,
+        meanNetReturnPct: returns.length ? returns.reduce((sum, value) => sum + value, 0) / returns.length : null,
+        winRatePct: returns.length ? returns.filter((value) => value > 0).length / returns.length * 100 : null,
+        worstNetReturnPct: returns.length ? Math.min(...returns) : null,
+      };
+    }),
+  };
+}
+
 export interface ExecutorBasket {
   basketId: string;
   sourceObservationId: string;
@@ -382,6 +544,170 @@ export interface ExecutorBasket {
    *  never retroactively assigned an invented tilt share. */
   cortexAppliedWeightPct?: number;
   cortexRawStaticWeightPct?: number;
+}
+
+export type CrossSectionalLossReentryBlock = {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  grossUnrealizedUsd: number | null;
+  afterEstimatedCloseCostUsd: number | null;
+  openBasketIds: string[];
+  reason: "LOSING_AFTER_CLOSE_COST" | "MARK_UNAVAILABLE";
+};
+
+/** Aggregate only still-open legs. A missing mark blocks safely rather than pretending it is flat. */
+export function lossMakingCrossSectionalOpenLegs(
+  baskets: readonly ExecutorBasket[],
+  markBySymbol: ReadonlyMap<string, number>,
+  estimatedCloseCostPct: number,
+): CrossSectionalLossReentryBlock[] {
+  const rows = new Map<string, {
+    symbol: string; side: "LONG" | "SHORT"; grossUsd: number; closeCostUsd: number;
+    markUnavailable: boolean; basketIds: Set<string>;
+  }>();
+  for (const basket of baskets) {
+    if (basket.status !== "OPEN") continue;
+    for (const leg of basket.legs) {
+      if (leg.exitOrderId !== null) continue;
+      const key = `${leg.symbol}|${leg.side}`;
+      const row = rows.get(key) ?? { symbol: leg.symbol, side: leg.side, grossUsd: 0, closeCostUsd: 0, markUnavailable: false, basketIds: new Set<string>() };
+      row.basketIds.add(basket.basketId);
+      const mark = markBySymbol.get(leg.symbol);
+      if (mark == null || !Number.isFinite(mark) || mark <= 0) row.markUnavailable = true;
+      else {
+        row.grossUsd += (mark - leg.entryPrice) * leg.qty * (leg.side === "LONG" ? 1 : -1);
+        row.closeCostUsd += mark * leg.qty * Math.max(0, estimatedCloseCostPct);
+      }
+      rows.set(key, row);
+    }
+  }
+  return [...rows.values()]
+    .filter((row) => row.markUnavailable || row.grossUsd - row.closeCostUsd < 0)
+    .map((row) => ({
+      symbol: row.symbol,
+      side: row.side,
+      grossUnrealizedUsd: row.markUnavailable ? null : row.grossUsd,
+      afterEstimatedCloseCostUsd: row.markUnavailable ? null : row.grossUsd - row.closeCostUsd,
+      openBasketIds: [...row.basketIds].sort(),
+      reason: row.markUnavailable ? "MARK_UNAVAILABLE" as const : "LOSING_AFTER_CLOSE_COST" as const,
+    }))
+    .sort((a, b) => a.symbol.localeCompare(b.symbol) || a.side.localeCompare(b.side));
+}
+
+export type CrossSectionalOverlapDecision = {
+  allowed: boolean;
+  reason: string | null;
+  repeatedSymbols: string[];
+};
+
+/**
+ * Basket-to-basket diversity gate. It permits one continued winner per side only when the new
+ * rank is stronger and the old live exposure is already non-negative after estimated exit cost.
+ * Old baskets without frozen scores fail closed for repetition; they remain open and unmanaged.
+ */
+export function evaluateCrossSectionalOverlap(
+  signal: CrossSectionalObservation,
+  openBaskets: readonly ExecutorBasket[],
+  markBySymbol: ReadonlyMap<string, number>,
+  estimatedCloseCostPct: number,
+  opts: {
+    maxTotal: number;
+    maxPerSide: number;
+    minScoreDelta: number;
+    minAbsScore?: number;
+    maxAdverseExtensionVol?: number;
+    minAdverseExtensionPct?: number;
+    maxSignalDriftVol?: number;
+    minSignalDriftPct?: number;
+  },
+): CrossSectionalOverlapDecision {
+  const open = openBaskets.flatMap((basket) => basket.status === "OPEN" ? basket.legs
+    .filter((leg) => leg.exitOrderId === null)
+    .map((leg) => ({ basketId: basket.basketId, leg })) : []);
+  const repeated: string[] = [];
+  const bySide = new Map<"LONG" | "SHORT", number>([["LONG", 0], ["SHORT", 0]]);
+  for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
+    for (const candidate of legs) {
+      const sameSymbol = open.filter((row) => row.leg.symbol === candidate.symbol);
+      if (!sameSymbol.length) continue;
+      if (sameSymbol.some((row) => row.leg.side !== side)) {
+        return { allowed: false, reason: `overlap guard: ${candidate.symbol} already has opposite-side open exposure`, repeatedSymbols: repeated };
+      }
+      const sameSide = sameSymbol.filter((row) => row.leg.side === side);
+      const candidateScore = candidate.scoreAtOpen;
+      if (!Number.isFinite(candidateScore)) {
+        return { allowed: false, reason: `overlap guard: ${candidate.symbol} has no frozen new score`, repeatedSymbols: repeated };
+      }
+      const correctDirection = side === "LONG" ? candidateScore! > 0 : candidateScore! < 0;
+      if (!correctDirection || Math.abs(candidateScore!) < (opts.minAbsScore ?? 0)) {
+        return { allowed: false, reason: `overlap guard: ${candidate.symbol} continuation conviction is insufficient`, repeatedSymbols: repeated };
+      }
+      if (!(Number.isFinite(candidate.entryPrice) && candidate.entryPrice > 0)) {
+        return { allowed: false, reason: `overlap guard: ${candidate.symbol} fresh signal price unavailable`, repeatedSymbols: repeated };
+      }
+      let gross = 0;
+      let closeCost = 0;
+      for (const row of sameSide) {
+        const mark = markBySymbol.get(row.leg.symbol);
+        if (!(Number.isFinite(mark) && mark! > 0)) {
+          return { allowed: false, reason: `overlap guard: ${candidate.symbol} mark unavailable`, repeatedSymbols: repeated };
+        }
+        if (!Number.isFinite(row.leg.scoreAtOpen)) {
+          return { allowed: false, reason: `overlap guard: ${candidate.symbol} old basket lacks frozen score`, repeatedSymbols: repeated };
+        }
+        const adverseExtensionEnabled = (opts.maxAdverseExtensionVol ?? 0) > 0 || (opts.minAdverseExtensionPct ?? 0) > 0;
+        const signalDriftEnabled = (opts.maxSignalDriftVol ?? 0) > 0 || (opts.minSignalDriftPct ?? 0) > 0;
+        const volatility = Math.max(
+          Number.isFinite(candidate.volatilityAtOpen) && candidate.volatilityAtOpen! > 0 ? candidate.volatilityAtOpen! : 0,
+          Number.isFinite(row.leg.volatilityAtOpen) && row.leg.volatilityAtOpen! > 0 ? row.leg.volatilityAtOpen! : 0,
+        );
+        if ((adverseExtensionEnabled || signalDriftEnabled) && volatility <= 0) {
+          return { allowed: false, reason: `overlap guard: ${candidate.symbol} lacks volatility for normal-price check`, repeatedSymbols: repeated };
+        }
+        const adverseExtensionPct = Math.max(
+          opts.minAdverseExtensionPct ?? 0,
+          volatility * (opts.maxAdverseExtensionVol ?? 0),
+        );
+        const signalDriftPct = Math.max(
+          opts.minSignalDriftPct ?? 0,
+          volatility * (opts.maxSignalDriftVol ?? 0),
+        );
+        const extensionFromOldEntry = side === "LONG"
+          ? mark! / row.leg.entryPrice - 1
+          : 1 - mark! / row.leg.entryPrice;
+        if (adverseExtensionEnabled && extensionFromOldEntry > adverseExtensionPct) {
+          return { allowed: false, reason: `overlap guard: ${candidate.symbol} mark is overextended versus old entry`, repeatedSymbols: repeated };
+        }
+        const driftFromFreshSignal = side === "LONG"
+          ? mark! / candidate.entryPrice - 1
+          : 1 - mark! / candidate.entryPrice;
+        if (signalDriftEnabled && driftFromFreshSignal > signalDriftPct) {
+          return { allowed: false, reason: `overlap guard: ${candidate.symbol} mark ran away from fresh signal`, repeatedSymbols: repeated };
+        }
+        const pnl = (mark! - row.leg.entryPrice) * row.leg.qty * (side === "LONG" ? 1 : -1);
+        gross += pnl;
+        closeCost += mark! * row.leg.qty * Math.max(0, estimatedCloseCostPct);
+        const improved = side === "LONG"
+          ? candidateScore! > row.leg.scoreAtOpen! + opts.minScoreDelta
+          : candidateScore! < row.leg.scoreAtOpen! - opts.minScoreDelta;
+        if (!improved) {
+          return { allowed: false, reason: `overlap guard: ${candidate.symbol} score did not improve`, repeatedSymbols: repeated };
+        }
+      }
+      if (gross - closeCost < 0) {
+        return { allowed: false, reason: `overlap guard: ${candidate.symbol} open leg is negative after close cost`, repeatedSymbols: repeated };
+      }
+      repeated.push(`${candidate.symbol} ${side}`);
+      bySide.set(side, (bySide.get(side) ?? 0) + 1);
+    }
+  }
+  if (repeated.length > opts.maxTotal) {
+    return { allowed: false, reason: `overlap guard: ${repeated.length} repeated symbols exceeds total cap ${opts.maxTotal}`, repeatedSymbols: repeated };
+  }
+  if ([...(bySide.entries())].some(([, count]) => count > opts.maxPerSide)) {
+    return { allowed: false, reason: `overlap guard: repeated symbols exceeds per-side cap ${opts.maxPerSide}`, repeatedSymbols: repeated };
+  }
+  return { allowed: true, reason: null, repeatedSymbols: repeated };
 }
 
 /**
@@ -604,6 +930,17 @@ export interface CrossSectionalExecutorOptions {
   leverage?: () => number;
   maxOpenBaskets?: () => number;
   maxSignalAgeMs?: () => number;
+  lossReentryGuardEnabled?: () => boolean;
+  estimatedCloseCostPct?: () => number;
+  overlapGuardEnabled?: () => boolean;
+  maxOverlappingSymbols?: () => number;
+  maxOverlappingSymbolsPerSide?: () => number;
+  overlapMinScoreDelta?: () => number;
+  overlapMinAbsScore?: () => number;
+  overlapMaxAdverseExtensionVol?: () => number;
+  overlapMinAdverseExtensionPct?: () => number;
+  overlapMaxSignalDriftVol?: () => number;
+  overlapMinSignalDriftPct?: () => number;
   /** Prevents client-order-id collisions between isolated innovation stores sharing a timestamp. */
   idNamespace?: string;
   /** Honor signal-owned basket TP/SL. Off by default so existing live behavior is unchanged. */
@@ -639,6 +976,17 @@ export class CrossSectionalExecutor {
   private readonly leverageFn: () => number;
   private readonly maxOpenBasketsFn: () => number;
   private readonly maxSignalAgeMsFn: () => number;
+  private readonly lossReentryGuardEnabledFn: () => boolean;
+  private readonly estimatedCloseCostPctFn: () => number;
+  private readonly overlapGuardEnabledFn: () => boolean;
+  private readonly maxOverlappingSymbolsFn: () => number;
+  private readonly maxOverlappingSymbolsPerSideFn: () => number;
+  private readonly overlapMinScoreDeltaFn: () => number;
+  private readonly overlapMinAbsScoreFn: () => number;
+  private readonly overlapMaxAdverseExtensionVolFn: () => number;
+  private readonly overlapMinAdverseExtensionPctFn: () => number;
+  private readonly overlapMaxSignalDriftVolFn: () => number;
+  private readonly overlapMinSignalDriftPctFn: () => number;
   private readonly idNamespace: string;
   private readonly respectSignalRiskGeometry: boolean;
   private readonly enabledFn: () => boolean;
@@ -667,6 +1015,17 @@ export class CrossSectionalExecutor {
     this.leverageFn = opts.leverage ?? EXEC_LEVERAGE;
     this.maxOpenBasketsFn = opts.maxOpenBaskets ?? MAX_OPEN_BASKETS;
     this.maxSignalAgeMsFn = opts.maxSignalAgeMs ?? MAX_SIGNAL_AGE_MS;
+    this.lossReentryGuardEnabledFn = opts.lossReentryGuardEnabled ?? isCrossSectionalLossReentryGuardEnabled;
+    this.estimatedCloseCostPctFn = opts.estimatedCloseCostPct ?? REENTRY_ESTIMATED_CLOSE_COST_PCT;
+    this.overlapGuardEnabledFn = opts.overlapGuardEnabled ?? isCrossSectionalOverlapGuardEnabled;
+    this.maxOverlappingSymbolsFn = opts.maxOverlappingSymbols ?? MAX_OVERLAPPING_SYMBOLS;
+    this.maxOverlappingSymbolsPerSideFn = opts.maxOverlappingSymbolsPerSide ?? MAX_OVERLAPPING_SYMBOLS_PER_SIDE;
+    this.overlapMinScoreDeltaFn = opts.overlapMinScoreDelta ?? OVERLAP_MIN_SCORE_DELTA;
+    this.overlapMinAbsScoreFn = opts.overlapMinAbsScore ?? OVERLAP_MIN_ABS_SCORE;
+    this.overlapMaxAdverseExtensionVolFn = opts.overlapMaxAdverseExtensionVol ?? OVERLAP_MAX_ADVERSE_EXTENSION_VOL;
+    this.overlapMinAdverseExtensionPctFn = opts.overlapMinAdverseExtensionPct ?? OVERLAP_MIN_ADVERSE_EXTENSION_PCT;
+    this.overlapMaxSignalDriftVolFn = opts.overlapMaxSignalDriftVol ?? OVERLAP_MAX_SIGNAL_DRIFT_VOL;
+    this.overlapMinSignalDriftPctFn = opts.overlapMinSignalDriftPct ?? OVERLAP_MIN_SIGNAL_DRIFT_PCT;
     this.idNamespace = (opts.idNamespace ?? this.targetVariant).replace(/[^a-zA-Z0-9]/g, "").slice(-6).toLowerCase() || "basket";
     this.respectSignalRiskGeometry = opts.respectSignalRiskGeometry ?? false;
     this.enabledFn = opts.enabled ?? isCrossSectionalExecEnabled;
@@ -844,6 +1203,8 @@ export class CrossSectionalExecutor {
      *  reflects the CURRENT cycle, not a stale snapshot. */
     adaptiveFilters: ReturnType<typeof deriveAdaptiveSymbolFilters>["provenance"];
     adaptiveFiltersDisabled: boolean;
+    /** Report-only cohort evaluator. It starts at 8 closes and never auto-switches execution. */
+    formationEvaluation: ReturnType<typeof evaluateCrossSectionalFormationCohort>;
     /** 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): real, still-open exchange
      *  exposure this executor's normal HORIZON/PROFIT_BANK close paths can no longer reach — see
      *  OrphanedLeg's doc comment. retryOrphanedLegFlattens() retries every tick automatically, but
@@ -888,6 +1249,7 @@ export class CrossSectionalExecutor {
       signalStale: signalAgeMs === null || signalAgeMs > signalMaxAgeMs,
       adaptiveFilters: deriveAdaptiveSymbolFilters(this.signalStore as CrossSectionalStore).provenance,
       adaptiveFiltersDisabled: isCrossSectionalAdaptiveDisabled(),
+      formationEvaluation: evaluateCrossSectionalFormationCohort(closed),
       orphanedLegs: st.orphanedLegs ?? [],
     };
   }
@@ -938,6 +1300,19 @@ export class CrossSectionalExecutor {
    *  closedAt/netPnl (e.g. the lane-performance timeline) rather than the aggregate summary. */
   getClosedBaskets(): ExecutorBasket[] {
     return this.store.getState().baskets.filter((b) => b.status === "CLOSED");
+  }
+
+  /** Read-only re-entry blocks used by both the signal cycle and final execution admission. */
+  async getLossReentryBlocks(): Promise<CrossSectionalLossReentryBlock[]> {
+    if (!this.lossReentryGuardEnabledFn()) return [];
+    const open = this.store.getState().baskets.filter((basket) => basket.status === "OPEN");
+    if (!open.length) return [];
+    const positions = await this.sharedGetPositions();
+    const marks = new Map<string, number>();
+    for (const position of positions) {
+      if (Number.isFinite(position.markPrice) && position.markPrice > 0) marks.set(position.symbol, position.markPrice);
+    }
+    return lossMakingCrossSectionalOpenLegs(open, marks, this.estimatedCloseCostPctFn());
   }
 
   /** Single-flight tick: bank early winners, close due baskets, then consider opening a new one. */
@@ -1412,20 +1787,79 @@ export class CrossSectionalExecutor {
     const signal = candidates[0];
     if (!signal) return;
 
+    let reentryBlocks: CrossSectionalLossReentryBlock[];
+    try {
+      reentryBlocks = await this.getLossReentryBlocks();
+    } catch (error) {
+      this.openHalted = `loss re-entry guard could not read marks: ${(error as Error).message ?? "unknown error"}`;
+      return;
+    }
+    const blocked = new Set(reentryBlocks.map((row) => `${row.symbol}|${row.side}`));
+    const conflicts = [
+      ...signal.longLeg.filter((leg) => blocked.has(`${leg.symbol}|LONG`)).map((leg) => `${leg.symbol} LONG`),
+      ...signal.shortLeg.filter((leg) => blocked.has(`${leg.symbol}|SHORT`)).map((leg) => `${leg.symbol} SHORT`),
+    ];
+    if (conflicts.length) {
+      // Consume this signal. The next hourly one is rebuilt with these dynamic blocks and can use
+      // the next ranked eligible symbols instead of adding to a losing same-side leg.
+      st.lastSeenSignalMs = signal.openedAtMs;
+      this.store.save();
+      this.openHalted = `loss re-entry guard skipped overlapping signal: ${conflicts.join(", ")}`;
+      return;
+    }
+
+    if (this.overlapGuardEnabledFn()) {
+      try {
+        const positions = await this.sharedGetPositions();
+        const marks = new Map<string, number>();
+        for (const position of positions) {
+          if (Number.isFinite(position.markPrice) && position.markPrice > 0) marks.set(position.symbol, position.markPrice);
+        }
+        const overlap = evaluateCrossSectionalOverlap(
+          signal,
+          st.baskets,
+          marks,
+          this.estimatedCloseCostPctFn(),
+          {
+            maxTotal: this.maxOverlappingSymbolsFn(),
+            maxPerSide: this.maxOverlappingSymbolsPerSideFn(),
+            minScoreDelta: this.overlapMinScoreDeltaFn(),
+            minAbsScore: this.overlapMinAbsScoreFn(),
+            maxAdverseExtensionVol: this.overlapMaxAdverseExtensionVolFn(),
+            minAdverseExtensionPct: this.overlapMinAdverseExtensionPctFn(),
+            maxSignalDriftVol: this.overlapMaxSignalDriftVolFn(),
+            minSignalDriftPct: this.overlapMinSignalDriftPctFn(),
+          },
+        );
+        if (!overlap.allowed) {
+          st.lastSeenSignalMs = signal.openedAtMs;
+          this.store.save();
+          this.openHalted = overlap.reason;
+          return;
+        }
+      } catch (error) {
+        this.openHalted = `overlap guard could not read marks: ${(error as Error).message ?? "unknown error"}`;
+        return;
+      }
+    }
+
     // Watermark BEFORE placing orders: a failed basket must not retry forever.
     st.lastSeenSignalMs = signal.openedAtMs;
     this.store.save();
 
     const filters = await this.client.getExchangeFilters();
-    const legUsd = this.effectiveLegUsd();
-    if (!(legUsd > 0)) return;
+    const equalLegUsd = this.effectiveLegUsd();
+    if (!(equalLegUsd > 0)) return;
+    const totalBasketUsd = equalLegUsd * (signal.longLeg.length + signal.shortLeg.length);
     const notionalCap = this.maxNotionalPerSymbolAcrossLanesFn();
-    const plannedLegs: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number; refPrice: number }> = [];
+    const plannedLegs: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number; refPrice: number; targetNotionalUsd: number; signalWeight: number | null; scoreAtOpen: number | null; volatilityAtOpen: number | null }> = [];
     for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
       for (const leg of legs) {
         const f = filters.get(leg.symbol);
         if (!f || !(leg.entryPrice > 0)) return; // missing filters/price ⇒ skip whole basket
-        const qty = sizeCrossSectionalLeg(legUsd, leg.entryPrice, f);
+        const signalWeight = Number.isFinite(leg.weight) && leg.weight! > 0 ? leg.weight! : null;
+        const targetNotionalUsd = signalWeight === null ? equalLegUsd : totalBasketUsd * signalWeight;
+        const qty = sizeCrossSectionalLeg(targetNotionalUsd, leg.entryPrice, f);
         if (qty === null) return; // any un-sizeable leg ⇒ skip whole basket (hedge integrity)
         // 2026-07-19 real-money audit fix: this leg's notional, ADDED to whatever every OTHER
         // executor sharing this netted account (the 9 single-symbol lanes AND this instance's own
@@ -1441,7 +1875,16 @@ export class CrossSectionalExecutor {
           notionalCap > 0 &&
           this.existingNotionalForSymbolFn(leg.symbol) + this.ownOpenNotionalForSymbol(leg.symbol) + qty * leg.entryPrice > notionalCap
         ) return;
-        plannedLegs.push({ symbol: leg.symbol, side, qty: Number(qty.toFixed(8)), refPrice: leg.entryPrice });
+        plannedLegs.push({
+          symbol: leg.symbol,
+          side,
+          qty: Number(qty.toFixed(8)),
+          refPrice: leg.entryPrice,
+          targetNotionalUsd,
+          signalWeight,
+          scoreAtOpen: Number.isFinite(leg.scoreAtOpen) ? leg.scoreAtOpen! : null,
+          volatilityAtOpen: Number.isFinite(leg.volatilityAtOpen) ? leg.volatilityAtOpen! : null,
+        });
       }
     }
     if (plannedLegs.length !== signal.longLeg.length + signal.shortLeg.length) return;
@@ -1523,8 +1966,41 @@ export class CrossSectionalExecutor {
           exitPrice: null,
           exitOrderId: null,
           exitPriceConfirmed: null,
+          signalWeight: planned.signalWeight,
+          scoreAtOpen: planned.scoreAtOpen,
+          volatilityAtOpen: planned.volatilityAtOpen,
+          targetNotionalUsd: planned.targetNotionalUsd,
         });
         this.store.save(); // persist per leg so a crash mid-open still records this filled leg
+      }
+
+      // OPEN-time netting guard (2026-08-15) — see basketLegNettingConflict. Throwing here hands the
+      // basket to the abort path below, which flattens every leg it opened and records ABORTED with
+      // no invented P&L. FAIL-OPEN on a failed position read: refusing a good basket because a
+      // status call timed out is worse than missing one check, so the read error is surfaced via
+      // lastError rather than turned into an abort.
+      try {
+        const netAfterOpen = await this.sharedGetPositions();
+        for (const leg of basket.legs) {
+          // NO entry for this symbol means the position list is incomplete, NOT that the position is
+          // zero — same convention closeBasketsHittingProfitTarget already uses for missing marks
+          // ("never force a decision on partial info"). Reading absence as 0 would abort every
+          // basket whenever the positions call came back thin.
+          const position = netAfterOpen.find((row) => row.symbol === leg.symbol);
+          if (!position || !Number.isFinite(position.positionAmt)) continue;
+          const netQty = position.positionAmt;
+          const siblingOpposite = this.siblingOppositeUnexitedQty(basket, leg.symbol, leg.side);
+          if (basketLegNettingConflict(leg, netQty, siblingOpposite)) {
+            throw new Error(
+              `NETTING_CONFLICT ${leg.symbol} ${leg.side} qty=${leg.qty}: exchange net=${netQty} after open ` +
+                `(known sibling opposite ${siblingOpposite}) — another lane holds the opposite side on this symbol`,
+            );
+          }
+        }
+      } catch (guardError) {
+        const message = (guardError as Error).message ?? "netting guard failed";
+        if (message.startsWith("NETTING_CONFLICT")) throw guardError;
+        this.lastError = `netting guard skipped: ${message}`;
       }
     } catch (error) {
       // A partial basket is a NAKED directional bet — flatten whatever opened, record ABORTED.

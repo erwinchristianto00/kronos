@@ -36,7 +36,7 @@ import {
   isCrossSectionalTrendMixedAdmissionIndependent,
   crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
-import { buildCrossSectionalReport, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import { buildCrossSectionalReport, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
 import {
   SingleSymbolLaneExecutor,
   SingleSymbolLaneExecutorStore,
@@ -601,6 +601,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     coreScanAutoRefreshController,
     notificationService,
     liveEngineGetter: () => liveEngine,
+    crossSectionalReentryBlocksGetter: async () => {
+      const blocks = await crossSectionalExecutor?.getLossReentryBlocks() ?? [];
+      return {
+        longBlocklist: blocks.filter((block) => block.side === "LONG").map((block) => block.symbol),
+        shortBlocklist: blocks.filter((block) => block.side === "SHORT").map((block) => block.symbol),
+      };
+    },
     kronosClient,
     fourBrainMetricsGetter: () => fourBrainMetricsRef?.summary() ?? null,
     fourBrainRecentDecisionsGetter: () => fourBrainRecentDecisionsRef?.getAll() ?? null,
@@ -1147,7 +1154,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           }
         }
       }
-      const xsecReport = buildCrossSectionalReport(getCrossSectionalStore(), nowMs, { variant: "FILTERED" });
+      const xsecReport = buildCrossSectionalReport(getCrossSectionalStore(), nowMs, {
+        variant: "FILTERED",
+        sinceMs: getCrossSectionalReportSinceMs(),
+      });
       const xsecHealth = rollingNetEntryHealth(xsecReport.recentNetReturns);
       const capturedAt = controller?.capturedAt ?? new Date(nowMs).toISOString();
       const sampleId = controller?.capturedAt ?? `fallback:${Math.floor(nowMs / (15 * 60_000))}:${primaryDirection}`;
@@ -1437,7 +1447,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // No new exchange call. Same singleton as the engine and the single-symbol lanes.
         executionFillRecorder: getExecutionFillRecorder(),
         entryHealthGate: () => {
-          const report = buildCrossSectionalReport(getCrossSectionalStore(), Date.now(), { variant: "FILTERED" });
+          const report = buildCrossSectionalReport(getCrossSectionalStore(), Date.now(), {
+            variant: "FILTERED",
+            sinceMs: getCrossSectionalReportSinceMs(),
+          });
           return rollingNetEntryHealth(report.recentNetReturns);
         },
         // 2026-07-11 real-money audit fix: FILTERED/TREND/MIXED share ONE netted exchange account —

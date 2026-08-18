@@ -10,6 +10,7 @@ import {
   buildMixedCrossSectionalBasket,
   resolveCrossSectional,
   buildCrossSectionalReport,
+  getCrossSectionalReportSinceMs,
   runCrossSectionalCycle,
   CrossSectionalStore,
   CROSS_SECTIONAL_HORIZON_MS,
@@ -37,6 +38,7 @@ import {
   CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR,
   CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS,
   crossSectionalLiquidityStarved,
+  isCrossSectionalAdaptiveDemotionFrozen,
   type ScoredSymbol,
   type CrossSectionalObservation,
 } from "../src/lib/cross-sectional-edge.js";
@@ -104,6 +106,21 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     expect(b.longLeg.map((l) => l.symbol)).toEqual(["SOLUSDT", "AVAXUSDT"]);
     expect(b.shortLeg.map((l) => l.symbol)).toEqual(["WLDUSDT", "DOGEUSDT"]);
     expect(b.scoreGap).toBeGreaterThanOrEqual(0.05);
+  });
+
+  it("[FILTERED-SIZING] keeps 50/50 sides while capping inverse-vol legs near equal size", () => {
+    const b = buildFilteredCrossSectionalBasket(
+      scored([["SOLUSDT", 0.2, 100], ["ETHUSDT", 0.1, 100], ["WLDUSDT", -0.1, 100], ["DOGEUSDT", -0.2, 100]]),
+      {
+        k: 2, now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS, minScoreGap: 0.01,
+        longAllowlist: new Set(["SOLUSDT", "ETHUSDT"]), shortAllowlist: new Set(["WLDUSDT", "DOGEUSDT"]),
+        volBySymbol: { SOLUSDT: 0.01, ETHUSDT: 0.20, WLDUSDT: 0.02, DOGEUSDT: 0.30 },
+      },
+    )!;
+    expect(b.weightingModel).toBe("CAPPED_INVERSE_VOL");
+    expect(b.longLeg.reduce((sum, leg) => sum + (leg.weight ?? 0), 0)).toBeCloseTo(0.5, 9);
+    expect(b.shortLeg.reduce((sum, leg) => sum + (leg.weight ?? 0), 0)).toBeCloseTo(0.5, 9);
+    expect(Math.max(...b.longLeg.map((leg) => leg.weight ?? 0))).toBeLessThanOrEqual(0.3125 + 1e-9);
   });
 
   it("[FILTERED-GAP] refuses low-dispersion baskets", () => {
@@ -317,6 +334,14 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     const freshEra = buildCrossSectionalReport(store, T0ms + 2, { variant: "RAW", sinceMs: T0ms + 1 });
     expect(freshEra.closed).toBe(1);
     expect(freshEra.totalNetReturn).toBeCloseTo(0.04, 9);
+  });
+
+  it("[REPORT CUTOFF] parses the shared evidence-era cutoff", () => {
+    expect(getCrossSectionalReportSinceMs({ CROSS_SECTIONAL_REPORT_START_AT: "2026-08-12T00:00:00.000Z" })).toBe(
+      Date.parse("2026-08-12T00:00:00.000Z"),
+    );
+    expect(getCrossSectionalReportSinceMs({ CROSS_SECTIONAL_REPORT_START_AT: "not-a-date" })).toBeUndefined();
+    expect(getCrossSectionalReportSinceMs({})).toBeUndefined();
   });
 });
 
@@ -1167,5 +1192,37 @@ describe("cross-sectional-edge — liquidity floor (2026-08-12)", () => {
     })!;
     expect(withFloor.shortLeg.map((l) => l.symbol)).not.toContain("SEIUSDT");
     expect(withFloor.shortLeg).toHaveLength(3); // still forms a full basket from what remains
+  });
+});
+
+describe("cross-sectional-edge — adaptive demotion freeze (2026-08-12)", () => {
+  it("[FREEZE-DEFAULT] ships OFF, and only the exact string \"1\" enables it", () => {
+    expect(isCrossSectionalAdaptiveDemotionFrozen({} as NodeJS.ProcessEnv)).toBe(false);
+    expect(isCrossSectionalAdaptiveDemotionFrozen({ CROSS_SECTIONAL_ADAPTIVE_DEMOTION_FROZEN: "1" } as NodeJS.ProcessEnv)).toBe(true);
+    for (const v of ["0", "", "true", "yes"]) {
+      expect(isCrossSectionalAdaptiveDemotionFrozen({ CROSS_SECTIONAL_ADAPTIVE_DEMOTION_FROZEN: v } as NodeJS.ProcessEnv)).toBe(false);
+    }
+  });
+
+  it("[FREEZE-OFF-UNCHANGED] with the flag off, demotion still runs exactly as before", () => {
+    // a symbol with >= 3 measured LONG legs averaging negative must still be demoted
+    const store = freshStore();
+    for (let i = 0; i < 3; i++) {
+      store.add({
+        observationId: `o${i}`, openedAt: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+        signal: CROSS_SECTIONAL_FILTERED_SIGNAL, variant: "FILTERED", strategyFamily: "MOMENTUM_DISPERSION",
+        k: 3, longK: 1, shortK: 1,
+        longLeg: [{ symbol: "ADAUSDT", entryPrice: 100, exitPrice: 90, weight: 0.5 }],
+        shortLeg: [{ symbol: "DOGEUSDT", entryPrice: 100, exitPrice: 90, weight: 0.5 }],
+        status: "CLOSED", scoreGap: 0.1, regimeContext: null, regimeClassAtOpen: null,
+        longCapitalWeight: 0.5, shortCapitalWeight: 0.5, weightingModel: "EQUAL_NOTIONAL",
+        takeProfitReturn: null, stopLossReturn: null, riskDistanceAtOpen: 0.003, regimeFlipExit: false,
+        exitReason: "HORIZON", grossReturn: 0, costReturn: 0, netReturn: 0,
+        longLegReturn: -0.1, shortLegReturn: 0.1, resolvedAt: T0,
+      } as CrossSectionalObservation);
+    }
+    const out = deriveAdaptiveSymbolFilters(store);
+    expect(out.provenance.demotedLong).toContain("ADAUSDT");
+    expect(out.longAllowlist).not.toContain("ADAUSDT");
   });
 });

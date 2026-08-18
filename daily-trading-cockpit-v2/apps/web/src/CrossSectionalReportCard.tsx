@@ -86,6 +86,7 @@ type ClosedLeg = {
   feeAllocatedUsd: number;
   netPnlUsd: number;
   priceConfirmed: boolean;
+  unrealizedExtrema?: LegUnrealizedExtrema | null;
 };
 type ClosedBasket = {
   basketId: string;
@@ -113,6 +114,16 @@ type UnrealizedExtrema = {
   lastRecordedAt: string;
   closedAt?: string;
 };
+type LegUnrealizedExtrema = {
+  grossHighUsd: number;
+  grossLowUsd: number;
+  afterEstimatedCloseCostHighUsd: number;
+  afterEstimatedCloseCostLowUsd: number;
+  entryAt: string;
+  firstRecordedAt: string;
+  lastRecordedAt: string;
+  closedAt?: string;
+};
 type OpenBasketUnrealized = {
   basketId: string;
   signal: string;
@@ -125,6 +136,8 @@ type OpenBasketUnrealized = {
     entryPrice: number;
     markPrice: number | null;
     grossUnrealizedUsd: number | null;
+    afterEstimatedCloseCostUsd: number | null;
+    unrealizedExtrema?: LegUnrealizedExtrema | null;
   }>;
   grossUnrealizedUsd: number | null;
   unrealizedAfterEstimatedCloseCostUsd: number | null;
@@ -151,6 +164,22 @@ type ClosedResponse = {
   crossSectionalPnl?: CrossSectionalPnl;
   openBaskets?: OpenBasketUnrealized[];
   lanes: ClosedLane[];
+};
+type DirectionalPick = { symbol: string; sideScore: number; relativeEdge: number; confidence: number };
+type DirectionalExecutor = { openPositions?: unknown[]; dailyMaxLossUsd?: number; lastError?: string | null };
+type DirectionalRegimeResponse = {
+  enabled: boolean;
+  mode: 'BEAR_SHORT_3' | 'BULL_LONG_3' | 'BALANCED_3X3' | 'NO_TRADE';
+  marketRegime: string | null;
+  canonicalRegimeFamily: 'BULLISH' | 'BEARISH' | 'MIXED' | 'UNKNOWN';
+  canonicalAllowed: boolean | null;
+  canonicalReason: string | null;
+  reason: string;
+  scanFinishedAt: string | null;
+  longPicks: DirectionalPick[];
+  shortPicks: DirectionalPick[];
+  longExecutor: DirectionalExecutor | null;
+  shortExecutor: DirectionalExecutor | null;
 };
 
 const pct = (x: number | null | undefined, d = 3) => x == null ? '—' : `${(x * 100).toFixed(d)}%`;
@@ -196,6 +225,10 @@ function SymbolList({ symbols, color = C.dim, empty = 'Tidak ada' }: { symbols: 
   return <div style={{ display: 'grid', gap: 2, paddingLeft: 12, marginTop: 3 }}>
     {symbols.length ? symbols.map((symbol) => <div key={symbol} style={{ color }}>{symbol}</div>) : <div style={{ color: C.dim }}>{empty}</div>}
   </div>;
+}
+
+function InlineSymbolList({ symbols, color = C.dim, empty = 'Tidak ada' }: { symbols: string[]; color?: string; empty?: string }) {
+  return <div style={{ color, paddingLeft: 12, marginTop: 3, lineHeight: 1.5 }}>{symbols.length ? symbols.join(', ') : empty}</div>;
 }
 
 function BasketRows({ baskets, open }: { baskets: XSecBasket[]; open?: boolean }) {
@@ -248,6 +281,16 @@ function UnrealizedExtremaBlock({ extrema }: { extrema: UnrealizedExtrema | null
   </div>;
 }
 
+function LegUnrealizedExtremaLine({ extrema }: { extrema: LegUnrealizedExtrema | null | undefined }) {
+  if (!extrema) return <small style={{ display: 'block', padding: '0 12px 7px', color: C.dim }}>ATH/ATL simbol mulai direkam setelah report ini aktif.</small>;
+  return <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(150px, 1fr))', gap: 5, padding: '0 12px 8px', color: C.dim, fontSize: 11 }}>
+    <span>ATH gross <strong style={{ color: tone(extrema.grossHighUsd) }}>{money(extrema.grossHighUsd)}</strong></span>
+    <span>ATH setelah biaya <strong style={{ color: tone(extrema.afterEstimatedCloseCostHighUsd) }}>{money(extrema.afterEstimatedCloseCostHighUsd)}</strong></span>
+    <span>ATL gross <strong style={{ color: tone(extrema.grossLowUsd) }}>{money(extrema.grossLowUsd)}</strong></span>
+    <span>ATL setelah biaya <strong style={{ color: tone(extrema.afterEstimatedCloseCostLowUsd) }}>{money(extrema.afterEstimatedCloseCostLowUsd)}</strong></span>
+  </div>;
+}
+
 function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: string }) {
   const longReturn = sideReturn(basket, 'LONG');
   const shortReturn = sideReturn(basket, 'SHORT');
@@ -275,15 +318,18 @@ function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: strin
         </tr></thead>
         <tbody>{basket.legs.map((leg) => {
           const ret = leg.entryPrice > 0 ? (leg.side === 'LONG' ? leg.exitPrice - leg.entryPrice : leg.entryPrice - leg.exitPrice) / leg.entryPrice : null;
-          return <tr key={`${basket.basketId}-${leg.symbol}`} style={{ borderTop: `1px solid ${C.border}` }}>
-            <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>{leg.symbol}</td>
-            <td style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</td>
-            <td>{leg.qty}</td><td>{leg.entryPrice}</td><td>{leg.exitPrice}</td>
-            <td style={{ color: tone(ret) }}>{pct(ret)}</td>
-            <td style={{ color: tone(leg.grossPnlUsd) }}>{money(leg.grossPnlUsd)}</td>
-            <td style={{ color: C.accent }}>{money(leg.feeAllocatedUsd)}</td>
-            <td style={{ color: tone(leg.netPnlUsd) }}>{money(leg.netPnlUsd)} {!leg.priceConfirmed && <span title="Entry or close fill price was not exchange-confirmed">⚠</span>}</td>
-          </tr>;
+          return <>
+            <tr key={`${basket.basketId}-${leg.symbol}`} style={{ borderTop: `1px solid ${C.border}` }}>
+              <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>{leg.symbol}</td>
+              <td style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</td>
+              <td>{leg.qty}</td><td>{leg.entryPrice}</td><td>{leg.exitPrice}</td>
+              <td style={{ color: tone(ret) }}>{pct(ret)}</td>
+              <td style={{ color: tone(leg.grossPnlUsd) }}>{money(leg.grossPnlUsd)}</td>
+              <td style={{ color: C.accent }}>{money(leg.feeAllocatedUsd)}</td>
+              <td style={{ color: tone(leg.netPnlUsd) }}>{money(leg.netPnlUsd)} {!leg.priceConfirmed && <span title="Entry or close fill price was not exchange-confirmed">⚠</span>}</td>
+            </tr>
+            <tr key={`${basket.basketId}-${leg.symbol}-extrema`}><td colSpan={9}><LegUnrealizedExtremaLine extrema={leg.unrealizedExtrema} /></td></tr>
+          </>;
         })}</tbody>
       </table>
     </div>
@@ -310,16 +356,82 @@ function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized })
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(105px, 1.2fr) minmax(72px, .7fr) repeat(3, minmax(92px, 1fr))', gap: 8, padding: '7px 12px', color: C.dim, fontSize: 11 }}>
         <span>Symbol</span><span>Arah</span><span>Entry</span><span>Mark sekarang</span><span>Unrealized P&amp;L</span>
       </div>
-      {basket.legs.map((leg) => <div key={`${basket.basketId}-${leg.symbol}-${leg.side}`} style={{ display: 'grid', gridTemplateColumns: 'minmax(105px, 1.2fr) minmax(72px, .7fr) repeat(3, minmax(92px, 1fr))', gap: 8, padding: '7px 12px', borderTop: `1px solid ${C.border}` }}>
-        <strong style={{ color: C.text }}>{leg.symbol}</strong>
-        <span style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</span>
-        <span>{price(leg.entryPrice)}</span>
-        <span>{price(leg.markPrice)}</span>
-        <strong style={{ color: tone(leg.grossUnrealizedUsd) }}>{money(leg.grossUnrealizedUsd)}</strong>
+      {basket.legs.map((leg) => <div key={`${basket.basketId}-${leg.symbol}-${leg.side}`} style={{ borderTop: `1px solid ${C.border}` }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(105px, 1.2fr) minmax(72px, .7fr) repeat(3, minmax(92px, 1fr))', gap: 8, padding: '7px 12px' }}>
+          <strong style={{ color: C.text }}>{leg.symbol}</strong>
+          <span style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</span>
+          <span>{price(leg.entryPrice)}</span>
+          <span>{price(leg.markPrice)}</span>
+          <strong style={{ color: tone(leg.grossUnrealizedUsd) }}>{money(leg.grossUnrealizedUsd)}</strong>
+        </div>
+        <LegUnrealizedExtremaLine extrema={leg.unrealizedExtrema} />
       </div>)}
     </div>
     <UnrealizedExtremaBlock extrema={basket.unrealizedExtrema} />
   </div>;
+}
+
+function directionalModeLabel(mode: DirectionalRegimeResponse['mode']): string {
+  if (mode === 'BEAR_SHORT_3') return 'BEARISH KUAT → SHORT 3';
+  if (mode === 'BULL_LONG_3') return 'BULLISH KUAT → LONG 3';
+  if (mode === 'BALANCED_3X3') return 'SEIMBANG → BASKET 3 LONG × 3 SHORT';
+  return 'NO TRADE';
+}
+
+function directionalModeColor(mode: DirectionalRegimeResponse['mode']): string {
+  if (mode === 'BEAR_SHORT_3') return C.bad;
+  if (mode === 'BULL_LONG_3') return C.good;
+  return mode === 'BALANCED_3X3' ? C.accent : C.measure;
+}
+
+/** Keputusan executor yang aktual, terpisah dari histori basket FILTERED di bawahnya. */
+function DirectionalRegimeStatus({ apiPrefix }: { apiPrefix: string }) {
+  const [data, setData] = useState<DirectionalRegimeResponse | null>(null);
+  const [error, setError] = useState(false);
+  const [lastGoodAt, setLastGoodAt] = useState<string | null>(null);
+  async function load() {
+    try {
+      const response = await fetch(`${apiPrefix}/live/cross-sectional-directional-regime`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setData(await response.json() as DirectionalRegimeResponse);
+      setLastGoodAt(new Date().toISOString());
+      setError(false);
+    } catch { setError(true); }
+  }
+  useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 10_000); return () => window.clearInterval(timer); }, [apiPrefix]);
+  const picks = data?.mode === 'BEAR_SHORT_3' ? data.shortPicks : data?.mode === 'BULL_LONG_3' ? data.longPicks : [];
+  const isStale = error && data !== null;
+  return <section className="testnet-panel testnet-wide-panel" id="cross-sectional-directional-decision">
+    <header><div><span>Keputusan arah cross-sectional</span><strong>{data ? directionalModeLabel(data.mode) : 'Memuat keputusan…'}</strong></div><span className="tone-measure">khusus testnet · executor source of truth</span></header>
+    {error && <div style={{ padding: '9px 12px', color: C.bad, borderBottom: `1px solid ${C.border}`, fontSize: 12 }}>
+      <strong>{isStale ? 'DATA TERAKHIR — BUKAN DATA LIVE. ' : 'DATA TIDAK TERSEDIA. '}</strong>
+      Fetch keputusan executor gagal; jangan gunakan card ini untuk menilai arah atau membuka entry.{lastGoodAt ? ` Terakhir berhasil dimuat ${ago(lastGoodAt)} lalu.` : ''}
+    </div>}
+    {data && <>
+      <div style={{ padding: '10px 12px', display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'baseline', borderBottom: `1px solid ${C.border}` }}>
+        <strong style={{ color: directionalModeColor(data.mode), fontSize: 16 }}>{directionalModeLabel(data.mode)}</strong>
+        <span style={{ color: C.dim }}>scan selesai {data.scanFinishedAt ? formatDate(data.scanFinishedAt) : 'belum ada'}</span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(180px, 1fr))', borderBottom: `1px solid ${C.border}` }}>
+        <Stat label="Scanner breadth" value={data.marketRegime ?? '—'} color={data.marketRegime?.includes('Bearish') ? C.bad : data.marketRegime?.includes('Bullish') ? C.good : C.measure} />
+        <Stat label="Canonical regime" value={data.canonicalRegimeFamily} color={data.canonicalRegimeFamily === 'BEARISH' ? C.bad : data.canonicalRegimeFamily === 'BULLISH' ? C.good : C.measure} />
+        <Stat label="Canonical gate" value={data.canonicalAllowed ? 'VALID' : data.canonicalAllowed === false ? 'BLOCKED' : 'MENUNGGU'} color={data.canonicalAllowed ? C.good : data.canonicalAllowed === false ? C.bad : C.measure} />
+      </div>
+      <div style={{ padding: '10px 12px', fontSize: 12, lineHeight: 1.55 }}>
+        <strong style={{ color: C.text }}>Mengapa:</strong> <span style={{ color: C.dim }}>{data.reason}</span>
+        {data.canonicalReason && <div style={{ color: C.dim, marginTop: 4 }}>Canonical detail: {data.canonicalReason}</div>}
+      </div>
+      {picks.length > 0 && <div style={{ padding: '0 12px 12px', overflowX: 'auto' }}>
+        <div style={{ color: C.dim, fontSize: 12, margin: '4px 0 6px' }}>Tiga simbol yang akan dieksekusi bila mode ini tetap valid</div>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}><thead><tr style={{ color: C.dim, textAlign: 'left' }}><th style={{ padding: 7 }}>Simbol</th><th>Skor sisi</th><th>Keunggulan relatif</th><th>Confidence</th></tr></thead>
+          <tbody>{picks.map((pick) => <tr key={pick.symbol} style={{ borderTop: `1px solid ${C.border}` }}><td style={{ padding: 7, color: C.text, fontWeight: 600 }}>{pick.symbol}</td><td>{pick.sideScore.toFixed(1)}</td><td>{pick.relativeEdge.toFixed(1)}</td><td>{pick.confidence.toFixed(1)}</td></tr>)}</tbody>
+        </table>
+      </div>}
+      <div style={{ padding: '8px 12px', borderTop: `1px solid ${C.border}`, color: C.dim, fontSize: 11 }}>
+        Lane short: {data.shortExecutor?.openPositions?.length ?? 0} open · batas rugi harian ${data.shortExecutor?.dailyMaxLossUsd ?? '—'} &nbsp;|&nbsp; Lane long: {data.longExecutor?.openPositions?.length ?? 0} open · batas rugi harian ${data.longExecutor?.dailyMaxLossUsd ?? '—'}. Status `NO TRADE` berarti guard bekerja, bukan lane rusak.
+      </div>
+    </>}
+  </section>;
 }
 
 function ClosedCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
@@ -380,15 +492,13 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
   const closed = variant === 'FILTERED' ? data?.filteredRecentClosed ?? [] : data?.recentClosed ?? [];
   const open = variant === 'FILTERED' ? data?.filteredOpenBaskets ?? [] : data?.openBaskets ?? [];
   const config = data?.filteredConfig;
-  const historical = data?.adaptiveSymbolFilters;
   const executionLong = config?.executionLongAllowlist ?? config?.longAllowlist ?? [];
   const executionShort = config?.executionShortAllowlist ?? config?.shortAllowlist ?? [];
   const executionShortBlocked = config?.executionShortBlocklist ?? config?.shortBlocklist ?? [];
   const activeShort = executionShort.filter((symbol) => !executionShortBlocked.includes(symbol));
-  const historicalBadLong = historical?.provenance.demotedLong.filter((symbol) => executionLong.includes(symbol)) ?? [];
-  const historicalBadShort = historical?.provenance.demotedShort.filter((symbol) => executionShort.includes(symbol)) ?? [];
 
   return <>
+  <DirectionalRegimeStatus apiPrefix={apiPrefix} />
   <section className="testnet-panel testnet-wide-panel" id="cross-sectional-definitions">
     <header><div><span>Istilah cross-basket</span><strong>Cara membaca report ini</strong></div><span className="tone-measure">khusus testnet</span></header>
     <div style={{ padding: '10px 12px', display: 'grid', gap: 8, color: C.dim, fontSize: 12, lineHeight: 1.5 }}>
@@ -397,19 +507,13 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
       <div style={{ display: 'grid', gap: 8, marginTop: 2, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
         <strong style={{ color: C.text }}>Pool FILTERED yang dipakai sekarang</strong>
         {config ? <>
-          <div><strong style={{ color: C.good }}>POOL LONG OPERATOR ({executionLong.length})</strong><SymbolList symbols={executionLong} color={C.good} /></div>
-          <div><strong style={{ color: C.good }}>POOL SHORT OPERATOR ({executionShort.length})</strong><SymbolList symbols={executionShort} color={C.good} /></div>
-          <div><strong style={{ color: C.bad }}>BLOCKED SHORT EKSPLISIT ({executionShortBlocked.length})</strong><SymbolList symbols={executionShortBlocked} color={C.bad} /></div>
-          <div><strong style={{ color: C.measure }}>SHORT ELIGIBLE SEKARANG ({activeShort.length})</strong><SymbolList symbols={activeShort} color={C.measure} /></div>
-          {!!config.executionExcludedSymbols?.length && <div><strong style={{ color: C.accent }}>DIKELUARKAN SEMENTARA DARI EXECUTOR ({config.executionExcludedSymbols.length})</strong><SymbolList symbols={config.executionExcludedSymbols} color={C.accent} /></div>}
+          <div><strong style={{ color: C.good }}>POOL LONG OPERATOR ({executionLong.length})</strong><InlineSymbolList symbols={executionLong} color={C.good} /></div>
+          <div><strong style={{ color: C.good }}>POOL SHORT OPERATOR ({executionShort.length})</strong><InlineSymbolList symbols={executionShort} color={C.good} /></div>
+          <div><strong style={{ color: C.bad }}>BLOCKED SHORT EKSPLISIT ({executionShortBlocked.length})</strong><InlineSymbolList symbols={executionShortBlocked} color={C.bad} /></div>
+          <div><strong style={{ color: C.measure }}>SHORT ELIGIBLE SEKARANG ({activeShort.length})</strong><InlineSymbolList symbols={activeShort} color={C.measure} /></div>
+          {!!config.executionExcludedSymbols?.length && <div><strong style={{ color: C.accent }}>DIKELUARKAN SEMENTARA DARI EXECUTOR ({config.executionExcludedSymbols.length})</strong><InlineSymbolList symbols={config.executionExcludedSymbols} color={C.accent} /></div>}
         </> : <div>Memuat konfigurasi FILTERED…</div>}
       </div>
-      {historical && <div style={{ display: 'grid', gap: 8, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
-        <strong style={{ color: C.text }}>Simbol buruk menurut histori lama — audit saja</strong>
-        <div style={{ color: C.dim }}>Dinilai dari {historical.provenance.closedBaskets} closed basket yang tersimpan. {historical.executionUsesThis ? 'Saat ini ikut memengaruhi executor.' : 'Tidak dipakai untuk membatasi executor MOM36 saat ini.'}</div>
-        <div><strong style={{ color: C.bad }}>BURUK DI LONG, DARI POOL OPERATOR ({historicalBadLong.length})</strong><SymbolList symbols={historicalBadLong} color={C.bad} empty="Belum ada simbol pool ini yang dinilai buruk." /></div>
-        <div><strong style={{ color: C.bad }}>BURUK DI SHORT, DARI POOL OPERATOR ({historicalBadShort.length})</strong><SymbolList symbols={historicalBadShort} color={C.bad} empty="Belum ada simbol pool ini yang dinilai buruk." /></div>
-      </div>}
       <div><strong style={{ color: C.text }}>MOM36_FILTERED</strong> = sinyal FILTERED dengan momentum dari 36 candle 1 jam yang sudah selesai. Angka <strong style={{ color: C.accent }}>36</strong> adalah lookback, bukan durasi holding; horizon basket saat ini ditampilkan terpisah di sebelah judul report dan dikonfigurasi secara terpisah.</div>
     </div>
   </section>
@@ -422,7 +526,7 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
       <span className="tone-measure">pengukuran testnet</span>
     </header>
     <div style={{ padding: '8px 12px', color: C.dim, fontSize: 12 }}>
-      {error ? 'Pengambilan report gagal — menampilkan data terakhir yang tersedia.' : report ? `${report.lastCycleAt ? `siklus terakhir ${ago(report.lastCycleAt)} lalu` : 'belum ada siklus'} · resolusi berikutnya ${duration(report.nextResolveInMs)} · cakupan mulai ${data?.reportStartAt ? formatDate(data.reportStartAt) : 'seluruh histori'}` : 'Memuat report cross-sectional…'}
+      {error ? 'DATA TERAKHIR — bukan data live. Pengambilan report gagal; jangan gunakan angka ini untuk entry baru.' : report ? `${report.lastCycleAt ? `siklus terakhir ${ago(report.lastCycleAt)} lalu` : 'belum ada siklus'} · resolusi berikutnya ${duration(report.nextResolveInMs)} · cakupan mulai ${data?.reportStartAt ? formatDate(data.reportStartAt) : 'seluruh histori'}` : 'Memuat report cross-sectional…'}
     </div>
     <div style={{ display: 'flex', gap: 8, padding: '0 12px 8px' }}>
       <button type="button" onClick={() => setVariant('RAW')} style={{ opacity: variant === 'RAW' ? 1 : 0.65 }}>RAW</button>

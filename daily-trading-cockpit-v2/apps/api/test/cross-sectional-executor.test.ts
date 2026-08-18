@@ -18,8 +18,12 @@ import {
   type CrossSectionalExecClient,
   type ExecutorBasket,
   closedBasketRealizedBreakdown,
+  basketLegNettingConflict,
   applyEntryHealthBypass,
   isCrossSectionalEntryHealthBypassed,
+  lossMakingCrossSectionalOpenLegs,
+  evaluateCrossSectionalOverlap,
+  evaluateCrossSectionalFormationCohort,
   sizeCrossSectionalLeg,
 } from "../src/lib/cross-sectional-executor.js";
 import { CortexRealAttributionStore } from "../src/lib/cortex-real-attribution.js";
@@ -37,6 +41,98 @@ describe("exchange-floor-aware cross-sectional sizing", () => {
   it("keeps the configured target when exchange floors are lower", () => {
     const qty = sizeCrossSectionalLeg(25, 100, { stepSize: 0.01, minQty: 0.01, minNotional: 5 });
     expect(qty).toBe(0.25);
+  });
+});
+
+describe("cross-sectional loss re-entry blocks", () => {
+  const basket = (legs: ExecutorBasket["legs"]): ExecutorBasket => ({
+    basketId: "open-1", sourceObservationId: "signal-1", signal: "MOM36_FILTERED", variant: "FILTERED",
+    openedAt: NOW, closesAtMs: NOW_MS + 86_400_000, legs, status: "OPEN", closedAt: null,
+    closeReason: null, grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
+  });
+  const leg = (symbol: string, side: "LONG" | "SHORT", entryPrice: number, qty: number): ExecutorBasket["legs"][number] => ({
+    symbol, side, qty, entryPrice, entryOrderId: "1", entryPriceConfirmed: true,
+    exitPrice: null, exitOrderId: null, exitPriceConfirmed: null,
+  });
+
+  it("blocks only the losing same-side leg after estimated close cost", () => {
+    const blocks = lossMakingCrossSectionalOpenLegs(
+      [basket([leg("LINKUSDT", "LONG", 10, 2), leg("ADAUSDT", "SHORT", 1, 10)])],
+      new Map([["LINKUSDT", 9], ["ADAUSDT", 0.9]]),
+      0.0022,
+    );
+    expect(blocks).toEqual([expect.objectContaining({
+      symbol: "LINKUSDT", side: "LONG", reason: "LOSING_AFTER_CLOSE_COST",
+    })]);
+  });
+
+  it("blocks safely when an open leg has no current mark", () => {
+    const blocks = lossMakingCrossSectionalOpenLegs([basket([leg("LINKUSDT", "LONG", 10, 2)])], new Map(), 0.0022);
+    expect(blocks).toEqual([expect.objectContaining({
+      symbol: "LINKUSDT", side: "LONG", reason: "MARK_UNAVAILABLE", afterEstimatedCloseCostUsd: null,
+    })]);
+  });
+});
+
+describe("cross-sectional overlap diversity guard", () => {
+  const openBasket = (): ExecutorBasket => ({
+    basketId: "open-1", sourceObservationId: "signal-1", signal: "MOM36_FILTERED", variant: "FILTERED",
+    openedAt: NOW, closesAtMs: NOW_MS + 86_400_000, status: "OPEN", closedAt: null, closeReason: null,
+    grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
+    legs: [{ symbol: "LINKUSDT", side: "LONG", qty: 1, entryPrice: 10, entryOrderId: "1", entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null, scoreAtOpen: 0.10, volatilityAtOpen: 0.01 }],
+  });
+  const signal = (score: number): CrossSectionalObservation => ({
+    observationId: "new", openedAt: NOW, openedAtMs: NOW_MS + 1, horizonMs: 1, signal: "MOM36_FILTERED", variant: "FILTERED", k: 1,
+    longLeg: [{ symbol: "LINKUSDT", entryPrice: 11, exitPrice: null, scoreAtOpen: score, volatilityAtOpen: 0.01 }],
+    shortLeg: [{ symbol: "DOGEUSDT", entryPrice: 1, exitPrice: null, scoreAtOpen: -0.1 }],
+    status: "OPEN", grossReturn: null, costReturn: null, netReturn: null, longLegReturn: null, shortLegReturn: null, resolvedAt: null,
+  });
+
+  it("allows one repeated winner only when score improves and old leg is net-positive", () => {
+    const result = evaluateCrossSectionalOverlap(signal(0.12), [openBasket()], new Map([["LINKUSDT", 11]]), 0.0022, { maxTotal: 1, maxPerSide: 1, minScoreDelta: 0 });
+    expect(result).toEqual({ allowed: true, reason: null, repeatedSymbols: ["LINKUSDT LONG"] });
+  });
+
+  it("rejects repetition if the old score is not beaten", () => {
+    const result = evaluateCrossSectionalOverlap(signal(0.10), [openBasket()], new Map([["LINKUSDT", 11]]), 0.0022, { maxTotal: 1, maxPerSide: 1, minScoreDelta: 0 });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("did not improve");
+  });
+
+  it("rejects a continued long when the mark is already too far above the old entry", () => {
+    const result = evaluateCrossSectionalOverlap(signal(0.12), [openBasket()], new Map([["LINKUSDT", 10.2]]), 0.0022, {
+      maxTotal: 1, maxPerSide: 1, minScoreDelta: 0, minAbsScore: 0.03,
+      maxAdverseExtensionVol: 1, minAdverseExtensionPct: 0, maxSignalDriftVol: 1, minSignalDriftPct: 0,
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("overextended");
+  });
+
+  it("rejects a repeated leg without strong directionally-correct momentum", () => {
+    const result = evaluateCrossSectionalOverlap(signal(0.02), [openBasket()], new Map([["LINKUSDT", 10.05]]), 0.0022, {
+      maxTotal: 1, maxPerSide: 1, minScoreDelta: 0, minAbsScore: 0.03,
+      maxAdverseExtensionVol: 1, minAdverseExtensionPct: 0, maxSignalDriftVol: 1, minSignalDriftPct: 0,
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("conviction");
+  });
+});
+
+describe("cross-sectional formation cohort evaluator", () => {
+  it("starts reporting at eight closed baskets and never auto-switches execution", () => {
+    const baskets: ExecutorBasket[] = Array.from({ length: 8 }, (_, i) => ({
+      basketId: `closed-${i}`, sourceObservationId: `s-${i}`, signal: "MOM36_FILTERED", variant: "FILTERED",
+      openedAt: NOW, closesAtMs: NOW_MS + 1, status: "CLOSED", closedAt: NOW, closeReason: "TAKE_PROFIT",
+      grossPnlUsd: 1, feeEstimateUsd: 0.02, netPnlUsd: 0.98,
+      legs: [
+        { symbol: "LINKUSDT", side: "LONG", qty: 1, entryPrice: 10, entryOrderId: "1", entryPriceConfirmed: true, exitPrice: 11, exitOrderId: "2", exitPriceConfirmed: true, scoreAtOpen: 0.12, volatilityAtOpen: 0.03 },
+        { symbol: "DOGEUSDT", side: "SHORT", qty: 10, entryPrice: 1, entryOrderId: "3", entryPriceConfirmed: true, exitPrice: 0.9, exitOrderId: "4", exitPriceConfirmed: true, scoreAtOpen: -0.10, volatilityAtOpen: 0.08 },
+      ],
+    }));
+    const report = evaluateCrossSectionalFormationCohort(baskets);
+    expect(report.status).toBe("EVALUATING");
+    expect(report.autoSwitch).toBe(false);
+    expect(report.metrics.every((metric) => metric.samples === 8 && metric.meanNetReturnPct !== null)).toBe(true);
   });
 });
 
@@ -1664,5 +1760,64 @@ describe("cross-sectional-executor — operator entry-health bypass (2026-08-12)
     const out = applyEntryHealthBypass(crashed, ON);
     expect(out.allowed).toBe(true);
     expect(out.reason).toContain("boom");
+  });
+});
+
+describe("cross-sectional-executor — open-time netting guard (2026-08-15)", () => {
+  const LONG = { side: "LONG" as const, qty: 0.011 };
+  const SHORT = { side: "SHORT" as const, qty: 0.013 };
+
+  it("[NETTING-REAL] reproduces 2026-08-14: LONG 0.011 opened into an external SHORT, net -0.002", () => {
+    // directional lane held ETHUSDT SHORT 0.013; this basket added LONG 0.011; exchange netted to
+    // -0.002 and neither book could explain it. No sibling BASKET held the other side, so nothing
+    // legitimate accounts for the net being against us.
+    expect(basketLegNettingConflict(LONG, -0.002, 0)).toBe(true);
+  });
+
+  it("[NETTING-CLEAN] a normal open, where the exchange carries exactly what we added, is fine", () => {
+    expect(basketLegNettingConflict(LONG, 0.011, 0)).toBe(false);
+    expect(basketLegNettingConflict(SHORT, -0.013, 0)).toBe(false);
+  });
+
+  it("[NETTING-SIBLING-OK] a sibling basket legitimately holding the other side is NOT a conflict", () => {
+    // designed-for case (siblingOppositeUnexitedQty): sibling short 0.011 cancels our long 0.011
+    expect(basketLegNettingConflict(LONG, 0, 0.011)).toBe(false);
+    expect(basketLegNettingConflict(SHORT, 0, 0.013)).toBe(false);
+    // partially explained: sibling covers 0.008 of our 0.011, so net may sit at 0.003, not lower
+    expect(basketLegNettingConflict(LONG, 0.003, 0.008)).toBe(false);
+    expect(basketLegNettingConflict(LONG, -0.004, 0.008)).toBe(true); // beyond what the sibling explains
+  });
+
+  it("[NETTING-SAME-SIDE-OK] MORE net in our favour is never a conflict", () => {
+    expect(basketLegNettingConflict(LONG, 5, 0)).toBe(false);
+    expect(basketLegNettingConflict(SHORT, -5, 0)).toBe(false);
+  });
+
+  it("[NETTING-FLAT] a net of exactly zero after opening IS a conflict — our size vanished", () => {
+    expect(basketLegNettingConflict(LONG, 0, 0)).toBe(true);
+    expect(basketLegNettingConflict(SHORT, 0, 0)).toBe(true);
+  });
+
+  it("[NETTING-WIRED] a leg opened into an external opposite position ABORTS the basket and flattens it", async () => {
+    const client = new FakeExecClient();
+    // SOL leg opens LONG 0.25, but the account already nets SHORT on SOLUSDT (another lane's
+    // position, invisible to this executor) — exactly the 2026-08-14 ETHUSDT shape.
+    client.positionAmtBySymbol.set("SOLUSDT", -0.2);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("ABORTED");
+    expect(basket.closeReason).toContain("NETTING_CONFLICT");
+    expect(basket.closeReason).toContain("SOLUSDT");
+    // every leg it managed to open is flattened reduce-only — no naked exposure left behind
+    const flattens = client.placed.filter((p) => p.reduceOnly === true);
+    expect(flattens.length).toBe(basket.legs.length);
+    expect(executor.getStatus().lastError).toContain("NETTING_CONFLICT");
+  });
+
+  it("[NETTING-GARBAGE] unusable inputs never fabricate a conflict", () => {
+    expect(basketLegNettingConflict({ side: "LONG", qty: 0 }, -5, 0)).toBe(false);
+    expect(basketLegNettingConflict(LONG, Number.NaN, 0)).toBe(false);
+    expect(basketLegNettingConflict(LONG, 0.011, Number.NaN)).toBe(false); // bad sibling read -> treated as 0
   });
 });

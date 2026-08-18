@@ -243,15 +243,22 @@ function ResearchDashboardInner() {
         </div>
       </header>
 
-      {/* Kesiapan CORTEX: the headline summary. */}
-      <CortexReadinessCard />
-
-      {/* Four-Brain (2026-07-23 operator ask): health + recent Market State/Direction/Entry/Exit
-          decisions + direction/entry-brain measured performance for the shadow decision layer
-          sitting above CORTEX/incumbent — see FourBrainDashboardCard.tsx. Four-brain shadow mode
-          runs on research (3101) AND testnet (3102), never live (3103) — this card is
-          testnet-preferred, same as InnovationLanesCard below. */}
-      <FourBrainDashboardCard />
+      {/* One intelligence/evidence group: CORTEX is the governing evidence layer, Four-Brain is the
+          shadow observer directly beneath it. Keeping both in a single shell prevents the research
+          page from visually presenting Four-Brain as a separate execution system. */}
+      <section style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, overflow: 'hidden', marginBottom: 18 }}>
+        <header style={{ padding: '10px 16px', borderBottom: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', background: C.sub }}>
+          <div>
+            <div style={{ color: C.measure, fontSize: 10, fontWeight: 700, letterSpacing: 0.7 }}>INTELLIGENCE &amp; EVIDENCE</div>
+            <div style={{ color: C.dim, fontSize: 12, marginTop: 2 }}>CORTEX mengukur bukti; Four-Brain mengamati keputusan secara shadow-only.</div>
+          </div>
+          <span style={{ color: C.dim, fontSize: 11 }}>read-only · tidak mengubah order</span>
+        </header>
+        <div style={{ borderBottom: `1px solid ${C.border}` }}>
+          <CortexReadinessCard grouped />
+        </div>
+        <FourBrainDashboardCard grouped />
+      </section>
 
       {(() => {
         // 3 — Lane Performance & Edge Readiness (2026-07-23 declutter): merges the per-symbol book

@@ -29,6 +29,7 @@ import { buildLiveWalletReconciliationReport, resolveDayUtc } from "../lib/walle
 import { getCortexRealAttributionStore } from "../lib/cortex-real-attribution.js";
 import { getFundingFeeRecorder, withFundingFeeRecording } from "../lib/funding-fee-recorder.js";
 import { sumExternalClosedFeesUsd, sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
+import { getCrossSectionalReportSinceMs } from "../lib/cross-sectional-edge.js";
 import type { UnifiedTestnetOrchestrator } from "../lib/unified-testnet-orchestrator.js";
 import type { UnifiedTestnetProposalStore } from "../lib/unified-testnet-proposal-source.js";
 import {
@@ -74,6 +75,20 @@ type CrossSectionalUnrealizedExtrema = {
   firstRecordedAt: string;
   lastRecordedAt: string;
   closedAt?: string;
+  /** Keyed by side+symbol because a symbol may legally appear on both sides in different legs. */
+  legs?: Record<string, CrossSectionalLegUnrealizedExtrema>;
+};
+
+type CrossSectionalLegUnrealizedExtrema = {
+  grossHighUsd: number;
+  grossLowUsd: number;
+  afterEstimatedCloseCostHighUsd: number;
+  afterEstimatedCloseCostLowUsd: number;
+  /** Basket open time: the known zero-P&L baseline for this leg. */
+  entryAt: string;
+  firstRecordedAt: string;
+  lastRecordedAt: string;
+  closedAt?: string;
 };
 
 type CrossSectionalUnrealizedExtremaStore = {
@@ -115,7 +130,12 @@ function writeCrossSectionalUnrealizedExtremaStore(store: CrossSectionalUnrealiz
 }
 
 function recordCrossSectionalUnrealizedExtrema(
-  samples: Array<{ basketId: string; grossUsd: number; afterEstimatedCloseCostUsd: number }>,
+  samples: Array<{
+    basketId: string;
+    grossUsd: number;
+    afterEstimatedCloseCostUsd: number;
+    legs: Array<{ symbol: string; side: "LONG" | "SHORT"; grossUsd: number; afterEstimatedCloseCostUsd: number; entryAt: string }>;
+  }>,
   closed: Array<{ basketId: string; closedAt: string }>,
   nowIso: string,
 ): Record<string, CrossSectionalUnrealizedExtrema> {
@@ -124,7 +144,7 @@ function recordCrossSectionalUnrealizedExtrema(
   for (const sample of samples) {
     if (!Number.isFinite(sample.grossUsd) || !Number.isFinite(sample.afterEstimatedCloseCostUsd)) continue;
     const previous = store.baskets[sample.basketId];
-    store.baskets[sample.basketId] = previous
+    const basket = previous
       ? {
         ...previous,
         grossHighUsd: Math.max(previous.grossHighUsd, sample.grossUsd),
@@ -141,12 +161,41 @@ function recordCrossSectionalUnrealizedExtrema(
         firstRecordedAt: nowIso,
         lastRecordedAt: nowIso,
       };
+    const legs = { ...(previous?.legs ?? {}) };
+    for (const leg of sample.legs) {
+      if (!Number.isFinite(leg.grossUsd) || !Number.isFinite(leg.afterEstimatedCloseCostUsd)) continue;
+      const key = `${leg.side}:${leg.symbol}`;
+      const priorLeg = legs[key];
+      legs[key] = priorLeg
+        ? {
+          ...priorLeg,
+          grossHighUsd: Math.max(priorLeg.grossHighUsd, leg.grossUsd),
+          grossLowUsd: Math.min(priorLeg.grossLowUsd, leg.grossUsd),
+          afterEstimatedCloseCostHighUsd: Math.max(priorLeg.afterEstimatedCloseCostHighUsd, leg.afterEstimatedCloseCostUsd),
+          afterEstimatedCloseCostLowUsd: Math.min(priorLeg.afterEstimatedCloseCostLowUsd, leg.afterEstimatedCloseCostUsd),
+          lastRecordedAt: nowIso,
+        }
+        : {
+          grossHighUsd: Math.max(0, leg.grossUsd),
+          grossLowUsd: Math.min(0, leg.grossUsd),
+          afterEstimatedCloseCostHighUsd: Math.max(0, leg.afterEstimatedCloseCostUsd),
+          afterEstimatedCloseCostLowUsd: Math.min(0, leg.afterEstimatedCloseCostUsd),
+          entryAt: leg.entryAt,
+          firstRecordedAt: nowIso,
+          lastRecordedAt: nowIso,
+        };
+    }
+    store.baskets[sample.basketId] = { ...basket, legs };
     changed = true;
   }
   for (const basket of closed) {
     const previous = store.baskets[basket.basketId];
     if (previous && previous.closedAt !== basket.closedAt) {
-      store.baskets[basket.basketId] = { ...previous, closedAt: basket.closedAt };
+      store.baskets[basket.basketId] = {
+        ...previous,
+        closedAt: basket.closedAt,
+        legs: Object.fromEntries(Object.entries(previous.legs ?? {}).map(([key, leg]) => [key, { ...leg, closedAt: basket.closedAt }])),
+      };
       changed = true;
     }
   }
@@ -1348,9 +1397,7 @@ export async function registerLiveRoutes(
    * and an unconfirmed fill price makes that leg's figure unreliable) — both are in the payload.
    */
   app.get("/api/live/cross-sectional-closed-baskets", async () => {
-    const configuredReportStartAt = process.env.CROSS_SECTIONAL_REPORT_START_AT ?? null;
-    const parsedReportStartMs = configuredReportStartAt ? Date.parse(configuredReportStartAt) : NaN;
-    const reportSinceMs = Number.isFinite(parsedReportStartMs) ? parsedReportStartMs : undefined;
+    const reportSinceMs = getCrossSectionalReportSinceMs();
     const reportStartAt = reportSinceMs === undefined ? null : new Date(reportSinceMs).toISOString();
     const inReportEra = (openedAt: string): boolean => reportSinceMs === undefined || new Date(openedAt).getTime() >= reportSinceMs;
     const instances: Array<{ label: string; executor: CrossSectionalExecutor | null }> = [
@@ -1377,6 +1424,7 @@ export async function registerLiveRoutes(
       entryPrice: number;
       markPrice: number | null;
       grossUnrealizedUsd: number | null;
+      afterEstimatedCloseCostUsd: number | null;
     }>>();
     if (filteredOpenBaskets.length > 0 && engine) {
       const account = await engine.getAccountSnapshot();
@@ -1396,6 +1444,7 @@ export async function registerLiveRoutes(
           entryPrice: number;
           markPrice: number | null;
           grossUnrealizedUsd: number | null;
+          afterEstimatedCloseCostUsd: number | null;
         }> = [];
         for (const leg of basket.legs) {
           if (leg.exitOrderId !== null) continue;
@@ -1410,6 +1459,7 @@ export async function registerLiveRoutes(
               entryPrice: leg.entryPrice,
               markPrice: null,
               grossUnrealizedUsd: null,
+              afterEstimatedCloseCostUsd: null,
             });
             continue;
           }
@@ -1422,6 +1472,7 @@ export async function registerLiveRoutes(
             entryPrice: leg.entryPrice,
             markPrice: mark,
             grossUnrealizedUsd: legGross,
+            afterEstimatedCloseCostUsd: legGross - mark * leg.qty * Math.max(0, estimatedCloseCostPct),
           });
           gross += legGross;
           basketGross += legGross;
@@ -1442,13 +1493,25 @@ export async function registerLiveRoutes(
     const estimatedSlippageUsd = grossUnrealizedUsd == null ? null : unrealizedMarkNotionalUsd * Math.max(0, estimatedCloseCostPct);
     const nowIso = new Date().toISOString();
     const unrealizedExtremaByBasket = recordCrossSectionalUnrealizedExtrema(
-      [...openBasketUnrealized.entries()].map(([basketId, value]) => ({ basketId, ...value })),
+      [...openBasketUnrealized.entries()].map(([basketId, value]) => ({
+        basketId,
+        ...value,
+        legs: (openBasketLegs.get(basketId) ?? []).flatMap((leg) =>
+          leg.grossUnrealizedUsd != null && leg.afterEstimatedCloseCostUsd != null
+            ? [{ symbol: leg.symbol, side: leg.side, grossUsd: leg.grossUnrealizedUsd, afterEstimatedCloseCostUsd: leg.afterEstimatedCloseCostUsd, entryAt: filteredOpenBaskets.find((basket) => basket.basketId === basketId)?.openedAt ?? nowIso }]
+            : [],
+        ),
+      })),
       filteredClosedBaskets.map((basket) => ({ basketId: basket.basketId, closedAt: basket.closedAt })),
       nowIso,
     );
-    const withUnrealizedExtrema = <T extends { basketId: string }>(basket: T) => ({
+    const withUnrealizedExtrema = <T extends { basketId: string; legs: Array<{ symbol: string; side: "LONG" | "SHORT" }> }>(basket: T) => ({
       ...basket,
       unrealizedExtrema: unrealizedExtremaByBasket[basket.basketId] ?? null,
+      legs: basket.legs.map((leg) => ({
+        ...leg,
+        unrealizedExtrema: unrealizedExtremaByBasket[basket.basketId]?.legs?.[`${leg.side}:${leg.symbol}`] ?? null,
+      })),
     });
     const lanes = instances
       .filter((row): row is { label: string; executor: CrossSectionalExecutor } => row.executor !== null)
@@ -1509,19 +1572,16 @@ export async function registerLiveRoutes(
           signal: basket.signal,
           variant: basket.variant,
           openedAt: basket.openedAt,
-          legs: openBasketLegs.get(basket.basketId) ?? basket.legs
-            .filter((leg) => leg.exitOrderId === null)
-            .map((leg) => ({
-              symbol: leg.symbol,
-              side: leg.side,
-              qty: leg.qty,
-              entryPrice: leg.entryPrice,
-              markPrice: null,
-              grossUnrealizedUsd: null,
-            })),
           grossUnrealizedUsd: current?.grossUsd ?? null,
           unrealizedAfterEstimatedCloseCostUsd: current?.afterEstimatedCloseCostUsd ?? null,
           unrealizedExtrema: unrealizedExtremaByBasket[basket.basketId] ?? null,
+          legs: (openBasketLegs.get(basket.basketId) ?? basket.legs
+            .filter((leg) => leg.exitOrderId === null)
+            .map((leg) => ({ symbol: leg.symbol, side: leg.side, qty: leg.qty, entryPrice: leg.entryPrice, markPrice: null, grossUnrealizedUsd: null, afterEstimatedCloseCostUsd: null })))
+            .map((leg) => ({
+              ...leg,
+              unrealizedExtrema: unrealizedExtremaByBasket[basket.basketId]?.legs?.[`${leg.side}:${leg.symbol}`] ?? null,
+            })),
         };
       }),
       lanes,
@@ -1901,21 +1961,50 @@ export async function registerLiveRoutes(
       reply.code(503);
       return { ok: false, reason: "live execution disabled" };
     }
-    const query = (request.query ?? {}) as { view?: string; period?: string; anchor?: string; regime?: string };
+    const query = (request.query ?? {}) as {
+      view?: string;
+      period?: string;
+      anchor?: string;
+      regime?: string;
+      cohort?: string;
+    };
     try {
+      // The XRP/WLD MFE rollout is deliberately a fresh, symbol-scoped cohort. Do not blend it
+      // with older CG_MFE_GIVEBACK orders from symbols that were never approved for this rollout.
+      const mfeRollout = query.cohort === "testnet_mfe_giveback_xrp_wld";
+      const configuredMfeRolloutStartAt = process.env.TESTNET_MFE_GIVEBACK_ROLLOUT_START_AT ?? null;
       let series = engine.getLanePerformanceSeries({
         view: query.view,
         period: query.period,
         anchor: query.anchor,
         regime: query.regime,
+        ...(mfeRollout
+          ? {
+            laneIds: ["CG_VARIANT_MATRIX:CG_MFE_GIVEBACK"],
+            symbols: ["XRPUSDT", "WLDUSDT"],
+            since: configuredMfeRolloutStartAt,
+          }
+          : {}),
       });
-      for (const executor of allCrossSectionalExecutors()) {
-        series = mergeCrossSectionalIntoLaneSeries(series, executor);
+      if (!mfeRollout) {
+        for (const executor of allCrossSectionalExecutors()) {
+          series = mergeCrossSectionalIntoLaneSeries(series, executor);
+        }
+        for (const executor of allSingleSymbolExecutors()) {
+          series = mergeSingleSymbolIntoLaneSeries(series, executor);
+        }
       }
-      for (const executor of allSingleSymbolExecutors()) {
-        series = mergeSingleSymbolIntoLaneSeries(series, executor);
-      }
-      return { ok: true, ...series };
+      return {
+        ok: true,
+        ...series,
+        cohort: mfeRollout
+          ? {
+            id: "testnet_mfe_giveback_xrp_wld",
+            label: "CG_MFE_GIVEBACK — XRP/WLD rollout",
+            rolloutStartAt: configuredMfeRolloutStartAt,
+          }
+          : null,
+      };
     } catch (err) {
       reply.code(500);
       return { ok: false, reason: err instanceof Error ? err.message : "lane performance series failed" };

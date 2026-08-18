@@ -234,7 +234,7 @@ function RateStatsInline({ rv, dim }: { rv: RateView; dim?: boolean }) {
   );
 }
 
-export function FourBrainDashboardCard() {
+export function FourBrainDashboardCard({ grouped = false }: { grouped?: boolean } = {}) {
   const report = useShadowReport<FourBrainReport>('four-brain');
   // TESTNET ONLY, deliberately (2026-07-28). Research's edge memory holds 3 samples against testnet's
   // 19, and none in the regime family the market is in — its Direction longEdge/shortEdge can never
@@ -248,7 +248,7 @@ export function FourBrainDashboardCard() {
 
   if (!r) {
     return (
-      <section style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, marginBottom: 18, padding: 16, color: C.dim }}>
+      <section style={{ background: C.card, border: grouped ? 'none' : `1px solid ${C.border}`, borderRadius: grouped ? 0 : 10, marginBottom: grouped ? 0 : 18, padding: 16, color: C.dim }}>
         Four-Brain: loading…
       </section>
     );
@@ -269,7 +269,7 @@ export function FourBrainDashboardCard() {
   const avgFreshPct = sourceFreshPcts.length ? sourceFreshPcts.reduce((a, b) => a + b, 0) / sourceFreshPcts.length : null;
 
   return (
-    <section style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, overflow: 'hidden', marginBottom: 18 }}>
+    <section style={{ background: C.card, border: grouped ? 'none' : `1px solid ${C.border}`, borderRadius: grouped ? 0 : 10, overflow: 'hidden', marginBottom: grouped ? 0 : 18 }}>
       <header style={{ padding: '12px 16px', borderBottom: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
         <div>
           <h2 style={{ margin: 0, fontSize: 16, color: C.text }}>Four-Brain (shadow decision layer)</h2>
