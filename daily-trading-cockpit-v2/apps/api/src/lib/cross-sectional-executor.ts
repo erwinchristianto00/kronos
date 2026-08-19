@@ -2137,10 +2137,36 @@ export class CrossSectionalExecutor {
     const makerQty = decision.filledQty;
     const takerQty = Number.isFinite(taker.executedQty) && taker.executedQty > 0 ? taker.executedQty : decision.fallbackQty;
     const makerPx = Number.isFinite(latest.avgPrice) && latest.avgPrice > 0 ? latest.avgPrice : limitPrice;
-    const takerPx = Number.isFinite(taker.avgPrice) && taker.avgPrice > 0 ? taker.avgPrice : 0;
+    // 2026-08-19: resolve the TAKER price against the TAKER order id, HERE, while it is in scope.
+    // Returning 0 used to defer this to resolveFillPrice — but that resolver is handed the MAKER
+    // order id (the identity of the leg, see below), and on this path the maker order is CANCELED
+    // with executedQty 0. Querying it can never confirm a taker fill, and because CANCELED is
+    // terminal resolveConfirmedFillPrice breaks out on its very first attempt without retrying.
+    // Live booked 5 legs at the pre-trade REFERENCE price instead of the real fill (baskets
+    // xb-msyft2cg and xb-msz3bsar, 2026-08-18). The bias is systematic, not noise: the reference
+    // omits exactly the slippage the taker fallback just paid, so shorts record too high and longs
+    // too low — always in the direction that flatters the position.
+    const takerResolution = await resolveConfirmedFillPrice(
+      this.client,
+      planned.symbol,
+      taker.orderId,
+      taker.avgPrice,
+      0,
+      {
+        retryDelayMs: this.fillConfirmRetryDelayMs,
+        onUnconfirmed: (sym, id) =>
+          console.error(
+            `[cross-sectional-executor] UNCONFIRMED TAKER FALLBACK FILL: ${sym} order ${id} never ` +
+              `returned a real avgPrice — leaving the leg unpriced rather than booking it at the ` +
+              `pre-trade reference, which would understate entry slippage.`,
+          ),
+      },
+    );
+    const takerPx = takerResolution.price > 0 ? takerResolution.price : 0;
     const totalQty = makerQty + takerQty;
-    // Blend by NOTIONAL. An unconfirmed taker price (avgPrice 0 at ACK is routine) leaves the blend
-    // to resolveFillPrice rather than inventing one: returning 0 is what makes it re-query.
+    // Blend by NOTIONAL. A taker price still unconfirmed after the resolve above leaves the blend at
+    // 0 rather than inventing one — the same safe degradation as before, but now only after the
+    // order that actually filled has been asked.
     const avgPrice = takerPx > 0 && totalQty > 0 ? (makerQty * makerPx + takerQty * takerPx) / totalQty : 0;
     // The MAKER order id is the leg's identity: it is what planned.entryClientOrderId maps to and
     // what every existing recovery path already looks up.
