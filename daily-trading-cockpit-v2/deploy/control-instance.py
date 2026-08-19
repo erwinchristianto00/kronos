@@ -71,7 +71,23 @@ def episodes_of(rows,hz_h=48):
             kept+=1; free=r["openedAtMs"]+hz_h*3600_000
     return kept
 
-def load_obs(path,signal=PROD_SIGNAL):
+PRICE_RATIO_MIN, PRICE_RATIO_MAX = 0.02, 50.0
+
+def corrupt_legs(o):
+    """Price-scale corruption detector. A leg whose exit/entry ratio leaves [0.02, 50] is a
+    decimal-scale error, not a market move: 1000PEPE has been stored at 0.0028 entry against a
+    0.00000265 exit, which books a fake +15-18% basket. Thirteen such rows were inflating the
+    measured mean from +0.89% to +2.75% per basket and the t-stat with it."""
+    bad=[]
+    for side in ("longLeg","shortLeg"):
+        for l in o.get(side) or []:
+            e,x=l.get("entryPrice"),l.get("exitPrice")
+            if not (fin(e) and fin(x) and e>0 and x>0): continue
+            r=x/e
+            if r<PRICE_RATIO_MIN or r>PRICE_RATIO_MAX: bad.append(l.get("symbol"))
+    return bad
+
+def load_obs(path,signal=PROD_SIGNAL,rejected=None):
     try: obs=(json.load(open(path)) or {}).get("observations") or []
     except Exception: return []
     out=[]
@@ -79,6 +95,11 @@ def load_obs(path,signal=PROD_SIGNAL):
         if o.get("signal")!=signal or o.get("status")=="OPEN": continue
         nr,oa=o.get("netReturn"),o.get("openedAtMs")
         if not fin(nr) or not fin(oa): continue
+        cb=corrupt_legs(o)
+        if cb:
+            if rejected is not None:
+                rejected.append({"at":o.get("openedAt"),"net":nr,"symbols":sorted(set(cb))})
+            continue
         out.append({"netReturn":nr,"openedAtMs":oa,"openedAt":o.get("openedAt"),
                     "resolvedAt":o.get("resolvedAt"),"scoreGap":o.get("scoreGap"),
                     "regime":o.get("regimeClassAtOpen"),"longRet":o.get("longLegReturn"),
@@ -301,7 +322,7 @@ def collect():
         R["inst"][k]={**cfg,"ex":ex,"rep":rep,"pool":pool,"fc":fc,"gate":gate,
                       "adm":ex.get("entryAdmission") or {},"attempt":att,
                       "admAudit":ex.get("entryAdmissionAudit") or {},
-                      "signalToOrderSec":lat,"rows":load_obs(cfg["store"]),
+                      "signalToOrderSec":lat,"rows":load_obs(cfg["store"],PROD_SIGNAL,R.setdefault("corrupt",[])),
                       "envPolicy":sh("%s/deploy/apply-required-env.sh --check %s/.env %s 2>&1 | tail -1"%(cfg["rel"],cfg["rel"],cfg["id"]))}
     sfidx={}
     for k in INST:
@@ -325,7 +346,7 @@ def collect():
         try: obs=(json.load(open(INST[k]["store"])) or {}).get("observations") or []
         except Exception: obs=[]
         for ob in obs:
-            if ob.get("signal")!=PROD_SIGNAL: continue
+            if ob.get("signal")!=PROD_SIGNAL or corrupt_legs(ob): continue
             sf=ob.get("smartFormation") or {}; sel=[c for c in (sf.get("candidates") or []) if c.get("selected")]
             if len(sel)!=6: continue
             if fin(ob.get("scoreGap")): D["gap"].append(ob["scoreGap"])
@@ -1078,8 +1099,16 @@ def tab_edge(R):
         "Angka mentahnya %d observasi, tapi hanya %d petak pasar yang benar-benar terpisah. "
         "<b>t-stat terkoreksi %s</b> (mentah %s). Di bawah ~30 episode, selisih sebesar edge lane ini belum bisa dipisahkan dari nol."%(
         allw["n"],eps,num(e["tEff"],2),num(e["tRaw"],2))))
+    cr=R.get("corrupt") or []
+    if cr:
+        o.append("<div class='card' style='border-left:3px solid #d9a441'><div class='k'>%s Observasi dibuang karena korupsi skala harga</div>"
+                 "<div class='s'>%d observasi punya kaki dengan rasio harga keluar/masuk di luar [0,02 – 50] — itu kesalahan desimal, bukan gerak pasar. "
+                 "Masing-masing membukukan basket palsu +15%% sampai +18%%. Semuanya dikeluarkan dari seluruh angka di halaman ini.</div>"
+                 "<table style='margin-top:6px'><tr><th>waktu</th><th>simbol</th><th class='num'>net palsu</th></tr>%s</table></div>"%(
+            DOT["watch"],len(cr),"".join("<tr><td class='dim'>%s</td><td>%s</td><td class='num neg'>%+.2f%%</td></tr>"%(
+                esc(str(c["at"])[:16]),esc(", ".join(c["symbols"])),100*c["net"]) for c in cr[:8])))
     o.append("<div class='grid'>")
-    o.append(card("Episode independen",str(eps),"dari %d observasi (%.1f× tumpang tindih)"%(allw["n"],allw["n"]/max(1,eps))))
+    o.append(card("Episode independen",str(eps),"dari %d observasi bersih (%.1f× tumpang tindih)"%(allw["n"],allw["n"]/max(1,eps))))
     o.append(card("t-stat terkoreksi",num(e["tEff"],2),"angka utama · mentah %s ada di detail"%num(e["tRaw"],2)))
     o.append(card("Rata-rata per basket",pct(allw.get("meanPct"),3),"seluruh riwayat"))
     o.append(card("Rentetan rugi terpanjang","%d basket"%e["longestLossStreak"],"berturut-turut"))
@@ -1306,6 +1335,7 @@ def snapshot_md(R):
     P("t-stat terkoreksi tumpang tindih: **%.2f** (mentah %.2f). Di bawah ~30 episode, selisih"%(e["tEff"] or 0,e["tRaw"] or 0))
     P("sebesar edge lane ini belum bisa dipisahkan dari nol.")
     P("Rentetan rugi terpanjang: %d basket berturut."%e["longestLossStreak"])
+    if R.get("corrupt"): P("%d observasi dibuang karena korupsi skala harga (kaki 1000PEPE, basket palsu +15..18%%)."%len(R["corrupt"]))
     c=e.get("concentration")
     if c: P("Konsentrasi: kuartal %s menyumbang %.0f%% pergerakan; %d dari %d bulan untung."%(c["topQuarter"],c["share"],c["profitableMonths"],c["months"]))
     P("")
