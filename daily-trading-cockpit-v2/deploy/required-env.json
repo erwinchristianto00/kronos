@@ -7,7 +7,7 @@
     "was lost exactly this way once (2026-08-05), and nothing failed loudly when it happened.",
     "",
     "Apply or verify with deploy/apply-required-env.sh. Run --check after EVERY cutover.",
-    "Values here are per-lane policy, never secrets — API keys stay out of version control."
+    "Values here are per-lane policy, never secrets \u2014 API keys stay out of version control."
   ],
   "shared": {
     "CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS": {
@@ -41,10 +41,20 @@
     "CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP": {
       "value": "0.058",
       "why": "Formation admission gate: long-short separation floor. The code default 0.02 is inert (rejects ~0.2% of baskets). At 0.058 across 48 offsets, mean/basket rises monotonically 0.1634% -> 0.2394%, max drawdown falls -54.47% -> -44.03%, and it improves BOTH out-of-sample halves - turning the losing half from -6.92% to +4.79%. Absolute MOM36 strength and dispersion were tested as alternative gates and have no gradient."
+    },
+    "CROSS_SECTIONAL_EDGE_MAX_STORED_OBSERVATIONS": {
+      "value": "15000",
+      "why": "Code default 5000 prunes after ~4 months at the observed 37-47 observations/day. Each observation carries regimeClassAtOpen, and the directional controller's own decision stream is retained only 15 days - so this store is the ONLY path to ever testing SMART_REGIME_LOSS_EXIT against the real classifier instead of a market-momentum proxy. 15000 buys ~11-13 months (~24MB); do not raise much further without checking store-rewrite cost, a 234MB store once made testnet unresponsive."
     }
   },
   "instances": {
-    "3102": { "role": "testnet", "extra": {} },
-    "3103": { "role": "mainnet", "extra": {} }
+    "3102": {
+      "role": "testnet",
+      "extra": {}
+    },
+    "3103": {
+      "role": "mainnet",
+      "extra": {}
+    }
   }
 }
