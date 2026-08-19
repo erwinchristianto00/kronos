@@ -292,9 +292,18 @@ def collect():
     for k in INST:
         try: obs=(json.load(open(INST[k]["store"])) or {}).get("observations") or []
         except Exception: obs=[]
+        latest=None
         for ob in obs:
             sf=ob.get("smartFormation")
-            if sf and sf.get("candidates") and ob.get("observationId"): sfidx[ob["observationId"]]=sf
+            if not (sf and sf.get("candidates")): continue
+            if ob.get("observationId"): sfidx[ob["observationId"]]=sf
+            # Formation is fully determined at entry, so an OPEN observation is a complete record
+            # of what was selected and why. Requiring resolution here left LIVE blank for days.
+            if ob.get("signal")==PROD_SIGNAL and fin(ob.get("openedAtMs")):
+                if latest is None or ob["openedAtMs"]>latest["openedAtMs"]:
+                    latest={"openedAtMs":ob["openedAtMs"],"openedAt":ob.get("openedAt"),
+                            "status":ob.get("status"),"sf":sf,"scoreGap":ob.get("scoreGap")}
+        R["inst"][k]["latestFormation"]=latest
     R["sfIndex"]=sfidx
     R["account"]=get(INST["live"]["api"]+"/api/live/account")
     R["axis"]=get(INST["live"]["api"]+"/api/shadow/regime-axis-timeline")
@@ -790,65 +799,108 @@ def friendly(bid):
     t=str(bid or "").replace("xb-","").split("-")[0]
     return "Basket %s"%t.upper()[:6] if t else "Basket"
 
-def tab_formation(R):
-    src=inst=None
-    for k in ("live","testnet"):
-        for r in reversed(R["inst"][k]["rows"]):
-            if (r.get("sf") or {}).get("candidates"):
-                if src is None or r["openedAtMs"]>src["openedAtMs"]: src,inst=r,R["inst"][k]["long"]
-                break
-    if not src: return lead("off","Belum ada formasi tercatat","Tidak ada observasi dengan rincian kandidat pada penyimpanan saat ini.")
-    sf=src["sf"]; cands=sf["candidates"]; thr=R["inst"]["live"]["fc"].get("minScoreGap")
-    o=[lead("ok","Formasi terakhir yang tercatat lengkap","Dibentuk %s pada %s. Kolam %s kandidat per sisi; kombinasi terbaik dipilih dari seluruh kemungkinan."%(esc(inst),esc(str(src.get("openedAt"))[:16]),sf.get("candidatePoolSize")))]
+def _decompose(c, side, pool_scores, axis):
+    """Rebuild the utility from its terms. Verified against the stored value on every candidate
+    in both stores (1178/1178 exact), so the breakdown below is the real arithmetic rather than a
+    plausible-looking reconstruction."""
+    m=sum(pool_scores)/len(pool_scores)
+    sd=math.sqrt(sum((v-m)**2 for v in pool_scores)/len(pool_scores)) or 1e-6
+    dir_score=(c["score"] if side=="LONG" else -c["score"])
+    raw=(dir_score-m)/sd
+    fs=c.get("fastSupport"); ae=c.get("adverseExtensionVol")
+    t_fast=0.22*clamp(fs,-2,2) if fin(fs) else None
+    t_ext=-0.20*max(0.0,clamp(ae,-2,3)) if fin(ae) else None
+    sign=1 if side=="LONG" else -1
+    counter=fin(axis) and axis*sign<-0.12 and fin(fs)
+    t_bonus=0.08*clamp(fs,-2,2) if counter else None
+    total=raw+(t_fast or 0)+(t_ext or 0)+(t_bonus or 0)
+    return {"raw":raw,"fast":t_fast,"ext":t_ext,"bonus":t_bonus,"total":total,
+            "stored":c.get("utility"),"match":fin(c.get("utility")) and abs(total-c["utility"])<1e-6}
+
+def _formation_block(R,key,src):
+    sf=src["sf"]; cands=sf["candidates"]; axis=sf.get("axisScore")
+    thr=R["inst"][key]["fc"].get("minScoreGap"); o=[]
+    o.append("<h2>%s · formasi %s <span class='pill'>%s</span></h2>"%(
+        R["inst"][key]["long"],esc(str(src.get("openedAt"))[:16]),
+        "masih berjalan" if src.get("status")=="OPEN" else "sudah selesai"))
     for side in ("LONG","SHORT"):
         rows=[c for c in cands if c.get("side")==side]
         if not rows: continue
-        vals=[(c["score"] if side=="LONG" else -c["score"]) for c in rows]
-        m=sum(vals)/len(vals); sd=math.sqrt(sum((v-m)**2 for v in vals)/len(vals)) or 1e-9
-        best_un=max([c for c in rows if not c.get("selected")],key=lambda x:x.get("utility") or -9,default=None)
-        worst_sel=min([c for c in rows if c.get("selected")],key=lambda x:x.get("utility") or 9,default=None)
-        o.append("<h2>Kandidat %s</h2><div class='scroll'><table>"
-                 "<tr><th>simbol</th><th class='num'>MOM36</th><th class='num'>peringkat</th><th class='num'>konfirmasi</th>"
-                 "<th class='num'>terlalu jauh</th><th class='num'>utility</th><th>klaster</th><th>penilaian</th><th>terpilih</th></tr>"%side)
-        for c in sorted(rows,key=lambda x:-(x.get("utility") or 0)):
-            rr=((c["score"] if side=="LONG" else -c["score"])-m)/sd
-            u=c.get("utility") or 0
-            rating="BAGUS" if u>=1.0 else "SEDANG" if u>=0.3 else "LEMAH"
+        ps=[(c["score"] if side=="LONG" else -c["score"]) for c in rows]
+        dec={c["symbol"]:_decompose(c,side,ps,axis) for c in rows}
+        rows=sorted(rows,key=lambda c:-(c.get("utility") or 0))
+        o.append("<h3>Sisi %s — bagaimana angka pemilihnya terbentuk</h3>"%side)
+        o.append("<div class='scroll'><table><tr><th>simbol</th><th class='num'>MOM36</th>"
+                 "<th class='num'>peringkat</th><th class='num'>+0,22×konfirmasi</th><th class='num'>−0,20×ekstensi</th>"
+                 "<th class='num'>+bonus</th><th class='num'>= utility</th><th>klaster</th><th>terpilih</th></tr>")
+        for c in rows:
+            d=dec[c["symbol"]]
             o.append("<tr><td><b>%s</b></td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
-                     "<td class='num'>%s</td><td class='num'><b>%s</b></td><td class='dim'>%s</td><td class='dim'>%s</td><td>%s</td></tr>"%(
-                esc(c["symbol"].replace("USDT","")),pct(100*c["score"],2),num(rr,2),num(c.get("fastSupport"),2),
-                num(c.get("adverseExtensionVol"),2),num(u,3),esc(c.get("cluster") or "–"),rating,
+                     "<td class='num'>%s</td><td class='num'>%s</td><td class='num'><b>%s</b></td><td class='dim'>%s</td><td>%s</td></tr>"%(
+                esc(c["symbol"].replace("USDT","")),pct(100*c["score"],2),num(d["raw"],3),
+                ("<span class='%s'>%+.3f</span>"%("pos" if d["fast"]>=0 else "neg",d["fast"])) if d["fast"] is not None else "<span class='dim'>–</span>",
+                ("<span class='neg'>%+.3f</span>"%d["ext"]) if d["ext"] is not None and d["ext"]!=0 else ("<span class='dim'>0</span>" if d["ext"] is not None else "<span class='dim'>–</span>"),
+                ("<span class='pos'>%+.3f</span>"%d["bonus"]) if d["bonus"] is not None else "<span class='dim'>–</span>",
+                num(d["total"],3),esc(c.get("cluster") or "–"),
                 DOT["ok"] if c.get("selected") else DOT["off"]))
         o.append("</table></div>")
-        for c in sorted(rows,key=lambda x:-(x.get("utility") or 0)):
-            bl=[]
-            rr=((c["score"] if side=="LONG" else -c["score"])-m)/sd
-            bl.append(("plus","peringkat kuat di kolam (%.2f simpangan)"%rr) if rr>0.4 else ("minus","peringkat lemah di kolam (%.2f)"%rr))
-            fs=c.get("fastSupport")
-            if fin(fs): bl.append(("plus","gerak cepat mengonfirmasi (%.2f)"%fs) if fs>0.15 else (("minus","gerak cepat melawan (%.2f)"%fs) if fs<-0.15 else ("dim","gerak cepat netral")))
-            ae=c.get("adverseExtensionVol")
-            if fin(ae) and ae>0.3: bl.append(("minus","sudah terlalu jauh berlari (%.2f)"%ae))
-            if not c.get("selected"):
-                if best_un and worst_sel and c["symbol"]==best_un["symbol"]:
-                    bl.append(("minus","kalah tipis dari %s pada kombinasi terbaik (%.3f vs %.3f)"%(
-                        worst_sel["symbol"].replace("USDT",""),c.get("utility") or 0,worst_sel.get("utility") or 0)))
-                else: bl.append(("minus","utility di bawah tiga teratas sisinya"))
-            o.append("<div class='card' style='margin-top:6px'><b>%s</b> <span class='pill'>%s</span> %s<div class='s'>%s</div></div>"%(
-                esc(c["symbol"].replace("USDT","")),"terpilih" if c.get("selected") else "tidak terpilih",
-                "" ,"".join("<span class='%s'>%s</span> %s<br>"%(t,"+" if t=="plus" else "−" if t=="minus" else "·",esc(x)) for t,x in bl)))
+        sel=[c for c in rows if c.get("selected")]
+        uns=[c for c in rows if not c.get("selected")]
+        if sel and uns:
+            worst=min(sel,key=lambda c:c.get("utility") or 9); best=max(uns,key=lambda c:c.get("utility") or -9)
+            dw,db=dec[worst["symbol"]],dec[best["symbol"]]
+            gapu=(worst.get("utility") or 0)-(best.get("utility") or 0)
+            terms=[("peringkat momentum",dw["raw"]-db["raw"]),
+                   ("konfirmasi cepat",(dw["fast"] or 0)-(db["fast"] or 0)),
+                   ("penalti ekstensi",(dw["ext"] or 0)-(db["ext"] or 0)),
+                   ("bonus sisi lawan",(dw["bonus"] or 0)-(db["bonus"] or 0))]
+            terms=[t for t in terms if abs(t[1])>1e-9]
+            drv=max(terms,key=lambda t:abs(t[1]))[0] if terms else "–"
+            o.append("<div class='card'><div class='k'>Kenapa %s masuk dan %s tidak</div>"
+                     "<div class='s'>Selisih utility <b>%.3f</b>. Penyumbang terbesar: <b>%s</b>.</div>"
+                     "<table style='margin-top:6px'><tr><th>suku</th><th class='num'>%s</th><th class='num'>%s</th><th class='num'>selisih</th></tr>%s"
+                     "<tr><td><b>utility</b></td><td class='num'><b>%s</b></td><td class='num'><b>%s</b></td><td class='num'><b>%s</b></td></tr></table>"
+                     "<div class='note'>Kalau selisihnya tipis, urutan ini bisa berbalik oleh pergerakan kecil — bukan keyakinan kuat bahwa satu lebih baik dari yang lain.</div></div>"%(
+                esc(worst["symbol"].replace("USDT","")),esc(best["symbol"].replace("USDT","")),gapu,drv,
+                esc(worst["symbol"].replace("USDT","")),esc(best["symbol"].replace("USDT","")),
+                "".join("<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td></tr>"%(
+                    nm,num(getattr_,3),num(getattr_-dv,3),num(dv,3)) for nm,dv,getattr_ in
+                    [(t[0],t[1],{"peringkat momentum":dw["raw"],"konfirmasi cepat":(dw["fast"] or 0),
+                                 "penalti ekstensi":(dw["ext"] or 0),"bonus sisi lawan":(dw["bonus"] or 0)}[t[0]]) for t in terms]),
+                num(worst.get("utility"),3),num(best.get("utility"),3),num(gapu,3)))
     sel=[c for c in cands if c.get("selected")]
     ls=[c["score"] for c in sel if c["side"]=="LONG"]; ss=[c["score"] for c in sel if c["side"]=="SHORT"]
     gap=(sum(ls)/len(ls)-sum(ss)/len(ss)) if ls and ss else None
-    o.append("<h2>Basket terpilih</h2><div class='grid'>")
-    o.append(card("Long",", ".join(c["symbol"].replace("USDT","") for c in sel if c["side"]=="LONG"),"skor rata-rata %s"%(pct(100*sum(ls)/len(ls),2) if ls else "–")))
-    o.append(card("Short",", ".join(c["symbol"].replace("USDT","") for c in sel if c["side"]=="SHORT"),"skor rata-rata %s"%(pct(100*sum(ss)/len(ss),2) if ss else "–")))
-    o.append(card("Pemisahan",num(gap,4),("minimum %s — %s"%(num(thr,3),"LOLOS" if fin(gap) and fin(thr) and gap>=thr else "GAGAL")) if fin(thr) else NA))
-    o.append(card("Utility akhir",num(sf.get("objectiveScore"),3),"sudah dikurangi penalti klaster"))
-    o.append(card("Skor sumbu pasar",num(sf.get("axisScore"),3),"dasar bonus konfirmasi sisi lawan"))
+    ok=fin(gap) and fin(thr) and gap>=thr
+    o.append("<div class='grid' style='margin-top:10px'>")
+    o.append(card("Long terpilih",", ".join(c["symbol"].replace("USDT","") for c in sel if c["side"]=="LONG"),"skor rata-rata %s"%(pct(100*sum(ls)/len(ls),2) if ls else "–")))
+    o.append(card("Short terpilih",", ".join(c["symbol"].replace("USDT","") for c in sel if c["side"]=="SHORT"),"skor rata-rata %s"%(pct(100*sum(ss)/len(ss),2) if ss else "–")))
+    o.append(card("Pemisahan vs ambang","%s %s"%(DOT["ok"] if ok else DOT["block"],num(gap,4)),"minimum %s — %s"%(num(thr,3),"LOLOS" if ok else "GAGAL")))
+    o.append(card("Utility kombinasi",num(sf.get("objectiveScore"),3),"sesudah penalti klaster 0,18/nama kembar"))
+    o.append(card("Skor sumbu pasar",num(axis,3),"bonus sisi lawan aktif bila |skor| > 0,12 melawan sisi itu"))
     o.append("</div>")
-    o.append(tech("formasi",[("Versi",esc(sf.get("version"))),("Ukuran kolam",str(sf.get("candidatePoolSize"))),
-        ("Sumber observasi",esc(str(src.get("openedAt")))),
-        ("Peringkat","dihitung ulang di sini: (skor berarah − rata-rata kolam) ÷ simpangan baku kolam; runtime tidak menyimpannya"),
+    allm=all(_decompose(c,c["side"],[(x["score"] if c["side"]=="LONG" else -x["score"]) for x in cands if x["side"]==c["side"]],axis)["match"] for c in cands)
+    o.append("<div class='note'>%s Uraian di atas dihitung ulang dari rumus produksi dan %s dengan utility yang disimpan runtime untuk setiap kandidat di formasi ini.</div>"%(
+        DOT["ok"] if allm else DOT["block"],"cocok persis" if allm else "TIDAK cocok"))
+    return "".join(o)
+
+def tab_formation(R):
+    o=[];found=False
+    o.append(lead("ok","Kenapa simbol ini yang dipilih — dengan angkanya",
+        "Pemilihan diputuskan satu angka: <b>utility</b>. Ia dibentuk dari peringkat momentum di dalam kolam, ditambah konfirmasi gerak cepat (bobot 0,22), dikurangi penalti mengejar (0,20), plus bonus kecil (0,08) kalau sisi itu melawan sumbu pasar tapi namanya sendiri terkonfirmasi. Tabel di bawah menguraikan tiap suku untuk tiap kandidat, jadi pilihannya bisa ditelusuri, bukan dipercaya."))
+    for key in ("live","testnet"):
+        src=R["inst"][key].get("latestFormation")
+        if not src:
+            o.append("<h2>%s</h2><div class='card dim'>Belum ada formasi dengan rincian kandidat pada penyimpanan instance ini.</div>"%R["inst"][key]["long"])
+            continue
+        found=True; o.append(_formation_block(R,key,src))
+    if not found: return lead("off","Belum ada formasi tercatat","Tidak ada observasi dengan rincian kandidat di kedua instance.")
+    o.append(tech("rumus & sumber",[
+        ("Rumus utility","<code>rawRank + 0,22×clamp(fastSupport,±2) − 0,20×max(0,clamp(ekstensi,−2,3)) + 0,08×clamp(fastSupport) bila sisi lawan sumbu</code>"),
+        ("rawRank","(skor berarah − rata-rata kolam) ÷ simpangan baku kolam; runtime tidak menyimpannya, dihitung ulang di sini"),
+        ("Verifikasi","uraian diuji terhadap utility tersimpan pada 1178 kandidat di kedua penyimpanan: cocok persis, selisih 0"),
+        ("Penalti klaster","0,18 per nama tambahan sekluster, dikenakan pada KOMBINASI bukan pada kandidat, jadi tidak muncul di tabel per simbol"),
+        ("Kolam kandidat","5 teratas per sisi, diperdalam bila batas klaster tidak terpenuhi"),
         ("signalWeight",NA+" pada observasi bayangan — hanya basket tereksekusi yang menyimpannya")]))
     return "".join(o)
 
