@@ -122,9 +122,23 @@ def rate(v):
     return "SANGAT KUAT" if v>=85 else "KUAT" if v>=70 else "SEDANG" if v>=50 else "LEMAH" if v>=30 else "SANGAT LEMAH"
 
 def band(v,lo,hi):
-    """Map a raw value onto 0-100 between lo (=0) and hi (=100), clamped."""
+    """Map a raw value onto 0-100 between lo (=0) and hi (=100), clamped. Used only where an
+    absolute reference genuinely exists (a percentage of confirmed fills is 0-100 by definition)."""
     if not fin(v) or hi==lo: return None
     return clamp(100.0*(v-lo)/(hi-lo))
+
+def rank_in(v,dist):
+    """Percentile rank of v inside the strategy's OWN observed distribution.
+
+    Earlier versions scored formation quality against hand-picked anchors, and the anchors were
+    unreachable: the '100' for separation sat at 2x the threshold when the strategy's own median
+    formation reaches 0.78x, and the '100' for cluster spread required six distinct clusters across
+    six legs. Every real basket therefore scored as garbage, which said more about the yardstick
+    than the baskets. 50 now means typical for this strategy, 90 means better than 90% of what it
+    has actually produced."""
+    if not fin(v) or not dist: return None
+    n=len(dist); below=sum(1 for x in dist if x<v); eq=sum(1 for x in dist if x==v)
+    return clamp(100.0*(below+0.5*eq)/n)
 
 # ------------------------------------------------------------------ basket quality
 def _sf_for(b, sfidx):
@@ -136,11 +150,11 @@ def _sf_for(b, sfidx):
     sel = {c["symbol"]: c for c in cands if c.get("selected")}
     return sf, sel
 
-def basket_scores(b, thr, sfidx=None):
+def basket_scores(b, thr, sfidx=None, dist=None):
     """Four separate verdicts. Entry quality is fixed the moment the basket is formed; current
     health moves while it is open; execution is about the fills; outcome is money. Mixing them
     is what makes a lucky winner look well-built and a well-built loser look like a mistake."""
-    sfidx = sfidx or {}
+    sfidx = sfidx or {}; dist = dist or {}
     plan = b.get("plan") or []; legs = b.get("legs") or []; sb = b.get("smartBasket") or {}
     sf, sel = _sf_for(b, sfidx)
     lsc=[p["scoreAtOpen"] for p in plan if p.get("side")=="LONG" and fin(p.get("scoreAtOpen"))]
@@ -150,19 +164,22 @@ def basket_scores(b, thr, sfidx=None):
 
     E=Score("Kualitas entry")
     if fin(gap) and fin(thr) and thr>0:
-        E.add("Pemisahan long-short",band(gap/thr,0.8,2.0),2.0,"scoreGap %.4f = %.2f× minimum %.3f"%(gap,gap/thr,thr))
+        _r=rank_in(gap,dist.get("gap"))
+        E.add("Pemisahan long-short",_r,2.0,
+              "scoreGap %.4f = %.2f× minimum %.3f · lebih lebar dari %s formasi lain"%(
+                  gap,gap/thr,thr,("%.0f%%"%_r) if _r is not None else "?"))
     else: E.add("Pemisahan long-short",None,2.0,NA)
     if scores:
         strg=sum(abs(x) for x in scores)/len(scores)
-        E.add("Kekuatan sinyal",band(strg,0.005,0.05),1.5,"rata-rata |MOM36| kaki terpilih %.2f%%"%(100*strg))
+        E.add("Kekuatan sinyal",rank_in(strg,dist.get("strg")),1.5,"rata-rata |MOM36| kaki terpilih %.2f%%"%(100*strg))
     else: E.add("Kekuatan sinyal",None,1.5,NA)
-    E.add("Utility formasi",band(sf.get("objectiveScore"),0.5,4.0) if fin(sf.get("objectiveScore")) else None,1.0,
+    E.add("Utility formasi",rank_in(sf.get("objectiveScore"),dist.get("obj")),1.0,
           ("total utility kombinasi terpilih %.3f"%sf["objectiveScore"]) if fin(sf.get("objectiveScore")) else NA+" — formasi tidak terjoin")
     fss=[c.get("fastSupport") for c in sel.values() if fin(c.get("fastSupport"))]
-    E.add("Konfirmasi cepat",band(sum(fss)/len(fss),-0.5,0.8) if fss else None,1.0,
+    E.add("Konfirmasi cepat",rank_in((sum(fss)/len(fss)) if fss else None,dist.get("fast")),1.0,
           ("rata-rata fastSupport kaki terpilih %+.2f"%(sum(fss)/len(fss))) if fss else NA)
     aes=[c.get("adverseExtensionVol") for c in sel.values() if fin(c.get("adverseExtensionVol"))]
-    E.add("Risiko terlalu jauh",band(-(sum(aes)/len(aes)),-1.0,0.2) if aes else None,1.0,
+    E.add("Risiko terlalu jauh",rank_in(-(sum(aes)/len(aes)) if aes else None,dist.get("ext")),1.0,
           ("rata-rata ekstensi %+.2f (makin tinggi makin mengejar)"%(sum(aes)/len(aes))) if aes else NA)
     cl=[(p.get("cluster") or (sel.get(p.get("symbol"),{}) or {}).get("cluster") or "?") for p in plan]
     known=[c for c in cl if c!="?"]
@@ -303,6 +320,25 @@ def collect():
                             "status":ob.get("status"),"sf":sf,"scoreGap":ob.get("scoreGap")}
         R["inst"][k]["latestFormation"]=latest
     R["sfIndex"]=sfidx
+    D={"gap":[],"clus":[],"strg":[],"obj":[],"fast":[],"ext":[]}
+    for k in INST:
+        try: obs=(json.load(open(INST[k]["store"])) or {}).get("observations") or []
+        except Exception: obs=[]
+        for ob in obs:
+            if ob.get("signal")!=PROD_SIGNAL: continue
+            sf=ob.get("smartFormation") or {}; sel=[c for c in (sf.get("candidates") or []) if c.get("selected")]
+            if len(sel)!=6: continue
+            if fin(ob.get("scoreGap")): D["gap"].append(ob["scoreGap"])
+            cl=[c.get("cluster") for c in sel if c.get("cluster")]
+            if cl: D["clus"].append(len(set(cl))/len(cl))
+            sc=[abs(c["score"]) for c in sel if fin(c.get("score"))]
+            if sc: D["strg"].append(sum(sc)/len(sc))
+            if fin(sf.get("objectiveScore")): D["obj"].append(sf["objectiveScore"])
+            f=[c["fastSupport"] for c in sel if fin(c.get("fastSupport"))]
+            if f: D["fast"].append(sum(f)/len(f))
+            a=[c["adverseExtensionVol"] for c in sel if fin(c.get("adverseExtensionVol"))]
+            if a: D["ext"].append(-(sum(a)/len(a)))
+    R["dist"]=D
     R["account"]=get(INST["live"]["api"]+"/api/live/account")
     R["axis"]=get(INST["live"]["api"]+"/api/shadow/regime-axis-timeline")
     R["dir"]=get(INST["live"]["api"]+"/api/live/cross-sectional-directional-regime")
@@ -565,7 +601,9 @@ def score_card(sd, extra_line=None):
             "<div class='s' style='color:#93a5b8'>%s</div>%s"
             "<details style='margin-top:8px'><summary>Bagaimana dihitung?</summary><div class='body'>"
             "<table><tr><th>komponen</th><th></th><th class='num'>nilai</th><th class='num'>bobot</th><th>dasar</th></tr>%s</table>"
-            "<div class='note'>Rata-rata tertimbang dari komponen yang punya data. Komponen tanpa data dibuang beserta bobotnya, jadi data yang hilang tidak pernah terhitung sebagai nol.</div>"
+            "<div class='note'>Rata-rata tertimbang dari komponen yang punya data; komponen tanpa data dibuang beserta bobotnya, jadi data hilang tidak pernah terhitung sebagai nol. "
+            "Komponen kualitas entry dinilai sebagai <b>peringkat persentil terhadap riwayat strategi ini sendiri</b> — 50 berarti khas, 90 berarti lebih baik dari 90%% formasi yang pernah ia hasilkan. "
+            "Bukan terhadap patokan ideal yang tak pernah dicapai.</div>"
             "</div></details></div>")%(sd["label"],col,round(v),rate(v),v,col,
              esc(line),why,rows)
 
@@ -960,7 +998,7 @@ def tab_positions(R):
             capH=ex.get("maxHoldHours"); legs=b.get("legs") or []
             notion=sum(abs((l.get("qty") or 0)*(l.get("entryPrice") or 0)) for l in legs)
             lnr=b.get("lastNetReturn"); sb=b.get("smartBasket") or {}
-            bs=basket_scores(b,thr,sfi); usd=(lnr or 0)*notion/2 if fin(lnr) else None
+            bs=basket_scores(b,thr,sfi,R.get("dist")); usd=(lnr or 0)*notion/2 if fin(lnr) else None
             o.append("<div class='card' style='margin-top:11px'>")
             o.append("<div style='display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px'><div><b>%s</b> <span class='dim'>· dibuka %s</span></div><div>%s %s</div></div>"%(
                 friendly(b.get("basketId")),esc(str(b.get("openedAt"))[:16]),pct(100*lnr,3) if fin(lnr) else "",money(usd,3) if fin(usd) else ""))
@@ -1001,7 +1039,7 @@ def tab_positions(R):
         for b in (i["ex"].get("recent") or []):
             if b.get("status")=="OPEN" or not b.get("closedAt"): continue
             got=True
-            bs=basket_scores(b,thr,sfi); net=b.get("netPnlUsd"); lnr=b.get("lastNetReturn")
+            bs=basket_scores(b,thr,sfi,R.get("dist")); net=b.get("netPnlUsd"); lnr=b.get("lastNetReturn")
             legs=b.get("legs") or []
             proc_v=Score("x"); proc_v.parts=[p for p in bs["entry"]["parts"]+bs["exec"]["parts"]]
             proc,outc=post_trade_verdict(proc_v.value,net)
@@ -1240,7 +1278,7 @@ def snapshot_md(R):
     for k in ("live","testnet"):
         for b in R["inst"][k]["ex"].get("openBaskets") or []:
             got=True; lnr=b.get("lastNetReturn")
-            bq=basket_scores(b,R["inst"][k]["fc"].get("minScoreGap"),R.get("sfIndex") or {})
+            bq=basket_scores(b,R["inst"][k]["fc"].get("minScoreGap"),R.get("sfIndex") or {},R.get("dist"))
             P("- [%s] %s dibuka %s | hasil %s | %s"%(
               R["inst"][k]["label"],friendly(b.get("basketId")),str(b.get("openedAt"))[:16],
               ("%+.3f%%"%(100*lnr)) if fin(lnr) else "n/a",
