@@ -896,6 +896,98 @@ def tab_system(R):
     ]))
     return "".join(o)
 
+
+def snapshot_md(R):
+    """Compact, paste-able digest. Deliberately NOT the 310KB JSON: an assistant reasons better
+    from a page of state than from a dump, and a smaller artefact leaks less if it is pasted
+    somewhere careless."""
+    a = R["account"]; liv = R["inst"]["live"]; tst = R["inst"]["testnet"]
+    W = R["edge"]["windows"]; g = R["gauges"]; ax = (R["axis"] or {}).get("current") or {}
+    L = []
+    P = L.append
+    P("# Kronos — ringkasan keadaan  (%s UTC)" % R["generatedAt"][:19])
+    P("")
+    P("Strategi: market-neutral lintas-simbol, 3 long / 3 short, peringkat momentum 36 jam,")
+    P("ditahan sampai batas waktu kecuali stop/TP kena. Bursa: Binance USD-M Futures.")
+    P("")
+    P("## Modal")
+    P("- Ekuitas: $%.2f  (wallet $%.2f, tersedia $%.2f)" % (
+        a.get("accountEquity") or 0, a.get("walletBalance") or 0, a.get("availableBalance") or 0))
+    P("- P&L belum terealisasi: $%.4f dari %s posisi" % (a.get("unrealizedPnl") or 0, a.get("openPositionCount")))
+    P("- P&L terealisasi live: $%.4f dari %s basket selesai" % (liv["ex"].get("totalNetPnlUsd") or 0, liv["ex"].get("closedCount")))
+    P("- P&L terealisasi testnet (uang demo): $%.4f dari %s basket" % (tst["ex"].get("totalNetPnlUsd") or 0, tst["ex"].get("closedCount")))
+    P("")
+    P("## Konfigurasi berjalan")
+    fc = ((get(INST["live"]["api"] + "/api/shadow/cross-sectional-report") or {}).get("filteredConfig") or {})
+    P("- Ukuran per kaki: $%s, leverage %s, eksposur kotor ~$%s" % (
+        liv["ex"].get("legUsd"), liv["ex"].get("leverage"),
+        (liv["ex"].get("legUsd") or 0) * 6))
+    P("- Batas tahan %s jam; stop/TP simetris ±%s%% / %s%% dari nilai basket" % (
+        liv["ex"].get("maxHoldHours"), liv["ex"].get("stopNetReturnPct"), liv["ex"].get("tpNetReturnPct")))
+    P("- Ambang pemisahan skor long-short: %s" % fc.get("minScoreGap"))
+    P("- Exit adaptif (regime/tesis/kunci-laba): DIMATIKAN sejak 2026-08-19")
+    P("")
+    P("## Izin masuk")
+    for k in ("live", "testnet"):
+        i = R["inst"][k]
+        P("- %s: tier %s%s — %s" % (i["label"], i["adm"].get("tier"),
+          " (override operator)" if i["ex"].get("entryHealthBypassed") else "",
+          str(i["adm"].get("reason") or "semua syarat terpenuhi")[:150]))
+        P("  gerbang bukti: 8 terakhir %s, 30 terakhir %s" % (
+          ("%+.3f%%" % i["gate"]["last8"]) if isinstance(i["gate"]["last8"], float) else "n/a",
+          ("%+.3f%%" % i["gate"]["last30"]) if isinstance(i["gate"]["last30"], float) else "n/a"))
+    P("")
+    P("## Posisi terbuka")
+    got = False
+    for k in ("live", "testnet"):
+        for b in R["inst"][k]["ex"].get("openBaskets") or []:
+            got = True
+            lnr = b.get("lastNetReturn")
+            P("- [%s] %s dibuka %s, P&L berjalan %s" % (
+              R["inst"][k]["label"], b.get("basketId"), str(b.get("openedAt"))[:16],
+              ("%+.3f%%" % (100 * lnr)) if isinstance(lnr, float) else "n/a"))
+            P("  kaki: %s" % ", ".join("%s %s" % (l.get("side"), (l.get("symbol") or "").replace("USDT", ""))
+                                       for l in b.get("legs") or []))
+    if not got: P("- tidak ada")
+    P("")
+    P("## Bukti performa (sinyal produksi %s)" % R["edge"]["signal"])
+    P("| jendela | N | rata-rata/basket | menang | t-stat |")
+    P("|---|---|---|---|---|")
+    for lbl in ("8 terakhir", "30 terakhir", "90 terakhir", "seluruhnya"):
+        s_ = W[lbl]
+        P("| %s | %s | %s | %s | %s |" % (lbl, s_.get("n"),
+          ("%+.3f%%" % s_["meanPct"]) if s_.get("n") else "-",
+          ("%.0f%%" % s_["winPct"]) if s_.get("n") else "-",
+          ("%.2f" % s_["tStat"]) if isinstance(s_.get("tStat"), float) else "-"))
+    P("")
+    P("PENTING untuk interpretasi: N di atas adalah observasi bayangan yang dibuka tiap ~1 jam dan")
+    P("ditahan 48 jam, jadi hampir seluruhnya tumpang tindih. Episode benar-benar independen: **%d**." % R["edge"]["episodes"])
+    P("Semua t-stat di atas TIDAK dikoreksi untuk tumpang tindih, jadi terlalu optimistis.")
+    P("")
+    P("## Keadaan pasar")
+    P("- Regime: %s, zona %s, skor sumbu %s" % (
+        ax.get("regime"), ((R["axis"] or {}).get("guidance") or {}).get("zoneLabel"),
+        ("%.3f" % ax["score"]) if isinstance(ax.get("score"), float) else "n/a"))
+    P("- Mode directional: %s (%s)" % ((R["dir"] or {}).get("mode"), (R["dir"] or {}).get("marketRegime")))
+    P("")
+    P("## Skor 0-100")
+    for key, lbl in (("overall", "Keseluruhan"), ("edge", "Kualitas edge"), ("recent", "Performa terakhir"),
+                     ("dd", "Kendali drawdown"), ("exec", "Kualitas eksekusi"), ("data", "Kualitas data"),
+                     ("research", "Kekuatan bukti")):
+        v = g.get(key)
+        P("- %s: %s" % (lbl, ("%d" % round(v)) if isinstance(v, float) else "tidak tersedia"))
+    P("")
+    al = _alerts(R)
+    P("## Peringatan aktif")
+    if not al: P("- tidak ada")
+    for s_, t, d in al: P("- [%s] %s — %s" % (s_.upper(), t, d))
+    P("")
+    P("## Yang TIDAK tersedia dari runtime (jangan diasumsikan)")
+    P("- funding dan slippage tidak dibukukan terpisah")
+    P("- provenance harness riset tidak terekspos")
+    P("- tidak ada pemisahan holdout; perbandingan kebijakan bersifat in-sample")
+    return "\n".join(L)
+
 TABS = [("overview", "Ringkasan", tab_overview), ("strategy", "Strategi", tab_strategy),
         ("decision", "Keputusan", tab_decision), ("formation", "Formasi", tab_formation),
         ("positions", "Posisi", tab_positions), ("edge", "Edge", tab_edge),
@@ -932,6 +1024,8 @@ class H(BaseHTTPRequestHandler):
                 slim = {k: v for k, v in R.items() if k != "inst"}
                 slim["inst"] = {k: {kk: vv for kk, vv in v.items() if kk not in ("rows",)} for k, v in R["inst"].items()}
                 body, ct = json.dumps(slim, default=str).encode(), "application/json"
+            elif self.path.startswith("/snapshot"):
+                body, ct = snapshot_md(collect()).encode(), "text/plain; charset=utf-8"
             elif self.path == "/healthz":
                 body, ct = b"ok", "text/plain"
             else:
