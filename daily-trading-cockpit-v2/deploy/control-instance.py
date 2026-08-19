@@ -207,12 +207,10 @@ def basket_scores(b, thr, sfidx=None):
         X.add("Keseimbangan long/short",band(-imb,-0.10,0.0),1.5,"selisih nilai %.1f%% (long $%.0f vs short $%.0f)"%(100*imb,L,S))
     else: X.add("Keseimbangan long/short",None,1.5,NA)
 
-    parts=[]
-    for sc in (E,H,X): parts+= [p for p in sc.parts if fin(p["value"])]
-    parts.sort(key=lambda p:-p["value"])
     return {"entry":E.as_dict(),"health":H.as_dict(),"exec":X.as_dict(),
-            "scoreGap":gap,"drivers":{"up":parts[:3],"down":list(reversed(parts))[:3]},
-            "formationJoined":bool(sf)}
+            "scoreGap":gap,"formationJoined":bool(sf),
+            "execCoverage":{"measured":[p["name"] for p in X.parts if fin(p["value"])],
+                            "unmeasured":[p["name"] for p in X.parts if not fin(p["value"])]}}
 
 GHOST_SCANS=2
 def ghost_chain(b):
@@ -542,23 +540,34 @@ def score_card(sd, extra_line=None):
     have=[p for p in sd["parts"] if fin(p["value"])]
     ups=sorted([p for p in have if p["value"]>=60],key=lambda p:-p["value"])
     dns=sorted([p for p in have if p["value"]<45],key=lambda p:p["value"])
+    mid=[p for p in have if 45<=p["value"]<60]
     miss=[p["name"] for p in sd["parts"] if not fin(p["value"])]
-    line = extra_line or ("Ditarik naik oleh %s%s. %s"%(
-        ", ".join(p["name"].lower() for p in ups[:2]) if ups else "tidak ada komponen kuat",
-        (" dan ditekan %s"%", ".join(p["name"].lower() for p in dns[:2])) if dns else "",
-        ("%d komponen tanpa data dikeluarkan beserta bobotnya."%len(miss)) if miss else ""))
+    line = extra_line or ("Ditarik naik oleh %s%s.%s"%(
+        ", ".join(p["name"].lower() for p in ups[:2]) if ups else "tidak ada komponen yang kuat",
+        (" Ditekan oleh %s"%", ".join(p["name"].lower() for p in dns[:2])) if dns else " Tidak ada komponen yang benar-benar lemah",
+        (" %d komponen tanpa data dikeluarkan beserta bobotnya."%len(miss)) if miss else ""))
+    def _blk(title,items,cls,sym,empty):
+        if not items: return "<div><span class='k'>%s</span><div class='dim' style='font-size:12px'>%s</div></div>"%(title,empty)
+        return "<div><span class='k'>%s</span>%s</div>"%(title,"".join(
+            "<div style='font-size:12px'><span class='%s'>%s</span> %s <span class='dim'>· %s · %s</span></div>"%(
+                cls,sym,esc(p["name"]),num(p["value"],0),esc(p["detail"])) for p in items[:3]))
+    why=("<div class='g2' style='margin-top:8px'>%s%s</div>"%(
+        _blk("Pendorong",ups,"plus","+","tidak ada komponen yang mencapai kuat"),
+        _blk("Penekan",dns,"minus","−","tidak ada komponen yang benar-benar lemah — sisanya sedang"))
+        +(("<div class='note'>%d komponen di rentang sedang: %s</div>"%(len(mid),esc(", ".join(p["name"] for p in mid)))) if mid else "")
+        +(("<div class='note'>Tanpa data (dikeluarkan beserta bobotnya): %s</div>"%esc(", ".join(miss))) if miss else ""))
     rows="".join("<tr><td>%s</td><td>%s</td><td class='num'>%s</td><td class='num dim'>%.1f</td><td class='dim'>%s</td></tr>"%(
         p["name"],("<span class='plus'>+</span>" if fin(p["value"]) and p["value"]>=60 else "<span class='minus'>−</span>" if fin(p["value"]) else "<span class='dim'>·</span>"),
         num(p["value"],0),p["weight"],esc(p["detail"] or "")) for p in sd["parts"])
     return ("<div class='card'><div class='k'>%s</div>"
             "<div class='v' style='color:%s'>%d<span style='font-size:12px;color:#68788a'> / 100 · %s</span></div>"
             "<div class='bar'><i style='width:%.0f%%;background:%s'></i></div>"
-            "<div class='s' style='color:#93a5b8'>%s</div>"
+            "<div class='s' style='color:#93a5b8'>%s</div>%s"
             "<details style='margin-top:8px'><summary>Bagaimana dihitung?</summary><div class='body'>"
             "<table><tr><th>komponen</th><th></th><th class='num'>nilai</th><th class='num'>bobot</th><th>dasar</th></tr>%s</table>"
             "<div class='note'>Rata-rata tertimbang dari komponen yang punya data. Komponen tanpa data dibuang beserta bobotnya, jadi data yang hilang tidak pernah terhitung sebagai nol.</div>"
             "</div></details></div>")%(sd["label"],col,round(v),rate(v),v,col,
-             esc(line),rows)
+             esc(line),why,rows)
 
 def curve_svg(pts,w=600,h=120):
     if len(pts)<2: return "<div class='dim'>Data tidak cukup.</div>"
@@ -904,11 +913,24 @@ def tab_formation(R):
         ("signalWeight",NA+" pada observasi bayangan — hanya basket tereksekusi yang menyimpannya")]))
     return "".join(o)
 
-def drivers_html(bs):
-    up="".join("<div><span class='plus'>+</span> %s <span class='dim'>(%s · %s)</span></div>"%(esc(d["name"]),num(d["value"],0),esc(d["detail"])) for d in bs["drivers"]["up"])
-    dn="".join("<div><span class='minus'>−</span> %s <span class='dim'>(%s · %s)</span></div>"%(esc(d["name"]),num(d["value"],0),esc(d["detail"])) for d in bs["drivers"]["down"])
-    return ("<div class='g2'><div class='card'><div class='k'>Pendorong terkuat</div><div class='s'>%s</div></div>"
-            "<div class='card'><div class='k'>Penekan terkuat</div><div class='s'>%s</div></div></div>")%(up or "<span class='dim'>–</span>",dn or "<span class='dim'>–</span>")
+EXEC_UNCOVERED=[("Slippage terukur","executor tidak membukukan harga acuan vs fill sebagai biaya tersendiri"),
+ ("Funding","tidak dibukukan per basket"),
+ ("Fill sebagian / order ditolak","tidak terekspos per basket; hanya ada penghitung kaki yatim tingkat instance"),
+ ("Campuran maker/taker","tidak disimpan pada catatan kaki"),
+ ("Latensi per kaki","hanya ada latensi sinyal→order tingkat instance, bukan per kaki"),
+ ("Selisih harga keluar","hanya harga masuk yang punya harga acuan rencana untuk dibandingkan")]
+
+def exec_coverage_html(bs):
+    cov=bs.get("execCoverage") or {}
+    m=cov.get("measured") or []; u=cov.get("unmeasured") or []
+    return ("<details><summary>Apakah seluruh logika eksekusi sudah tercakup? — <b>belum, ini batasnya</b></summary><div class='body'>"
+            "<div class='k'>Yang benar-benar diukur untuk basket ini</div><div class='s'>%s</div>"
+            "<div class='k' style='margin-top:8px'>Ada di skor tapi tanpa data pada basket ini</div><div class='s'>%s</div>"
+            "<div class='k' style='margin-top:8px'>Tidak diukur sama sekali oleh runtime</div>%s"
+            "<div class='note'>Karena itu skor eksekusi hanya menilai apa yang tercatat. Ia <b>tidak</b> bisa membuktikan eksekusinya bersih — hanya bahwa hal-hal di daftar pertama tidak bermasalah.</div>"
+            "</div></details>")%( ", ".join(m) or "<span class=\'dim\'>tidak ada</span>",
+             ", ".join(u) or "<span class=\'dim\'>tidak ada</span>",
+             "".join("<div style='font-size:12px'><span class='dim'>·</span> %s <span class='dim'>— %s</span></div>"%(esc(a),esc(b)) for a,b in EXEC_UNCOVERED))
 
 def ghost_html(b):
     steps,any_fire=ghost_chain(b)
@@ -952,7 +974,7 @@ def tab_positions(R):
             o.append("</div>")
             o.append("<div class='g2' style='margin-top:10px'>%s%s%s</div>"%(
                 score_card(bs["entry"]),score_card(bs["health"]),score_card(bs["exec"])))
-            o.append(drivers_html(bs))
+            o.append(exec_coverage_html(bs))
             if not bs["formationJoined"]:
                 o.append("<div class='note'>Utility formasi, konfirmasi cepat dan risiko ekstensi %s untuk basket ini — observasi sumbernya sudah tidak ada di penyimpanan, jadi tiga komponen itu dikeluarkan beserta bobotnya.</div>"%NA.lower())
             o.append(ghost_html(b))
@@ -994,7 +1016,7 @@ def tab_positions(R):
             o.append(card("Kualitas eksekusi",num(bs["exec"]["value"],0),rate(bs["exec"]["value"])))
             o.append(card("Nilai posisi",money(notion,0),"biaya %s"%money(b.get("feeEstimateUsd"),4)))
             o.append("</div>")
-            o.append(drivers_html(bs))
+            o.append(exec_coverage_html(bs))
             o.append("<div class='scroll'><table style='margin-top:8px'><tr><th>kaki</th><th>sisi</th><th class='num'>masuk</th><th class='num'>keluar</th><th class='num'>kontribusi</th></tr>")
             for l in legs:
                 e_,x_=l.get("entryPrice"),l.get("exitPrice"); c=None
