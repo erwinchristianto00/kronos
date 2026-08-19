@@ -811,12 +811,23 @@ def tab_strategy(R):
     o.append(card("Stop / ambil untung","±%s%% / %s%%"%(ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct")),"atas nilai basket"))
     o.append(card("Ambang pemisahan",num(fc.get("minScoreGap"),3),"basket ditolak di bawah ini"))
     o.append("</div>")
-    o.append("<h2>Smart Formation — memilih basket, bukan sinyal baru</h2>")
-    o.append("<div class='lead' style='border-left-color:#8a6fbf'><div class='r'>Formation tidak membuat sinyal. Ia mengambil peringkat MOM36 yang sudah ada, memotongnya jadi kolam 5 kandidat teratas per sisi, lalu <b>mencoba semua kombinasi</b> dan memilih yang total utility-nya tertinggi setelah dikurangi penalti klaster. Peringkat mentah tetap dominan; dua faktor lain sengaja dibuat berbatas supaya tidak bisa mengangkat skor yang jelas kalah.</div></div>")
-    o.append("<table><tr><th>fitur</th><th>artinya</th></tr>%s</table>"%"".join(
-        "<tr><td><b>%s</b></td><td class='dim' style='white-space:normal'>%s</td></tr>"%(esc(a),esc(b)) for a,b in FEATURES))
+    fl0=liv.get("flags") or {}
+    rerank=fl0.get("CROSS_SECTIONAL_SMART_FORMATION_RERANK","1")!="0"
+    o.append("<h2>Bagaimana basket dipilih</h2>")
+    if rerank:
+        o.append("<div class='lead' style='border-left-color:#8a6fbf'><div class='r'>Formation mengambil peringkat MOM36, memotongnya jadi kolam 5 kandidat teratas per sisi, lalu <b>mencoba semua kombinasi</b> dan memilih yang total utility-nya tertinggi setelah dikurangi penalti klaster. Peringkat mentah dominan; dua faktor lain berbatas.</div></div>")
+    else:
+        o.append("<div class='lead' style='border-left-color:#8a6fbf'><div class='r'><b>Re-ranking dimatikan.</b> Pemilihan sekarang murni peringkat MOM36: ambil 3 teratas tiap sisi, dengan cluster cap sebagai batas keras. "
+                 "fastSupport, adverseExtension dan bonus counter-axis <b>tetap dihitung dan dicatat</b> untuk diagnostik dan evaluasi ghost — tapi tidak lagi memengaruhi siapa yang terpilih. "
+                 "Dasarnya: ablasi 12 offset selama 2 tahun memberi +0,2227%/basket dengan re-ranking penuh vs +0,2220% tanpanya — selisih 0,0007pp, dengan PF, hit rate, stabilitas kuartal dan kuartal terburuk yang identik.</div></div>")
+    o.append("<table><tr><th>fitur</th><th>peran sekarang</th><th>artinya</th></tr>%s</table>"%"".join(
+        "<tr><td><b>%s</b></td><td>%s</td><td class='dim' style='white-space:normal'>%s</td></tr>"%(
+            esc(a),
+            ("%s memilih"%DOT["ok"]) if (rerank or a in ("MOM36","rawRank","scoreGap","penalti klaster")) else ("%s cuma dicatat"%DOT["off"]),
+            esc(b)) for a,b in FEATURES))
+    if not rerank:
+        o.append("<div class='note'>Baris bertanda ⚪ masih muncul di tab Formasi dan di skor kualitas entry sebagai <b>diagnostik</b>. Mereka menggambarkan basketnya, bukan alasan ia terpilih.</div>")
     fl=liv.get("flags") or {}
-    rerank=fl.get("CROSS_SECTIONAL_SMART_FORMATION_RERANK","1")!="0"
     mex=fl.get("CROSS_SECTIONAL_MAKER_EXIT_ENABLED")=="1"
     ee=R.get("exitEcon") or {}
     o.append("<h2>Mode produksi yang benar-benar berjalan</h2><table>"
@@ -852,7 +863,10 @@ def tab_strategy(R):
         ("Context Invalidation","off · Eksekusi MATI, ghost AKTIF","≥2 dari 3 kaki satu sisi kehilangan alasan masuknya, 2 scan","Menutup saat alasan pemilihan nama-nama itu hilang."),
         ("MFE Giveback","off · Eksekusi MATI, ghost AKTIF","puncak ≥0,2% lalu turun ke ≤50% puncak","Mengunci laba yang mulai menguap."),
         ("Batas waktu keras","ok · aktif","%s jam"%ex.get("maxHoldHours"),"Selalu menutup di sini apa pun keadaannya."),
-        ("Stop / TP","ok · aktif","±%s%% / %s%%"%(ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct")),"Plafon bencana simetris, bukan pengambil untung harian.")]:
+        ("Stop / TP","ok · aktif","±%s%% / %s%%"%(ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct")),"Plafon bencana simetris, bukan pengambil untung harian."),
+        ("Cara menutup","ok · maker-first" if (liv.get("flags") or {}).get("CROSS_SECTIONAL_MAKER_EXIT_ENABLED")=="1" else "off · taker penuh",
+         "reduce-only post-only, tunggu %ss, sisanya MARKET"%(int((liv.get("flags") or {}).get("CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS","0") or 0)//1000),
+         "Hanya untuk penutupan terjadwal. Stop, darurat dan rekonsiliasi paksa tetap menyeberang seketika.")]:
         s=stt.split(" · ")[0]
         o.append("<tr><td>%s</td><td>%s %s</td><td class='dim'>%s</td><td class='dim' style='white-space:normal'>%s</td></tr>"%(
             nm,DOT[s],esc(stt.split(" · ",1)[1] if " · " in stt else stt),esc(par),esc(mean)))
@@ -946,9 +960,15 @@ def _decompose(c, side, pool_scores, axis):
 def _formation_block(R,key,src):
     sf=src["sf"]; cands=sf["candidates"]; axis=sf.get("axisScore")
     thr=R["inst"][key]["fc"].get("minScoreGap"); o=[]
-    o.append("<h2>%s · formasi %s <span class='pill'>%s</span></h2>"%(
+    _rr=any(fin(c.get("utility")) and abs(_decompose(c,c["side"],
+              [(x["score"] if c["side"]=="LONG" else -x["score"]) for x in cands if x["side"]==c["side"]],axis)["raw"]-c["utility"])>1e-9
+            for c in cands)
+    o.append("<h2>%s · formasi %s <span class='pill'>%s</span> <span class='pill'>%s</span></h2>"%(
         R["inst"][key]["long"],esc(str(src.get("openedAt"))[:16]),
-        "masih berjalan" if src.get("status")=="OPEN" else "sudah selesai"))
+        "masih berjalan" if src.get("status")=="OPEN" else "sudah selesai",
+        "dibentuk DENGAN re-ranking" if _rr else "dibentuk dengan peringkat MOM36 saja"))
+    if not _rr:
+        o.append("<div class='note'>Formasi ini dibuat setelah re-ranking dimatikan: kolom konfirmasi dan ekstensi di bawah bernilai nol pada utility karena memang tidak lagi ikut memilih — nilainya tetap ditampilkan sebagai diagnostik.</div>")
     for side in ("LONG","SHORT"):
         rows=[c for c in cands if c.get("side")==side]
         if not rows: continue
