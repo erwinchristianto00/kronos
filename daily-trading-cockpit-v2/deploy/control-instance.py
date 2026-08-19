@@ -1050,6 +1050,111 @@ def tab_system(R):
         ("SHA rilis / hash konfigurasi",NA+" — manifest kode tidak mengekspos hash pohon yang bisa dibandingkan lintas-instance")]))
     return "".join(o)
 
+
+def snapshot_md(R):
+    """Compact, paste-able digest for handing state to an outside reader without handing over
+    access. ~3KB instead of the 100KB page: a reader reasons better from a page of state than from
+    a dump, and a smaller artefact leaks less if pasted somewhere careless. Caveats travel WITH the
+    numbers, never after them."""
+    a=R["account"]; liv=R["inst"]["live"]; tst=R["inst"]["testnet"]
+    W=R["edge"]["windows"]; e=R["edge"]; sc=R["scores"]; ax=(R["axis"] or {}).get("current") or {}
+    L=[];P=L.append
+    P("# Kronos — ringkasan keadaan  (%s UTC)"%R["generatedAt"][:19])
+    P("")
+    P("Strategi: momentum relatif lintas-simbol. Memeringkat universe dengan MOM36, membeli 3")
+    P("terkuat dan menjual 3 terlemah, netral pasar. Bursa: Binance USD-M Futures.")
+    P("Yang dikejar selisih kuat-vs-lemah, bukan arah pasar.")
+    P("")
+    P("## Modal")
+    P("- Ekuitas $%.2f (wallet $%.2f, tersedia $%.2f)"%(a.get("accountEquity") or 0,a.get("walletBalance") or 0,a.get("availableBalance") or 0))
+    P("- Belum terealisasi $%.4f dari %s posisi"%(a.get("unrealizedPnl") or 0,a.get("openPositionCount")))
+    P("- Terealisasi hari ini $%.4f | total live $%.4f (%s basket)"%(
+        liv["ex"].get("dailyRealizedUsd") or 0,liv["ex"].get("totalNetPnlUsd") or 0,liv["ex"].get("closedCount")))
+    P("- Testnet (uang demo) $%.4f (%s basket)"%(tst["ex"].get("totalNetPnlUsd") or 0,tst["ex"].get("closedCount")))
+    P("")
+    P("## Konfigurasi berjalan")
+    P("- Leg $%s, leverage %s, kotor ~$%s | batas tahan %s jam | stop/TP +-%s%%/%s%%"%(
+        liv["ex"].get("legUsd"),liv["ex"].get("leverage"),(liv["ex"].get("legUsd") or 0)*6,
+        liv["ex"].get("maxHoldHours"),liv["ex"].get("stopNetReturnPct"),liv["ex"].get("tpNetReturnPct")))
+    P("- Ambang pemisahan skor long-short: %s"%liv["fc"].get("minScoreGap"))
+    P("- Exit adaptif (regime/tesis/kunci-laba): EKSEKUSI DIMATIKAN, evaluasi ghost tetap jalan")
+    P("")
+    P("## Status per instance")
+    for k in ("live","testnet"):
+        i=R["inst"][k]; ex=i["ex"]; g=i["gate"]
+        P("- %s"%i["long"])
+        P("  eksekusi %s | kesehatan bukti %s | override operator %s | sinyal %s"%(
+          "BERJALAN" if not ex.get("__error__") else "MATI",
+          "LOLOS" if g["pass"] else "GAGAL",
+          "AKTIF" if ex.get("entryHealthBypassed") else "tidak",
+          "BASI" if ex.get("signalStale") else "segar"))
+        P("  gerbang: 8 terakhir %s, 30 terakhir %s"%(
+          ("%+.3f%%"%g["last8"]) if fin(g["last8"]) else "n/a",
+          ("%+.3f%%"%g["last30"]) if fin(g["last30"]) else "n/a"))
+    P("")
+    P("## Posisi terbuka")
+    got=False
+    for k in ("live","testnet"):
+        for b in R["inst"][k]["ex"].get("openBaskets") or []:
+            got=True; lnr=b.get("lastNetReturn")
+            bq=basket_quality(b,R["inst"][k]["fc"].get("minScoreGap"))
+            P("- [%s] %s dibuka %s | hasil %s | kualitas basket %s/100"%(
+              R["inst"][k]["label"],friendly(b.get("basketId")),str(b.get("openedAt"))[:16],
+              ("%+.3f%%"%(100*lnr)) if fin(lnr) else "n/a",
+              ("%d"%round(bq["value"])) if fin(bq.get("value")) else "n/a"))
+            P("  %s"%", ".join("%s %s"%(l.get("side"),(l.get("symbol") or "").replace("USDT","")) for l in b.get("legs") or []))
+            gh=[x["rule"] for x in ghost_exits(b) if x["fire"]]
+            if gh: P("  ghost exit yang AKAN memicu: %s"%", ".join(gh))
+    if not got: P("- tidak ada")
+    P("")
+    P("## Bukti performa (sinyal produksi %s)"%e["signal"])
+    P("| jendela | N | rata-rata/basket | menang | t mentah |")
+    P("|---|---|---|---|---|")
+    for lbl in ("8 terakhir","30 terakhir","90 terakhir","seluruhnya"):
+        s_=W[lbl]
+        P("| %s | %s | %s | %s | %s |"%(lbl,s_.get("n"),
+          ("%+.3f%%"%s_["meanPct"]) if s_.get("n") else "-",
+          ("%.0f%%"%s_["winPct"]) if s_.get("n") else "-",
+          ("%.2f"%s_["tStat"]) if fin(s_.get("tStat")) else "-"))
+    P("")
+    P("BACA INI SEBELUM MENYIMPULKAN APA PUN DARI TABEL DI ATAS:")
+    P("N adalah observasi bayangan yang dibuka tiap ~1 jam dan ditahan sampai horizonnya, jadi")
+    P("hampir seluruhnya tumpang tindih. Episode yang benar-benar independen: **%d**."%e["episodes"])
+    P("t-stat terkoreksi tumpang tindih: **%.2f** (mentah %.2f). Di bawah ~30 episode, selisih"%(e["tEff"] or 0,e["tRaw"] or 0))
+    P("sebesar edge lane ini belum bisa dipisahkan dari nol.")
+    P("Rentetan rugi terpanjang: %d basket berturut."%e["longestLossStreak"])
+    c=e.get("concentration")
+    if c: P("Konsentrasi: kuartal %s menyumbang %.0f%% pergerakan; %d dari %d bulan untung."%(c["topQuarter"],c["share"],c["profitableMonths"],c["months"]))
+    P("")
+    if R.get("mismatch"):
+        P("## PERINGATAN: bukti tidak persis mewakili produksi")
+        for m in R["mismatch"]:
+            P("- %s — produksi: %s | bukti: %s"%(m["what"],m["prod"],m["evid"]))
+        P("")
+    P("## Keadaan pasar")
+    P("- Regime %s, zona %s, skor sumbu %s"%(ax.get("regime"),((R["axis"] or {}).get("guidance") or {}).get("zoneLabel"),
+      ("%.3f"%ax["score"]) if fin(ax.get("score")) else "n/a"))
+    P("- Mode directional: %s (%s)"%((R["dir"] or {}).get("mode"),(R["dir"] or {}).get("marketRegime")))
+    P("")
+    P("## Skor 0-100 (komponen lengkap ada di dashboard)")
+    for k,lbl in (("overall","Keseluruhan"),("edge","Kualitas edge"),("recent","Performa terakhir"),
+                  ("dd","Kendali drawdown"),("exec","Kualitas eksekusi"),("data","Kualitas data"),
+                  ("evidence","Kekuatan bukti")):
+        v=sc[k]["value"]
+        P("- %s: %s"%(lbl,("%d (%s)"%(round(v),rate(v))) if fin(v) else NA))
+    P("")
+    A=alerts_of(R)
+    P("## Peringatan aktif (prioritas menurun)")
+    if not A: P("- tidak ada")
+    names={0:"MENGHALANGI",1:"RISIKO",2:"PANTAU",3:"INFO"}
+    for pr,st,t,d in A: P("- [%s] %s — %s"%(names[pr],t,d))
+    P("")
+    P("## Yang TIDAK diukur runtime (jangan diasumsikan nol)")
+    P("- funding dan slippage tidak dibukukan terpisah")
+    P("- provenance harness riset dan pemisahan holdout tidak terekspos")
+    P("- riwayat parameter->perubahan->bukti tidak terbaca dari runtime")
+    return "\n".join(L)
+
 TABS=[("overview","Ringkasan",tab_overview),("strategy","Strategi",tab_strategy),("decision","Keputusan",tab_decision),
       ("formation","Formasi",tab_formation),("positions","Posisi",tab_positions),("edge","Edge",tab_edge),
       ("research","Riset",tab_research),("system","Sistem",tab_system)]
@@ -1079,6 +1184,8 @@ class H(BaseHTTPRequestHandler):
                 R=collect(); slim={k:v for k,v in R.items() if k!="inst"}
                 slim["inst"]={k:{kk:vv for kk,vv in v.items() if kk not in ("rows","rep")} for k,v in R["inst"].items()}
                 body,ct=json.dumps(slim,default=str).encode(),"application/json"
+            elif self.path.startswith("/snapshot"):
+                body,ct=snapshot_md(collect()).encode(),"text/plain; charset=utf-8"
             elif self.path=="/healthz": body,ct=b"ok","text/plain"
             else: body,ct=render(collect()).encode(),"text/html; charset=utf-8"
             self.send_response(200); self.send_header("Content-Type",ct)
