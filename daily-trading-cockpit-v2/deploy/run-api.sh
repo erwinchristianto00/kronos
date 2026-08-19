@@ -13,25 +13,30 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # anyway (use it if this ever blocks a recovery), REQUIRED_ENV_CHECK=off skips entirely.
 #
 # Scoped by path to the two policy-governed release roots, so other instances (3101 research, ad-hoc
-# trees) are unaffected and cannot be blocked by a policy that was never written for them.
+# trees) are unaffected and cannot be blocked by a policy that was never written for them. The path
+# also names the instance, so the check picks up instances.<id>.extra — the places testnet
+# deliberately differs from live (capital protection only, never strategy).
+instance=""
 case "$here" in
-  /root/kronos-live-releases/*|/root/kronos-testnet-releases/*)
+  /root/kronos-live-releases/*)    instance=3103 ;;
+  /root/kronos-testnet-releases/*) instance=3102 ;;
+esac
+if [ -n "$instance" ]; then
     envfile="$here/../.env"
     checker="$here/apply-required-env.sh"
     mode="${REQUIRED_ENV_CHECK:-enforce}"
     if [ "$mode" != "off" ] && [ -x "$checker" ] && [ -f "$envfile" ]; then
-      if ! "$checker" --check "$envfile"; then
+      if ! "$checker" --check "$envfile" "$instance"; then
         echo ""
         echo "!!  REQUIRED ENV DRIFT — this release is NOT running the measured configuration."
-        echo "!!  Fix:   $checker --apply $envfile   (then restart)"
+        echo "!!  Fix:   $checker --apply $envfile $instance   (then restart)"
         echo "!!  Start anyway, knowingly:   REQUIRED_ENV_CHECK=warn pm2 restart <process>"
         echo ""
         [ "$mode" = "warn" ] || exit 78   # EX_CONFIG
         echo "!!  REQUIRED_ENV_CHECK=warn — starting despite the drift above."
       fi
     fi
-    ;;
-esac
+fi
 
 cd "$here/../apps/api"
 exec npx tsx src/server.ts

@@ -6,6 +6,11 @@
     "forward silently reverts them to code defaults. That is not hypothetical: the 36h hold policy",
     "was lost exactly this way once (2026-08-05), and nothing failed loudly when it happened.",
     "",
+    "'shared' applies to every policy-governed instance. 'instances.<id>.extra' is where an instance",
+    "DELIBERATELY diverges \u2014 today only testnet, and only on capital protection, never on strategy:",
+    "a paper account has no capital to protect, and its whole job is to produce the evidence that the",
+    "gates elsewhere consume. Strategy keys stay shared so testnet results describe what live runs.",
+    "",
     "Apply or verify with deploy/apply-required-env.sh. Run --check after EVERY cutover.",
     "Values here are per-lane policy, never secrets \u2014 API keys stay out of version control."
   ],
@@ -50,7 +55,16 @@
   "instances": {
     "3102": {
       "role": "testnet",
-      "extra": {}
+      "extra": {
+        "CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH": {
+          "value": "1",
+          "why": "PERMANENT on testnet, unlike the temporary operator bypass on live. The entry-health gate exists to stop a lane with negative recent evidence from sending orders \u2014 a capital-protection rule, and a paper account has no capital to protect. Worse, it is self-blocking here: the gate reads the shadow report, and a lane that cannot open baskets still cannot produce the executed open/close cycles the operator reviews. The executor's own doc comment draws exactly this line: trading without the evidence is legitimate on testnet, where the point is to generate it, and a very different thing on real money. NOT in 'shared' on purpose \u2014 live's =1 is a dated bypass that must expire, this one must not."
+        },
+        "CROSS_SECTIONAL_ENTRY_TRAFFIC_LIGHT": {
+          "value": "0",
+          "why": "Required for the bypass above to do anything. entryAdmissionForSignal says it outright: when the traffic light is enabled the global bypass is deliberately NOT consulted, and only the narrow YELLOW path may bridge an INCOMPLETE sample. Testnet's verdict is 'rolling edge negative', not incomplete, so YELLOW never applies and it sits RED forever \u2014 unable to produce the executed closes that would clear it. Off here, testnet uses the same legacy admission path live uses, so the two are comparable; live already runs this =0."
+        }
+      }
     },
     "3103": {
       "role": "mainnet",

@@ -3,8 +3,11 @@
 # Verify (or apply) the env values that MUST survive a release cutover.
 # Policy and evidence live in deploy/required-env.json — this script only enforces it.
 #
-#   deploy/apply-required-env.sh --check <path/to/.env>   # exit 1 if anything drifted
-#   deploy/apply-required-env.sh --apply <path/to/.env>   # back up, then set what drifted
+#   deploy/apply-required-env.sh --check <path/to/.env> [id]   # exit 1 if anything drifted
+#   deploy/apply-required-env.sh --apply <path/to/.env> [id]   # back up, then set what drifted
+#
+# The optional instance id merges instances.<id>.extra on top of shared — that is how testnet
+# declares the places it deliberately differs (capital protection only, never strategy).
 #
 # WHY THIS EXISTS: a release dir gets a REAL .env, not a symlink. A cutover that forgets to carry
 # these forward reverts them to code defaults, and nothing fails loudly — the 36h hold policy was
@@ -17,22 +20,24 @@ set -euo pipefail
 
 mode="${1:-}"
 target="${2:-}"
+instance="${3:-}"   # optional: merge instances.<id>.extra on top of shared
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 policy="$here/required-env.json"
 
 case "$mode" in
   --check|--apply) ;;
-  *) echo "usage: $0 --check|--apply <path/to/.env>" >&2; exit 2 ;;
+  *) echo "usage: $0 --check|--apply <path/to/.env> [instance-id]" >&2; exit 2 ;;
 esac
 [ -n "$target" ] || { echo "usage: $0 $mode <path/to/.env>" >&2; exit 2; }
 [ -f "$target" ] || { echo "ABORT: no such .env: $target" >&2; exit 2; }
 [ -f "$policy" ] || { echo "ABORT: policy missing: $policy" >&2; exit 2; }
 
 # Everything NOT under policy must survive byte-identical; proven by hashing it before and after.
-before_others="$(python3 - "$target" "$policy" <<'PY'
+before_others="$(python3 - "$target" "$policy" "$instance" <<'PY'
 import json,sys,hashlib
-env,pol=sys.argv[1],sys.argv[2]
-keys=set(json.load(open(pol))["shared"])
+env,pol,inst=sys.argv[1],sys.argv[2],(sys.argv[3] if len(sys.argv)>3 else "")
+d=json.load(open(pol))
+keys=set(d["shared"])|set(((d.get("instances") or {}).get(inst) or {}).get("extra") or {})
 rest=[l for l in open(env,encoding="utf-8").read().split("\n")
       if l.split("=",1)[0] not in keys]
 print(hashlib.sha256("\n".join(rest).encode()).hexdigest())
@@ -45,10 +50,13 @@ if [ "$mode" = "--apply" ]; then
   echo "  backup: $bak"
 fi
 
-python3 - "$target" "$policy" "$mode" <<'PY'
+python3 - "$target" "$policy" "$mode" "$instance" <<'PY'
 import json,sys,re
 env,pol,mode=sys.argv[1],sys.argv[2],sys.argv[3]
-want={k:v["value"] for k,v in json.load(open(pol))["shared"].items()}
+inst=sys.argv[4] if len(sys.argv)>4 else ""
+d=json.load(open(pol))
+want={k:v["value"] for k,v in d["shared"].items()}
+want.update({k:v["value"] for k,v in (((d.get("instances") or {}).get(inst) or {}).get("extra") or {}).items()})
 text=open(env,encoding="utf-8").read()
 lines=text.split("\n")
 cur={}
@@ -81,10 +89,11 @@ PY
 rc=$?
 
 if [ "$mode" = "--apply" ]; then
-  after_others="$(python3 - "$target" "$policy" <<'PY'
+  after_others="$(python3 - "$target" "$policy" "$instance" <<'PY'
 import json,sys,hashlib
-env,pol=sys.argv[1],sys.argv[2]
-keys=set(json.load(open(pol))["shared"])
+env,pol,inst=sys.argv[1],sys.argv[2],(sys.argv[3] if len(sys.argv)>3 else "")
+d=json.load(open(pol))
+keys=set(d["shared"])|set(((d.get("instances") or {}).get(inst) or {}).get("extra") or {})
 rest=[l for l in open(env,encoding="utf-8").read().split("\n")
       if l.split("=",1)[0] not in keys]
 print(hashlib.sha256("\n".join(rest).encode()).hexdigest())
