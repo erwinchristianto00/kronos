@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Kronos control cockpit (port 3104).
+"""Kronos control cockpit (3104) — trading + research + decision audit.
 
-READ-ONLY BY CONSTRUCTION: no exchange credentials, no exchange client import. It GETs from the
+READ-ONLY BY CONSTRUCTION: no exchange credentials, no exchange client. It GETs from the
 live/testnet APIs and reads their stores. It cannot place, cancel, or size an order.
 
-Every number is either read from runtime or computed here from runtime data. Nothing about the
-strategy's measured performance is hardcoded — where a source does not exist the UI says
-"Tidak tersedia" rather than inventing one.
+Every number is read from runtime or computed here from runtime data. Nothing about measured
+performance is hardcoded. Where runtime has no source the UI says so.
 """
 import json, math, os, statistics as st, subprocess, time, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -14,280 +13,427 @@ from datetime import datetime, timezone, timedelta
 
 PORT = 3104
 INST = {
-    "live":    {"api": "http://127.0.0.1:3103", "label": "LIVE (mainnet)", "port": 3103, "id": "3103",
-                "rel": "/root/kronos-live-releases/migrate-20260818T060000Z/daily-trading-cockpit-v2",
-                "store": "/root/kronos-live/daily-trading-cockpit-v2/apps/api/data/cross-sectional-edge.json"},
-    "testnet": {"api": "http://127.0.0.1:3102", "label": "TESTNET (paper)", "port": 3102, "id": "3102",
-                "rel": "/root/kronos-testnet-releases/history-fb-lock-20260814T130500Z/daily-trading-cockpit-v2",
-                "store": "/root/kronos-testnet-releases/128b09f/daily-trading-cockpit-v2/apps/api/data/cross-sectional-edge.json"},
+ "live":    {"api":"http://127.0.0.1:3103","label":"LIVE","long":"LIVE · mainnet","port":3103,"id":"3103",
+             "rel":"/root/kronos-live-releases/migrate-20260818T060000Z/daily-trading-cockpit-v2",
+             "store":"/root/kronos-live/daily-trading-cockpit-v2/apps/api/data/cross-sectional-edge.json"},
+ "testnet": {"api":"http://127.0.0.1:3102","label":"TESTNET","long":"TESTNET · uang demo","port":3102,"id":"3102",
+             "rel":"/root/kronos-testnet-releases/history-fb-lock-20260814T130500Z/daily-trading-cockpit-v2",
+             "store":"/root/kronos-testnet-releases/128b09f/daily-trading-cockpit-v2/apps/api/data/cross-sectional-edge.json"},
 }
 PROD_SIGNAL = "MOM36_FILTERED"
-_cache = {"at": 0.0, "data": None}
-CACHE_TTL = 25.0
+NA = "Tidak tersedia"
+_c = {"at":0.0,"d":None}; TTL = 25.0
 
-def get(url, timeout=12):
+def get(u,t=12):
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return json.load(r)
-    except Exception as e:
-        return {"__error__": str(e)[:140]}
+        with urllib.request.urlopen(u,timeout=t) as r: return json.load(r)
+    except Exception as e: return {"__error__":str(e)[:140]}
 
-def sh(cmd, timeout=25):
-    try:
-        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout).stdout.strip()
-    except Exception as e:
-        return "ERR %s" % str(e)[:60]
+def sh(c,t=25):
+    try: return subprocess.run(c,shell=True,capture_output=True,text=True,timeout=t).stdout.strip()
+    except Exception as e: return "ERR %s"%str(e)[:60]
 
-def age_h(path):
-    try: return (time.time() - os.path.getmtime(path)) / 3600.0
+def age_h(p):
+    try: return (time.time()-os.path.getmtime(p))/3600.0
     except OSError: return None
 
-def parse_iso(s):
-    try: return datetime.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+def piso(s):
+    try: return datetime.strptime(str(s)[:19],"%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception: return None
 
-# ---------------------------------------------------------------- edge statistics
+def clamp(v,lo=0.0,hi=100.0): return max(lo,min(hi,v))
+def fin(v): return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
+
+# ------------------------------------------------------------------ statistics
 def _dd(seq):
-    eq = peak = worst = 0.0
+    eq=peak=worst=0.0
     for x in seq:
-        eq += x; peak = max(peak, eq); worst = min(worst, eq - peak)
+        eq+=x; peak=max(peak,eq); worst=min(worst,eq-peak)
     return worst
 
-def edge_stats(rets):
-    """Deterministic. rets = resolved net returns as fractions, oldest first."""
-    n = len(rets)
-    if n == 0:
-        return {"n": 0}
-    mean = sum(rets) / n
-    wins = [r for r in rets if r > 0]
-    losses = [r for r in rets if r < 0]
-    pf = (sum(wins) / abs(sum(losses))) if losses and sum(losses) != 0 else None
-    t = None
-    if n > 1:
-        sd = st.stdev(rets)
-        if sd > 0: t = mean / (sd / math.sqrt(n))
-    return {"n": n, "meanPct": 100 * mean, "winPct": 100 * len(wins) / n,
-            "pf": pf, "tStat": t, "ddPct": 100 * _dd(rets), "totalPct": 100 * sum(rets)}
+def stats(rets):
+    n=len(rets)
+    if not n: return {"n":0}
+    m=sum(rets)/n
+    w=[r for r in rets if r>0]; l=[r for r in rets if r<0]
+    pf=(sum(w)/abs(sum(l))) if l and sum(l)!=0 else None
+    t=None
+    if n>1:
+        sd=st.stdev(rets)
+        if sd>0: t=m/(sd/math.sqrt(n))
+    return {"n":n,"meanPct":100*m,"winPct":100*len(w)/n,"pf":pf,"tStat":t,
+            "ddPct":100*_dd(rets),"totalPct":100*sum(rets)}
 
-def independent_episodes(rows, horizon_h=48):
-    """Non-overlapping count: consecutive shadow baskets overlap almost completely, so a raw N
-    overstates the evidence. Same rule the harness uses."""
-    kept, free = 0, None
-    for r in sorted(rows, key=lambda x: x["openedAtMs"]):
-        if free is None or r["openedAtMs"] >= free:
-            kept += 1; free = r["openedAtMs"] + horizon_h * 3600_000
+def episodes_of(rows,hz_h=48):
+    kept,free=0,None
+    for r in sorted(rows,key=lambda x:x["openedAtMs"]):
+        if free is None or r["openedAtMs"]>=free:
+            kept+=1; free=r["openedAtMs"]+hz_h*3600_000
     return kept
 
-def load_observations(path, signal=PROD_SIGNAL):
-    try:
-        obs = (json.load(open(path)) or {}).get("observations") or []
-    except Exception:
-        return []
-    out = []
+def load_obs(path,signal=PROD_SIGNAL):
+    try: obs=(json.load(open(path)) or {}).get("observations") or []
+    except Exception: return []
+    out=[]
     for o in obs:
-        if o.get("signal") != signal or o.get("status") == "OPEN": continue
-        nr, oa = o.get("netReturn"), o.get("openedAtMs")
-        if not isinstance(nr, (int, float)) or not isinstance(oa, (int, float)): continue
-        out.append({"netReturn": nr, "openedAtMs": oa, "openedAt": o.get("openedAt"),
-                    "scoreGap": o.get("scoreGap"), "regime": o.get("regimeClassAtOpen"),
-                    "longRet": o.get("longLegReturn"), "shortRet": o.get("shortLegReturn"),
-                    "exitReason": o.get("exitReason"), "resolvedAt": o.get("resolvedAt"),
-                    "smartFormation": o.get("smartFormation")})
-    out.sort(key=lambda r: r["openedAtMs"])
+        if o.get("signal")!=signal or o.get("status")=="OPEN": continue
+        nr,oa=o.get("netReturn"),o.get("openedAtMs")
+        if not fin(nr) or not fin(oa): continue
+        out.append({"netReturn":nr,"openedAtMs":oa,"openedAt":o.get("openedAt"),
+                    "resolvedAt":o.get("resolvedAt"),"scoreGap":o.get("scoreGap"),
+                    "regime":o.get("regimeClassAtOpen"),"longRet":o.get("longLegReturn"),
+                    "shortRet":o.get("shortLegReturn"),"exitReason":o.get("exitReason"),
+                    "horizonMs":o.get("horizonMs"),"sf":o.get("smartFormation")})
+    out.sort(key=lambda r:r["openedAtMs"]); return out
+
+def bucket(rows,keyfn,order=None):
+    g={}
+    for r in rows:
+        k=keyfn(r)
+        if k is None: continue
+        g.setdefault(k,[]).append(r["netReturn"])
+    ks=order or sorted(g)
+    return [{"key":k,**stats(g[k])} for k in ks if k in g]
+
+def hold_h(r):
+    a,b=piso(r.get("openedAt")),piso(r.get("resolvedAt"))
+    return None if not a or not b else (b-a).total_seconds()/3600.0
+
+# ------------------------------------------------------------------ scoring engine
+class Score:
+    """A 0-100 score built from named, weighted components. Only components with data
+    contribute; the weights of the rest are dropped so a missing input never silently
+    counts as zero."""
+    def __init__(self,label): self.label=label; self.parts=[]
+    def add(self,name,value,weight,detail="",rating=None):
+        self.parts.append({"name":name,"value":value,"weight":weight,"detail":detail,
+                           "rating":rating or rate(value)})
+        return self
+    @property
+    def value(self):
+        have=[p for p in self.parts if fin(p["value"])]
+        if not have: return None
+        return sum(p["value"]*p["weight"] for p in have)/sum(p["weight"] for p in have)
+    def as_dict(self):
+        return {"label":self.label,"value":self.value,"rating":rate(self.value),"parts":self.parts}
+
+def rate(v):
+    if not fin(v): return NA
+    return "SANGAT KUAT" if v>=85 else "KUAT" if v>=70 else "SEDANG" if v>=50 else "LEMAH" if v>=30 else "SANGAT LEMAH"
+
+def band(v,lo,hi):
+    """Map a raw value onto 0-100 between lo (=0) and hi (=100), clamped."""
+    if not fin(v) or hi==lo: return None
+    return clamp(100.0*(v-lo)/(hi-lo))
+
+# ------------------------------------------------------------------ basket quality
+def basket_quality(b, thr, legs_conf=None):
+    """0-100 from what runtime actually records about this basket. Deliberately independent of
+    P&L: a well-formed basket may lose and a badly-formed one may win."""
+    s = Score("Kualitas basket"); why_up=[]; why_dn=[]
+    plan = b.get("plan") or []
+    legs = b.get("legs") or []
+    sb = b.get("smartBasket") or {}
+    scores = [p.get("scoreAtOpen") for p in plan if fin(p.get("scoreAtOpen"))]
+    lsc = [p["scoreAtOpen"] for p in plan if p.get("side")=="LONG" and fin(p.get("scoreAtOpen"))]
+    ssc = [p["scoreAtOpen"] for p in plan if p.get("side")=="SHORT" and fin(p.get("scoreAtOpen"))]
+    gap = (sum(lsc)/len(lsc)-sum(ssc)/len(ssc)) if lsc and ssc else None
+    # 1 separation vs the live threshold
+    if fin(gap) and fin(thr) and thr>0:
+        v = band(gap/thr, 0.8, 2.0)
+        s.add("Pemisahan long-short", v, 2.0, "scoreGap %.4f vs minimum %.3f (%.2f×)"%(gap,thr,gap/thr))
+        (why_up if (v or 0)>=60 else why_dn).append("pemisahan %.4f = %.2f× ambang"%(gap,gap/thr))
+    else: s.add("Pemisahan long-short", None, 2.0, NA)
+    # 2 raw signal strength
+    if scores:
+        strength = sum(abs(x) for x in scores)/len(scores)
+        v = band(strength, 0.005, 0.05)
+        s.add("Kekuatan sinyal", v, 1.0, "rata-rata |MOM36| kaki terpilih %.4f"%strength)
+        (why_up if (v or 0)>=60 else why_dn).append("kekuatan momentum rata-rata %.2f%%"%(100*strength))
+    else: s.add("Kekuatan sinyal", None, 1.0, NA)
+    # 3 cluster diversification
+    cl = [ (p.get("cluster") or "?") for p in plan ]
+    if plan:
+        v = band(len(set(cl))/float(len(plan)), 0.34, 1.0)
+        s.add("Sebaran klaster", v, 1.0, "%d klaster berbeda dari %d kaki"%(len(set(cl)),len(plan)))
+    else: s.add("Sebaran klaster", None, 1.0, NA)
+    # 4 long/short notional balance
+    L = sum(abs((l.get("qty") or 0)*(l.get("entryPrice") or 0)) for l in legs if l.get("side")=="LONG")
+    S = sum(abs((l.get("qty") or 0)*(l.get("entryPrice") or 0)) for l in legs if l.get("side")=="SHORT")
+    if L+S>0:
+        imb = abs(L-S)/(L+S)
+        v = band(-imb, -0.10, 0.0)
+        s.add("Keseimbangan long/short", v, 1.5, "selisih nilai %.1f%% (long $%.0f vs short $%.0f)"%(100*imb,L,S))
+        (why_dn if imb>0.03 else why_up).append("ketimpangan nilai %.1f%%"%(100*imb))
+    else: s.add("Keseimbangan long/short", None, 1.5, NA)
+    # 5 execution: exchange-confirmed fill prices
+    tot=conf=0
+    for l in legs:
+        for f in ("entryPriceConfirmed","exitPriceConfirmed"):
+            if l.get(f) is None: continue
+            tot+=1; conf+= 1 if l[f] else 0
+    if tot:
+        v = 100.0*conf/tot
+        s.add("Kualitas eksekusi", v, 1.5, "%d dari %d harga fill dikonfirmasi bursa"%(conf,tot))
+        (why_up if v>=99 else why_dn).append("%d/%d harga fill terkonfirmasi"%(conf,tot))
+    else: s.add("Kualitas eksekusi", None, 1.5, NA)
+    # 6 lot rounding vs planned notional
+    errs=[]
+    pmap={p.get("symbol"):p for p in plan if isinstance(p,dict)}
+    for l in legs:
+        p=pmap.get(l.get("symbol"))
+        if not p or not fin(p.get("targetNotionalUsd")) or p["targetNotionalUsd"]<=0: continue
+        act=abs((l.get("qty") or 0)*(l.get("entryPrice") or 0))
+        errs.append(abs(act/p["targetNotionalUsd"]-1))
+    if errs:
+        e=sum(errs)/len(errs)
+        v=band(-e,-0.25,0.0)
+        s.add("Ketepatan ukuran kaki", v, 1.0, "simpangan rata-rata %.1f%% dari nilai rencana"%(100*e))
+        if e>0.10: why_dn.append("pembulatan lot meleset %.0f%%"%(100*e))
+    else: s.add("Ketepatan ukuran kaki", None, 1.0, NA)
+    # 7 thesis health (open baskets only)
+    scans=2
+    rs,cs = sb.get("consecutiveRegimeLossScans"), sb.get("consecutiveInvalidationScans")
+    if isinstance(rs,int) or isinstance(cs,int):
+        worst=max(rs or 0, cs or 0)
+        v=band(-worst,-float(scans),0.0)
+        s.add("Kesehatan tesis", v, 1.5, "scan berturut tertinggi %d dari ambang %d"%(worst,scans))
+        if worst>=scans: why_dn.append("tesis pembentuknya sudah terbantah %d scan berturut"%worst)
+    else: s.add("Kesehatan tesis", None, 1.5, NA)
+    d=s.as_dict(); d["whyUp"]=why_up; d["whyDown"]=why_dn; d["scoreGap"]=gap
+    return d
+
+def ghost_exits(b, thr_scans=2):
+    """Counterfactual for the disabled adaptive exits. The executor still accrues these counters,
+    so this is live state, not a simulation."""
+    sb=b.get("smartBasket") or {}
+    lnr=b.get("lastNetReturn"); mfe=sb.get("maxNetReturn")
+    out=[]
+    for nm,cnt,why,when in (("Regime berbalik",sb.get("consecutiveRegimeLossScans"),sb.get("lastRegimeLossReason"),sb.get("lastRegimeLossSignalMs")),
+                            ("Tesis batal",sb.get("consecutiveInvalidationScans"),sb.get("lastInvalidationReason"),sb.get("lastInvalidationSignalMs"))):
+        fire = isinstance(cnt,int) and cnt>=thr_scans
+        out.append({"rule":nm,"scans":cnt,"threshold":thr_scans,"fire":fire,"reason":why,
+                    "atMs":when if fire else None,"pnlAtTrigger":None})
+    mf = fin(mfe) and fin(lnr) and mfe>=0.002 and lnr<=mfe*0.5
+    out.append({"rule":"Kunci laba (MFE giveback)","scans":None,"threshold":None,"fire":bool(mf),
+                "reason":("puncak %.3f%% turun ke %.3f%%"%(100*mfe,100*lnr)) if fin(mfe) and fin(lnr) else None,
+                "atMs":sb.get("maxNetAt") if mf else None,
+                "pnlAtTrigger":(mfe*0.5) if mf else None})
     return out
 
-def bucket(rows, keyfn, order=None):
-    g = {}
-    for r in rows:
-        k = keyfn(r)
-        if k is None: continue
-        g.setdefault(k, []).append(r["netReturn"])
-    keys = order or sorted(g)
-    return [{"key": k, **edge_stats(g[k])} for k in keys if k in g]
+def post_trade_verdict(bq, net):
+    """Process quality and outcome are judged separately, on purpose."""
+    if not fin(bq) or not fin(net): return NA, NA
+    proc = "PROSES BAGUS" if bq>=65 else "PROSES SEDANG" if bq>=45 else "PROSES LEMAH"
+    outc = "HASIL BAGUS" if net>0 else "HASIL RUGI"
+    return proc, outc
 
-def hold_hours(r):
-    a, b = parse_iso(r.get("openedAt")), parse_iso(r.get("resolvedAt"))
-    return None if not a or not b else (b - a).total_seconds() / 3600.0
-
-# ---------------------------------------------------------------- gauges (deterministic)
-def clamp(v, lo=0.0, hi=100.0): return max(lo, min(hi, v))
-
-GAUGE_DOC = {
- "edge":      "50 + 15 x t-stat TERKOREKSI, dibatasi 0-100. Koreksi = t mentah x akar(episode independen / N), karena observasi bayangan tumpang tindih hampir seluruhnya sehingga t mentah melebih-lebihkan bukti. t=0 -> 50; t=+2 -> 80; t=-2 -> 20.",
- "recent":    "50 + 50 x (mean 30 terakhir / |mean seluruh riwayat|), dibatasi 0-100. 50 berarti performa terakhir setara rata-rata panjangnya.",
- "dd":        "100 x (1 - |drawdown| / (|drawdown| + |total return|)). 100 = tidak pernah drawdown; turun saat drawdown besar relatif terhadap hasil.",
- "exec":      "100 x (harga fill terkonfirmasi bursa / total harga fill yang dibukukan) di seluruh basket tereksekusi.",
- "data":      "Rata-rata dua bagian: simbol pool yang likuiditasnya terukur, dan sinyal tidak basi di tiap instance.",
- "research":  "100 x (episode independen 48 jam / 30). 30 dipilih karena di bawah itu MDE lebih besar daripada edge lane-nya sendiri, jadi hasil apa pun tak bisa dibedakan dari nol.",
- "overall":   "Rata-rata tertimbang: Edge 35%, Recent 20%, Drawdown 20%, Execution 15%, Data 10%. Research dan System sengaja TIDAK dimasukkan - keduanya menilai apakah angka lain layak dipercaya, bukan performa.",
-}
-
-def build_gauges(all_stats, w30, exec_conf, data_q, episodes):
-    g = {}
-    t = all_stats.get("tStat")
-    n = all_stats.get("n") or 0
-    # Deflate the t-stat by the overlap ratio. Without this the gauge reads 100 off a t of 5.5 that
-    # rests on 3 independent episodes — flatly contradicting the evidence-strength gauge beside it.
-    if isinstance(t, float) and n > 0 and isinstance(episodes, int) and episodes > 0:
-        t_eff = t * math.sqrt(min(1.0, episodes / float(n)))
-    else:
-        t_eff = t if isinstance(t, float) else None
-    g["edgeTRaw"], g["edgeTEff"] = t, t_eff
-    g["edge"] = clamp(50 + 15 * t_eff) if isinstance(t_eff, float) else None
-    am, rm = all_stats.get("meanPct"), w30.get("meanPct")
-    g["recent"] = clamp(50 + 50 * (rm / abs(am))) if isinstance(am, float) and isinstance(rm, float) and am != 0 else None
-    dd, tot = all_stats.get("ddPct"), all_stats.get("totalPct")
-    if isinstance(dd, float) and isinstance(tot, float):
-        den = abs(dd) + abs(tot)
-        g["dd"] = clamp(100 * (1 - abs(dd) / den)) if den > 0 else None
-    else: g["dd"] = None
-    g["exec"] = exec_conf
-    g["data"] = data_q
-    g["research"] = clamp(100 * episodes / 30.0) if isinstance(episodes, int) else None
-    parts = [("edge", .35), ("recent", .20), ("dd", .20), ("exec", .15), ("data", .10)]
-    have = [(g[k], w) for k, w in parts if isinstance(g.get(k), float)]
-    g["overall"] = sum(v * w for v, w in have) / sum(w for _, w in have) if have else None
-    return g
-
-# ---------------------------------------------------------------- collector
+# ------------------------------------------------------------------ collector
 def collect():
-    if _cache["data"] is not None and time.time() - _cache["at"] < CACHE_TTL:
-        return _cache["data"]
-    now = datetime.now(timezone.utc)
-    R = {"generatedAt": now.isoformat(), "inst": {}}
+    if _c["d"] is not None and time.time()-_c["at"]<TTL: return _c["d"]
+    now=datetime.now(timezone.utc)
+    R={"generatedAt":now.isoformat(),"inst":{}}
+    for k,cfg in INST.items():
+        ex=get(cfg["api"]+"/api/live/cross-sectional-executor")
+        rep=get(cfg["api"]+"/api/shadow/cross-sectional-report")
+        pool=get(cfg["api"]+"/api/live/cross-sectional-pool")
+        fc=(rep or {}).get("filteredConfig") or {}
+        rn=((rep or {}).get("filteredReport") or {}).get("recentNetReturns") or []
+        gate={"n":len(rn),
+              "last8":100*sum(rn[-8:])/8 if len(rn)>=8 else None,
+              "last30":100*sum(rn[-30:])/len(rn[-30:]) if rn else None,
+              "openShadow":len((rep or {}).get("filteredOpenBaskets") or [])}
+        gate["pass"]=fin(gate["last8"]) and fin(gate["last30"]) and gate["last8"]>0 and gate["last30"]>0
+        att=(ex.get("entryAttemptAudit") or {}).get("latest") or {}
+        lat=None
+        a_at,a_src=piso(att.get("at")),att.get("sourceOpenedAtMs")
+        if a_at and fin(a_src): lat=(a_at.timestamp()*1000-a_src)/1000.0
+        R["inst"][k]={**cfg,"ex":ex,"rep":rep,"pool":pool,"fc":fc,"gate":gate,
+                      "adm":ex.get("entryAdmission") or {},"attempt":att,
+                      "admAudit":ex.get("entryAdmissionAudit") or {},
+                      "signalToOrderSec":lat,"rows":load_obs(cfg["store"]),
+                      "envPolicy":sh("%s/deploy/apply-required-env.sh --check %s/.env %s 2>&1 | tail -1"%(cfg["rel"],cfg["rel"],cfg["id"]))}
+    R["account"]=get(INST["live"]["api"]+"/api/live/account")
+    R["axis"]=get(INST["live"]["api"]+"/api/shadow/regime-axis-timeline")
+    R["dir"]=get(INST["live"]["api"]+"/api/live/cross-sectional-directional-regime")
 
-    for key, cfg in INST.items():
-        ex = get(cfg["api"] + "/api/live/cross-sectional-executor")
-        rep = get(cfg["api"] + "/api/shadow/cross-sectional-report")
-        pool = get(cfg["api"] + "/api/live/cross-sectional-pool")
-        adm = ex.get("entryAdmission") or {}
-        fr = (rep or {}).get("filteredReport") or {}
-        rn = fr.get("recentNetReturns") or []
-        gate = {"n": len(rn),
-                "last8": 100 * sum(rn[-8:]) / 8 if len(rn) >= 8 else None,
-                "last30": 100 * sum(rn[-30:]) / len(rn[-30:]) if rn else None,
-                "openShadow": len((rep or {}).get("filteredOpenBaskets") or [])}
-        gate["pass"] = isinstance(gate["last8"], float) and isinstance(gate["last30"], float) \
-                       and gate["last8"] > 0 and gate["last30"] > 0
-        rows = load_observations(cfg["store"])
-        R["inst"][key] = {
-            "label": cfg["label"], "port": cfg["port"], "id": cfg["id"], "rel": cfg["rel"],
-            "ex": ex, "adm": adm, "gate": gate, "pool": pool, "rows": rows,
-            "envPolicy": sh("%s/deploy/apply-required-env.sh --check %s/.env %s 2>&1 | tail -1"
-                            % (cfg["rel"], cfg["rel"], cfg["id"])),
-            "attempt": (ex.get("entryAttemptAudit") or {}),
-            "admAudit": (ex.get("entryAdmissionAudit") or {}),
-        }
+    # merged production-signal evidence
+    rows=[]; seen=set()
+    for k in INST:
+        for r in R["inst"][k]["rows"]:
+            key=(r["openedAtMs"],round(r["netReturn"],12))
+            if key in seen: continue
+            seen.add(key); rows.append(r)
+    rows.sort(key=lambda r:r["openedAtMs"])
+    nets=[r["netReturn"] for r in rows]
+    W={}
+    for lbl,n in (("8 terakhir",8),("30 terakhir",30),("90 terakhir",90),("seluruhnya",None)):
+        W[lbl]=stats(nets if n is None else nets[-n:])
+    eps=episodes_of(rows) if rows else 0
+    allw=W["seluruhnya"]
+    traw=allw.get("tStat")
+    teff=(traw*math.sqrt(min(1.0,eps/float(allw["n"])))) if fin(traw) and allw.get("n") else None
+    months=bucket(rows,lambda r:(r.get("openedAt") or "")[:7])
+    quarters=bucket(rows,lambda r:(lambda d:"%s-Q%d"%(d[:4],(int(d[5:7])-1)//3+1))(r.get("openedAt") or "0000-00") if r.get("openedAt") else None)
+    conc=None
+    if quarters:
+        tot=sum(abs(q.get("totalPct") or 0) for q in quarters) or 1
+        top=max(quarters,key=lambda q:abs(q.get("totalPct") or 0))
+        conc={"topQuarter":top["key"],"share":100*abs(top.get("totalPct") or 0)/tot,
+              "profitableMonths":sum(1 for m in months if (m.get("totalPct") or 0)>0),"months":len(months)}
+    # longest losing streak of consecutive baskets
+    ls=cur=0
+    for x in nets:
+        cur = cur+1 if x<0 else 0; ls=max(ls,cur)
+    hzs=sorted({(r.get("horizonMs") or 0)/3600000.0 for r in rows if r.get("horizonMs")})
+    R["edge"]={"windows":W,"episodes":eps,"tRaw":traw,"tEff":teff,"signal":PROD_SIGNAL,
+               "curve":[{"at":r["openedAt"],"net":r["netReturn"]} for r in rows],
+               "byRegime":bucket(rows,lambda r:r.get("regime"),["TREND_LONG","MIXED_CHOP","TREND_SHORT"]),
+               "byGap":bucket(rows,lambda r:None if not fin(r.get("scoreGap")) else
+                    ("<0.04" if r["scoreGap"]<.04 else "0.04-0.058" if r["scoreGap"]<.058
+                     else "0.058-0.08" if r["scoreGap"]<.08 else ">=0.08"),
+                    ["<0.04","0.04-0.058","0.058-0.08",">=0.08"]),
+               "byHold":bucket(rows,lambda r:(lambda h:None if h is None else
+                    "<12j" if h<12 else "12-24j" if h<24 else "24-36j" if h<36 else ">=36j")(hold_h(r)),
+                    ["<12j","12-24j","24-36j",">=36j"]),
+               "byMonth":months,"byQuarter":quarters,"concentration":conc,"longestLossStreak":ls,
+               "sideLong":stats([r["longRet"] for r in rows if fin(r.get("longRet"))]),
+               "sideShort":stats([r["shortRet"] for r in rows if fin(r.get("shortRet"))]),
+               "gapVsReturn":[{"gap":r["scoreGap"],"net":r["netReturn"]} for r in rows if fin(r.get("scoreGap"))],
+               "evidenceHorizonsH":hzs}
 
-    R["account"] = get(INST["live"]["api"] + "/api/live/account")
-    R["axis"] = get(INST["live"]["api"] + "/api/shadow/regime-axis-timeline")
-    R["dir"] = get(INST["live"]["api"] + "/api/live/cross-sectional-directional-regime")
+    # research vs production policy mismatch — detected, never assumed
+    prod_h=R["inst"]["live"]["ex"].get("maxHoldHours")
+    mism=[]
+    if fin(prod_h) and hzs and prod_h not in hzs:
+        mism.append({"what":"Horizon tahan","prod":"%s jam"%prod_h,"evid":"%s jam"%(" / ".join("%g"%h for h in hzs)),
+                     "why":"Bukti mengukur basket yang ditahan penuh sampai horizon sinyal. Produksi menutup lebih awal di batas %s jam, jadi hasil yang diukur bukan hasil yang dijalankan."%prod_h})
+    ex_off = "999" in (R["inst"]["live"]["envPolicy"] or "") or True
+    mism.append({"what":"Exit adaptif","prod":"dimatikan (ghost tetap dievaluasi)",
+                 "evid":"observasi bayangan menutup dengan aturannya sendiri (%s)"%
+                        (", ".join(sorted({r.get("exitReason") or "?" for r in rows}))[:60] or "?"),
+                 "why":"Observasi diselesaikan oleh aturan exit-nya sendiri, bukan oleh kontrak stop/TP/batas-waktu yang dipakai executor."})
+    R["mismatch"]=mism
 
-    # ---- edge, computed from the production signal's own resolved observations -------------
-    rows = R["inst"]["testnet"]["rows"] + R["inst"]["live"]["rows"]
-    rows.sort(key=lambda r: r["openedAtMs"])
-    seen, merged = set(), []
-    for r in rows:
-        k = (r["openedAtMs"], round(r["netReturn"], 12))
-        if k in seen: continue
-        seen.add(k); merged.append(r)
-    nets = [r["netReturn"] for r in merged]
-    windows = {}
-    for lbl, k in (("8 terakhir", 8), ("30 terakhir", 30), ("90 terakhir", 90), ("seluruhnya", None)):
-        seq = nets if k is None else nets[-k:]
-        windows[lbl] = edge_stats(seq)
-    episodes = independent_episodes(merged) if merged else 0
-    R["edge"] = {
-        "windows": windows, "episodes": episodes, "signal": PROD_SIGNAL,
-        "curve": [{"at": r["openedAt"], "net": r["netReturn"]} for r in merged],
-        "byRegime": bucket(merged, lambda r: r.get("regime"), ["TREND_LONG", "MIXED_CHOP", "TREND_SHORT"]),
-        "byGap": bucket(merged, lambda r: None if not isinstance(r.get("scoreGap"), float) else
-                        ("<0.04" if r["scoreGap"] < .04 else "0.04-0.058" if r["scoreGap"] < .058
-                         else "0.058-0.08" if r["scoreGap"] < .08 else ">=0.08"),
-                        ["<0.04", "0.04-0.058", "0.058-0.08", ">=0.08"]),
-        "byHold": bucket(merged, lambda r: (lambda h: None if h is None else
-                         "<12j" if h < 12 else "12-24j" if h < 24 else "24-36j" if h < 36 else ">=36j")(hold_hours(r)),
-                         ["<12j", "12-24j", "24-36j", ">=36j"]),
-        "byMonth": bucket(merged, lambda r: (r.get("openedAt") or "")[:7]),
-        "sideLong": edge_stats([r["longRet"] for r in merged if isinstance(r.get("longRet"), float)]),
-        "sideShort": edge_stats([r["shortRet"] for r in merged if isinstance(r.get("shortRet"), float)]),
-        "gapVsReturn": [{"gap": r["scoreGap"], "net": r["netReturn"]} for r in merged
-                        if isinstance(r.get("scoreGap"), float)],
-    }
-
-    # ---- execution quality: exchange-confirmed fill prices across executed baskets ----------
-    conf = tot = 0
-    for key in INST:
-        for b in (R["inst"][key]["ex"].get("recent") or []) + (R["inst"][key]["ex"].get("openBaskets") or []):
+    # execution + data quality
+    conf=tot=0; drift=[]; werr=[]
+    for k in INST:
+        ex=R["inst"][k]["ex"]
+        for b in (ex.get("recent") or [])+(ex.get("openBaskets") or []):
+            pmap={p.get("symbol"):p for p in (b.get("plan") or []) if isinstance(p,dict)}
             for l in b.get("legs") or []:
-                for f in ("entryPriceConfirmed", "exitPriceConfirmed"):
-                    v = l.get(f)
-                    if v is None: continue
-                    tot += 1; conf += 1 if v else 0
-    R["execQuality"] = {"confirmed": conf, "total": tot,
-                        "pct": (100.0 * conf / tot) if tot else None}
+                for f in ("entryPriceConfirmed","exitPriceConfirmed"):
+                    if l.get(f) is None: continue
+                    tot+=1; conf+=1 if l[f] else 0
+                p=pmap.get(l.get("symbol"))
+                if p and fin(p.get("targetNotionalUsd")) and p["targetNotionalUsd"]>0:
+                    act=abs((l.get("qty") or 0)*(l.get("entryPrice") or 0))
+                    werr.append(abs(act/p["targetNotionalUsd"]-1))
+                if p and fin(p.get("refPrice")) and p["refPrice"]>0 and fin(l.get("entryPrice")):
+                    drift.append(abs(l["entryPrice"]/p["refPrice"]-1))
+    R["exec"]={"confirmed":conf,"total":tot,"pct":(100.0*conf/tot) if tot else None,
+               "notionalErrPct":(100*sum(werr)/len(werr)) if werr else None,
+               "entryDriftPct":(100*sum(drift)/len(drift)) if drift else None,
+               "latency":{k:R["inst"][k]["signalToOrderSec"] for k in INST}}
+    prow=(R["inst"]["live"]["pool"] or {}).get("rows") or []
+    miss=[r["symbol"] for r in prow if not fin(r.get("liquidityUsdPerHour"))]
+    stale=[k for k in INST if R["inst"][k]["ex"].get("signalStale")]
+    dq=clamp(100*(0.5*(len(prow)-len(miss))/max(1,len(prow))+0.5*(len(INST)-len(stale))/len(INST))) if prow else None
+    R["data"]={"pct":dq,"missing":miss,"universe":len(prow),"stale":stale}
 
-    # ---- data quality ----------------------------------------------------------------------
-    prow = (R["inst"]["live"]["pool"] or {}).get("rows") or []
-    measured = sum(1 for r in prow if isinstance(r.get("liquidityUsdPerHour"), (int, float)))
-    fresh = [not R["inst"][k]["ex"].get("signalStale") for k in INST]
-    dq = None
-    if prow:
-        dq = clamp(100 * (0.5 * measured / len(prow) + 0.5 * (sum(1 for f in fresh if f) / len(fresh))))
-    R["dataQuality"] = {"pct": dq, "measured": measured, "universe": len(prow),
-                        "staleSignals": [k for k in INST if R["inst"][k]["ex"].get("signalStale")]}
+    # exchange clock skew (public endpoint, no credentials)
+    skew=None
+    try:
+        t0=time.time()*1000
+        srv=get("https://fapi.binance.com/fapi/v1/time",8).get("serverTime")
+        if fin(srv): skew=srv-(t0+time.time()*1000)/2
+    except Exception: pass
+    R["clockSkewMs"]=skew
 
-    R["gauges"] = build_gauges(windows["seluruhnya"], windows["30 terakhir"],
-                               R["execQuality"]["pct"], dq, episodes)
+    # ---- explainable performance scores ----
+    S={}
+    e=Score("Kualitas edge")
+    e.add("Rata-rata jangka panjang",band(allw.get("meanPct"),-0.3,0.5),1.5,"%s per basket"%(("%+.3f%%"%allw["meanPct"]) if allw.get("n") else NA))
+    e.add("Tingkat menang",band(allw.get("winPct"),40,65),1.0,"%s"%(("%.0f%%"%allw["winPct"]) if allw.get("n") else NA))
+    e.add("Signifikansi (terkoreksi tumpang tindih)",band(teff,-1.0,2.5),2.0,
+          ("t=%.2f setelah dikoreksi (mentah %.2f)"%(teff,traw)) if fin(teff) else NA)
+    e.add("Konsentrasi hasil",band(-(conc["share"] if conc else None) if conc else None,-90,-40) if conc else None,1.0,
+          ("kuartal terbesar menyumbang %.0f%%"%conc["share"]) if conc else NA)
+    S["edge"]=e
+    r30=W["30 terakhir"]
+    rc=Score("Performa terakhir")
+    rc.add("Rata-rata 30 terakhir",band(r30.get("meanPct"),-0.3,0.5),2.0,("%+.3f%% per basket"%r30["meanPct"]) if r30.get("n") else NA)
+    rc.add("Menang 30 terakhir",band(r30.get("winPct"),40,65),1.0,("%.0f%%"%r30["winPct"]) if r30.get("n") else NA)
+    rc.add("Arah vs jangka panjang",band((r30.get("meanPct") or 0)-(allw.get("meanPct") or 0),-0.4,0.4) if r30.get("n") and allw.get("n") else None,1.0,
+           ("selisih %+.3fpp dari rata-rata panjang"%((r30.get("meanPct") or 0)-(allw.get("meanPct") or 0))) if r30.get("n") else NA)
+    S["recent"]=rc
+    dd=Score("Kendali drawdown")
+    ddv,tv=allw.get("ddPct"),allw.get("totalPct")
+    dd.add("Drawdown vs hasil",clamp(100*(1-abs(ddv)/(abs(ddv)+abs(tv)))) if fin(ddv) and fin(tv) and (abs(ddv)+abs(tv))>0 else None,2.0,
+           ("drawdown %.2f%% terhadap total %+.2f%%"%(ddv,tv)) if fin(ddv) else NA)
+    dd.add("Rentetan rugi terpanjang",band(-ls,-12,0),1.0,"%d basket rugi berturut"%ls)
+    S["dd"]=dd
+    ex_s=Score("Kualitas eksekusi")
+    ex_s.add("Harga fill terkonfirmasi",R["exec"]["pct"],2.0,("%d dari %d"%(conf,tot)) if tot else NA)
+    ex_s.add("Ketepatan ukuran kaki",band(-(R["exec"]["notionalErrPct"] or 0),-25,0) if R["exec"]["notionalErrPct"] is not None else None,1.0,
+             ("simpangan %.1f%% dari rencana"%R["exec"]["notionalErrPct"]) if R["exec"]["notionalErrPct"] is not None else NA)
+    ex_s.add("Selisih harga masuk",band(-(R["exec"]["entryDriftPct"] or 0),-0.5,0) if R["exec"]["entryDriftPct"] is not None else None,1.0,
+             ("%.3f%% dari harga acuan"%R["exec"]["entryDriftPct"]) if R["exec"]["entryDriftPct"] is not None else NA)
+    S["exec"]=ex_s
+    dq_s=Score("Kualitas data")
+    dq_s.add("Simbol terukur",band((len(prow)-len(miss))/max(1,len(prow))*100,60,100) if prow else None,1.5,
+             "%d dari %d simbol pool"%(len(prow)-len(miss),len(prow)))
+    dq_s.add("Kesegaran sinyal",100.0*(len(INST)-len(stale))/len(INST),1.5,
+             ("basi di: %s"%", ".join(stale)) if stale else "semua segar")
+    S["data"]=dq_s
+    ev=Score("Kekuatan bukti")
+    ev.add("Episode independen",band(eps,0,30),2.5,"%d episode non-tumpang-tindih (butuh ~30)"%eps)
+    ev.add("Rasio tumpang tindih",band(-(allw["n"]/max(1,eps)) if allw.get("n") else None,-20,-1) if allw.get("n") and eps else None,1.0,
+           ("%d observasi mewakili %d episode (%.1f×)"%(allw["n"],eps,allw["n"]/max(1,eps))) if allw.get("n") and eps else NA)
+    ev.add("Kecocokan bukti dgn produksi",0.0 if mism else 100.0,1.5,
+           ("%d ketidakcocokan kebijakan terdeteksi"%len(mism)) if mism else "bukti mengukur kebijakan produksi")
+    S["evidence"]=ev
+    ov=Score("Performa keseluruhan")
+    for k,w in (("edge",.35),("recent",.20),("dd",.20),("exec",.15),("data",.10)):
+        ov.add(S[k].label,S[k].value,w,rate(S[k].value))
+    S["overall"]=ov
+    R["scores"]={k:v.as_dict() for k,v in S.items()}
 
-    # ---- system ----------------------------------------------------------------------------
-    pm2 = []
+    # system
+    pm2=[]
     try:
         for p in json.loads(sh("pm2 jlist") or "[]"):
-            e = p.get("pm2_env", {})
-            if p.get("name", "").startswith(("dtc-api", "kronos-control")):
-                pm2.append({"name": p["name"], "status": e.get("status"), "restarts": e.get("restart_time")})
+            if p.get("name","").startswith(("dtc-api","kronos-control")):
+                pm2.append({"name":p["name"],"status":p["pm2_env"].get("status"),"restarts":p["pm2_env"].get("restart_time")})
     except Exception: pass
-    jobs = []
-    for lbl, path, mx in (("Perekam positioning", "/root/xsec-sim/record.log", 2.0),
-                          ("Arsip observasi", "/root/xsec-archive/harvest.log", 2.0),
-                          ("Cek drift konfigurasi", "/root/env-drift.log", 26.0),
-                          ("Perekam microstructure", "/root/kronos-microstructure/cron.log", 2.0)):
-        a = age_h(path)
-        jobs.append({"job": lbl, "ageHours": a, "stale": (a is None or a > mx), "maxHours": mx})
-    man = {}
-    for iid in ("3101", "3102", "3103"):
-        p = "%s/deploy/manifests/%s.json" % (INST["live"]["rel"], iid)
-        try:
-            d = json.load(open(p))
-            man[iid] = d.get("treeHash") or d.get("hash") or (d.get("summary") or {}).get("hash")
-        except Exception: man[iid] = None
-    disk = sh("df -h / | tail -1").split()
-    R["system"] = {"pm2": pm2, "jobs": jobs, "manifests": man,
-                   "disk": {"size": disk[1], "used": disk[2], "avail": disk[3], "pct": disk[4]} if len(disk) > 5 else None,
-                   "hostTimeUtc": now.isoformat()}
-    _cache["at"], _cache["data"] = time.time(), R
+    jobs=[]
+    for lbl,path,mx in (("Perekam positioning","/root/xsec-sim/record.log",2.0),
+                        ("Arsip observasi","/root/xsec-archive/harvest.log",2.0),
+                        ("Cek drift konfigurasi","/root/env-drift.log",26.0),
+                        ("Perekam microstructure","/root/kronos-microstructure/cron.log",2.0)):
+        a=age_h(path); jobs.append({"job":lbl,"ageHours":a,"stale":(a is None or a>mx),"maxHours":mx})
+    d=sh("df -h / | tail -1").split()
+    R["system"]={"pm2":pm2,"jobs":jobs,"hostTimeUtc":now.isoformat(),
+                 "disk":{"size":d[1],"used":d[2],"avail":d[3],"pct":d[4]} if len(d)>5 else None}
+    _c["at"],_c["d"]=time.time(),R
     return R
 
 # ================================================================ presentation
-CSS = """
-*{box-sizing:border-box}
-body{margin:0;background:#0b0f14;color:#c9d4e0;font:13.5px/1.6 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif}
-.wrap{max-width:1280px;margin:0 auto;padding:18px 16px 60px}
-header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:4px}
-h1{font-size:16px;margin:0;color:#e8eef5;font-weight:600;letter-spacing:.2px}
+CSS="""
+*{box-sizing:border-box}body{margin:0;background:#0b0f14;color:#c9d4e0;font:13.5px/1.6 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1300px;margin:0 auto;padding:18px 16px 70px}
+header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}h1{font-size:16px;margin:0;color:#e8eef5;font-weight:600}
 .stamp{color:#68788a;font-size:11px}
 nav{display:flex;gap:2px;flex-wrap:wrap;margin:14px 0 18px;border-bottom:1px solid #1b2430}
 nav button{background:none;border:0;border-bottom:2px solid transparent;color:#7d8fa3;padding:8px 13px;font:inherit;font-size:13px;cursor:pointer;border-radius:4px 4px 0 0}
-nav button:hover{color:#c9d4e0;background:#111823}
-nav button.on{color:#e8eef5;border-bottom-color:#4c8fd6;font-weight:600}
+nav button:hover{color:#c9d4e0;background:#111823}nav button.on{color:#e8eef5;border-bottom-color:#4c8fd6;font-weight:600}
 section{display:none}section.on{display:block}
 h2{font-size:12px;margin:24px 0 10px;color:#8fa3b8;font-weight:600;letter-spacing:.7px;text-transform:uppercase}
-h2:first-child{margin-top:0}
+h2:first-child{margin-top:0}h3{font-size:12.5px;color:#c9d4e0;margin:16px 0 6px;font-weight:600}
 .lead{background:#111823;border:1px solid #1e2836;border-left:3px solid #4c8fd6;border-radius:0 7px 7px 0;padding:13px 16px;margin-bottom:14px}
-.lead .c{font-size:16px;color:#e8eef5;font-weight:600;margin-bottom:3px}
-.lead .r{color:#93a5b8;font-size:13px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:9px}
+.lead .c{font-size:16px;color:#e8eef5;font-weight:600;margin-bottom:3px}.lead .r{color:#93a5b8;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:9px}
+.g2{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:11px}
 .card{background:#111823;border:1px solid #1e2836;border-radius:7px;padding:11px 13px}
 .card .k{color:#68788a;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px}
 .card .v{font-size:20px;color:#e8eef5;margin-top:3px;font-weight:600;letter-spacing:-.3px}
@@ -295,757 +441,651 @@ h2:first-child{margin-top:0}
 table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12.5px}
 th,td{text-align:left;padding:6px 9px;border-bottom:1px solid #18202b;white-space:nowrap}
 th{color:#68788a;font-weight:500;font-size:10.5px;text-transform:uppercase;letter-spacing:.4px}
-tr:hover td{background:#101722}
-td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr:hover td{background:#101722}td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .pos{color:#4ec9a0}.neg{color:#e5686d}.dim{color:#68788a}.warnc{color:#d9a441}
 details{margin-top:9px;border:1px solid #1e2836;border-radius:7px;background:#0e141c}
-summary{cursor:pointer;padding:8px 13px;color:#7d8fa3;font-size:12px;user-select:none}
-summary:hover{color:#c9d4e0}
-details[open] summary{border-bottom:1px solid #1e2836;color:#c9d4e0}
-details .body{padding:11px 13px}
-.kv{display:grid;grid-template-columns:minmax(190px,auto) 1fr;gap:3px 14px;font-size:12.5px}
+summary{cursor:pointer;padding:8px 13px;color:#7d8fa3;font-size:12px}summary:hover{color:#c9d4e0}
+details[open] summary{border-bottom:1px solid #1e2836;color:#c9d4e0}details .body{padding:11px 13px}
+.kv{display:grid;grid-template-columns:minmax(200px,auto) 1fr;gap:3px 14px;font-size:12.5px}
 .kv dt{color:#68788a}.kv dd{margin:0;color:#c9d4e0;word-break:break-word}
 code{background:#0b1017;border:1px solid #1e2836;border-radius:4px;padding:1px 5px;font-size:11.5px;color:#8fb8dd}
-.gauge{background:#111823;border:1px solid #1e2836;border-radius:7px;padding:11px 13px}
-.bar{height:6px;background:#18202b;border-radius:3px;overflow:hidden;margin-top:7px}
-.bar i{display:block;height:100%;border-radius:3px}
-.trace{border-left:2px solid #1e2836;margin-left:7px;padding-left:14px}
-.trace .step{position:relative;padding:7px 0}
-.trace .step:before{content:'';position:absolute;left:-19px;top:13px;width:9px;height:9px;border-radius:50%;background:#1e2836;border:2px solid #0b0f14}
-.trace .step.p:before{background:#4ec9a0}.trace .step.f:before{background:#e5686d}.trace .step.w:before{background:#d9a441}
+.bar{height:6px;background:#18202b;border-radius:3px;overflow:hidden;margin-top:7px}.bar i{display:block;height:100%;border-radius:3px}
+.flow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:10px 0}
+.flow .n{background:#111823;border:1px solid #1e2836;border-radius:6px;padding:7px 11px;font-size:12px;color:#c9d4e0}
+.flow .a{color:#3a4a5c}
+.trace .step{position:relative;padding:6px 0 6px 24px}
+.trace .step:before{position:absolute;left:0;top:6px;font-size:13px}
+.trace .step.p:before{content:'✓';color:#4ec9a0}.trace .step.f:before{content:'✕';color:#e5686d}
+.trace .step.w:before{content:'⚠';color:#d9a441}.trace .step.o:before{content:'○';color:#68788a}
 .trace .t{color:#e8eef5;font-size:13px}.trace .d{color:#7d8fa3;font-size:12px}
-.note{color:#68788a;font-size:11.5px;margin-top:7px}
-.scroll{overflow-x:auto}
+.plus{color:#4ec9a0}.minus{color:#e5686d}
+.note{color:#68788a;font-size:11.5px;margin-top:7px}.scroll{overflow-x:auto}
+.pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:10.5px;border:1px solid #1e2836;color:#8fa3b8}
 @media(max-width:640px){.kv{grid-template-columns:1fr}.card .v{font-size:17px}}
 """
+DOT={"ok":"🟢","watch":"🟡","override":"🟠","block":"🔴","off":"⚪"}
 
-def esc(s):
-    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+def esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+def money(v,d=2):
+    if not fin(v): return "<span class='dim'>–</span>"
+    return "<span class='%s'>%s$%s</span>"%("pos" if v>0 else "neg" if v<0 else "","+" if v>0 else "-" if v<0 else "",format(abs(round(v,d)),",.%df"%d))
+def pct(v,d=2,sign=True):
+    if not fin(v): return "<span class='dim'>–</span>"
+    return "<span class='%s'>%s%.*f%%</span>"%("pos" if v>0 else "neg" if v<0 else "","+" if sign and v>0 else "",d,v)
+def num(v,d=2): return "<span class='dim'>–</span>" if not fin(v) else format(round(v,d),",.%df"%d)
+def money_pct(v,base,d=2):
+    if not fin(v): return "<span class='dim'>–</span>"
+    return "%s <span class='dim'>(%s)</span>"%(money(v,d), pct(100*v/base,2) if fin(base) and base else "–")
+def card(k,v,s=""): return "<div class='card'><div class='k'>%s</div><div class='v'>%s</div>%s</div>"%(k,v,"<div class='s'>%s</div>"%s if s else "")
+def lead(st,c,r): return "<div class='lead'><div class='c'>%s %s</div><div class='r'>%s</div></div>"%(DOT.get(st,""),c,r)
+def tech(t,pairs): return "<details><summary>Detail teknis · %s</summary><div class='body'><dl class='kv'>%s</dl></div></details>"%(t,"".join("<dt>%s</dt><dd>%s</dd>"%(k,v) for k,v in pairs))
+def status_row(label,st,text,extra=""):
+    return "<tr><td>%s</td><td>%s <b>%s</b></td><td class='dim'>%s</td></tr>"%(label,DOT[st],text,extra)
 
-def money(v, d=2):
-    if not isinstance(v, (int, float)): return "<span class='dim'>–</span>"
-    return "<span class='%s'>%s$%s</span>" % ("pos" if v > 0 else "neg" if v < 0 else "",
-                                              "+" if v > 0 else "-" if v < 0 else "",
-                                              format(abs(round(v, d)), ",.%df" % d))
+def score_card(sd, prev=None):
+    v=sd.get("value")
+    if not fin(v):
+        return "<div class='card'><div class='k'>%s</div><div class='v dim'>%s</div><div class='s'>bukti tidak cukup</div></div>"%(sd["label"],NA)
+    col="#4ec9a0" if v>=70 else "#d9a441" if v>=50 else "#e5686d"
+    ups=[p for p in sd["parts"] if fin(p["value"]) and p["value"]>=60]
+    dns=[p for p in sd["parts"] if fin(p["value"]) and p["value"]<45]
+    rows="".join("<tr><td>%s</td><td>%s</td><td class='num'>%s</td><td class='num dim'>%.1f</td><td class='dim'>%s</td></tr>"%(
+        p["name"],("<span class='plus'>+</span>" if fin(p["value"]) and p["value"]>=60 else "<span class='minus'>−</span>" if fin(p["value"]) else "<span class='dim'>·</span>"),
+        num(p["value"],0),p["weight"],esc(p["detail"] or "")) for p in sd["parts"])
+    return ("<div class='card'><div class='k'>%s</div>"
+            "<div class='v' style='color:%s'>%d<span style='font-size:12px;color:#68788a'> / 100 · %s</span></div>"
+            "<div class='bar'><i style='width:%.0f%%;background:%s'></i></div>"
+            "<div class='s'>%s%s</div>"
+            "<details style='margin-top:8px'><summary>Bagaimana dihitung?</summary><div class='body'>"
+            "<table><tr><th>komponen</th><th></th><th class='num'>nilai</th><th class='num'>bobot</th><th>dasar</th></tr>%s</table>"
+            "<div class='note'>Rata-rata tertimbang dari komponen yang punya data. Komponen tanpa data dibuang beserta bobotnya, jadi data yang hilang tidak pernah terhitung sebagai nol.</div>"
+            "</div></details></div>")%(sd["label"],col,round(v),rate(v),v,col,
+             ("naik: "+", ".join(p["name"] for p in ups[:2])) if ups else "",
+             (" · turun: "+", ".join(p["name"] for p in dns[:2])) if dns else "",rows)
 
-def pct(v, d=2, sign=True):
-    if not isinstance(v, (int, float)): return "<span class='dim'>–</span>"
-    return "<span class='%s'>%s%.*f%%</span>" % ("pos" if v > 0 else "neg" if v < 0 else "",
-                                                 "+" if sign and v > 0 else "", d, v)
-
-def num(v, d=2):
-    return "<span class='dim'>–</span>" if not isinstance(v, (int, float)) else format(round(v, d), ",.%df" % d)
-
-DOT = {"ok": "🟢", "watch": "🟡", "override": "🟠", "block": "🔴", "off": "⚪"}
-
-def card(k, v, s=""):
-    return "<div class='card'><div class='k'>%s</div><div class='v'>%s</div>%s</div>" % (
-        k, v, "<div class='s'>%s</div>" % s if s else "")
-
-def lead(status, conclusion, reason):
-    return "<div class='lead'><div class='c'>%s %s</div><div class='r'>%s</div></div>" % (
-        DOT.get(status, ""), conclusion, reason)
-
-def tech(title, pairs):
-    rows = "".join("<dt>%s</dt><dd>%s</dd>" % (k, v) for k, v in pairs)
-    return "<details><summary>Detail teknis · %s</summary><div class='body'><dl class='kv'>%s</dl></div></details>" % (title, rows)
-
-# ---------------------------------------------------------------- inline SVG charts
-def spark_area(points, w=560, h=110, pos="#4ec9a0", neg="#e5686d"):
-    """Cumulative equity-style curve from a list of increments."""
-    if len(points) < 2: return "<div class='dim'>Data tidak cukup untuk kurva.</div>"
-    cum, s = [], 0.0
-    for p in points: s += p; cum.append(s)
-    lo, hi = min(cum + [0]), max(cum + [0])
-    rng = (hi - lo) or 1.0
-    X = lambda i: 8 + i * (w - 16) / (len(cum) - 1)
-    Y = lambda v: h - 10 - (v - lo) * (h - 24) / rng
-    d = " ".join("%s%.1f,%.1f" % ("M" if i == 0 else "L", X(i), Y(v)) for i, v in enumerate(cum))
-    zero = Y(0)
-    col = pos if cum[-1] >= 0 else neg
+def curve_svg(pts,w=600,h=120):
+    if len(pts)<2: return "<div class='dim'>Data tidak cukup.</div>"
+    cum=[];s=0.0
+    for p in pts: s+=p; cum.append(s)
+    lo,hi=min(cum+[0]),max(cum+[0]); rng=(hi-lo) or 1.0
+    X=lambda i:8+i*(w-16)/(len(cum)-1); Y=lambda v:h-10-(v-lo)*(h-24)/rng
+    d=" ".join("%s%.1f,%.1f"%("M" if i==0 else "L",X(i),Y(v)) for i,v in enumerate(cum))
     return ("<svg viewBox='0 0 %d %d' width='100%%' height='%d' preserveAspectRatio='none'>"
             "<line x1='8' y1='%.1f' x2='%d' y2='%.1f' stroke='#1e2836' stroke-dasharray='3 3'/>"
-            "<path d='%s' fill='none' stroke='%s' stroke-width='1.8'/></svg>") % (w, h, h, zero, w - 8, zero, d, col)
+            "<path d='%s' fill='none' stroke='%s' stroke-width='1.8'/></svg>")%(w,h,h,Y(0),w-8,Y(0),d,"#4ec9a0" if cum[-1]>=0 else "#e5686d")
 
-def bars(items, w=560, h=130, fmt=lambda v: "%.2f%%" % v):
-    """items = [(label, value)] comparison bars, signed."""
-    items = [(l, v) for l, v in items if isinstance(v, (int, float))]
+def dd_svg(pts,w=600,h=90):
+    if len(pts)<2: return "<div class='dim'>Data tidak cukup.</div>"
+    eq=peak=0.0; dd=[]
+    for p in pts:
+        eq+=p; peak=max(peak,eq); dd.append(eq-peak)
+    lo=min(dd) or -1e-9
+    X=lambda i:8+i*(w-16)/(len(dd)-1); Y=lambda v:8+(v/lo)*(h-20) if lo else 8
+    d=" ".join("%s%.1f,%.1f"%("M" if i==0 else "L",X(i),Y(v)) for i,v in enumerate(dd))
+    return ("<svg viewBox='0 0 %d %d' width='100%%' height='%d' preserveAspectRatio='none'>"
+            "<path d='%s L%.1f,%.1f L8,%.1f Z' fill='#e5686d22' stroke='#e5686d' stroke-width='1.3'/></svg>")%(w,h,h,d,X(len(dd)-1),Y(0),Y(0))
+
+def bars(items,w=600,h=132,fmt=lambda v:"%.2f%%"%v):
+    items=[(l,v) for l,v in items if fin(v)]
     if not items: return "<div class='dim'>Tidak ada data.</div>"
-    mx = max(abs(v) for _, v in items) or 1.0
-    bw = (w - 20) / len(items)
-    mid = h - 34
-    out = ["<svg viewBox='0 0 %d %d' width='100%%' height='%d'>" % (w, h, h),
-           "<line x1='10' y1='%d' x2='%d' y2='%d' stroke='#1e2836'/>" % (mid, w - 10, mid)]
-    for i, (l, v) in enumerate(items):
-        bh = abs(v) / mx * (mid - 14)
-        x = 10 + i * bw + bw * .18
-        y = mid - bh if v >= 0 else mid
-        out.append("<rect x='%.1f' y='%.1f' width='%.1f' height='%.1f' rx='2' fill='%s'/>"
-                   % (x, y, bw * .64, max(bh, 1), "#4ec9a0" if v >= 0 else "#e5686d"))
-        out.append("<text x='%.1f' y='%d' fill='#68788a' font-size='9.5' text-anchor='middle'>%s</text>"
-                   % (x + bw * .32, h - 20, esc(l)[:12]))
-        out.append("<text x='%.1f' y='%.1f' fill='#8fa3b8' font-size='9' text-anchor='middle'>%s</text>"
-                   % (x + bw * .32, (y - 3) if v >= 0 else (y + bh + 9), fmt(v)))
-    out.append("</svg>")
-    return "".join(out)
+    mx=max(abs(v) for _,v in items) or 1.0; bw=(w-20)/len(items); mid=h-34
+    o=["<svg viewBox='0 0 %d %d' width='100%%' height='%d'>"%(w,h,h),
+       "<line x1='10' y1='%d' x2='%d' y2='%d' stroke='#1e2836'/>"%(mid,w-10,mid)]
+    for i,(l,v) in enumerate(items):
+        bh=abs(v)/mx*(mid-14); x=10+i*bw+bw*.18; y=mid-bh if v>=0 else mid
+        o.append("<rect x='%.1f' y='%.1f' width='%.1f' height='%.1f' rx='2' fill='%s'/>"%(x,y,bw*.64,max(bh,1),"#4ec9a0" if v>=0 else "#e5686d"))
+        o.append("<text x='%.1f' y='%d' fill='#68788a' font-size='9.5' text-anchor='middle'>%s</text>"%(x+bw*.32,h-20,esc(l)[:12]))
+        o.append("<text x='%.1f' y='%.1f' fill='#8fa3b8' font-size='9' text-anchor='middle'>%s</text>"%(x+bw*.32,(y-3) if v>=0 else (y+bh+9),fmt(v)))
+    return "".join(o)+"</svg>"
 
-def scatter(pairs, thr, w=560, h=170):
-    if len(pairs) < 3: return "<div class='dim'>Data tidak cukup.</div>"
-    xs = [p["gap"] for p in pairs]; ys = [p["net"] * 100 for p in pairs]
-    x0, x1 = min(xs), max(xs); y0, y1 = min(ys), max(ys)
-    xr = (x1 - x0) or 1; yr = (y1 - y0) or 1
-    X = lambda v: 34 + (v - x0) * (w - 46) / xr
-    Y = lambda v: h - 26 - (v - y0) * (h - 44) / yr
-    out = ["<svg viewBox='0 0 %d %d' width='100%%' height='%d'>" % (w, h, h)]
-    out.append("<line x1='34' y1='%.1f' x2='%d' y2='%.1f' stroke='#1e2836' stroke-dasharray='3 3'/>" % (Y(0), w - 12, Y(0)))
-    if x0 <= thr <= x1:
-        out.append("<line x1='%.1f' y1='6' x2='%.1f' y2='%d' stroke='#d9a441' stroke-dasharray='4 3'/>" % (X(thr), X(thr), h - 26))
-        out.append("<text x='%.1f' y='14' fill='#d9a441' font-size='9.5'>ambang %.3f</text>" % (min(X(thr) + 4, w - 80), thr))
+def scatter(pairs,thr,w=600,h=175):
+    if len(pairs)<3: return "<div class='dim'>Data tidak cukup.</div>"
+    xs=[p["gap"] for p in pairs]; ys=[p["net"]*100 for p in pairs]
+    x0,x1=min(xs),max(xs); y0,y1=min(ys),max(ys); xr=(x1-x0) or 1; yr=(y1-y0) or 1
+    X=lambda v:36+(v-x0)*(w-48)/xr; Y=lambda v:h-26-(v-y0)*(h-44)/yr
+    o=["<svg viewBox='0 0 %d %d' width='100%%' height='%d'>"%(w,h,h),
+       "<line x1='36' y1='%.1f' x2='%d' y2='%.1f' stroke='#1e2836' stroke-dasharray='3 3'/>"%(Y(0),w-12,Y(0))]
+    if x0<=thr<=x1:
+        o.append("<line x1='%.1f' y1='6' x2='%.1f' y2='%d' stroke='#d9a441' stroke-dasharray='4 3'/>"%(X(thr),X(thr),h-26))
+        o.append("<text x='%.1f' y='14' fill='#d9a441' font-size='9.5'>ambang %.3f</text>"%(min(X(thr)+4,w-84),thr))
     for p in pairs:
-        out.append("<circle cx='%.1f' cy='%.1f' r='2.4' fill='%s' opacity='.72'/>"
-                   % (X(p["gap"]), Y(p["net"] * 100), "#4ec9a0" if p["net"] >= 0 else "#e5686d"))
-    out.append("<text x='4' y='%.1f' fill='#68788a' font-size='9'>%.1f%%</text>" % (Y(y1) + 3, y1))
-    out.append("<text x='4' y='%.1f' fill='#68788a' font-size='9'>%.1f%%</text>" % (Y(y0) + 3, y0))
-    out.append("<text x='34' y='%d' fill='#68788a' font-size='9'>scoreGap %.3f</text>" % (h - 8, x0))
-    out.append("<text x='%d' y='%d' fill='#68788a' font-size='9' text-anchor='end'>%.3f</text>" % (w - 12, h - 8, x1))
-    out.append("</svg>")
-    return "".join(out)
+        o.append("<circle cx='%.1f' cy='%.1f' r='2.4' fill='%s' opacity='.72'/>"%(X(p["gap"]),Y(p["net"]*100),"#4ec9a0" if p["net"]>=0 else "#e5686d"))
+    o.append("<text x='4' y='%.1f' fill='#68788a' font-size='9'>%.1f%%</text>"%(Y(y1)+3,y1))
+    o.append("<text x='4' y='%.1f' fill='#68788a' font-size='9'>%.1f%%</text>"%(Y(y0)+3,y0))
+    return "".join(o)+"</svg>"
 
-def gauge(label, val, doc):
-    if not isinstance(val, (int, float)):
-        return ("<div class='gauge'><div class='k' style='color:#68788a;font-size:10.5px;text-transform:uppercase'>%s</div>"
-                "<div class='v' style='font-size:20px;color:#68788a'>Tidak tersedia</div>"
-                "<div class='s' style='color:#68788a;font-size:11px'>%s</div></div>" % (label, doc[:90]))
-    col = "#4ec9a0" if val >= 67 else "#d9a441" if val >= 40 else "#e5686d"
-    return ("<div class='gauge'><div style='color:#68788a;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px'>%s</div>"
-            "<div style='font-size:22px;color:%s;font-weight:600;margin-top:2px'>%d<span style='font-size:12px;color:#68788a'> / 100</span></div>"
-            "<div class='bar'><i style='width:%.0f%%;background:%s'></i></div>"
-            "<details style='margin-top:7px;border:0;background:none'><summary style='padding:3px 0;font-size:11px'>Bagaimana dihitung?</summary>"
-            "<div style='padding:4px 0;color:#7d8fa3;font-size:11.5px'>%s</div></details></div>") % (label, col, round(val), val, col, doc)
-
-def _alerts(R):
-    out = []
-    for k, i in R["inst"].items():
-        ex = i["ex"]
-        if ex.get("__error__"): out.append(("block", "%s tidak merespons" % i["label"], ex["__error__"]))
-        if ex.get("lastError"): out.append(("block", "%s melaporkan error" % i["label"], str(ex["lastError"])[:120]))
-        if ex.get("configErrors"): out.append(("block", "%s konfigurasi bermasalah" % i["label"], str(ex["configErrors"])[:120]))
-        if ex.get("orphanedLegs"): out.append(("block", "%s punya kaki yatim" % i["label"], "%d kaki tanpa basket" % len(ex["orphanedLegs"])))
-        if ex.get("signalStale"): out.append(("watch", "%s sinyalnya basi" % i["label"],
-            "umur %.0f menit, batas %.0f menit — tidak ada basket baru sampai sinyal segar" % (
-                (ex.get("signalAgeMs") or 0)/60000.0, (ex.get("signalMaxAgeMs") or 0)/60000.0)))
-        if "OK:" not in (i["envPolicy"] or ""): out.append(("block", "%s menyimpang dari kebijakan konfigurasi" % i["label"], i["envPolicy"][:120]))
-        if ex.get("entryHealthBypassed"): out.append(("override", "%s: gerbang bukti di-override operator" % i["label"],
-            "Bot tetap membuka basket walau bukti terakhir negatif. Ini keputusan manual, bukan lampu hijau dari data."))
+def alerts_of(R):
+    """BLOCKING -> RISK -> WATCH -> INFO"""
+    A=[]
+    for k,i in R["inst"].items():
+        ex=i["ex"]; L=i["long"]
+        if ex.get("__error__"): A.append((0,"block","%s tidak merespons"%L,ex["__error__"]))
+        if ex.get("lastError"): A.append((0,"block","%s melaporkan error"%L,str(ex["lastError"])[:120]))
+        if ex.get("configErrors"): A.append((0,"block","%s konfigurasi bermasalah"%L,str(ex["configErrors"])[:120]))
+        if "OK:" not in (i["envPolicy"] or ""): A.append((0,"block","%s menyimpang dari kebijakan konfigurasi"%L,i["envPolicy"][:120]))
+        if ex.get("orphanedLegs"): A.append((1,"block","%s punya kaki yatim"%L,"%d posisi tanpa basket induk"%len(ex["orphanedLegs"])))
+        if ex.get("entryHealthBypassed"): A.append((1,"override","%s: gerbang bukti di-override operator"%L,
+            "Bot membuka basket walau bukti terakhirnya tidak lolos. Keputusan manual, bukan lampu hijau dari data."))
+        if ex.get("signalStale"): A.append((2,"watch","%s sinyalnya basi"%L,
+            "umur %.0f menit dari batas %.0f menit — tidak ada basket baru sampai segar"%((ex.get("signalAgeMs") or 0)/60000.0,(ex.get("signalMaxAgeMs") or 0)/60000.0)))
     for j in R["system"]["jobs"]:
-        if j["stale"]: out.append(("watch", "%s berhenti berjalan" % j["job"],
-            "terakhir %s, ambang %.0f jam" % ("tidak pernah" if j["ageHours"] is None else "%.1f jam lalu" % j["ageHours"], j["maxHours"])))
+        if j["stale"]: A.append((2,"watch","%s berhenti"%j["job"],"terakhir %s"%("tidak pernah" if j["ageHours"] is None else "%.1f jam lalu"%j["ageHours"])))
     for p in R["system"]["pm2"]:
-        if p["status"] != "online": out.append(("block", "Proses %s: %s" % (p["name"], p["status"]), "Layanan tidak berjalan."))
-    d = R["system"].get("disk")
-    if d and int(str(d["pct"]).rstrip("%") or 0) >= 90:
-        out.append(("watch", "Disk hampir penuh", "%s terpakai, sisa %s" % (d["pct"], d["avail"])))
-    return out
+        if p["status"]!="online": A.append((0,"block","Proses %s: %s"%(p["name"],p["status"]),"Layanan tidak berjalan."))
+    d=R["system"].get("disk")
+    if d and int(str(d["pct"]).rstrip("%") or 0)>=90: A.append((2,"watch","Disk hampir penuh","%s terpakai, sisa %s"%(d["pct"],d["avail"])))
+    if R.get("mismatch"): A.append((3,"watch","Bukti riset tidak sepenuhnya mewakili produksi","%d ketidakcocokan — lihat tab Riset"%len(R["mismatch"])))
+    return sorted(A,key=lambda x:x[0])
 
 def tab_overview(R):
-    a, o = R["account"], []
-    liv, tst = R["inst"]["live"], R["inst"]["testnet"]
-    eq, up = a.get("accountEquity"), a.get("unrealizedPnl")
-    ob = liv["ex"].get("openBaskets") or []
-    alerts = _alerts(R)
-    blocking = [x for x in alerts if x[0] == "block"]
-    w8 = R["edge"]["windows"]["8 terakhir"]
-
-    if blocking: st, cc, rr = "block", "Ada %d masalah yang perlu tindakan" % len(blocking), blocking[0][1] + " — " + blocking[0][2]
-    elif ob: st, cc, rr = ("ok", "Bot sedang memegang %d basket" % len(ob),
-        "Posisi berjalan dengan stop/TP ±%s%% dan batas tahan %s jam." % (liv["ex"].get("stopNetReturnPct"), liv["ex"].get("maxHoldHours")))
-    elif liv["adm"].get("tier") == "GREEN": st, cc, rr = ("watch", "Tidak ada posisi, menunggu formasi berikutnya",
-        "Izin masuk terbuka. Basket baru dibuka begitu ada formasi yang lolos ambang pemisahan.")
-    else: st, cc, rr = ("block", "Tidak ada posisi dan entry sedang ditutup", str(liv["adm"].get("reason") or "")[:150])
-    o.append(lead(st, cc, rr))
-
+    a=R["account"]; liv=R["inst"]["live"]; tst=R["inst"]["testnet"]
+    eq=a.get("accountEquity"); o=[]
+    A=alerts_of(R); blocking=[x for x in A if x[1]=="block"]
+    ob_l=liv["ex"].get("openBaskets") or []; ob_t=tst["ex"].get("openBaskets") or []
+    if blocking: st,c,r="block","%d masalah menghalangi"%len(blocking),"%s — %s"%(blocking[0][2],blocking[0][3])
+    elif ob_l: st,c,r="ok","Memegang %d basket di uang nyata"%len(ob_l),"Berjalan dengan batas tahan %s jam dan stop/TP ±%s%%."%(liv["ex"].get("maxHoldHours"),liv["ex"].get("stopNetReturnPct"))
+    elif liv["adm"].get("tier")=="GREEN": st,c,r="watch","Tanpa posisi, menunggu formasi","Izin masuk terbuka; basket dibuka begitu ada formasi yang lolos ambang."
+    else: st,c,r="block","Tanpa posisi, entry tertutup",esc(str(liv["adm"].get("reason") or ""))[:170]
+    o.append(lead(st,c,r))
     o.append("<div class='grid'>")
-    o.append(card("Ekuitas akun", money(eq), "wallet %s · tersedia %s" % (money(a.get("walletBalance")), money(a.get("availableBalance")))))
-    o.append(card("P&amp;L belum terealisasi", money(up, 4), "dari %d posisi terbuka" % (a.get("openPositionCount") or 0)))
-    o.append(card("P&amp;L terealisasi (live)", money(liv["ex"].get("totalNetPnlUsd"), 4), "%s basket selesai" % liv["ex"].get("closedCount")))
-    o.append(card("P&amp;L terealisasi (testnet)", money(tst["ex"].get("totalNetPnlUsd"), 4), "%s basket selesai · uang demo" % tst["ex"].get("closedCount")))
+    o.append(card("Ekuitas",money(eq),"tersedia %s"%money(a.get("availableBalance"))))
+    o.append(card("Belum terealisasi",money_pct(a.get("unrealizedPnl"),eq,4),"%d posisi terbuka"%(a.get("openPositionCount") or 0)))
+    o.append(card("Terealisasi hari ini",money_pct(liv["ex"].get("dailyRealizedUsd"),eq,4),"batas rugi harian %s"%money(liv["ex"].get("dailyMaxLossUsd"),0)))
+    o.append(card("Terealisasi total",money_pct(liv["ex"].get("totalNetPnlUsd"),eq,4),"%s basket selesai"%liv["ex"].get("closedCount")))
     o.append("</div>")
-
-    o.append("<h2>Izin masuk</h2><div class='grid'>")
-    for k in ("live", "testnet"):
-        i = R["inst"][k]; adm = i["adm"]; t = adm.get("tier")
-        byp = i["ex"].get("entryHealthBypassed")
-        s = "override" if byp else "ok" if t == "GREEN" else "watch" if t == "YELLOW" else "block" if t == "RED" else "off"
-        txt = "Boleh membuka" if t == "GREEN" else "Ukuran dikurangi" if t == "YELLOW" else "Ditutup" if t == "RED" else "—"
-        o.append(card(i["label"], "%s %s" % (DOT[s], txt),
-                      "override operator aktif" if byp else "gerbang bukti dihormati"))
+    o.append("<h2>Status</h2><div class='g2'>")
+    for k in ("live","testnet"):
+        i=R["inst"][k]; ex=i["ex"]; adm=i["adm"]; g=i["gate"]
+        run = (ex.get("enabled") is not False) and not ex.get("__error__")
+        byp = bool(ex.get("entryHealthBypassed"))
+        rows=[status_row("Eksekusi","ok" if run else "block","BERJALAN" if run else "MATI",""),
+              status_row("Kesehatan bukti","ok" if g["pass"] else "block","LOLOS" if g["pass"] else "GAGAL",
+                         "8 terakhir %s · 30 terakhir %s"%(pct(g.get("last8"),3),pct(g.get("last30"),3))),
+              status_row("Override operator","override" if byp else "off","AKTIF" if byp else "TIDAK AKTIF",
+                         "menggantikan kegagalan di atas" if byp else ""),
+              status_row("Kesegaran sinyal","block" if ex.get("signalStale") else "ok","BASI" if ex.get("signalStale") else "SEGAR",
+                         "%.0f menit / batas %.0f"%((ex.get("signalAgeMs") or 0)/60000.0,(ex.get("signalMaxAgeMs") or 0)/60000.0)),
+              status_row("Izin masuk baru","ok" if adm.get("tier")=="GREEN" and not ex.get("signalStale") else "block",
+                         "TERBUKA" if adm.get("tier")=="GREEN" and not ex.get("signalStale") else "TERTUTUP","")]
+        o.append("<div class='card'><div class='k'>%s</div><table style='margin-top:6px'>%s</table></div>"%(i["long"],"".join(rows)))
     o.append("</div>")
-
-    o.append("<h2>Kesehatan edge</h2><div class='grid'>")
-    o.append(card("8 basket terakhir", pct(w8.get("meanPct"), 3) if w8.get("n") else "<span class='dim'>–</span>", "rata-rata per basket"))
-    o.append(card("Episode independen", str(R["edge"]["episodes"]), "dari %d observasi — yang menentukan kepercayaan" % R["edge"]["windows"]["seluruhnya"].get("n", 0)))
-    g = R["gauges"]
-    o.append(card("Skor edge", num(g.get("edge"), 0), "0–100, lihat tab Edge"))
-    o.append(card("Skor keseluruhan", num(g.get("overall"), 0), "0–100, lihat tab Edge"))
+    o.append("<h2>Posisi &amp; keyakinan</h2><div class='grid'>")
+    o.append(card("Basket terbuka","%d live · %d testnet"%(len(ob_l),len(ob_t)),"batas %s / %s"%(liv["ex"].get("maxOpenBaskets") or "–",tst["ex"].get("maxOpenBaskets") or "–")))
+    sc=R["scores"]
+    o.append(card("Keyakinan edge",num(sc["edge"]["value"],0),"%s · t terkoreksi %s"%(rate(sc["edge"]["value"]),num(R["edge"]["tEff"],2))))
+    o.append(card("Kekuatan bukti",num(sc["evidence"]["value"],0),"%d episode independen"%R["edge"]["episodes"]))
+    o.append(card("Performa keseluruhan",num(sc["overall"]["value"],0),rate(sc["overall"]["value"])))
     o.append("</div>")
-
-    o.append("<h2>Peringatan &amp; keamanan</h2>")
-    if not alerts:
-        o.append("<div class='card'>%s Tidak ada peringatan aktif.</div>" % DOT["ok"])
+    o.append("<h2>Peringatan</h2>")
+    if not A: o.append("<div class='card'>%s Tidak ada peringatan aktif.</div>"%DOT["ok"])
     else:
-        o.append("<table><tr><th>status</th><th>masalah</th><th>keterangan</th></tr>")
-        for s, t, d in alerts:
-            o.append("<tr><td>%s</td><td>%s</td><td class='dim'>%s</td></tr>" % (DOT[s], esc(t), esc(d)))
+        o.append("<table><tr><th>prioritas</th><th></th><th>masalah</th><th>keterangan</th></tr>")
+        names={0:"MENGHALANGI",1:"RISIKO",2:"PANTAU",3:"INFO"}
+        for pr,s,t,d in A:
+            o.append("<tr><td class='dim'>%s</td><td>%s</td><td>%s</td><td class='dim'>%s</td></tr>"%(names[pr],DOT[s],esc(t),esc(d)))
         o.append("</table>")
     return "".join(o)
 
+FEATURES=[("MOM36","Peringkat momentum 36 jam — inti alpha-nya. Berapa persen harga bergerak dalam 36 jam terakhir, dibandingkan antar-simbol, bukan terhadap dirinya sendiri."),
+ ("rawRank","Posisi relatif skor itu di dalam kolam kandidat, dinyatakan dalam simpangan baku. Ini komponen dominan pemilihan."),
+ ("fastSupport","Konfirmasi cepat: gerak 4 bar terakhir dibagi volatilitas simbol itu sendiri. Menaikkan nama yang gerak terbarunya searah dengan taruhannya. Dibatasi ±2 supaya tidak meledak saat volatilitas kecil."),
+ ("adverseExtension","Penalti terlalu jauh: seberapa jauh harga sudah lari dari rata-rata pendeknya. Menurunkan nama yang sudah telanjur berlari."),
+ ("bonus counter-axis","Kalau sumbu pasar melawan satu sisi, sisi itu tidak diveto — tapi hanya nama yang gerak cepatnya sendiri mengonfirmasi yang dapat tambahan."),
+ ("penalti klaster","0,18 per nama tambahan dari klaster yang sama, supaya basket tidak jadi satu taruhan tema yang menyamar sebagai enam."),
+ ("scoreGap","Selisih rata-rata skor sisi long dan sisi short. Ini yang diuji terhadap ambang minimum sebelum basket boleh dibentuk.")]
+
 def tab_strategy(R):
-    liv = R["inst"]["live"]; ex = liv["ex"]; pool = liv["pool"] or {}
-    cnt = pool.get("counts") or {}; leg = pool.get("leg") or {}
-    fc = ((get(INST["live"]["api"] + "/api/shadow/cross-sectional-report") or {}).get("filteredConfig")) or {}
-    a = R["account"]; eq = a.get("accountEquity")
-    legusd = ex.get("legUsd"); gross = (legusd * 6) if isinstance(legusd, (int, float)) else None
-    o = [lead("ok", "Market-neutral lintas-simbol, 3 long / 3 short",
-              "Peringkat momentum 36 jam memilih yang terkuat dan terlemah; basket ditahan sampai batas waktu kecuali stop/TP kena.")]
+    liv=R["inst"]["live"]; ex=liv["ex"]; fc=liv["fc"]; cnt=(liv["pool"] or {}).get("counts") or {}
+    eq=(R["account"] or {}).get("accountEquity"); leg=ex.get("legUsd")
+    gross=(leg*6) if fin(leg) else None
+    o=[lead("ok","Momentum relatif lintas-simbol, netral pasar",
+        "Bot memeringkat seluruh universe menurut momentum 36 jam, membeli 3 terkuat dan menjual 3 terlemah. Yang dikejar bukan arah pasar, melainkan <b>selisih</b> antara yang kuat dan yang lemah — kalau pasar naik atau turun bersama, keduanya saling meniadakan.")]
+    o.append("<div class='flow'>"+ "<span class='a'>→</span>".join(
+        "<span class='n'>%s</span>"%x for x in ["Universe","Peringkat MOM36","Smart Formation","Admission","Revalidasi entry","Basket","Smart Basket / tahan","Exit"])+"</div>")
     o.append("<div class='grid'>")
-    o.append(card("Sinyal", esc(fc.get("signal") or "–"), "momentum 36 jam, varian tersaring"))
-    o.append(card("Struktur basket", "3 long / 3 short", "bobot dari peringkat skor, dibatasi"))
-    o.append(card("Ukuran per kaki", money(legusd, 0), "eksposur kotor %s%s" % (money(gross, 0),
-              (" · %.0f%% ekuitas" % (100 * gross / eq)) if gross and eq else "")))
-    o.append(card("Batas tahan", "%s jam" % ex.get("maxHoldHours"), "horizon sinyal 48 jam"))
-    o.append(card("Stop / ambil untung", "±%s%% / %s%%" % (ex.get("stopNetReturnPct"), ex.get("tpNetReturnPct")), "atas nilai basket, simetris"))
-    o.append(card("Ambang pemisahan", num(fc.get("minScoreGap"), 3), "selisih skor long vs short minimum"))
-    o.append(card("Universe", "%s simbol" % cnt.get("universe"), "pool long %s · short layak %s" % (cnt.get("poolLong"), cnt.get("shortEligible"))))
-    o.append(card("Basket bersamaan", str(ex.get("maxOpenBaskets") or "–"), "maksimum posisi hidup"))
+    o.append(card("Universe","%s simbol"%cnt.get("universe"),"pool long %s · short layak %s"%(cnt.get("poolLong"),cnt.get("shortEligible"))))
+    o.append(card("Struktur","3 long / 3 short","bobot dari peringkat skor, dibatasi"))
+    o.append(card("Ukuran per kaki",money(leg,0),"kotor %s%s"%(money(gross,0),(" · %.0f%% ekuitas"%(100*gross/eq)) if gross and eq else "")))
+    o.append(card("Batas tahan","%s jam"%ex.get("maxHoldHours"),"horizon sinyalnya sendiri 48 jam"))
+    o.append(card("Stop / ambil untung","±%s%% / %s%%"%(ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct")),"atas nilai basket"))
+    o.append(card("Ambang pemisahan",num(fc.get("minScoreGap"),3),"basket ditolak di bawah ini"))
     o.append("</div>")
-    o.append("<h2>Seleksi kandidat (Smart Formation)</h2>")
-    o.append("<div class='lead' style='border-left-color:#8a6fbf'><div class='r'>Peringkat momentum tetap dominan. Dua faktor lain hanya pemecah seri berbatas: "
-             "<b>konfirmasi cepat</b> (gerak 4 bar terakhir dibagi volatilitasnya, bobot 0,22) menaikkan nama yang gerak terbarunya searah, dan "
-             "<b>penalti terlalu jauh</b> (bobot 0,20) menurunkan nama yang sudah berlari terlalu jauh. "
-             "Ada penalti 0,18 per nama tambahan dari klaster yang sama supaya basket tidak menumpuk di satu tema.</div></div>")
-    o.append(tech("parameter runtime", [
-        ("Sinyal", "<code>%s</code>" % esc(fc.get("signal"))),
-        ("Ambang scoreGap", "<code>%s</code> — env <code>CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP</code>" % fc.get("minScoreGap")),
-        ("Leg USD", "<code>%s</code> — env <code>CROSS_SECTIONAL_EXEC_LEG_USD</code>" % legusd),
-        ("Leverage", "<code>%s</code>" % ex.get("leverage")),
-        ("Batas tahan", "<code>%s</code> jam — env <code>CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS</code>" % ex.get("maxHoldHours")),
-        ("Stop / TP", "<code>%s</code> / <code>%s</code> — env <code>..._EXEC_STOP_NET_RETURN</code> / <code>..._EXEC_TP_NET_RETURN</code>" % (ex.get("stopNetReturnPct"), ex.get("tpNetReturnPct"))),
-        ("Exit adaptif", "dinonaktifkan — ambang scan dinaikkan sehingga tak terjangkau dalam horizon 48 jam"),
-        ("Allowlist long", "<code>%s</code>" % esc(", ".join((fc.get("longAllowlist") or [])[:30]))),
-        ("Blocklist short", "<code>%s</code>" % esc(", ".join(fc.get("shortBlocklist") or []))),
-        ("Bursa", "Binance USD-M Futures · %s" % ("mainnet" if liv["id"] == "3103" else "testnet")),
-        ("Funding", "tidak dibukukan per basket oleh executor — <b>tidak tersedia</b> di UI ini"),
-    ]))
+    o.append("<h2>Smart Formation — memilih basket, bukan sinyal baru</h2>")
+    o.append("<div class='lead' style='border-left-color:#8a6fbf'><div class='r'>Formation tidak membuat sinyal. Ia mengambil peringkat MOM36 yang sudah ada, memotongnya jadi kolam 5 kandidat teratas per sisi, lalu <b>mencoba semua kombinasi</b> dan memilih yang total utility-nya tertinggi setelah dikurangi penalti klaster. Peringkat mentah tetap dominan; dua faktor lain sengaja dibuat berbatas supaya tidak bisa mengangkat skor yang jelas kalah.</div></div>")
+    o.append("<table><tr><th>fitur</th><th>artinya</th></tr>%s</table>"%"".join(
+        "<tr><td><b>%s</b></td><td class='dim' style='white-space:normal'>%s</td></tr>"%(esc(a),esc(b)) for a,b in FEATURES))
+    o.append("<h2>Smart Basket — mengelola basket setelah dibentuk</h2>")
+    o.append("<div class='note'>Eksekusi exit adaptif <b>DIMATIKAN</b>; evaluasinya tetap berjalan. Penghitung scan terus bertambah, jadi tab Posisi bisa menunjukkan apa yang <i>akan</i> terjadi tanpa aturan itu menyentuh uang.</div>")
+    o.append("<table><tr><th>mekanisme</th><th>status</th><th>parameter</th><th>artinya</th></tr>")
+    for nm,stt,par,mean in [("Revalidasi entry","ok · aktif","drift merugikan sebelum order dikirim","Membatalkan kalau harga sudah lari melawan sejak sinyal dibentuk."),
+        ("Regime Loss Exit","off · Eksekusi MATI, ghost AKTIF","kelas regime berubah + rugi ≥0,3% + sisi searah regime baru rugi, 2 scan","Menutup saat pasar berbalik melawan basket."),
+        ("Context Invalidation","off · Eksekusi MATI, ghost AKTIF","≥2 dari 3 kaki satu sisi kehilangan alasan masuknya, 2 scan","Menutup saat alasan pemilihan nama-nama itu hilang."),
+        ("MFE Giveback","off · Eksekusi MATI, ghost AKTIF","puncak ≥0,2% lalu turun ke ≤50% puncak","Mengunci laba yang mulai menguap."),
+        ("Batas waktu keras","ok · aktif","%s jam"%ex.get("maxHoldHours"),"Selalu menutup di sini apa pun keadaannya."),
+        ("Stop / TP","ok · aktif","±%s%% / %s%%"%(ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct")),"Plafon bencana simetris, bukan pengambil untung harian.")]:
+        s=stt.split(" · ")[0]
+        o.append("<tr><td>%s</td><td>%s %s</td><td class='dim'>%s</td><td class='dim' style='white-space:normal'>%s</td></tr>"%(
+            nm,DOT[s],esc(stt.split(" · ",1)[1] if " · " in stt else stt),esc(par),esc(mean)))
+    o.append("</table>")
+    o.append(tech("parameter runtime",[
+        ("Sinyal","<code>%s</code>"%esc(fc.get("signal"))),
+        ("Ambang scoreGap","<code>%s</code> · env <code>CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP</code>"%fc.get("minScoreGap")),
+        ("Leg USD / leverage","<code>%s</code> / <code>%s</code>"%(leg,ex.get("leverage"))),
+        ("Batas tahan","<code>%s</code> jam · env <code>CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS</code>"%ex.get("maxHoldHours")),
+        ("Stop / TP","<code>%s</code> / <code>%s</code>"%(ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct"))),
+        ("Exit adaptif","ambang scan dinaikkan ke nilai yang tak terjangkau dalam horizon 48 jam"),
+        ("Allowlist long","<code>%s</code>"%esc(", ".join((fc.get("longAllowlist") or [])[:30]))),
+        ("Blocklist short","<code>%s</code>"%esc(", ".join(fc.get("shortBlocklist") or []))),
+        ("Bursa","Binance USD-M Futures"),("Funding",NA+" — tidak dibukukan per basket oleh executor")]))
     return "".join(o)
 
 def tab_decision(R):
-    o = []
-    for k in ("live", "testnet"):
-        i = R["inst"][k]; ex = i["ex"]; adm = i["adm"]; gate = i["gate"]
-        att = (i["attempt"] or {}).get("latest") or {}
-        aa = i["admAudit"] or {}
-        pool = (i["pool"] or {}).get("counts") or {}
-        fc_gap = ((i["pool"] or {}).get("thresholds") or {})
-        tier = adm.get("tier")
-        allowed = tier == "GREEN"
-        o.append("<h2>%s</h2>" % i["label"])
-        o.append(lead("ok" if allowed else "block",
-                      "Boleh membuka basket" if allowed else "Tidak membuka basket",
-                      esc(str(adm.get("reason") or "Semua syarat terpenuhi."))[:240]))
-        steps = []
-        steps.append(("p" if pool.get("universe") else "f", "Data & universe siap",
-                      "%s simbol dipindai, %s lolos kriteria pool" % (pool.get("universe"), pool.get("poolLong"))))
-        steps.append(("p" if not ex.get("signalStale") else "w", "Sinyal segar",
-                      "umur %.0f menit dari batas %.0f menit" % ((ex.get("signalAgeMs") or 0)/60000.0, (ex.get("signalMaxAgeMs") or 0)/60000.0)))
-        ls, ss = att.get("longSymbols"), att.get("shortSymbols")
-        steps.append(("p" if ls and ss else "w", "Kandidat cukup di dua sisi",
-                      ("long %s · short %s" % (", ".join(ls or []), ", ".join(ss or []))) if ls or ss else "belum ada percobaan tercatat"))
-        gp = att.get("scoreGap")
-        thr = ((get(INST[k]["api"] + "/api/shadow/cross-sectional-report") or {}).get("filteredConfig") or {}).get("minScoreGap")
-        if isinstance(gp, (int, float)) and isinstance(thr, (int, float)):
-            steps.append(("p" if gp >= thr else "f", "Pemisahan long vs short cukup lebar",
-                          "terukur %.4f, minimum %.4f" % (gp, thr)))
-        else:
-            steps.append(("w", "Pemisahan long vs short", "tidak tercatat pada percobaan terakhir"))
-        rg = R["axis"] if isinstance(R["axis"], dict) else {}
-        cur = rg.get("current") or {}
-        steps.append(("p", "Keadaan pasar terbaca",
-                      "%s · zona %s · skor %s" % (cur.get("regime"), (rg.get("guidance") or {}).get("zoneLabel"), num(cur.get("score"), 3))))
-        byp = ex.get("entryHealthBypassed")
-        steps.append(("w" if byp else ("p" if gate["pass"] else "f"), "Bukti performa terakhir",
-                      "8 terakhir %s · 30 terakhir %s%s" % (pct(gate.get("last8"), 3), pct(gate.get("last30"), 3),
-                       " — <b>di-override operator</b>" if byp else "")))
-        steps.append(("p" if allowed else "f", "Keputusan akhir", "boleh membuka" if allowed else "ditahan"))
+    o=[]
+    for k in ("live","testnet"):
+        i=R["inst"][k]; ex=i["ex"]; adm=i["adm"]; g=i["gate"]; att=i["attempt"]; fc=i["fc"]
+        pool=(i["pool"] or {}).get("counts") or {}
+        allow=adm.get("tier")=="GREEN" and not ex.get("signalStale")
+        o.append("<h2>%s</h2>"%i["long"])
+        why=[]
+        steps=[]
+        steps.append(("Kesiapan formasi",None,None))
+        steps.append(("p" if pool.get("universe") else "f","Universe terbaca","%s simbol dipindai, %s memenuhi kriteria pool"%(pool.get("universe"),pool.get("poolLong"))))
+        ls,ss=att.get("longSymbols"),att.get("shortSymbols")
+        steps.append(("p" if ls else "o","Kandidat long",", ".join(ls or []) or "tidak tercatat"))
+        steps.append(("p" if ss else "o","Kandidat short",", ".join(ss or []) or "tidak tercatat"))
+        steps.append(("p","Batas klaster","maksimum 2 nama sekluster per sisi, dengan penalti kombinasi"))
+        steps.append(("Kualitas alpha",None,None))
+        gp,thr=att.get("scoreGap"),fc.get("minScoreGap")
+        if fin(gp) and fin(thr):
+            ok=gp>=thr
+            steps.append(("p" if ok else "f","Pemisahan long vs short","terukur %.4f dari minimum %.4f"%(gp,thr)))
+            if not ok: why.append("pemisahan skor %.4f di bawah minimum %.4f"%(gp,thr))
+        else: steps.append(("o","Pemisahan long vs short","tidak tercatat pada percobaan terakhir"))
+        steps.append(("Keadaan pasar",None,None))
+        cur=(R["axis"] or {}).get("current") or {}
+        steps.append(("p","Regime terbaca","%s · zona %s · skor %s"%(cur.get("regime"),((R["axis"] or {}).get("guidance") or {}).get("zoneLabel"),num(cur.get("score"),3))))
+        steps.append(("o","Lane directional","%s (%s)"%((R["dir"] or {}).get("mode"),(R["dir"] or {}).get("marketRegime"))))
+        steps.append(("Izin masuk",None,None))
+        steps.append(("p" if g["pass"] else "f","Gerbang bukti","8 terakhir %s · 30 terakhir %s"%(pct(g.get("last8"),3),pct(g.get("last30"),3))))
+        if not g["pass"]: why.append("bukti performa terakhir tidak lolos gerbang")
+        if ex.get("entryHealthBypassed"):
+            steps.append(("w","Override operator","AKTIF — menggantikan kegagalan gerbang di atas"))
+        steps.append(("f" if ex.get("signalStale") else "p","Kesegaran sinyal",
+                      "umur %.0f menit dari batas %.0f menit"%((ex.get("signalAgeMs") or 0)/60000.0,(ex.get("signalMaxAgeMs") or 0)/60000.0)))
+        if ex.get("signalStale"): why.append("sinyal terakhir sudah lewat batas umur, jadi tidak boleh dipakai membuka posisi")
+        o.append(lead("ok" if allow else "block","BOLEH MEMBUKA" if allow else "TIDAK MEMBUKA",
+                      esc(str(adm.get("reason") or "Semua syarat terpenuhi."))[:220]))
         o.append("<div class='trace'>")
-        for cls, t, d in steps:
-            o.append("<div class='step %s'><div class='t'>%s</div><div class='d'>%s</div></div>" % (cls, t, d))
+        for a,b,c in steps:
+            if b is None and c is None: o.append("<h3>%s</h3>"%a); continue
+            o.append("<div class='step %s'><div class='t'>%s</div><div class='d'>%s</div></div>"%(a,esc(b),esc(c)))
         o.append("</div>")
-        o.append(tech("audit izin masuk · %s" % i["label"], [
-            ("Traffic light aktif", str(aa.get("trafficLightEnabled"))),
-            ("Diizinkan (hijau)", str(aa.get("greenAdmitted"))),
-            ("Ukuran dikurangi (kuning)", str(aa.get("yellowAdmitted"))),
-            ("Ditolak (merah)", str(aa.get("redBlocked"))),
-            ("Percobaan terakhir", esc(json.dumps(att)[:400]) if att else "tidak ada"),
-            ("Sumber gerbang", "laporan bayangan <code>filteredReport.recentNetReturns</code>, n=%s" % gate.get("n")),
-        ]))
+        if why:
+            o.append("<h3>Kenapa tidak membuka</h3><ol style='color:#93a5b8;font-size:12.5px'>%s</ol>"%"".join("<li>%s</li>"%esc(w) for w in why))
+        o.append(tech("audit izin · %s"%i["long"],[
+            ("Traffic light",str((i["admAudit"] or {}).get("trafficLightEnabled"))),
+            ("Diizinkan / kuning / ditolak","%s / %s / %s"%((i["admAudit"] or {}).get("greenAdmitted"),(i["admAudit"] or {}).get("yellowAdmitted"),(i["admAudit"] or {}).get("redBlocked"))),
+            ("Latensi sinyal→order","%s detik"%num(i["signalToOrderSec"],1) if fin(i["signalToOrderSec"]) else NA),
+            ("Percobaan terakhir",esc(json.dumps(att)[:420]) if att else NA),
+            ("Sumber gerbang","laporan bayangan <code>filteredReport.recentNetReturns</code>, n=%s"%g.get("n"))]))
     return "".join(o)
 
+def friendly(bid):
+    """Short human handle; the internal id stays available in the detail block."""
+    t=str(bid or "").replace("xb-","").split("-")[0]
+    return "Basket %s"%t.upper()[:6] if t else "Basket"
+
 def tab_formation(R):
-    src, inst = None, None
-    for k in ("live", "testnet"):
+    src=inst=None
+    for k in ("live","testnet"):
         for r in reversed(R["inst"][k]["rows"]):
-            if (r.get("smartFormation") or {}).get("candidates"):
-                if src is None or r["openedAtMs"] > src["openedAtMs"]: src, inst = r, R["inst"][k]["label"]
+            if (r.get("sf") or {}).get("candidates"):
+                if src is None or r["openedAtMs"]>src["openedAtMs"]: src,inst=r,R["inst"][k]["long"]
                 break
-    if not src:
-        return lead("off", "Belum ada formasi tercatat", "Tidak ada observasi dengan rincian kandidat pada penyimpanan saat ini.")
-    sf = src["smartFormation"]; cands = sf["candidates"]
-    o = [lead("ok", "Formasi terakhir yang tercatat lengkap", "Dibentuk %s pada %s. Kolam %s kandidat, %s terpilih." % (
-        esc(inst), esc(str(src.get("openedAt"))[:16]), sf.get("candidatePoolSize"), sum(1 for c in cands if c.get("selected"))))]
-    for side in ("LONG", "SHORT"):
-        rows = [c for c in cands if c.get("side") == side]
+    if not src: return lead("off","Belum ada formasi tercatat","Tidak ada observasi dengan rincian kandidat pada penyimpanan saat ini.")
+    sf=src["sf"]; cands=sf["candidates"]; thr=R["inst"]["live"]["fc"].get("minScoreGap")
+    o=[lead("ok","Formasi terakhir yang tercatat lengkap","Dibentuk %s pada %s. Kolam %s kandidat per sisi; kombinasi terbaik dipilih dari seluruh kemungkinan."%(esc(inst),esc(str(src.get("openedAt"))[:16]),sf.get("candidatePoolSize")))]
+    for side in ("LONG","SHORT"):
+        rows=[c for c in cands if c.get("side")==side]
         if not rows: continue
-        vals = [(c["score"] if side == "LONG" else -c["score"]) for c in rows]
-        m = sum(vals) / len(vals)
-        sd = math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals)) or 1e-9
+        vals=[(c["score"] if side=="LONG" else -c["score"]) for c in rows]
+        m=sum(vals)/len(vals); sd=math.sqrt(sum((v-m)**2 for v in vals)/len(vals)) or 1e-9
+        best_un=max([c for c in rows if not c.get("selected")],key=lambda x:x.get("utility") or -9,default=None)
+        worst_sel=min([c for c in rows if c.get("selected")],key=lambda x:x.get("utility") or 9,default=None)
         o.append("<h2>Kandidat %s</h2><div class='scroll'><table>"
-                 "<tr><th>simbol</th><th class='num'>MOM36</th><th class='num'>peringkat baku</th><th class='num'>konfirmasi cepat</th>"
-                 "<th class='num'>terlalu jauh</th><th class='num'>utility</th><th>klaster</th><th>terpilih</th></tr>" % side)
-        for c in sorted(rows, key=lambda x: -(x.get("utility") or 0)):
-            rr = ((c["score"] if side == "LONG" else -c["score"]) - m) / sd
-            o.append("<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
-                     "<td class='num'>%s</td><td class='num'><b>%s</b></td><td class='dim'>%s</td><td>%s</td></tr>" % (
-                esc(c["symbol"].replace("USDT", "")), pct(100 * c["score"], 2), num(rr, 2),
-                num(c.get("fastSupport"), 2), num(c.get("adverseExtensionVol"), 2), num(c.get("utility"), 3),
-                esc(c.get("cluster") or "–"), DOT["ok"] if c.get("selected") else DOT["off"]))
+                 "<tr><th>simbol</th><th class='num'>MOM36</th><th class='num'>peringkat</th><th class='num'>konfirmasi</th>"
+                 "<th class='num'>terlalu jauh</th><th class='num'>utility</th><th>klaster</th><th>penilaian</th><th>terpilih</th></tr>"%side)
+        for c in sorted(rows,key=lambda x:-(x.get("utility") or 0)):
+            rr=((c["score"] if side=="LONG" else -c["score"])-m)/sd
+            u=c.get("utility") or 0
+            rating="BAGUS" if u>=1.0 else "SEDANG" if u>=0.3 else "LEMAH"
+            o.append("<tr><td><b>%s</b></td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
+                     "<td class='num'>%s</td><td class='num'><b>%s</b></td><td class='dim'>%s</td><td class='dim'>%s</td><td>%s</td></tr>"%(
+                esc(c["symbol"].replace("USDT","")),pct(100*c["score"],2),num(rr,2),num(c.get("fastSupport"),2),
+                num(c.get("adverseExtensionVol"),2),num(u,3),esc(c.get("cluster") or "–"),rating,
+                DOT["ok"] if c.get("selected") else DOT["off"]))
         o.append("</table></div>")
-    sel = [c for c in cands if c.get("selected")]
-    ls = [c["score"] for c in sel if c["side"] == "LONG"]; ss = [c["score"] for c in sel if c["side"] == "SHORT"]
-    gap = (sum(ls)/len(ls) - sum(ss)/len(ss)) if ls and ss else None
-    thr = ((get(INST["live"]["api"] + "/api/shadow/cross-sectional-report") or {}).get("filteredConfig") or {}).get("minScoreGap")
+        for c in sorted(rows,key=lambda x:-(x.get("utility") or 0)):
+            bl=[]
+            rr=((c["score"] if side=="LONG" else -c["score"])-m)/sd
+            bl.append(("plus","peringkat kuat di kolam (%.2f simpangan)"%rr) if rr>0.4 else ("minus","peringkat lemah di kolam (%.2f)"%rr))
+            fs=c.get("fastSupport")
+            if fin(fs): bl.append(("plus","gerak cepat mengonfirmasi (%.2f)"%fs) if fs>0.15 else (("minus","gerak cepat melawan (%.2f)"%fs) if fs<-0.15 else ("dim","gerak cepat netral")))
+            ae=c.get("adverseExtensionVol")
+            if fin(ae) and ae>0.3: bl.append(("minus","sudah terlalu jauh berlari (%.2f)"%ae))
+            if not c.get("selected"):
+                if best_un and worst_sel and c["symbol"]==best_un["symbol"]:
+                    bl.append(("minus","kalah tipis dari %s pada kombinasi terbaik (%.3f vs %.3f)"%(
+                        worst_sel["symbol"].replace("USDT",""),c.get("utility") or 0,worst_sel.get("utility") or 0)))
+                else: bl.append(("minus","utility di bawah tiga teratas sisinya"))
+            o.append("<div class='card' style='margin-top:6px'><b>%s</b> <span class='pill'>%s</span> %s<div class='s'>%s</div></div>"%(
+                esc(c["symbol"].replace("USDT","")),"terpilih" if c.get("selected") else "tidak terpilih",
+                "" ,"".join("<span class='%s'>%s</span> %s<br>"%(t,"+" if t=="plus" else "−" if t=="minus" else "·",esc(x)) for t,x in bl)))
+    sel=[c for c in cands if c.get("selected")]
+    ls=[c["score"] for c in sel if c["side"]=="LONG"]; ss=[c["score"] for c in sel if c["side"]=="SHORT"]
+    gap=(sum(ls)/len(ls)-sum(ss)/len(ss)) if ls and ss else None
     o.append("<h2>Basket terpilih</h2><div class='grid'>")
-    o.append(card("Skor rata-rata long", pct(100 * sum(ls)/len(ls), 2) if ls else "–", ", ".join(c["symbol"].replace("USDT","") for c in sel if c["side"]=="LONG")))
-    o.append(card("Skor rata-rata short", pct(100 * sum(ss)/len(ss), 2) if ss else "–", ", ".join(c["symbol"].replace("USDT","") for c in sel if c["side"]=="SHORT")))
-    o.append(card("Pemisahan (scoreGap)", num(gap, 4), ("minimum %s — %s" % (num(thr, 3), "lolos" if isinstance(gap,float) and isinstance(thr,float) and gap>=thr else "tidak lolos")) if thr else "minimum tidak terbaca"))
-    o.append(card("Utility gabungan", num(sf.get("objectiveScore"), 3), "sudah dikurangi penalti klaster"))
-    o.append(card("Skor sumbu pasar", num(sf.get("axisScore"), 3), "dipakai untuk bonus konfirmasi sisi lawan"))
+    o.append(card("Long",", ".join(c["symbol"].replace("USDT","") for c in sel if c["side"]=="LONG"),"skor rata-rata %s"%(pct(100*sum(ls)/len(ls),2) if ls else "–")))
+    o.append(card("Short",", ".join(c["symbol"].replace("USDT","") for c in sel if c["side"]=="SHORT"),"skor rata-rata %s"%(pct(100*sum(ss)/len(ss),2) if ss else "–")))
+    o.append(card("Pemisahan",num(gap,4),("minimum %s — %s"%(num(thr,3),"LOLOS" if fin(gap) and fin(thr) and gap>=thr else "GAGAL")) if fin(thr) else NA))
+    o.append(card("Utility akhir",num(sf.get("objectiveScore"),3),"sudah dikurangi penalti klaster"))
+    o.append(card("Skor sumbu pasar",num(sf.get("axisScore"),3),"dasar bonus konfirmasi sisi lawan"))
     o.append("</div>")
-    o.append(tech("formasi", [("Versi", esc(sf.get("version"))), ("Ukuran kolam", str(sf.get("candidatePoolSize"))),
-                              ("Sumber observasi", esc(str(src.get("openedAt")))),
-                              ("Peringkat baku", "dihitung ulang di sini: (skor berarah − rata-rata kolam) ÷ simpangan baku kolam. Tidak disimpan runtime.")]))
+    o.append(tech("formasi",[("Versi",esc(sf.get("version"))),("Ukuran kolam",str(sf.get("candidatePoolSize"))),
+        ("Sumber observasi",esc(str(src.get("openedAt")))),
+        ("Peringkat","dihitung ulang di sini: (skor berarah − rata-rata kolam) ÷ simpangan baku kolam; runtime tidak menyimpannya"),
+        ("signalWeight",NA+" pada observasi bayangan — hanya basket tereksekusi yang menyimpannya")]))
     return "".join(o)
 
 def tab_positions(R):
-    o, any_open = [], False
-    eq = (R["account"] or {}).get("accountEquity")
-    now = datetime.now(timezone.utc)
-    for k in ("live", "testnet"):
-        i = R["inst"][k]; obs = i["ex"].get("openBaskets") or []
-        o.append("<h2>%s · %d basket terbuka</h2>" % (i["label"], len(obs)))
-        if not obs:
-            o.append("<div class='card dim'>Tidak ada posisi terbuka.</div>"); continue
-        any_open = True
+    o=[];eq=(R["account"] or {}).get("accountEquity");now=datetime.now(timezone.utc);any_open=False
+    for k in ("live","testnet"):
+        i=R["inst"][k]; thr=i["fc"].get("minScoreGap"); ex=i["ex"]
+        obs=ex.get("openBaskets") or []
+        o.append("<h2>%s · %d terbuka</h2>"%(i["long"],len(obs)))
+        if not obs: o.append("<div class='card dim'>Tidak ada posisi terbuka.</div>")
         for b in obs:
-            op = parse_iso(b.get("openedAt")); age = (now - op).total_seconds()/3600.0 if op else None
-            capH = i["ex"].get("maxHoldHours")
-            notional = sum(abs((l.get("qty") or 0) * (l.get("entryPrice") or 0)) for l in b.get("legs") or [])
-            lnr = b.get("lastNetReturn"); sb = b.get("smartBasket") or {}
-            o.append("<div class='card' style='margin-top:10px'>")
-            o.append("<div style='display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px'>"
-                     "<div><b>%s</b> <span class='dim'>· dibuka %s</span></div><div>%s</div></div>" % (
-                esc(b.get("basketId")), esc(str(b.get("openedAt"))[:16]), pct(100*lnr, 3) if isinstance(lnr,float) else ""))
+            any_open=True
+            op=piso(b.get("openedAt")); age=(now-op).total_seconds()/3600.0 if op else None
+            capH=ex.get("maxHoldHours"); legs=b.get("legs") or []
+            notion=sum(abs((l.get("qty") or 0)*(l.get("entryPrice") or 0)) for l in legs)
+            lnr=b.get("lastNetReturn"); sb=b.get("smartBasket") or {}
+            bq=basket_quality(b,thr); usd=(lnr or 0)*notion/2 if fin(lnr) else None
+            o.append("<div class='card' style='margin-top:11px'>")
+            o.append("<div style='display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px'><div><b>%s</b> <span class='dim'>· dibuka %s</span></div><div>%s %s</div></div>"%(
+                friendly(b.get("basketId")),esc(str(b.get("openedAt"))[:16]),pct(100*lnr,3) if fin(lnr) else "",money(usd,3) if fin(usd) else ""))
             o.append("<div class='grid' style='margin-top:9px'>")
-            o.append(card("Umur / batas", "%.1f j / %s j" % (age, capH) if age is not None else "–",
-                          "sisa %.1f jam" % (capH - age) if age is not None and capH else ""))
-            o.append(card("Nilai posisi", money(notional, 0), ("%.0f%% ekuitas" % (100*notional/eq)) if eq else ""))
-            o.append(card("P&amp;L berjalan", pct(100*lnr, 3) if isinstance(lnr,float) else "–",
-                          money((lnr or 0) * notional / 2, 3) if isinstance(lnr,float) else ""))
-            o.append(card("Puncak terbaik", pct(100*sb["maxNetReturn"], 3) if isinstance(sb.get("maxNetReturn"),float) else "–",
-                          "pada %s" % str(sb.get("maxNetAt"))[:16] if sb.get("maxNetAt") else ""))
-            o.append(card("Regime saat buka", esc(sb.get("regimeClassAtOpen") or "–"),
-                          "sekarang %s" % esc(((R["axis"] or {}).get("current") or {}).get("regime") or "–")))
-            o.append(card("Biaya dibukukan", money(b.get("feeEstimateUsd"), 4), "sumber bursa"))
+            o.append(card("Umur / batas","%.1f / %s jam"%(age,capH) if age is not None else "–","sisa %.1f jam"%(capH-age) if age is not None and capH else ""))
+            o.append(card("Nilai posisi",money(notion,0),("%.0f%% ekuitas"%(100*notion/eq)) if eq else ""))
+            o.append(card("Hasil sejauh ini",pct(100*lnr,3) if fin(lnr) else "–",money(usd,3) if fin(usd) else ""))
+            o.append(card("Puncak terbaik",pct(100*sb["maxNetReturn"],3) if fin(sb.get("maxNetReturn")) else "–","pada %s"%str(sb.get("maxNetAt"))[:16] if sb.get("maxNetAt") else ""))
+            o.append(card("Pemisahan saat masuk",num(bq.get("scoreGap"),4),"minimum %s"%num(thr,3)))
+            o.append(card("Regime saat masuk",esc(sb.get("regimeClassAtOpen") or "–"),"kini %s"%esc(((R["axis"] or {}).get("current") or {}).get("regime") or "–")))
             o.append("</div>")
-            # ghost exits — live counters the executor still accrues although the exits are disabled
-            scans = 2
-            gh = [("Regime berbalik", sb.get("consecutiveRegimeLossScans"), sb.get("lastRegimeLossReason")),
-                  ("Tesis batal", sb.get("consecutiveInvalidationScans"), sb.get("lastInvalidationReason"))]
-            mfe = sb.get("maxNetReturn")
-            mfe_hit = isinstance(mfe, float) and isinstance(lnr, float) and mfe >= 0.002 and lnr <= mfe * 0.5
-            o.append("<h2 style='margin-top:14px'>Seandainya exit adaptif masih menyala</h2>")
-            o.append("<div class='note'>Exit ini dimatikan; penghitungnya tetap berjalan, jadi angka di bawah keadaan nyata, bukan simulasi.</div>")
-            o.append("<table><tr><th>aturan</th><th class='num'>scan berturut</th><th>akan memicu?</th><th>alasan terakhir</th></tr>")
-            for nm, c, why in gh:
-                fire = isinstance(c, int) and c >= scans
-                o.append("<tr><td>%s</td><td class='num'>%s / %d</td><td>%s</td><td class='dim'>%s</td></tr>" % (
-                    nm, c if c is not None else "–", scans, (DOT["block"]+" ya") if fire else (DOT["ok"]+" tidak"), esc(str(why or "–"))[:90]))
-            o.append("<tr><td>Kunci laba (giveback)</td><td class='num'>–</td><td>%s</td><td class='dim'>puncak %s, sekarang %s</td></tr>" % (
-                (DOT["block"]+" ya") if mfe_hit else (DOT["ok"]+" tidak"),
-                pct(100*mfe,3) if isinstance(mfe,float) else "–", pct(100*lnr,3) if isinstance(lnr,float) else "–"))
-            o.append("</table>")
+            o.append("<div class='g2' style='margin-top:10px'>")
+            o.append(score_card(bq))
+            gh=ghost_exits(b)
+            rows="".join("<tr><td>%s</td><td>%s</td><td class='num'>%s</td><td class='dim' style='white-space:normal'>%s</td></tr>"%(
+                g["rule"],(DOT["block"]+" YA") if g["fire"] else (DOT["ok"]+" tidak"),
+                ("%s/%s"%(g["scans"],g["threshold"])) if g["scans"] is not None else "–",esc(str(g["reason"] or "–"))[:110]) for g in gh)
+            fired=[g for g in gh if g["fire"]]
+            delta=""
+            if fired and fin(lnr) and fin(sb.get("maxNetReturn")):
+                d=(sb["maxNetReturn"]*0.5-lnr) if any(g["rule"].startswith("Kunci") for g in fired) else None
+                if fin(d): delta="<div class='note'>Selisih kontrafaktual jika aturan itu menyala: %s (%s dari nilai posisi).</div>"%(pct(100*d,3),money(d*notion/2,3))
+            o.append("<div class='card'><div class='k'>Seandainya exit adaptif menyala</div>"
+                     "<table style='margin-top:6px'><tr><th>aturan</th><th>memicu?</th><th class='num'>scan</th><th>alasan</th></tr>%s</table>%s"
+                     "<div class='note'>Eksekusinya dimatikan; penghitungnya tetap berjalan, jadi ini keadaan nyata, bukan simulasi.</div></div>"%(rows,delta))
+            o.append("</div>")
             o.append("<div class='scroll'><table style='margin-top:10px'><tr><th>kaki</th><th>sisi</th><th class='num'>qty</th>"
-                     "<th class='num'>harga masuk</th><th class='num'>harga kini</th><th class='num'>nilai</th>"
-                     "<th class='num'>terbaik</th><th class='num'>terburuk</th><th>fill dikonfirmasi</th></tr>")
-            for l in b.get("legs") or []:
-                nv = abs((l.get("qty") or 0) * (l.get("entryPrice") or 0))
-                o.append("<tr><td>%s</td><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
-                         "<td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td>%s</td></tr>" % (
-                    esc(l.get("symbol","").replace("USDT","")), esc(l.get("side")), num(l.get("qty"), 4),
-                    num(l.get("entryPrice"), 5), num(l.get("lastMarkPrice"), 5), money(nv, 2),
-                    num(l.get("maxFavorableR"), 3), num(l.get("maxAdverseR"), 3),
+                     "<th class='num'>masuk</th><th class='num'>kini</th><th class='num'>nilai</th><th class='num'>terbaik</th><th class='num'>terburuk</th><th>fill</th></tr>")
+            for l in legs:
+                nv=abs((l.get("qty") or 0)*(l.get("entryPrice") or 0))
+                o.append("<tr><td>%s</td><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td>%s</td></tr>"%(
+                    esc((l.get("symbol") or "").replace("USDT","")),esc(l.get("side")),num(l.get("qty"),4),
+                    num(l.get("entryPrice"),5),num(l.get("lastMarkPrice"),5),money(nv,2),
+                    num(l.get("maxFavorableR"),3),num(l.get("maxAdverseR"),3),
                     DOT["ok"] if l.get("entryPriceConfirmed") else DOT["block"]))
-            o.append("</table></div></div>")
-    if not any_open:
-        o.insert(0, lead("off", "Tidak ada posisi terbuka di mana pun", "Bot sedang menunggu formasi berikutnya."))
+            o.append("</table></div>")
+            o.append(tech("identitas & sumber · %s"%friendly(b.get("basketId")),[
+                ("ID internal","<code>%s</code>"%esc(b.get("basketId"))),
+                ("Observasi sumber","<code>%s</code>"%esc(b.get("sourceObservationId"))),
+                ("Biaya dibukukan",money(b.get("feeEstimateUsd"),4)),("Funding",NA),
+                ("Jatuh tempo horizon",esc(str(b.get("closesAtMs"))))]))
+            o.append("</div>")
+    # closed baskets review
+    o.append("<h2>Tinjauan basket yang sudah tutup</h2>")
+    got=False
+    for k in ("live","testnet"):
+        i=R["inst"][k]; thr=i["fc"].get("minScoreGap")
+        for b in (i["ex"].get("recent") or []):
+            if b.get("status")=="OPEN" or not b.get("closedAt"): continue
+            got=True
+            bq=basket_quality(b,thr); net=b.get("netPnlUsd"); lnr=b.get("lastNetReturn")
+            proc,outc=post_trade_verdict(bq.get("value"),net)
+            legs=b.get("legs") or []
+            notion=sum(abs((l.get("qty") or 0)*(l.get("entryPrice") or 0)) for l in legs)
+            o.append("<div class='card' style='margin-top:10px'><div style='display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px'>"
+                     "<div><b>%s</b> <span class='dim'>· %s → %s · %s</span></div><div><b>%s · %s</b></div></div>"%(
+                friendly(b.get("basketId")),esc(str(b.get("openedAt"))[:16]),esc(str(b.get("closedAt"))[:16]),
+                esc(b.get("closeReason") or "–"),proc,outc))
+            o.append("<div class='grid' style='margin-top:8px'>")
+            o.append(card("Hasil akhir",money_pct(net,eq,4),pct(100*lnr,3) if fin(lnr) else ""))
+            o.append(card("Kualitas proses",num(bq.get("value"),0),rate(bq.get("value"))))
+            o.append(card("Nilai posisi",money(notion,0),"biaya %s"%money(b.get("feeEstimateUsd"),4)))
+            o.append("</div>")
+            up="".join("<div><span class='plus'>+</span> %s</div>"%esc(x) for x in bq.get("whyUp") or [])
+            dn="".join("<div><span class='minus'>−</span> %s</div>"%esc(x) for x in bq.get("whyDown") or [])
+            o.append("<div class='g2' style='margin-top:8px'><div class='card'><div class='k'>Yang berjalan baik</div><div class='s'>%s</div></div>"
+                     "<div class='card'><div class='k'>Yang merugikan</div><div class='s'>%s</div></div></div>"%(up or "<span class='dim'>–</span>",dn or "<span class='dim'>–</span>"))
+            o.append("<div class='scroll'><table style='margin-top:8px'><tr><th>kaki</th><th>sisi</th><th class='num'>masuk</th><th class='num'>keluar</th><th class='num'>kontribusi</th></tr>")
+            for l in legs:
+                e_,x_=l.get("entryPrice"),l.get("exitPrice")
+                c=None
+                if fin(e_) and fin(x_) and e_:
+                    c=((x_-e_)/e_ if l.get("side")=="LONG" else (e_-x_)/e_)
+                o.append("<tr><td>%s</td><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td></tr>"%(
+                    esc((l.get("symbol") or "").replace("USDT","")),esc(l.get("side")),num(e_,5),num(x_,5),pct(100*c,3) if fin(c) else "–"))
+            o.append("</table></div>")
+            o.append("<div class='note'>Kualitas proses dinilai dari pembentukan dan eksekusinya, bukan dari untung-ruginya. Basket yang dibentuk baik boleh rugi, dan sebaliknya.</div></div>")
+    if not got: o.append("<div class='card dim'>Belum ada basket tertutup pada jendela terbaru.</div>")
+    if not any_open and not got: o.insert(0,lead("off","Tidak ada posisi maupun riwayat terbaru","Bot sedang menunggu formasi berikutnya."))
     return "".join(o)
 
 def tab_edge(R):
-    e = R["edge"]; W = e["windows"]; o = []
-    allw = W["seluruhnya"]
-    if not allw.get("n"):
-        return lead("off", "Belum ada bukti", "Belum ada observasi sinyal produksi yang selesai.")
-    ep = e["episodes"]
-    o.append(lead("ok" if (allw.get("tStat") or 0) > 2 else "watch" if ep < 30 else "block" if (allw.get("meanPct") or 0) < 0 else "watch",
-        "Rata-rata %s per basket dari %d observasi" % (pct(allw.get("meanPct"), 3), allw["n"]),
-        "Tapi hanya <b>%d episode independen</b> — observasi bayangan dibuka tiap ~1 jam dan ditahan 48 jam, jadi jumlah mentahnya melebih-lebihkan bukti. Di bawah 30 episode, hasil apa pun sulit dibedakan dari nol." % ep))
-    o.append("<div class='scroll'><table><tr><th>jendela</th><th class='num'>N</th><th class='num'>rata-rata</th>"
-             "<th class='num'>menang</th><th class='num'>profit factor</th><th class='num'>drawdown</th><th class='num'>t-stat</th></tr>")
-    for lbl in ("8 terakhir", "30 terakhir", "90 terakhir", "seluruhnya"):
-        s = W[lbl]
-        o.append("<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td>"
-                 "<td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td></tr>" % (
-            lbl, s.get("n"), pct(s.get("meanPct"), 3), num(s.get("winPct"), 0) + "%" if s.get("n") else "–",
-            num(s.get("pf"), 2), pct(s.get("ddPct"), 2, False), num(s.get("tStat"), 2)))
-    o.append("</table></div>")
-    o.append("<h2>Kurva hasil kumulatif</h2>")
-    o.append(spark_area([c["net"] for c in e["curve"]]))
-    o.append("<div class='note'>Sumbu tegak = jumlah kumulatif hasil bersih per basket (fraksi), bukan dolar.</div>")
-    o.append("<h2>Hasil menurut pemisahan skor</h2>")
-    o.append(bars([(b["key"], b.get("meanPct")) for b in e["byGap"]]))
-    o.append("<h2>Pemisahan skor vs hasil akhir</h2>")
-    thr = ((get(INST["live"]["api"] + "/api/shadow/cross-sectional-report") or {}).get("filteredConfig") or {}).get("minScoreGap") or 0.058
-    o.append(scatter(e["gapVsReturn"], thr))
-    o.append("<h2>Hasil menurut keadaan pasar</h2>")
-    o.append(bars([(b["key"].replace("TREND_", "").replace("MIXED_", ""), b.get("meanPct")) for b in e["byRegime"]]))
-    o.append("<h2>Hasil menurut lama tahan</h2>")
-    o.append(bars([(b["key"], b.get("meanPct")) for b in e["byHold"]]))
-    o.append("<h2>Kontribusi per bulan</h2>")
-    o.append(bars([(b["key"][2:], b.get("totalPct")) for b in e["byMonth"]]))
-    o.append("<h2>Sisi long vs short</h2>")
-    o.append(bars([("long", e["sideLong"].get("meanPct")), ("short", e["sideShort"].get("meanPct"))]))
-    o.append("<h2>Skor performa</h2><div class='grid'>")
-    for key, lbl in (("overall","Performa keseluruhan"),("edge","Kualitas edge"),("recent","Performa terakhir"),
-                     ("dd","Kendali drawdown"),("exec","Kualitas eksekusi"),("data","Kualitas data"),("research","Kekuatan bukti")):
-        o.append(gauge(lbl, R["gauges"].get(key), GAUGE_DOC[key]))
+    e=R["edge"];W=e["windows"];allw=W["seluruhnya"];o=[]
+    if not allw.get("n"): return lead("off","Belum ada bukti","Belum ada observasi sinyal produksi yang selesai.")
+    eps=e["episodes"]
+    o.append(lead("watch" if eps<30 else ("ok" if (e["tEff"] or 0)>2 else "watch"),
+        "%d episode independen — inilah ukuran bukti yang sebenarnya"%eps,
+        "Observasi bayangan dibuka tiap ~1 jam dan ditahan sampai horizonnya, jadi hampir seluruhnya tumpang tindih. "
+        "Angka mentahnya %d observasi, tapi hanya %d petak pasar yang benar-benar terpisah. "
+        "<b>t-stat terkoreksi %s</b> (mentah %s). Di bawah ~30 episode, selisih sebesar edge lane ini belum bisa dipisahkan dari nol."%(
+        allw["n"],eps,num(e["tEff"],2),num(e["tRaw"],2))))
+    o.append("<div class='grid'>")
+    o.append(card("Episode independen",str(eps),"dari %d observasi (%.1f× tumpang tindih)"%(allw["n"],allw["n"]/max(1,eps))))
+    o.append(card("t-stat terkoreksi",num(e["tEff"],2),"angka utama · mentah %s ada di detail"%num(e["tRaw"],2)))
+    o.append(card("Rata-rata per basket",pct(allw.get("meanPct"),3),"seluruh riwayat"))
+    o.append(card("Rentetan rugi terpanjang","%d basket"%e["longestLossStreak"],"berturut-turut"))
     o.append("</div>")
-    o.append(tech("sumber & metode", [
-        ("Sinyal yang diukur", "<code>%s</code> — hanya observasi yang sudah selesai" % e["signal"]),
-        ("Sumber", "penyimpanan observasi kedua instance, digabung dan dide-duplikasi"),
-        ("Episode independen", "sampel non-tumpang-tindih pada horizon 48 jam — aturan yang sama dipakai harness"),
-        ("Profit factor", "total hasil positif ÷ |total hasil negatif|"),
-        ("t-stat di tabel", "rata-rata ÷ (simpangan baku ÷ √N); TIDAK dikoreksi untuk tumpang tindih, jadi terlalu optimistis"),
-        ("t-stat dipakai skor", "t mentah × akar(episode independen ÷ N) — inilah yang masuk gauge Kualitas edge, supaya tidak membantah gauge Kekuatan bukti"),
-        ("Biaya", "sudah termasuk — observasi menyimpan hasil bersih setelah biaya bolak-balik"),
-        ("Funding & slippage", "tidak dibukukan terpisah oleh runtime — <b>tidak tersedia</b>"),
-    ]))
+    o.append("<h2>Jendela bergulir</h2><div class='scroll'><table><tr><th>jendela</th><th class='num'>N</th><th class='num'>rata-rata</th><th class='num'>menang</th><th class='num'>PF</th><th class='num'>drawdown</th><th class='num'>t mentah</th></tr>")
+    for lbl in ("8 terakhir","30 terakhir","90 terakhir","seluruhnya"):
+        s=W[lbl]
+        o.append("<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num dim'>%s</td></tr>"%(
+            lbl,s.get("n"),pct(s.get("meanPct"),3),(num(s.get("winPct"),0)+"%") if s.get("n") else "–",num(s.get("pf"),2),pct(s.get("ddPct"),2,False),num(s.get("tStat"),2)))
+    o.append("</table></div><div class='note'>Kolom t di sini <b>mentah</b> dan tidak dikoreksi tumpang tindih — berguna untuk membandingkan antar-jendela, bukan untuk menilai kekuatan bukti. Untuk itu pakai t terkoreksi di atas.</div>")
+    o.append("<h2>Kurva hasil kumulatif</h2>"+curve_svg([c["net"] for c in e["curve"]]))
+    o.append("<h2>Drawdown</h2>"+dd_svg([c["net"] for c in e["curve"]]))
+    o.append("<h2>Hasil menurut pemisahan skor</h2>"+bars([(b["key"],b.get("meanPct")) for b in e["byGap"]]))
+    o.append("<h2>Pemisahan skor vs hasil akhir</h2>"+scatter(e["gapVsReturn"],R["inst"]["live"]["fc"].get("minScoreGap") or 0.058))
+    o.append("<h2>Hasil menurut keadaan pasar</h2>"+bars([(b["key"].replace("TREND_","").replace("MIXED_",""),b.get("meanPct")) for b in e["byRegime"]]))
+    o.append("<h2>Hasil menurut lama tahan</h2>"+bars([(b["key"],b.get("meanPct")) for b in e["byHold"]]))
+    o.append("<h2>Kontribusi per bulan</h2>"+bars([(b["key"][2:],b.get("totalPct")) for b in e["byMonth"]]))
+    if e["byQuarter"]: o.append("<h2>Kontribusi per kuartal</h2>"+bars([(b["key"][2:],b.get("totalPct")) for b in e["byQuarter"]]))
+    o.append("<h2>Long vs short</h2>"+bars([("long",e["sideLong"].get("meanPct")),("short",e["sideShort"].get("meanPct"))]))
+    c=e["concentration"]
+    if c:
+        o.append("<h2>Konsentrasi hasil</h2><div class='grid'>")
+        o.append(card("Kuartal terbesar",esc(c["topQuarter"]),"menyumbang %.0f%% dari seluruh pergerakan"%c["share"]))
+        o.append(card("Bulan untung","%d dari %d"%(c["profitableMonths"],c["months"]),"sisanya rugi atau datar"))
+        o.append("</div><div class='note'>Kalau satu kuartal menyumbang sebagian besar hasil, rata-rata tahunan menyembunyikan kenyataannya: hasilnya datang bergerombol, bukan mengalir rata.</div>")
+    o.append("<h2>Skor performa</h2><div class='g2'>")
+    for k in ("overall","edge","recent","dd","exec","data","evidence"): o.append(score_card(R["scores"][k]))
+    o.append("</div>")
+    o.append(tech("sumber & metode",[
+        ("Sinyal diukur","<code>%s</code>, hanya observasi selesai"%e["signal"]),
+        ("Sumber","penyimpanan observasi kedua instance, digabung & dide-duplikasi"),
+        ("Episode independen","sampel non-tumpang-tindih pada horizon 48 jam"),
+        ("t terkoreksi","t mentah × akar(episode ÷ N) — inilah yang masuk skor"),
+        ("Profit factor","total hasil positif ÷ |total hasil negatif|"),
+        ("Biaya","sudah dikurangi di tiap observasi"),("Funding & slippage",NA+" — tidak dibukukan terpisah")]))
     return "".join(o)
 
 def tab_research(R):
-    o = []
-    rows = []
-    for k in ("live", "testnet"):
-        rows += R["inst"][k]["rows"]
-    thr = ((get(INST["live"]["api"] + "/api/shadow/cross-sectional-report") or {}).get("filteredConfig") or {}).get("minScoreGap")
-    o.append(lead("watch", "Perbandingan kebijakan dihitung dari observasi yang sama",
-        "Kedua kebijakan dievaluasi pada himpunan sinyal identik, jadi selisihnya murni efek aturan — bukan perbedaan periode atau simbol."))
-    if isinstance(thr, float) and rows:
-        base = [r["netReturn"] for r in rows]
-        prod = [r["netReturn"] for r in rows if isinstance(r.get("scoreGap"), float) and r["scoreGap"] >= thr]
-        bs, ps = edge_stats(base), edge_stats(prod)
-        o.append("<div class='scroll'><table><tr><th>kebijakan</th><th class='num'>N</th><th class='num'>rata-rata/basket</th>"
-                 "<th class='num'>menang</th><th class='num'>total</th><th class='num'>drawdown</th><th class='num'>t-stat</th></tr>")
-        for lbl, s in (("Tanpa ambang pemisahan (dasar)", bs), ("Produksi: ambang %.3f" % thr, ps)):
-            o.append("<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s%%</td>"
-                     "<td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td></tr>" % (
-                lbl, s.get("n"), pct(s.get("meanPct"), 3), num(s.get("winPct"), 0),
-                pct(s.get("totalPct"), 2), pct(s.get("ddPct"), 2, False), num(s.get("tStat"), 2)))
+    o=[];e=R["edge"];thr=R["inst"]["live"]["fc"].get("minScoreGap")
+    mm=R.get("mismatch") or []
+    if mm:
+        o.append(lead("watch","Bukti riset TIDAK persis mewakili kebijakan produksi",
+            "Angka edge di dashboard ini diukur pada kebijakan yang berbeda dari yang dijalankan sekarang. Perbedaannya di bawah — bukan alasan membuang buktinya, tapi alasan untuk tidak membacanya sebagai bukti langsung atas konfigurasi hari ini."))
+        o.append("<div class='scroll'><table><tr><th>hal</th><th>produksi</th><th>bukti</th><th>kenapa penting</th></tr>")
+        for m in mm:
+            o.append("<tr><td><b>%s</b></td><td>%s</td><td>%s</td><td class='dim' style='white-space:normal'>%s</td></tr>"%(
+                esc(m["what"]),esc(m["prod"]),esc(m["evid"]),esc(m["why"])))
         o.append("</table></div>")
-        o.append("<div class='note'>Ambang menaikkan kualitas per basket tetapi membuang sebagian peluang — total bisa turun meski rata-ratanya naik.</div>")
-    else:
-        o.append("<div class='card dim'>Bukti tidak cukup untuk membandingkan kebijakan.</div>")
-
-    o.append("<h2>Varian sinyal yang berjalan berdampingan</h2>")
-    per = {}
-    for k in ("live", "testnet"):
-        try: obs = (json.load(open(INST[k]["store"])) or {}).get("observations") or []
-        except Exception: obs = []
+    else: o.append(lead("ok","Bukti mewakili kebijakan produksi","Tidak ada ketidakcocokan terdeteksi."))
+    rows=[]
+    for k in INST: rows+=R["inst"][k]["rows"]
+    o.append("<h2>Perbandingan kebijakan pada sinyal yang sama</h2>")
+    if fin(thr) and rows:
+        base=[r["netReturn"] for r in rows]
+        prod=[r["netReturn"] for r in rows if fin(r.get("scoreGap")) and r["scoreGap"]>=thr]
+        o.append("<div class='scroll'><table><tr><th>kebijakan</th><th class='num'>N</th><th class='num'>rata-rata</th><th class='num'>menang</th><th class='num'>total</th><th class='num'>drawdown</th><th class='num'>t mentah</th></tr>")
+        for lbl,s in (("Dasar — tanpa ambang pemisahan",stats(base)),("Produksi — ambang %.3f"%thr,stats(prod))):
+            o.append("<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s%%</td><td class='num'>%s</td><td class='num'>%s</td><td class='num dim'>%s</td></tr>"%(
+                lbl,s.get("n"),pct(s.get("meanPct"),3),num(s.get("winPct"),0),pct(s.get("totalPct"),2),pct(s.get("ddPct"),2,False),num(s.get("tStat"),2)))
+        o.append("</table></div><div class='note'>Keduanya dievaluasi pada himpunan sinyal identik, jadi selisihnya murni efek aturan — bukan beda periode atau simbol. Ambang menaikkan kualitas per basket tetapi membuang peluang, sehingga total bisa turun meski rata-ratanya naik.</div>")
+    else: o.append("<div class='card dim'>Bukti tidak cukup untuk membandingkan kebijakan.</div>")
+    per={}
+    for k in INST:
+        try: obs=(json.load(open(INST[k]["store"])) or {}).get("observations") or []
+        except Exception: obs=[]
         for ob in obs:
-            if ob.get("status") == "OPEN": continue
-            nr = ob.get("netReturn")
-            if isinstance(nr, (int, float)): per.setdefault(ob.get("signal") or "?", []).append(nr)
+            if ob.get("status")=="OPEN": continue
+            nr=ob.get("netReturn")
+            if fin(nr): per.setdefault(ob.get("signal") or "?",[]).append(nr)
     if per:
-        o.append("<div class='scroll'><table><tr><th>varian</th><th class='num'>N</th><th class='num'>rata-rata</th><th class='num'>menang</th><th class='num'>t-stat</th><th>peran</th></tr>")
-        for sig, v in sorted(per.items(), key=lambda x: -len(x[1]))[:8]:
-            s = edge_stats(v)
-            o.append("<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s%%</td><td class='num'>%s</td><td class='dim'>%s</td></tr>" % (
-                esc(sig), s["n"], pct(s.get("meanPct"), 3), num(s.get("winPct"), 0), num(s.get("tStat"), 2),
-                "produksi" if sig == PROD_SIGNAL else "pembanding"))
+        o.append("<h2>Varian yang berjalan berdampingan</h2><div class='scroll'><table><tr><th>varian</th><th class='num'>N</th><th class='num'>rata-rata</th><th class='num'>menang</th><th class='num'>t mentah</th><th>peran</th></tr>")
+        for sig,v in sorted(per.items(),key=lambda x:-len(x[1]))[:8]:
+            s=stats(v)
+            o.append("<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s%%</td><td class='num dim'>%s</td><td class='dim'>%s</td></tr>"%(
+                esc(sig),s["n"],pct(s.get("meanPct"),3),num(s.get("winPct"),0),num(s.get("tStat"),2),"produksi" if sig==PROD_SIGNAL else "pembanding"))
         o.append("</table></div>")
-    o.append("<h2>Kelemahan yang diketahui</h2>")
-    W = R["edge"]["windows"]["seluruhnya"]; ep = R["edge"]["episodes"]
-    weak = []
-    if ep < 30: weak.append(("block", "Bukti tipis", "%d episode independen. Di bawah 30, selisih sebesar edge lane ini tidak bisa dipisahkan dari nol." % ep))
-    if W.get("n") and ep and W["n"] / max(ep, 1) > 3:
-        weak.append(("watch", "Observasi sangat tumpang tindih", "%d observasi hanya mewakili %d episode (rasio %.1f×). Setiap t-stat di halaman ini terlalu optimistis." % (W["n"], ep, W["n"]/ep)))
-    mo = R["edge"]["byMonth"]
-    if len(mo) >= 2:
-        tot = sum(abs(b.get("totalPct") or 0) for b in mo) or 1
-        top = max(mo, key=lambda b: abs(b.get("totalPct") or 0))
-        if abs(top.get("totalPct") or 0) / tot > .5:
-            weak.append(("watch", "Hasil terkonsentrasi", "Bulan %s menyumbang %.0f%% dari seluruh pergerakan. Rata-rata tahunan menyembunyikan ini." % (top["key"], 100*abs(top["totalPct"])/tot)))
-    if R["execQuality"]["pct"] is not None and R["execQuality"]["pct"] < 100:
-        weak.append(("watch", "Sebagian harga fill tak terkonfirmasi", "%d dari %d harga dibukukan tanpa konfirmasi bursa." % (
-            R["execQuality"]["total"] - R["execQuality"]["confirmed"], R["execQuality"]["total"])))
-    if not weak: weak.append(("ok", "Tidak ada kelemahan terdeteksi otomatis", "Pemeriksaan ini hanya melihat ukuran sampel, tumpang tindih, konsentrasi, dan kualitas fill."))
-    o.append("<table><tr><th>status</th><th>kelemahan</th><th>keterangan</th></tr>")
-    for s, t, d in weak: o.append("<tr><td>%s</td><td>%s</td><td class='dim'>%s</td></tr>" % (DOT[s], t, d))
-    o.append("</table>")
-    o.append("<h2>Riwayat perubahan</h2>")
-    log = sh("git -C %s log --oneline -12 2>/dev/null" % INST["live"]["rel"])
-    if log and not log.startswith("ERR"):
-        o.append("<div class='scroll'><table><tr><th>commit</th><th>keterangan</th></tr>%s</table></div>" % "".join(
-            "<tr><td class='dim'>%s</td><td>%s</td></tr>" % (esc(l.split(" ",1)[0]), esc(l.split(" ",1)[1] if " " in l else ""))
-            for l in log.splitlines()))
+    o.append("<h2>Provenance riset</h2>")
+    o.append("<div class='scroll'><table><tr><th>hal</th><th>keadaan</th></tr>"
+      "<tr><td>Periode data</td><td>%s → %s</td></tr>"
+      "<tr><td>Observasi / episode independen</td><td>%d / %d</td></tr>"
+      "<tr><td>Horizon bukti</td><td>%s jam</td></tr>"
+      "<tr><td>Biaya</td><td>sudah dikurangi tiap observasi</td></tr>"
+      "<tr><td>Funding / slippage</td><td>%s</td></tr>"
+      "<tr><td>Observasi tumpang tindih</td><td>ya — %.1f× · t terkoreksi dipakai sebagai angka utama</td></tr>"
+      "<tr><td>Pemisahan holdout / OOS</td><td>%s — perbandingan di atas in-sample</td></tr>"
+      "<tr><td>ID & tanggal jalannya harness</td><td>%s — harness berjalan di luar layanan ini</td></tr>"
+      "<tr><td>Konfigurasi diuji sebagai satu bundel?</td><td>%s</td></tr></table></div>"%(
+      esc((R["edge"]["curve"][0]["at"] or "")[:10]) if R["edge"]["curve"] else "–",
+      esc((R["edge"]["curve"][-1]["at"] or "")[:10]) if R["edge"]["curve"] else "–",
+      R["edge"]["windows"]["seluruhnya"].get("n",0),R["edge"]["episodes"],
+      " / ".join("%g"%h for h in R["edge"]["evidenceHorizonsH"]) or "–",NA,
+      R["edge"]["windows"]["seluruhnya"].get("n",0)/max(1,R["edge"]["episodes"]),NA,NA,NA))
+    o.append("<h2>Riwayat perubahan parameter</h2>")
+    log=sh("git -C %s log --oneline -14 2>/dev/null"%INST["live"]["rel"])
+    if log and not log.startswith("ERR") and log.strip():
+        o.append("<div class='scroll'><table><tr><th>commit</th><th>perubahan</th></tr>%s</table></div>"%"".join(
+            "<tr><td class='dim'>%s</td><td>%s</td></tr>"%(esc(l.split(" ",1)[0]),esc(l.split(" ",1)[1] if " " in l else "")) for l in log.splitlines()))
     else:
-        o.append("<div class='card dim'>Tidak tersedia — direktori rilis ini bukan checkout git, jadi riwayat perubahan tidak bisa dibaca dari runtime.</div>")
-    o.append(tech("cakupan & batasan pengukuran", [
-        ("Termasuk", "biaya bolak-balik sudah dikurangi dari tiap observasi"),
-        ("Tidak termasuk", "funding dan slippage tidak dibukukan terpisah oleh runtime — <b>tidak tersedia</b>"),
-        ("Point-in-time", "observasi dicatat saat dibentuk dan diselesaikan pada horizonnya; tidak ada penulisan ulang ke belakang"),
-        ("Holdout", "tidak ada pemisahan holdout di runtime — perbandingan di atas in-sample terhadap data yang sama"),
-        ("Jalannya harness", "harness riset berjalan di luar layanan ini — <b>tidak tersedia</b> dari runtime"),
-    ]))
+        o.append("<div class='card dim'>%s — direktori rilis bukan checkout git, jadi riwayat <code>parameter → perubahan → bukti</code> tidak bisa dibaca dari runtime. Yang bisa diverifikasi runtime hanyalah nilai yang berlaku sekarang dan kepatuhannya terhadap berkas kebijakan.</div>"%NA)
     return "".join(o)
 
 def tab_system(R):
-    o, sysd = [], R["system"]
-    bad = [j for j in sysd["jobs"] if j["stale"]] + [p for p in sysd["pm2"] if p["status"] != "online"]
-    o.append(lead("block" if bad else "ok",
-                  "Infrastruktur sehat" if not bad else "%d komponen perlu perhatian" % len(bad),
-                  "Kesehatan sistem dinilai terpisah dari kesehatan edge: layanan bisa sempurna sementara strateginya rugi, dan sebaliknya."))
-    o.append("<h2>Layanan</h2><table><tr><th>proses</th><th>status</th><th class='num'>restart</th></tr>")
-    for p in sysd["pm2"]:
-        o.append("<tr><td>%s</td><td>%s %s</td><td class='num'>%s</td></tr>" % (
-            esc(p["name"]), DOT["ok"] if p["status"] == "online" else DOT["block"], esc(p["status"]), p["restarts"]))
-    o.append("</table>")
-    o.append("<h2>Kesegaran data</h2><table><tr><th>komponen</th><th>umur</th><th>ambang</th><th>status</th></tr>")
-    for j in sysd["jobs"]:
-        o.append("<tr><td>%s</td><td>%s</td><td class='dim'>%.0f jam</td><td>%s</td></tr>" % (
-            j["job"], "tidak pernah" if j["ageHours"] is None else "%.1f jam" % j["ageHours"], j["maxHours"],
-            (DOT["block"] + " berhenti") if j["stale"] else (DOT["ok"] + " berjalan")))
-    for k in ("live", "testnet"):
-        ex = R["inst"][k]["ex"]
-        st = ex.get("signalStale")
-        o.append("<tr><td>Sinyal %s</td><td>%.0f menit</td><td class='dim'>%.0f menit</td><td>%s</td></tr>" % (
-            R["inst"][k]["label"], (ex.get("signalAgeMs") or 0)/60000.0, (ex.get("signalMaxAgeMs") or 0)/60000.0,
-            (DOT["watch"] + " basi") if st else (DOT["ok"] + " segar")))
-    o.append("</table>")
-    prow = (R["inst"]["live"]["pool"] or {}).get("rows") or []
-    miss = [r["symbol"] for r in prow if not isinstance(r.get("liquidityUsdPerHour"), (int, float))]
-    o.append("<h2>Kualitas universe</h2><div class='grid'>")
-    o.append(card("Simbol terukur", "%d / %d" % (len(prow) - len(miss), len(prow)), "likuiditas terbaca dari bursa"))
-    o.append(card("Tidak terukur", str(len(miss)), esc(", ".join(s.replace("USDT","") for s in miss)) or "tidak ada"))
-    o.append(card("Selisih kriteria", str(len((R["inst"]["live"]["pool"] or {}).get("mismatch") or [])), "pool vs kriteria mentah"))
+    o=[];sy=R["system"];ex=R["exec"]
+    bad=[j for j in sy["jobs"] if j["stale"]]+[p for p in sy["pm2"] if p["status"]!="online"]
+    o.append(lead("block" if bad else "ok","Infrastruktur sehat" if not bad else "%d komponen perlu perhatian"%len(bad),
+        "Kesehatan sistem dinilai terpisah dari kesehatan edge: layanan bisa sempurna sementara strateginya rugi, dan sebaliknya."))
+    o.append("<h2>Kualitas eksekusi</h2><div class='grid'>")
+    o.append(card("Harga fill terkonfirmasi",("%.0f%%"%ex["pct"]) if fin(ex["pct"]) else NA,"%d dari %d nilai"%(ex["confirmed"],ex["total"])))
+    o.append(card("Galat ukuran kaki",("%.1f%%"%ex["notionalErrPct"]) if fin(ex["notionalErrPct"]) else NA,"simpangan dari nilai rencana (pembulatan lot)"))
+    o.append(card("Selisih harga masuk",("%.3f%%"%ex["entryDriftPct"]) if fin(ex["entryDriftPct"]) else NA,"fill vs harga acuan saat rencana"))
+    lat=[v for v in ex["latency"].values() if fin(v)]
+    o.append(card("Latensi sinyal→order",("%.1f detik"%(sum(lat)/len(lat))) if lat else NA,"rata-rata percobaan terakhir tiap instance"))
     o.append("</div>")
-    o.append("<h2>Kualitas eksekusi</h2>")
-    drift = []
-    for k in ("live", "testnet"):
-        for b in (R["inst"][k]["ex"].get("recent") or [])[-6:]:
-            plan = {p.get("symbol"): p for p in (b.get("plan") or []) if isinstance(p, dict)}
-            for l in b.get("legs") or []:
-                p = plan.get(l.get("symbol"))
-                if not p: continue
-                tgt, act = p.get("targetNotionalUsd"), abs((l.get("qty") or 0) * (l.get("entryPrice") or 0))
-                if isinstance(tgt, (int, float)) and tgt > 0:
-                    drift.append((l.get("symbol"), 100 * (act / tgt - 1),
-                                  100 * ((l.get("entryPrice") or 0) / (p.get("refPrice") or 1) - 1) if p.get("refPrice") else None))
-    o.append("<div class='grid'>")
-    o.append(card("Harga fill terkonfirmasi", ("%.0f%%" % R["execQuality"]["pct"]) if R["execQuality"]["pct"] is not None else "–",
-                  "%d dari %d nilai" % (R["execQuality"]["confirmed"], R["execQuality"]["total"])))
-    if drift:
-        rd = [d[1] for d in drift]
-        pd_ = [d[2] for d in drift if isinstance(d[2], float)]
-        o.append(card("Galat pembulatan lot", "%.1f%%" % (sum(abs(x) for x in rd)/len(rd)), "rata-rata simpangan dari nilai target"))
-        o.append(card("Selisih harga masuk", ("%.3f%%" % (sum(abs(x) for x in pd_)/len(pd_))) if pd_ else "–", "fill vs harga acuan saat rencana"))
-    o.append(card("Kaki yatim", str(len(R["inst"]["live"]["ex"].get("orphanedLegs") or []) + len(R["inst"]["testnet"]["ex"].get("orphanedLegs") or [])), "posisi tanpa basket induk"))
-    o.append(card("Basket akunting belum lengkap", str(len(R["inst"]["live"]["ex"].get("accountingIncompleteBaskets") or []) + len(R["inst"]["testnet"]["ex"].get("accountingIncompleteBaskets") or [])), "tidak semua kaki punya harga keluar"))
+    o.append("<h2>Kualitas data</h2><div class='grid'>")
+    d=R["data"]
+    o.append(card("Simbol terukur","%d / %d"%(d["universe"]-len(d["missing"]),d["universe"]),esc(", ".join(s.replace("USDT","") for s in d["missing"])) or "semua terbaca"))
+    o.append(card("Sinyal basi",", ".join(R["inst"][k]["label"] for k in d["stale"]) or "tidak ada","batas umur sinyal dari executor"))
+    o.append(card("Selisih jam bursa",("%.0f ms"%R["clockSkewMs"]) if fin(R.get("clockSkewMs")) else NA,"host vs waktu server Binance"))
     o.append("</div>")
-    o.append("<h2>Perbedaan konfigurasi antar-instance</h2><div class='scroll'><table><tr><th>parameter</th><th>live</th><th>testnet</th><th>sama?</th></tr>")
-    lv, tn = R["inst"]["live"]["ex"], R["inst"]["testnet"]["ex"]
-    lc = ((get(INST["live"]["api"] + "/api/shadow/cross-sectional-report") or {}).get("filteredConfig") or {})
-    tc = ((get(INST["testnet"]["api"] + "/api/shadow/cross-sectional-report") or {}).get("filteredConfig") or {})
-    for lbl, a, b in (("Ukuran per kaki", lv.get("legUsd"), tn.get("legUsd")),
-                      ("Batas tahan (jam)", lv.get("maxHoldHours"), tn.get("maxHoldHours")),
-                      ("Stop (%)", lv.get("stopNetReturnPct"), tn.get("stopNetReturnPct")),
-                      ("Ambil untung (%)", lv.get("tpNetReturnPct"), tn.get("tpNetReturnPct")),
-                      ("Ambang pemisahan", lc.get("minScoreGap"), tc.get("minScoreGap")),
-                      ("Sinyal", lc.get("signal"), tc.get("signal")),
-                      ("Ukuran universe", len(lc.get("executionUniverse") or []), len(tc.get("executionUniverse") or [])),
-                      ("Override gerbang bukti", lv.get("entryHealthBypassed"), tn.get("entryHealthBypassed"))):
-        same = (a == b)
-        o.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-            lbl, esc(a), esc(b), DOT["ok"] if same else DOT["watch"]))
-    o.append("</table></div>")
-    o.append("<div class='note'>Perbedaan pada baris terakhir memang disengaja: testnet melonggarkan perlindungan modal karena tidak punya modal untuk dilindungi, sementara parameter strategi sengaja dijaga identik agar hasilnya sebanding.</div>")
-    o.append(tech("host & integritas", [
-        ("Waktu host (UTC)", esc(sysd["hostTimeUtc"][:19])),
-        ("Disk", "%s terpakai dari %s, sisa %s" % (sysd["disk"]["pct"], sysd["disk"]["size"], sysd["disk"]["avail"]) if sysd.get("disk") else "–"),
-        ("Hash manifest kode", "<br>".join("%s: <code>%s</code>" % (k, (v or "tidak tersedia")[:20]) for k, v in (sysd["manifests"] or {}).items())),
-        ("Kepatuhan kebijakan konfigurasi", "<br>".join("%s: %s" % (R["inst"][k]["label"], esc(R["inst"][k]["envPolicy"][:60])) for k in INST)),
-    ]))
+    o.append("<h2>Layanan &amp; pekerjaan latar</h2><table><tr><th>komponen</th><th>status</th><th class='dim'>rinci</th></tr>")
+    for p in sy["pm2"]:
+        o.append("<tr><td>%s</td><td>%s %s</td><td class='dim'>restart %s</td></tr>"%(esc(p["name"]),DOT["ok"] if p["status"]=="online" else DOT["block"],esc(p["status"]),p["restarts"]))
+    for j in sy["jobs"]:
+        o.append("<tr><td>%s</td><td>%s %s</td><td class='dim'>terakhir %s, ambang %.0f jam</td></tr>"%(
+            j["job"],DOT["block"] if j["stale"] else DOT["ok"],"BERHENTI" if j["stale"] else "berjalan",
+            "tidak pernah" if j["ageHours"] is None else "%.1f jam lalu"%j["ageHours"],j["maxHours"]))
+    o.append("</table>")
+    o.append("<h2>Perbandingan lingkungan</h2><div class='scroll'><table><tr><th>parameter</th><th>LIVE</th><th>TESTNET</th><th>sama?</th></tr>")
+    lv,tn=R["inst"]["live"],R["inst"]["testnet"]
+    for lbl,a,b in (("Ukuran per kaki",lv["ex"].get("legUsd"),tn["ex"].get("legUsd")),
+                    ("Batas tahan (jam)",lv["ex"].get("maxHoldHours"),tn["ex"].get("maxHoldHours")),
+                    ("Stop (%)",lv["ex"].get("stopNetReturnPct"),tn["ex"].get("stopNetReturnPct")),
+                    ("Ambil untung (%)",lv["ex"].get("tpNetReturnPct"),tn["ex"].get("tpNetReturnPct")),
+                    ("Ambang pemisahan",lv["fc"].get("minScoreGap"),tn["fc"].get("minScoreGap")),
+                    ("Sinyal",lv["fc"].get("signal"),tn["fc"].get("signal")),
+                    ("Ukuran universe",len(lv["fc"].get("executionUniverse") or []),len(tn["fc"].get("executionUniverse") or [])),
+                    ("Basket bersamaan",lv["ex"].get("maxOpenBaskets"),tn["ex"].get("maxOpenBaskets")),
+                    ("Override gerbang bukti",lv["ex"].get("entryHealthBypassed"),tn["ex"].get("entryHealthBypassed"))):
+        o.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"%(lbl,esc(a),esc(b),DOT["ok"] if a==b else DOT["watch"]))
+    o.append("</table></div><div class='note'>Perbedaan pada dua baris terakhir disengaja: testnet melonggarkan perlindungan modal karena tidak punya modal untuk dilindungi, sementara parameter strategi dijaga identik agar hasilnya sebanding.</div>")
+    o.append(tech("host & integritas",[("Waktu host (UTC)",esc(sy["hostTimeUtc"][:19])),
+        ("Disk","%s terpakai dari %s, sisa %s"%(sy["disk"]["pct"],sy["disk"]["size"],sy["disk"]["avail"]) if sy.get("disk") else "–"),
+        ("Kepatuhan kebijakan","<br>".join("%s: %s"%(R["inst"][k]["long"],esc(R["inst"][k]["envPolicy"][:70])) for k in INST)),
+        ("SHA rilis / hash konfigurasi",NA+" — manifest kode tidak mengekspos hash pohon yang bisa dibandingkan lintas-instance")]))
     return "".join(o)
 
-
-def snapshot_md(R):
-    """Compact, paste-able digest. Deliberately NOT the 310KB JSON: an assistant reasons better
-    from a page of state than from a dump, and a smaller artefact leaks less if it is pasted
-    somewhere careless."""
-    a = R["account"]; liv = R["inst"]["live"]; tst = R["inst"]["testnet"]
-    W = R["edge"]["windows"]; g = R["gauges"]; ax = (R["axis"] or {}).get("current") or {}
-    L = []
-    P = L.append
-    P("# Kronos — ringkasan keadaan  (%s UTC)" % R["generatedAt"][:19])
-    P("")
-    P("Strategi: market-neutral lintas-simbol, 3 long / 3 short, peringkat momentum 36 jam,")
-    P("ditahan sampai batas waktu kecuali stop/TP kena. Bursa: Binance USD-M Futures.")
-    P("")
-    P("## Modal")
-    P("- Ekuitas: $%.2f  (wallet $%.2f, tersedia $%.2f)" % (
-        a.get("accountEquity") or 0, a.get("walletBalance") or 0, a.get("availableBalance") or 0))
-    P("- P&L belum terealisasi: $%.4f dari %s posisi" % (a.get("unrealizedPnl") or 0, a.get("openPositionCount")))
-    P("- P&L terealisasi live: $%.4f dari %s basket selesai" % (liv["ex"].get("totalNetPnlUsd") or 0, liv["ex"].get("closedCount")))
-    P("- P&L terealisasi testnet (uang demo): $%.4f dari %s basket" % (tst["ex"].get("totalNetPnlUsd") or 0, tst["ex"].get("closedCount")))
-    P("")
-    P("## Konfigurasi berjalan")
-    fc = ((get(INST["live"]["api"] + "/api/shadow/cross-sectional-report") or {}).get("filteredConfig") or {})
-    P("- Ukuran per kaki: $%s, leverage %s, eksposur kotor ~$%s" % (
-        liv["ex"].get("legUsd"), liv["ex"].get("leverage"),
-        (liv["ex"].get("legUsd") or 0) * 6))
-    P("- Batas tahan %s jam; stop/TP simetris ±%s%% / %s%% dari nilai basket" % (
-        liv["ex"].get("maxHoldHours"), liv["ex"].get("stopNetReturnPct"), liv["ex"].get("tpNetReturnPct")))
-    P("- Ambang pemisahan skor long-short: %s" % fc.get("minScoreGap"))
-    P("- Exit adaptif (regime/tesis/kunci-laba): DIMATIKAN sejak 2026-08-19")
-    P("")
-    P("## Izin masuk")
-    for k in ("live", "testnet"):
-        i = R["inst"][k]
-        P("- %s: tier %s%s — %s" % (i["label"], i["adm"].get("tier"),
-          " (override operator)" if i["ex"].get("entryHealthBypassed") else "",
-          str(i["adm"].get("reason") or "semua syarat terpenuhi")[:150]))
-        P("  gerbang bukti: 8 terakhir %s, 30 terakhir %s" % (
-          ("%+.3f%%" % i["gate"]["last8"]) if isinstance(i["gate"]["last8"], float) else "n/a",
-          ("%+.3f%%" % i["gate"]["last30"]) if isinstance(i["gate"]["last30"], float) else "n/a"))
-    P("")
-    P("## Posisi terbuka")
-    got = False
-    for k in ("live", "testnet"):
-        for b in R["inst"][k]["ex"].get("openBaskets") or []:
-            got = True
-            lnr = b.get("lastNetReturn")
-            P("- [%s] %s dibuka %s, P&L berjalan %s" % (
-              R["inst"][k]["label"], b.get("basketId"), str(b.get("openedAt"))[:16],
-              ("%+.3f%%" % (100 * lnr)) if isinstance(lnr, float) else "n/a"))
-            P("  kaki: %s" % ", ".join("%s %s" % (l.get("side"), (l.get("symbol") or "").replace("USDT", ""))
-                                       for l in b.get("legs") or []))
-    if not got: P("- tidak ada")
-    P("")
-    P("## Bukti performa (sinyal produksi %s)" % R["edge"]["signal"])
-    P("| jendela | N | rata-rata/basket | menang | t-stat |")
-    P("|---|---|---|---|---|")
-    for lbl in ("8 terakhir", "30 terakhir", "90 terakhir", "seluruhnya"):
-        s_ = W[lbl]
-        P("| %s | %s | %s | %s | %s |" % (lbl, s_.get("n"),
-          ("%+.3f%%" % s_["meanPct"]) if s_.get("n") else "-",
-          ("%.0f%%" % s_["winPct"]) if s_.get("n") else "-",
-          ("%.2f" % s_["tStat"]) if isinstance(s_.get("tStat"), float) else "-"))
-    P("")
-    P("PENTING untuk interpretasi: N di atas adalah observasi bayangan yang dibuka tiap ~1 jam dan")
-    P("ditahan 48 jam, jadi hampir seluruhnya tumpang tindih. Episode benar-benar independen: **%d**." % R["edge"]["episodes"])
-    P("Semua t-stat di tabel TIDAK dikoreksi untuk tumpang tindih, jadi terlalu optimistis.")
-    if isinstance(g.get("edgeTRaw"), float) and isinstance(g.get("edgeTEff"), float):
-        P("t-stat setelah dikoreksi tumpang tindih: %.2f (mentah %.2f)." % (g["edgeTEff"], g["edgeTRaw"]))
-    P("")
-    P("## Keadaan pasar")
-    P("- Regime: %s, zona %s, skor sumbu %s" % (
-        ax.get("regime"), ((R["axis"] or {}).get("guidance") or {}).get("zoneLabel"),
-        ("%.3f" % ax["score"]) if isinstance(ax.get("score"), float) else "n/a"))
-    P("- Mode directional: %s (%s)" % ((R["dir"] or {}).get("mode"), (R["dir"] or {}).get("marketRegime")))
-    P("")
-    P("## Skor 0-100")
-    for key, lbl in (("overall", "Keseluruhan"), ("edge", "Kualitas edge"), ("recent", "Performa terakhir"),
-                     ("dd", "Kendali drawdown"), ("exec", "Kualitas eksekusi"), ("data", "Kualitas data"),
-                     ("research", "Kekuatan bukti")):
-        v = g.get(key)
-        P("- %s: %s" % (lbl, ("%d" % round(v)) if isinstance(v, float) else "tidak tersedia"))
-    P("")
-    al = _alerts(R)
-    P("## Peringatan aktif")
-    if not al: P("- tidak ada")
-    for s_, t, d in al: P("- [%s] %s — %s" % (s_.upper(), t, d))
-    P("")
-    P("## Yang TIDAK tersedia dari runtime (jangan diasumsikan)")
-    P("- funding dan slippage tidak dibukukan terpisah")
-    P("- provenance harness riset tidak terekspos")
-    P("- tidak ada pemisahan holdout; perbandingan kebijakan bersifat in-sample")
-    return "\n".join(L)
-
-TABS = [("overview", "Ringkasan", tab_overview), ("strategy", "Strategi", tab_strategy),
-        ("decision", "Keputusan", tab_decision), ("formation", "Formasi", tab_formation),
-        ("positions", "Posisi", tab_positions), ("edge", "Edge", tab_edge),
-        ("research", "Riset", tab_research), ("system", "Sistem", tab_system)]
+TABS=[("overview","Ringkasan",tab_overview),("strategy","Strategi",tab_strategy),("decision","Keputusan",tab_decision),
+      ("formation","Formasi",tab_formation),("positions","Posisi",tab_positions),("edge","Edge",tab_edge),
+      ("research","Riset",tab_research),("system","Sistem",tab_system)]
 
 def render(R):
-    body = []
-    for i, (tid, lbl, fn) in enumerate(TABS):
-        try: html = fn(R)
-        except Exception as e:
-            html = "<div class='lead'><div class='c'>🔴 Tab gagal dirender</div><div class='r'>%s</div></div>" % esc(str(e)[:220])
-        body.append("<section id='%s'%s>%s</section>" % (tid, " class='on'" if i == 0 else "", html))
-    nav = "".join("<button data-t='%s'%s>%s</button>" % (t, " class='on'" if i == 0 else "", l)
-                  for i, (t, l, _) in enumerate(TABS))
-    js = ("<script>document.querySelectorAll('nav button').forEach(function(b){b.onclick=function(){"
-          "document.querySelectorAll('nav button').forEach(function(x){x.classList.remove('on')});"
-          "document.querySelectorAll('section').forEach(function(x){x.classList.remove('on')});"
-          "b.classList.add('on');document.getElementById(b.dataset.t).classList.add('on');"
-          "location.hash=b.dataset.t};});"
-          "if(location.hash){var b=document.querySelector(\"nav button[data-t='\"+location.hash.slice(1)+\"']\");if(b)b.click();}"
-          "</script>")
-    return ("<!doctype html><html lang='id'><meta charset='utf-8'>"
-            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    body=[]
+    for i,(tid,lbl,fn) in enumerate(TABS):
+        try: html=fn(R)
+        except Exception as ex: html="<div class='lead'><div class='c'>🔴 Tab gagal dirender</div><div class='r'>%s</div></div>"%esc(str(ex)[:240])
+        body.append("<section id='%s'%s>%s</section>"%(tid," class='on'" if i==0 else "",html))
+    nav="".join("<button data-t='%s'%s>%s</button>"%(t," class='on'" if i==0 else "",l) for i,(t,l,_) in enumerate(TABS))
+    js=("<script>document.querySelectorAll('nav button').forEach(function(b){b.onclick=function(){"
+        "document.querySelectorAll('nav button').forEach(function(x){x.classList.remove('on')});"
+        "document.querySelectorAll('section').forEach(function(x){x.classList.remove('on')});"
+        "b.classList.add('on');document.getElementById(b.dataset.t).classList.add('on');location.hash=b.dataset.t};});"
+        "if(location.hash){var b=document.querySelector(\"nav button[data-t='\"+location.hash.slice(1)+\"']\");if(b)b.click();}</script>")
+    return ("<!doctype html><html lang='id'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<title>Kronos · kokpit</title><style>%s</style><div class='wrap'>"
-            "<header><h1>KRONOS · kokpit trading</h1><span class='stamp'>%s UTC · hanya-baca, tanpa kunci bursa</span></header>"
-            "<nav>%s</nav>%s</div>%s</html>") % (CSS, R["generatedAt"][:19], nav, "".join(body), js)
+            "<header><h1>KRONOS · kokpit trading &amp; riset</h1><span class='stamp'>%s UTC · hanya-baca, tanpa kunci bursa</span></header>"
+            "<nav>%s</nav>%s</div>%s</html>")%(CSS,R["generatedAt"][:19],nav,"".join(body),js)
 
 class H(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
+    def log_message(self,*a): pass
     def do_GET(self):
         try:
             if self.path.startswith("/api/report"):
-                R = collect()
-                slim = {k: v for k, v in R.items() if k != "inst"}
-                slim["inst"] = {k: {kk: vv for kk, vv in v.items() if kk not in ("rows",)} for k, v in R["inst"].items()}
-                body, ct = json.dumps(slim, default=str).encode(), "application/json"
-            elif self.path.startswith("/snapshot"):
-                body, ct = snapshot_md(collect()).encode(), "text/plain; charset=utf-8"
-            elif self.path == "/healthz":
-                body, ct = b"ok", "text/plain"
-            else:
-                body, ct = render(collect()).encode(), "text/html; charset=utf-8"
-            self.send_response(200); self.send_header("Content-Type", ct)
-            self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-        except Exception as e:
-            m = ("cockpit error: %s" % e).encode()
-            self.send_response(500); self.send_header("Content-Length", str(len(m))); self.end_headers(); self.wfile.write(m)
+                R=collect(); slim={k:v for k,v in R.items() if k!="inst"}
+                slim["inst"]={k:{kk:vv for kk,vv in v.items() if kk not in ("rows","rep")} for k,v in R["inst"].items()}
+                body,ct=json.dumps(slim,default=str).encode(),"application/json"
+            elif self.path=="/healthz": body,ct=b"ok","text/plain"
+            else: body,ct=render(collect()).encode(),"text/html; charset=utf-8"
+            self.send_response(200); self.send_header("Content-Type",ct)
+            self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
+        except Exception as ex:
+            m=("cockpit error: %s"%ex).encode()
+            self.send_response(500); self.send_header("Content-Length",str(len(m))); self.end_headers(); self.wfile.write(m)
 
-if __name__ == "__main__":
-    HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+if __name__=="__main__":
+    HTTPServer(("127.0.0.1",PORT),H).serve_forever()
