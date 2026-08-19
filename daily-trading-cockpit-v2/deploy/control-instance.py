@@ -1089,6 +1089,107 @@ def tab_positions(R):
     if not any_open and not got: o.insert(0,lead("off","Tidak ada posisi maupun riwayat terbaru","Bot sedang menunggu formasi berikutnya."))
     return "".join(o)
 
+
+ENTRY_W={"gap":2.0,"strg":1.5,"obj":1.0,"fast":1.0,"ext":1.0,"clus":1.0}
+def obs_entry_score(ob,dist):
+    """The SAME six entry components and the SAME percentile calibration used for live baskets,
+    applied to a historical observation. That is what makes the attribution below a fair test:
+    the score being validated is the score the dashboard shows, not a stand-in for it."""
+    sf=ob.get("smartFormation") or {}
+    sel=[c for c in (sf.get("candidates") or []) if c.get("selected")]
+    if len(sel)!=6: return None,None
+    def mean_of(fld,absolute=False):
+        v=[abs(c[fld]) if absolute else c[fld] for c in sel if fin(c.get(fld))]
+        return (sum(v)/len(v)) if v else None
+    cl=[c.get("cluster") for c in sel if c.get("cluster")]
+    raw={"gap":ob.get("scoreGap"),"strg":mean_of("score",True),"obj":sf.get("objectiveScore"),
+         "fast":mean_of("fastSupport"),"ext":(-(mean_of("adverseExtensionVol")) if mean_of("adverseExtensionVol") is not None else None),
+         "clus":(len(set(cl))/len(cl)) if cl else None}
+    parts={k:rank_in(v,dist.get(k)) for k,v in raw.items()}
+    have=[(k,v) for k,v in parts.items() if fin(v)]
+    if not have: return None,raw
+    return sum(v*ENTRY_W[k] for k,v in have)/sum(ENTRY_W[k] for k,_ in have),raw
+
+def quality_attribution(R):
+    """Does formation quality actually earn money? Scored, bucketed, and correlated on the same
+    clean observations the rest of the page uses."""
+    dist=R.get("dist") or {}
+    pairs=[]
+    for k in INST:
+        try: obs=(json.load(open(INST[k]["store"])) or {}).get("observations") or []
+        except Exception: obs=[]
+        for ob in obs:
+            if ob.get("signal")!=PROD_SIGNAL or ob.get("status")=="OPEN": continue
+            if corrupt_legs(ob): continue
+            nr=ob.get("netReturn")
+            if not fin(nr): continue
+            sc,raw=obs_entry_score(ob,dist)
+            if sc is None: continue
+            pairs.append({"score":sc,"net":nr,"raw":raw,"at":ob.get("openedAt")})
+    if len(pairs)<8: return None
+    pairs.sort(key=lambda x:x["score"])
+    n=len(pairs); q=max(1,n//4)
+    buckets=[]
+    for i,lbl in enumerate(("terendah 25%","25-50%","50-75%","tertinggi 25%")):
+        seg=pairs[i*q:(i+1)*q] if i<3 else pairs[3*q:]
+        if not seg: continue
+        buckets.append({"key":lbl,"n":len(seg),
+                        "scoreLo":seg[0]["score"],"scoreHi":seg[-1]["score"],
+                        **stats([x["net"] for x in seg])})
+    def cor(xs,ys):
+        if len(xs)<8: return None
+        mx,my=sum(xs)/len(xs),sum(ys)/len(ys)
+        num=sum((a-mx)*(b-my) for a,b in zip(xs,ys))
+        den=math.sqrt(sum((a-mx)**2 for a in xs)*sum((b-my)**2 for b in ys))
+        return (num/den) if den else None
+    r_all=cor([x["score"] for x in pairs],[x["net"] for x in pairs])
+    comp=[]
+    for k,lbl in (("gap","Pemisahan skor"),("strg","Kekuatan sinyal"),("obj","Utility formasi"),
+                  ("fast","Konfirmasi cepat"),("ext","Tidak mengejar"),("clus","Sebaran klaster")):
+        xs=[x["raw"][k] for x in pairs if fin(x["raw"].get(k))]
+        ys=[x["net"] for x in pairs if fin(x["raw"].get(k))]
+        c=cor(xs,ys)
+        comp.append({"key":lbl,"r":c,"n":len(xs),"r2":(100*c*c) if c is not None else None})
+    top=[x["net"] for x in pairs[-q:]]; bot=[x["net"] for x in pairs[:q]]
+    return {"pairs":pairs,"buckets":buckets,"r":r_all,"r2":(100*r_all*r_all) if r_all is not None else None,
+            "components":sorted(comp,key=lambda c:-(c["r2"] or 0)),
+            "topMean":100*sum(top)/len(top),"botMean":100*sum(bot)/len(bot),
+            "spread":100*(sum(top)/len(top)-sum(bot)/len(bot)),"n":n,
+            "episodes":R["edge"]["episodes"]}
+
+def quality_vs_profit_html(R):
+    a=quality_attribution(R)
+    if not a: return "<div class='card dim'>Bukti tidak cukup untuk menguji hubungan kualitas dan hasil.</div>"
+    strong = a["r2"] is not None and a["r2"]>=25
+    o=[lead("ok" if strong else "watch",
+        "Kualitas pembentukan menjelaskan %s variasi hasil"%(("%.1f%%"%a["r2"]) if a["r2"] is not None else "?"),
+        "Skor entry yang sama dengan yang dipakai di tab Posisi, dihitung untuk %d basket bersih, lalu diadu dengan hasil nyatanya. "
+        "Korelasi <b>%s</b>. Basket berkualitas tertinggi menghasilkan <b>%s</b> per basket, terendah <b>%s</b> — selisih <b>%s</b>. "
+        "Ingat batasnya: %d observasi ini hanya %d episode independen, jadi selisih sebesar apa pun di sini belum bisa dipisahkan dari kebetulan."%(
+        a["n"],("%+.3f"%a["r"]) if a["r"] is not None else "?",pct(a["topMean"],3),pct(a["botMean"],3),pct(a["spread"],3),
+        a["n"],a["episodes"]))]
+    o.append("<h2>Hasil menurut kuartil kualitas pembentukan</h2>")
+    o.append("<div class='scroll'><table><tr><th>kuartil</th><th class='num'>rentang skor</th><th class='num'>N</th>"
+             "<th class='num'>rata-rata/basket</th><th class='num'>menang</th><th class='num'>total</th></tr>")
+    for b in a["buckets"]:
+        o.append("<tr><td>%s</td><td class='num dim'>%.0f–%.0f</td><td class='num'>%d</td><td class='num'>%s</td><td class='num'>%.0f%%</td><td class='num'>%s</td></tr>"%(
+            b["key"],b["scoreLo"],b["scoreHi"],b["n"],pct(b.get("meanPct"),3),b.get("winPct") or 0,pct(b.get("totalPct"),2)))
+    o.append("</table></div>")
+    o.append(bars([(b["key"],b.get("meanPct")) for b in a["buckets"]]))
+    o.append("<h2>Kontribusi tiap komponen terhadap hasil</h2>")
+    o.append("<div class='scroll'><table><tr><th>komponen</th><th class='num'>korelasi</th><th class='num'>menjelaskan</th><th class='num'>n</th><th>arah</th></tr>")
+    for c in a["components"]:
+        arah="–" if c["r"] is None else ("searah rancangan" if c["r"]>0.05 else ("BERLAWANAN rancangan" if c["r"]<-0.05 else "praktis nol"))
+        o.append("<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%d</td><td class='%s'>%s</td></tr>"%(
+            c["key"],("%+.3f"%c["r"]) if c["r"] is not None else "–",("%.1f%%"%c["r2"]) if c["r2"] is not None else "–",
+            c["n"],"neg" if (c["r"] or 0)<-0.05 else ("pos" if (c["r"] or 0)>0.05 else "dim"),arah))
+    o.append("</table></div>")
+    o.append("<div class='note'>Komponen bertanda BERLAWANAN berarti nilai yang lebih tinggi justru diikuti hasil sedikit lebih buruk — kebalikan dari niat rancangannya. Pada ukuran sampel ini itu lebih mungkin derau daripada temuan, tapi ia tidak boleh disembunyikan.</div>")
+    o.append("<h2>Skor pembentukan vs hasil, per basket</h2>")
+    o.append(scatter([{"gap":x["score"],"net":x["net"]} for x in a["pairs"]],50.0))
+    o.append("<div class='note'>Sumbu datar = skor kualitas pembentukan (0–100), garis kuning = median. Kalau kualitas menentukan hasil, titik hijau akan menumpuk di kanan.</div>")
+    return "".join(o)
+
 def tab_edge(R):
     e=R["edge"];W=e["windows"];allw=W["seluruhnya"];o=[]
     if not allw.get("n"): return lead("off","Belum ada bukti","Belum ada observasi sinyal produksi yang selesai.")
@@ -1134,6 +1235,8 @@ def tab_edge(R):
         o.append(card("Kuartal terbesar",esc(c["topQuarter"]),"menyumbang %.0f%% dari seluruh pergerakan"%c["share"]))
         o.append(card("Bulan untung","%d dari %d"%(c["profitableMonths"],c["months"]),"sisanya rugi atau datar"))
         o.append("</div><div class='note'>Kalau satu kuartal menyumbang sebagian besar hasil, rata-rata tahunan menyembunyikan kenyataannya: hasilnya datang bergerombol, bukan mengalir rata.</div>")
+    o.append("<h2>Apakah kualitas pembentukan menghasilkan uang?</h2>")
+    o.append(quality_vs_profit_html(R))
     o.append("<h2>Skor performa</h2><div class='g2'>")
     ev=R["scores"]["evidence"]["value"]
     ov_line=("Rata-rata tertimbang dari Edge 35%%, Performa terakhir 20%%, Drawdown 20%%, Eksekusi 15%%, Data 10%%. "
