@@ -113,7 +113,7 @@ def hold_hours(r):
 def clamp(v, lo=0.0, hi=100.0): return max(lo, min(hi, v))
 
 GAUGE_DOC = {
- "edge":      "50 + 15 x t-stat dari seluruh riwayat sinyal produksi, dibatasi 0-100. t=0 (tanpa bukti edge) -> 50; t=+2 -> 80; t=-2 -> 20.",
+ "edge":      "50 + 15 x t-stat TERKOREKSI, dibatasi 0-100. Koreksi = t mentah x akar(episode independen / N), karena observasi bayangan tumpang tindih hampir seluruhnya sehingga t mentah melebih-lebihkan bukti. t=0 -> 50; t=+2 -> 80; t=-2 -> 20.",
  "recent":    "50 + 50 x (mean 30 terakhir / |mean seluruh riwayat|), dibatasi 0-100. 50 berarti performa terakhir setara rata-rata panjangnya.",
  "dd":        "100 x (1 - |drawdown| / (|drawdown| + |total return|)). 100 = tidak pernah drawdown; turun saat drawdown besar relatif terhadap hasil.",
  "exec":      "100 x (harga fill terkonfirmasi bursa / total harga fill yang dibukukan) di seluruh basket tereksekusi.",
@@ -125,7 +125,15 @@ GAUGE_DOC = {
 def build_gauges(all_stats, w30, exec_conf, data_q, episodes):
     g = {}
     t = all_stats.get("tStat")
-    g["edge"] = clamp(50 + 15 * t) if isinstance(t, float) else None
+    n = all_stats.get("n") or 0
+    # Deflate the t-stat by the overlap ratio. Without this the gauge reads 100 off a t of 5.5 that
+    # rests on 3 independent episodes — flatly contradicting the evidence-strength gauge beside it.
+    if isinstance(t, float) and n > 0 and isinstance(episodes, int) and episodes > 0:
+        t_eff = t * math.sqrt(min(1.0, episodes / float(n)))
+    else:
+        t_eff = t if isinstance(t, float) else None
+    g["edgeTRaw"], g["edgeTEff"] = t, t_eff
+    g["edge"] = clamp(50 + 15 * t_eff) if isinstance(t_eff, float) else None
     am, rm = all_stats.get("meanPct"), w30.get("meanPct")
     g["recent"] = clamp(50 + 50 * (rm / abs(am))) if isinstance(am, float) and isinstance(rm, float) and am != 0 else None
     dd, tot = all_stats.get("ddPct"), all_stats.get("totalPct")
@@ -735,7 +743,8 @@ def tab_edge(R):
         ("Sumber", "penyimpanan observasi kedua instance, digabung dan dide-duplikasi"),
         ("Episode independen", "sampel non-tumpang-tindih pada horizon 48 jam — aturan yang sama dipakai harness"),
         ("Profit factor", "total hasil positif ÷ |total hasil negatif|"),
-        ("t-stat", "rata-rata ÷ (simpangan baku ÷ √N); TIDAK dikoreksi untuk tumpang tindih, jadi terlalu optimistis"),
+        ("t-stat di tabel", "rata-rata ÷ (simpangan baku ÷ √N); TIDAK dikoreksi untuk tumpang tindih, jadi terlalu optimistis"),
+        ("t-stat dipakai skor", "t mentah × akar(episode independen ÷ N) — inilah yang masuk gauge Kualitas edge, supaya tidak membantah gauge Kekuatan bukti"),
         ("Biaya", "sudah termasuk — observasi menyimpan hasil bersih setelah biaya bolak-balik"),
         ("Funding & slippage", "tidak dibukukan terpisah oleh runtime — <b>tidak tersedia</b>"),
     ]))
@@ -962,7 +971,9 @@ def snapshot_md(R):
     P("")
     P("PENTING untuk interpretasi: N di atas adalah observasi bayangan yang dibuka tiap ~1 jam dan")
     P("ditahan 48 jam, jadi hampir seluruhnya tumpang tindih. Episode benar-benar independen: **%d**." % R["edge"]["episodes"])
-    P("Semua t-stat di atas TIDAK dikoreksi untuk tumpang tindih, jadi terlalu optimistis.")
+    P("Semua t-stat di tabel TIDAK dikoreksi untuk tumpang tindih, jadi terlalu optimistis.")
+    if isinstance(g.get("edgeTRaw"), float) and isinstance(g.get("edgeTEff"), float):
+        P("t-stat setelah dikoreksi tumpang tindih: %.2f (mentah %.2f)." % (g["edgeTEff"], g["edgeTRaw"]))
     P("")
     P("## Keadaan pasar")
     P("- Regime: %s, zona %s, skor sumbu %s" % (
