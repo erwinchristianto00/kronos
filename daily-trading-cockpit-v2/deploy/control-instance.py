@@ -794,9 +794,10 @@ def tab_strategy(R):
     gross=(leg*6) if fin(leg) else None
     o=[lead("ok","Momentum relatif lintas-simbol, netral pasar",
         "Bot memeringkat seluruh universe menurut momentum 36 jam, membeli 3 terkuat dan menjual 3 terlemah. Yang dikejar bukan arah pasar, melainkan <b>selisih</b> antara yang kuat dan yang lemah — kalau pasar naik atau turun bersama, keduanya saling meniadakan.")]
-    rerank_now=(liv.get("flags") or {}).get("CROSS_SECTIONAL_SMART_FORMATION_RERANK","1")!="0"
+    _rr=(liv.get("flags") or {}).get("CROSS_SECTIONAL_SMART_FORMATION_RERANK","1")!="0"
+    PIPE2_TEXT=(("Ambil 5 kandidat teratas tiap sisi, coba SEMUA kombinasi 3-lawan-3, pilih total utility tertinggi setelah penalti klaster." if _rr else "Ambil 3 teratas tiap sisi menurut peringkat MOM36 dengan cluster cap sebagai batas keras. Re-ranking utility dimatikan — fitur lain tetap dicatat tapi tidak ikut memilih.") + " <b>Tidak membuat sinyal baru</b> — hanya memilih dari peringkat yang sudah ada.")
     steps=[("1 · MOM36","Peringkat momentum 36 jam atas %s simbol universe. Menghasilkan urutan kuat→lemah, belum memutuskan apa pun."%cnt.get("universe")),
-      ("2 · Pemilihan basket",("Ambil 5 kandidat teratas tiap sisi, coba SEMUA kombinasi 3-lawan-3, pilih total utility tertinggi setelah penalti klaster." if rerank_now else "Ambil 3 teratas tiap sisi menurut peringkat MOM36, dengan cluster cap sebagai batas keras. Re-ranking utility dimatikan — fitur lain tetap dicatat tapi tidak memilih.")+" <b>Tidak membuat sinyal baru</b> — hanya memilih dari peringkat yang sudah ada."),
+      ("2 · Pemilihan basket", PIPE2_TEXT),
       ("3 · Gerbang scoreGap","Selisih rata-rata skor long dan short harus ≥ <b>%s</b>. Di bawah itu basket ditolak sepenuhnya, betapapun bagus kombinasinya — cross-section yang rapat berarti tak ada yang bisa dipanen."%fc.get("minScoreGap")),
       ("4 · Revalidasi entry","Tepat sebelum order dikirim, cek apakah harga sudah lari melawan sejak sinyal dibentuk. Kalau sudah, batalkan daripada mengejar."),
       ("5 · Smart Basket / Ghost","Setelah basket hidup, tiga aturan adaptif <b>mengevaluasi</b> apakah alasan masuknya masih berlaku. Eksekusinya dimatikan; evaluasinya tetap jalan sehingga bisa diukur tanpa menyentuh uang."),
@@ -1033,8 +1034,10 @@ def _formation_block(R,key,src):
 
 def tab_formation(R):
     o=[];found=False
-    o.append(lead("ok","Kenapa simbol ini yang dipilih — dengan angkanya",
-        ("Pemilihan diputuskan satu angka: <b>utility</b> = peringkat momentum di kolam + konfirmasi cepat (0,22) − penalti mengejar (0,20) + bonus counter-axis (0,08)." if (R["inst"]["live"].get("flags") or {}).get("CROSS_SECTIONAL_SMART_FORMATION_RERANK","1")!="0" else "<b>Produksi memilih murni dari peringkat MOM36</b> dengan cluster cap sebagai batas keras — utility sama dengan peringkat itu sendiri." " Kolom konfirmasi dan ekstensi tetap ditampilkan sebagai diagnostik dan masih bernilai pada formasi lama; label tiap blok menyebut formasi mana yang mana."))]
+    _rrF=(R["inst"]["live"].get("flags") or {}).get("CROSS_SECTIONAL_SMART_FORMATION_RERANK","1")!="0"
+    _leadF=("Pemilihan diputuskan satu angka: <b>utility</b> = peringkat momentum di kolam + konfirmasi cepat (0,22) − penalti mengejar (0,20) + bonus counter-axis (0,08). Tabel di bawah menguraikan tiap suku." if _rrF else "<b>Produksi memilih murni dari peringkat MOM36</b> dengan cluster cap sebagai batas keras — utility sama dengan peringkat itu sendiri. Kolom konfirmasi dan ekstensi tetap ditampilkan sebagai diagnostik dan masih bernilai pada formasi lama; label tiap blok menyebut formasi mana yang mana.")
+    o.append(lead("ok","Kenapa simbol ini yang dipilih — dengan angkanya",_leadF))
+
     for key in ("live","testnet"):
         src=R["inst"][key].get("latestFormation")
         if not src:
