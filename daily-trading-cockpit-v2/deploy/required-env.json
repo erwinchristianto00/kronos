@@ -1,0 +1,50 @@
+{
+  "_": [
+    "Env values that MUST survive a release cutover, with the evidence for each.",
+    "",
+    "A release dir gets a REAL .env file, not a symlink, so a cutover that forgets to carry these",
+    "forward silently reverts them to code defaults. That is not hypothetical: the 36h hold policy",
+    "was lost exactly this way once (2026-08-05), and nothing failed loudly when it happened.",
+    "",
+    "Apply or verify with deploy/apply-required-env.sh. Run --check after EVERY cutover.",
+    "Values here are per-lane policy, never secrets — API keys stay out of version control."
+  ],
+  "shared": {
+    "CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS": {
+      "value": "36",
+      "why": "+35% return per unit of slot time at statistically identical per-basket return. Lost in a release cutover on 2026-08-05; this file exists because of it."
+    },
+    "CROSS_SECTIONAL_EXEC_STOP_NET_RETURN": {
+      "value": "0.06",
+      "why": "Symmetric disaster cap, fires on ~4% of baskets. Every TIGHTER stop tested on 364 blocks lost money; a narrow stop looked like a winner on close-only data (t +2.00) and reversed once intra-hour was modelled (t -2.58)."
+    },
+    "CROSS_SECTIONAL_EXEC_TP_NET_RETURN": {
+      "value": "0.06",
+      "why": "Symmetric partner to the stop. Do NOT lower it: TP 0.45% cost more than the lane earned (no-TP +68.4% vs TP -149.2% on one slot over 2 years, paired t +5.24)."
+    },
+    "CROSS_SECTIONAL_EXEC_TP_DISABLED": {
+      "value": "0",
+      "why": "Must be explicit. DELETING the numeric TP env does not disable the TP - it silently falls back to 0.60%, which is the losing configuration."
+    },
+    "CROSS_SECTIONAL_SMART_BASKET_V1": {
+      "value": "1",
+      "why": "GUARD, do not set to 0. This is the master switch for BOTH Smart Formation (selection, which is kept) and the lifecycle exits (which are disabled below via SMART_INVALIDATION_SCANS). Turning it off would silently kill the selection too."
+    },
+    "CROSS_SECTIONAL_SMART_INVALIDATION_SCANS": {
+      "value": "999",
+      "why": "Disables all three Smart Basket exits by making them arithmetically unreachable - a 48h horizon yields at most 48 hourly scans. Measured 2026-08-19 on 362 blocks x 24 offsets: the deployed REGIME+CONTEXT pair cost -0.2382pp/basket and lost in 24 of 24 offsets (median t -2.84), turning a +0.14%/basket lane into -0.11%. cross-sectional-edge.ts never reads this key, so Formation is untouched."
+    },
+    "CROSS_SECTIONAL_SMART_REGIME_LOSS_EXIT": {
+      "value": "0",
+      "why": "Second, explicit layer over the scans threshold. Its own measurement is the weakest of the three (proxy regime classifier, sign-flips out-of-sample), but it contributes to the pair via first-to-fire truncation."
+    },
+    "CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP": {
+      "value": "0.058",
+      "why": "Formation admission gate: long-short separation floor. The code default 0.02 is inert (rejects ~0.2% of baskets). At 0.058 across 48 offsets, mean/basket rises monotonically 0.1634% -> 0.2394%, max drawdown falls -54.47% -> -44.03%, and it improves BOTH out-of-sample halves - turning the losing half from -6.92% to +4.79%. Absolute MOM36 strength and dispersion were tested as alternative gates and have no gradient."
+    }
+  },
+  "instances": {
+    "3102": { "role": "testnet", "extra": {} },
+    "3103": { "role": "mainnet", "extra": {} }
+  }
+}
