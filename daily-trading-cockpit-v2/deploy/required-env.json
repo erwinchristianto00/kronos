@@ -50,6 +50,22 @@
     "CROSS_SECTIONAL_EDGE_MAX_STORED_OBSERVATIONS": {
       "value": "15000",
       "why": "Depth of the IN-APP shadow reports only. History no longer depends on it: deploy/archive-observations.py harvests every resolved observation into an append-only JSONL (~15MB/yr/instance, never pruned) so the cap can no longer silently decide what survives. 15000 keeps the store ~24MB, an order of magnitude below the 234MB that once made testnet unresponsive; it is now a free knob rather than a load-bearing one."
+    },
+    "CROSS_SECTIONAL_SMART_FORMATION_RERANK": {
+      "value": "0",
+      "why": "Smart Formation's utility re-ranking (fastSupport, adverseExtension, counter-axis, cluster penalty) OFF. Ablation over 12 block offsets across two years: full re-ranking +0.2227%/basket vs +0.2220% for plain MOM36 rank \u2014 0.0007pp, with identical PF, hit rate, quarterly stability and worst quarter. The hard cluster cap stays as a concentration guardrail; candidate diagnostics keep being recorded for the dashboard and ghost evaluation."
+    },
+    "CROSS_SECTIONAL_MAKER_EXIT_ENABLED": {
+      "value": "1",
+      "why": "Maker-first on the SCHEDULED (HORIZON) close only; stops, emergencies and forced reconciliation still cross immediately. Measured on this account: maker 2.00 bps vs taker 5.00 bps, and the exit side was 100% taker by construction. Moving the modelled round trip 12bps -> 8bps lifted the harness lane from +0.2227% to +0.2627%/basket and t from 1.25 to 1.48 \u2014 larger than every formation variant combined."
+    },
+    "CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS": {
+      "value": "20000",
+      "why": "How long the reduce-only post-only exit rests before it is cancelled and the remainder crosses. Bounded 1s-120s in code."
+    },
+    "CROSS_SECTIONAL_EXEC_TICK_MS": {
+      "value": "60000",
+      "why": "Executor tick. Was a hardcoded 5 minutes, so a fresh signal waited ~150s on average before anything looked at it \u2014 measured end to end at 239.8s live / 229.9s testnet, almost all of it this interval. No gate is weakened by being asked sooner; the tick is idempotent and single-flighted. Bounded 15s-5m in code."
     }
   },
   "instances": {

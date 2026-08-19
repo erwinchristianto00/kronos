@@ -360,6 +360,35 @@ def collect():
             a=[c["adverseExtensionVol"] for c in sel if fin(c.get("adverseExtensionVol"))]
             if a: D["ext"].append(-(sum(a)/len(a)))
     R["dist"]=D
+    # runtime flags read from the .env each instance actually loaded — not assumed
+    for k,cfg in INST.items():
+        fl={}
+        try:
+            for ln in open(cfg["rel"]+"/.env"):
+                if "=" not in ln or ln.lstrip().startswith("#"): continue
+                kk,vv=ln.split("=",1)
+                if kk.startswith("CROSS_SECTIONAL_"): fl[kk.strip()]=vv.strip()
+        except Exception: pass
+        R["inst"][k]["flags"]=fl
+    # execution economics from the leg records the executor now writes
+    mk=tk=0.0; mkq=tkq=0; drift=[]
+    for k in INST:
+        ex=R["inst"][k]["ex"]
+        for b in (ex.get("recent") or [])+(ex.get("openBaskets") or []):
+            for l in b.get("legs") or []:
+                q=l.get("exitMakerQty"); p_=l.get("exitMakerPrice")
+                fq=l.get("exitFallbackQty"); fp=l.get("exitFallbackPrice")
+                if fin(q) and q>0 and fin(p_): mk+=q*p_; mkq+=1
+                if fin(fq) and fq>0 and fin(fp): tk+=fq*fp; tkq+=1
+                if fin(p_) and fin(fp) and p_>0: drift.append(abs(fp/p_-1))
+    tot=mk+tk
+    R["exitEcon"]={"makerNotional":mk,"takerNotional":tk,
+                   "makerPct":(100*mk/tot) if tot>0 else None,
+                   "fallbackPct":(100*tk/tot) if tot>0 else None,
+                   "legsMaker":mkq,"legsTaker":tkq,
+                   "feePaid":(mk*0.0002+tk*0.0005) if tot>0 else None,
+                   "feeSaved":(mk*0.0003) if mk>0 else None,
+                   "exitDrift":(100*sum(drift)/len(drift)) if drift else None}
     R["account"]=get(INST["live"]["api"]+"/api/live/account")
     R["axis"]=get(INST["live"]["api"]+"/api/shadow/regime-axis-timeline")
     R["dir"]=get(INST["live"]["api"]+"/api/live/cross-sectional-directional-regime")
@@ -786,6 +815,35 @@ def tab_strategy(R):
     o.append("<div class='lead' style='border-left-color:#8a6fbf'><div class='r'>Formation tidak membuat sinyal. Ia mengambil peringkat MOM36 yang sudah ada, memotongnya jadi kolam 5 kandidat teratas per sisi, lalu <b>mencoba semua kombinasi</b> dan memilih yang total utility-nya tertinggi setelah dikurangi penalti klaster. Peringkat mentah tetap dominan; dua faktor lain sengaja dibuat berbatas supaya tidak bisa mengangkat skor yang jelas kalah.</div></div>")
     o.append("<table><tr><th>fitur</th><th>artinya</th></tr>%s</table>"%"".join(
         "<tr><td><b>%s</b></td><td class='dim' style='white-space:normal'>%s</td></tr>"%(esc(a),esc(b)) for a,b in FEATURES))
+    fl=liv.get("flags") or {}
+    rerank=fl.get("CROSS_SECTIONAL_SMART_FORMATION_RERANK","1")!="0"
+    mex=fl.get("CROSS_SECTIONAL_MAKER_EXIT_ENABLED")=="1"
+    ee=R.get("exitEcon") or {}
+    o.append("<h2>Mode produksi yang benar-benar berjalan</h2><table>"
+      "<tr><th>hal</th><th>status</th><th class='dim'>dasar</th></tr>"
+      "<tr><td>Mode formasi</td><td>%s <b>%s</b></td><td class='dim'>peringkat MOM36 + cluster cap sebagai pagar konsentrasi</td></tr>"
+      "<tr><td>Re-ranking Smart Formation</td><td>%s <b>%s</b></td><td class='dim'>fastSupport / adverseExtension / counter-axis / penalti klaster</td></tr>"
+      "<tr><td>Exit adaptif</td><td>%s <b>MATI · Ghost AKTIF</b></td><td class='dim'>penghitung scan tetap berjalan, eksekusinya tidak</td></tr>"
+      "<tr><td>Eksekusi exit</td><td>%s <b>%s</b></td><td class='dim'>%s</td></tr>"
+      "<tr><td>Interval tick executor</td><td>⚪ <b>%s detik</b></td><td class='dim'>sinyal segar dilihat lebih cepat; gerbang tidak berubah</td></tr>"
+      "</table>"%(
+        DOT["ok"],"MOM36 rank + cluster guardrail",
+        DOT["off"] if not rerank else DOT["watch"],"OFF" if not rerank else "ON",
+        DOT["off"],
+        DOT["ok"] if mex else DOT["off"],"maker-first + taker fallback" if mex else "taker penuh",
+        "hanya untuk penutupan terjadwal (HORIZON); stop/darurat tetap MARKET langsung",
+        int(fl.get("CROSS_SECTIONAL_EXEC_TICK_MS","300000") or 300000)//1000))
+    o.append("<h2>Ekonomi eksekusi exit</h2><div class='grid'>")
+    o.append(card("Porsi maker",("%.0f%%"%ee["makerPct"]) if fin(ee.get("makerPct")) else NA,"%d kaki pasif"%(ee.get("legsMaker") or 0)))
+    o.append(card("Porsi fallback taker",("%.0f%%"%ee["fallbackPct"]) if fin(ee.get("fallbackPct")) else NA,"%d kaki menyeberang"%(ee.get("legsTaker") or 0)))
+    o.append(card("Biaya dibayar",money(ee.get("feePaid"),4),"maker 2bps + taker 5bps"))
+    o.append(card("Biaya dihemat",money(ee.get("feeSaved"),4),"3bps atas notional yang pasif"))
+    o.append(card("Selisih harga exit",("%.3f%%"%ee["exitDrift"]) if fin(ee.get("exitDrift")) else NA,"fallback vs harga maker"))
+    lat=[v for v in (R.get("exec") or {}).get("latency",{}).values() if fin(v)]
+    o.append(card("Latensi sinyal→order",("%.0f detik"%(sum(lat)/len(lat))) if lat else NA,"percobaan terakhir tiap instance"))
+    o.append("</div>")
+    if not fin(ee.get("makerPct")):
+        o.append("<div class='note'>Belum ada penutupan terjadwal sejak exit maker-first dinyalakan, jadi porsi maker dan biaya yang dihemat %s. Angkanya akan terisi setelah basket pertama tutup di batas 36 jam.</div>"%NA.lower())
     o.append("<h2>Smart Basket — mengelola basket setelah dibentuk</h2>")
     o.append("<div class='note'>Eksekusi exit adaptif <b>DIMATIKAN</b>; evaluasinya tetap berjalan. Penghitung scan terus bertambah, jadi tab Posisi bisa menunjukkan apa yang <i>akan</i> terjadi tanpa aturan itu menyentuh uang.</div>")
     o.append("<table><tr><th>mekanisme</th><th>status</th><th>parameter</th><th>artinya</th></tr>")
