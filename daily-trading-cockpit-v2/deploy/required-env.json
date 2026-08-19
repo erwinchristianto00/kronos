@@ -44,7 +44,7 @@
     },
     "CROSS_SECTIONAL_EDGE_MAX_STORED_OBSERVATIONS": {
       "value": "15000",
-      "why": "Code default 5000 prunes after ~4 months at the observed 37-47 observations/day. Each observation carries regimeClassAtOpen, and the directional controller's own decision stream is retained only 15 days - so this store is the ONLY path to ever testing SMART_REGIME_LOSS_EXIT against the real classifier instead of a market-momentum proxy. 15000 buys ~11-13 months (~24MB); do not raise much further without checking store-rewrite cost, a 234MB store once made testnet unresponsive."
+      "why": "Depth of the IN-APP shadow reports only. History no longer depends on it: deploy/archive-observations.py harvests every resolved observation into an append-only JSONL (~15MB/yr/instance, never pruned) so the cap can no longer silently decide what survives. 15000 keeps the store ~24MB, an order of magnitude below the 234MB that once made testnet unresponsive; it is now a free knob rather than a load-bearing one."
     }
   },
   "instances": {
