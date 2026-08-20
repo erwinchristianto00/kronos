@@ -27,6 +27,8 @@ import {
   CROSS_SECTIONAL_MIXED_MIN_SCORE_GAP,
   crossSectionalMixedLongAllowlist,
   crossSectionalMixedShortBlocklist,
+  crossSectionalLegScaleAnomaly,
+  crossSectionalScaleAnomalies,
   isCrossSectionalMixedWideLongPoolEnabled,
   getCrossSectionalAdaptiveConfig,
   regimeSkewedK,
@@ -454,6 +456,31 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     expect(late.status).toBe("CLOSED");
     // long A +10%, short B +10% (price fell 10% → short gains 10%) → gross = (0.1+0.1)/2 = 0.1
     expect(late.grossReturn!).toBeCloseTo(0.1, 9);
+  });
+
+  it("[SCALE-GUARD] voids a 1000PEPE spot/futures price-scale mismatch from reporting", () => {
+    // The multiplier contract is priced near 0.003, while bare spot PEPE is
+    // near 0.000003.  A resolver may close the observation for auditability,
+    // but it must never let that ~1000x unit mismatch into learned results.
+    const basket = buildCrossSectionalBasket(
+      scored([["SOLUSDT", 0.5, 100], ["1000PEPEUSDT", -0.4, 0.003]]),
+      { k: 1, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: 1_000 },
+    )!;
+    const resolved = resolveCrossSectional(
+      basket,
+      { SOLUSDT: 101, "1000PEPEUSDT": 0.000003 },
+      new Date(T0ms + 2_000).toISOString(),
+      0,
+    );
+
+    expect(crossSectionalLegScaleAnomaly(0.003, 0.000003)).toBe(true);
+    expect(crossSectionalScaleAnomalies([...resolved.longLeg, ...resolved.shortLeg])).toEqual([
+      "1000PEPEUSDT entry=0.003 exit=0.000003",
+    ]);
+    expect(resolved.reportingExclusion).toMatchObject({
+      kind: "OPERATOR_VOID",
+      reason: expect.stringContaining("AUTOMATIC SCALE GUARD"),
+    });
   });
 
   it("[COST] netReturn = grossReturn − roundtrip bps", () => {

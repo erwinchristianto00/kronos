@@ -40,6 +40,10 @@ import type { ExposureReserveCampaignCap, ExposureReserveRequest, ExposureReserv
 import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, type BinanceFuturesPrivateClient, type FillPriceResolution, type FuturesOrder, type FuturesSymbolFilters } from "./binance-futures-private.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
+import {
+  verifiedFuturesMarketReferencePrice,
+  type FuturesMarketReference,
+} from "./futures-market-reference-cache.js";
 import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
 import type { FourBrainBridgeCandidate, FourBrainBridgeDecision } from "./four-brain-testnet-bridge.js";
 import {
@@ -1583,6 +1587,11 @@ export interface CrossSectionalExecutorOptions {
   /** Populates that cache for one symbol. Awaited immediately before placeOrder so the
    *  reference belongs to THIS submission; failure is swallowed and the order proceeds. */
   warmPublicQuote?: (symbol: string) => Promise<unknown>;
+  /** Fresh, exact-symbol USD-M sizing reference.  It is intentionally separate from the
+   * public quote cache, which may contain a spot observation for other entry telemetry. */
+  readFuturesMarketReference?: (symbol: string) => FuturesMarketReference | null;
+  /** Refreshes the selected testnet/mainnet USD-M mark, with a USD-M book-only fallback. */
+  warmFuturesMarketReference?: (symbol: string) => Promise<FuturesMarketReference | null>;
   /** Delay between queryOrder confirmation retries in resolveFillPrice. Default 400ms; tests pass 0. */
   fillConfirmRetryDelayMs?: number;
   /** Daily basket loss breaker limit override (tests inject; default reads
@@ -1740,6 +1749,8 @@ export class CrossSectionalExecutor {
   private readonly nowIso: () => string;
   private readonly readPublicQuoteFn: CrossSectionalExecutorOptions["readPublicQuote"] | null;
   private readonly warmPublicQuoteFn: CrossSectionalExecutorOptions["warmPublicQuote"] | null;
+  private readonly readFuturesMarketReferenceFn: CrossSectionalExecutorOptions["readFuturesMarketReference"] | null;
+  private readonly warmFuturesMarketReferenceFn: CrossSectionalExecutorOptions["warmFuturesMarketReference"] | null;
   private readonly targetVariant: string;
   private readonly laneId: string;
   private ticking = false;
@@ -1800,6 +1811,8 @@ export class CrossSectionalExecutor {
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
     this.readPublicQuoteFn = opts.readPublicQuote ?? null;
     this.warmPublicQuoteFn = opts.warmPublicQuote ?? null;
+    this.readFuturesMarketReferenceFn = opts.readFuturesMarketReference ?? null;
+    this.warmFuturesMarketReferenceFn = opts.warmFuturesMarketReference ?? null;
     this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
     this.existingNotionalForSymbolFn = opts.existingNotionalForSymbol ?? (() => 0);
     this.maxNotionalPerSymbolAcrossLanesFn = opts.maxNotionalPerSymbolAcrossLanes ?? (() => 0);
@@ -2773,21 +2786,24 @@ export class CrossSectionalExecutor {
   /**
    * A zero-position row on Binance's positionRisk endpoint can legitimately carry markPrice=0
    * for a multiplier perpetual, even while that contract is actively tradable.  The measurement
-   * signal's bare-spot price remains unsafe for sizing, so recover only from a freshly warmed
-   * USD-M book quote; a spot fallback is deliberately rejected.
+   * signal's bare-spot price remains unsafe for sizing.  Prefer the short-lived,
+   * exact-symbol USD-M mark cache and fall back only to its USD-M execution-book
+   * midpoint; a spot cache value is deliberately not even considered here.
    */
   private async liveMultiplierReferencePrice(symbol: string, mark: unknown = null): Promise<number | null> {
-    if (typeof mark === "number" && Number.isFinite(mark) && mark > 0) return mark;
+    const cached = verifiedFuturesMarketReferencePrice(symbol, this.readFuturesMarketReferenceFn?.(symbol));
+    if (cached !== null) return cached;
     try {
-      await this.warmPublicQuoteFn?.(symbol);
+      const refreshed = await this.warmFuturesMarketReferenceFn?.(symbol);
+      const fresh = verifiedFuturesMarketReferencePrice(symbol, refreshed);
+      if (fresh !== null) return fresh;
     } catch {
-      // A missing public quote stays a safe refusal at the caller; never substitute spot scale.
+      // A missing public futures reference stays a safe refusal at the caller.
     }
-    const quote = this.readPublicQuoteFn?.(symbol) ?? null;
-    return quote?.venue === "BINANCE_USDM_BOOK_TICKER" &&
-      Number.isFinite(quote.mid) && quote.mid > 0
-      ? quote.mid
-      : null;
+    // positionRisk is also a same-environment USD-M source.  It remains a last
+    // safe fallback for deployments that have not yet supplied the public cache,
+    // but the raw signal/spot price is never reachable from this method.
+    return typeof mark === "number" && Number.isFinite(mark) && mark > 0 ? mark : null;
   }
 
   /**
@@ -2822,7 +2838,7 @@ export class CrossSectionalExecutor {
           if (isCrossSectionalMultiplierContract(leg.symbol)) {
             return {
               allowed: false,
-              reason: `smart entry refresh: ${leg.symbol} has no live futures mark; refusing spot-scale sizing fallback`,
+              reason: `smart entry refresh: ${leg.symbol} has no verified live futures price; refusing spot-scale sizing fallback`,
               at: this.nowIso(),
               referencePrices,
             };
@@ -4535,7 +4551,7 @@ export class CrossSectionalExecutor {
           this.skipSignal(
             signal,
             "SIZING",
-            `${leg.symbol} requires a live futures mark; refusing spot-scale sizing fallback`,
+            `${leg.symbol} requires a verified live futures price; refusing spot-scale sizing fallback`,
             smartEntry.referencePrices,
           );
           return;

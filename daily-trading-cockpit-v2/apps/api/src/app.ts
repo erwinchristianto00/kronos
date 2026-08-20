@@ -25,6 +25,7 @@ import { registerScanRoute } from "./routes/scan.js";
 import { registerShadowRoutes } from "./routes/shadow.js";
 import { registerTradingAssistantRoutes } from "./routes/trading-assistant.js";
 import { BinanceFuturesPrivateClient } from "./lib/binance-futures-private.js";
+import { FuturesMarketReferenceCache } from "./lib/futures-market-reference-cache.js";
 import {
   CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
   CROSS_SECTIONAL_TREND_LANE_ID,
@@ -1274,13 +1275,26 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // Recording must never be able to disturb the gate that just fetched this quote.
       }
     };
+    // Sizing is deliberately separate from the public/spot quote cache above. A
+    // multiplier contract's bare spot symbol has a different unit, so only this
+    // cache's exact-symbol USD-M mark (or USD-M book midpoint) can price it.
+    const futuresMarketReferenceCache = new FuturesMarketReferenceCache(
+      {
+        getMarkPrice: (symbol) => liveClient.getMarkPrice(symbol),
+        getBookTicker: (symbol) => liveClient.getBookTicker(symbol),
+      },
+      { maxAgeMs: 10_000, maxSymbols: MAX_PUBLIC_QUOTE_SYMBOLS },
+    );
     const currentPublicPrice = async (symbol: string): Promise<number | null> => {
       const executionBookPromise = Promise.race([
         liveClient.getBookTicker(symbol).catch(() => null),
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 750)),
       ]);
       const [book, executionBook] = await Promise.all([
-        binanceClient.getBookTicker(symbol),
+        // A multiplier USD-M symbol may have no identically named spot market.
+        // Keep that failure local so it cannot discard a valid execution-book
+        // observation before it reaches the shared quote cache.
+        binanceClient.getBookTicker(symbol).catch(() => null),
         executionBookPromise,
       ]);
       // Stamped AFTER the await, so the age the executor derives from it is the age of the
@@ -1288,18 +1302,18 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       const atMs = Date.now();
       // Identical precedence/return values to the pre-2026-07-27 body (both-sided mid, else the
       // single usable side, else null) — restructured only so the quote can be remembered.
-      const mid = book.bid !== null && book.ask !== null && book.bid > 0 && book.ask > 0
+      const spotMid = book !== null && book.bid !== null && book.ask !== null && book.bid > 0 && book.ask > 0
         ? (book.bid + book.ask) / 2
-        : book.bid !== null && book.bid > 0
+        : book !== null && book.bid !== null && book.bid > 0
           ? book.bid
-          : book.ask !== null && book.ask > 0
+          : book !== null && book.ask !== null && book.ask > 0
             ? book.ask
             : null;
-      if (mid !== null) {
-        const executionMid =
-          executionBook?.bid && executionBook.ask
-            ? (executionBook.bid + executionBook.ask) / 2
-            : executionBook?.bid ?? executionBook?.ask ?? null;
+      const executionMid =
+        executionBook?.bid && executionBook.ask
+          ? (executionBook.bid + executionBook.ask) / 2
+          : executionBook?.bid ?? executionBook?.ask ?? null;
+      if (executionMid !== null || spotMid !== null) {
         rememberPublicQuote(
           symbol,
           executionMid !== null
@@ -1313,15 +1327,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
                 venue: "BINANCE_USDM_BOOK_TICKER",
               }
             : {
-                bid: book.bid !== null && book.bid > 0 ? book.bid : null,
-                ask: book.ask !== null && book.ask > 0 ? book.ask : null,
-                mid,
+                bid: book?.bid !== null && book?.bid !== undefined && book.bid > 0 ? book.bid : null,
+                ask: book?.ask !== null && book?.ask !== undefined && book.ask > 0 ? book.ask : null,
+                mid: spotMid!,
                 atMs,
                 venue: "BINANCE_SPOT_BOOK_TICKER",
               },
         );
       }
-      return mid;
+      // Preserve spot precedence for the pre-existing single-symbol gate, but
+      // make a valid USD-M book usable when no same-name spot symbol exists.
+      return spotMid ?? executionMid;
     };
     singleSymbolPriceTimeline = new SingleSymbolPriceTimelineService(
       (symbol, interval, limit) => binanceClient.getCandles(symbol, interval, limit),
@@ -2195,6 +2211,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // so this can only ever add a record — never block or delay a placement.
         readPublicQuote,
         warmPublicQuote: currentPublicPrice,
+        readFuturesMarketReference: (symbol) => futuresMarketReferenceCache.read(symbol),
+        warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
         cortexRealAttribution: getCortexRealAttributionStore(),
         // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
         // closeBasket() already fetches one getUserTrades page per unique symbol to sum the real
@@ -2304,6 +2322,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
         // 2026-07-22 bug-hunt fix: see the FILTERED instance above.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
+        readFuturesMarketReference: (symbol) => futuresMarketReferenceCache.read(symbol),
+        warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
         cortexRealAttribution: getCortexRealAttributionStore(),
         // Per-fill execution recorder — see the FILTERED instance above.
         executionFillRecorder: getExecutionFillRecorder(),
@@ -2338,6 +2358,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
         // 2026-07-22 bug-hunt fix: see the FILTERED instance above.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
+        readFuturesMarketReference: (symbol) => futuresMarketReferenceCache.read(symbol),
+        warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
         cortexRealAttribution: getCortexRealAttributionStore(),
         // Per-fill execution recorder — see the FILTERED instance above.
         executionFillRecorder: getExecutionFillRecorder(),

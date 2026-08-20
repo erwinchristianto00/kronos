@@ -60,6 +60,69 @@ describe("binance-futures-private signing", () => {
     expect(urls[0]).toContain("testnet.binancefuture.com/fapi/v1/ticker/bookTicker");
   });
 
+  it("reads the public premium-index mark from the same selected execution base", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({ symbol: "1000PEPEUSDT", markPrice: "0.00319802" }), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "testnet",
+      fetchImpl,
+    });
+
+    await expect(client.getMarkPrice("1000PEPEUSDT")).resolves.toBeCloseTo(0.00319802, 10);
+    expect(urls[0]).toContain("testnet.binancefuture.com/fapi/v1/premiumIndex?symbol=1000PEPEUSDT");
+  });
+
+  it("accepts only actively trading USD-M perpetual filters", async () => {
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      expect(String(url)).toContain("/fapi/v1/exchangeInfo");
+      return new Response(JSON.stringify({
+        symbols: [
+          {
+            symbol: "1000PEPEUSDT", status: "TRADING", contractType: "PERPETUAL", quoteAsset: "USDT",
+            pricePrecision: 7, quantityPrecision: 0,
+            filters: [
+              { filterType: "PRICE_FILTER", tickSize: "0.0000001" },
+              { filterType: "LOT_SIZE", stepSize: "1", minQty: "1" },
+              { filterType: "MIN_NOTIONAL", notional: "5" },
+            ],
+          },
+          {
+            symbol: "SOLUSDT", status: "TRADING", contractType: "PERPETUAL", quoteAsset: "USDT",
+            pricePrecision: 2, quantityPrecision: 2,
+            filters: [
+              { filterType: "PRICE_FILTER", tickSize: "0.01" },
+              { filterType: "LOT_SIZE", stepSize: "0.01", minQty: "0.01" },
+              { filterType: "MIN_NOTIONAL", notional: "5" },
+            ],
+          },
+          {
+            symbol: "SPOTONLYUSDT", status: "TRADING", contractType: "PERPETUAL", quoteAsset: "BUSD",
+            filters: [],
+          },
+          {
+            symbol: "DELISTEDUSDT", status: "SETTLING", contractType: "PERPETUAL", quoteAsset: "USDT",
+            filters: [],
+          },
+          {
+            symbol: "DELIVERYUSDT", status: "TRADING", contractType: "CURRENT_MONTH", quoteAsset: "USDT",
+            filters: [],
+          },
+        ],
+      }), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "mainnet", fetchImpl });
+
+    const filters = await client.getExchangeFilters();
+
+    expect([...filters.keys()]).toEqual(["1000PEPEUSDT", "SOLUSDT"]);
+    expect(filters.get("1000PEPEUSDT")).toMatchObject({ stepSize: 1, minQty: 1, minNotional: 5 });
+  });
+
   it("refuses signed requests when measured clock skew exceeds the guard", async () => {
     // Fake fetch: /fapi/v1/time replies with a server time 10s ahead of local.
     const fetchImpl = (async (url: RequestInfo | URL) => {
@@ -239,6 +302,9 @@ describe("binance-futures-private signing", () => {
         return new Response(JSON.stringify({
           symbols: [{
             symbol: "DOGEUSDT",
+            status: "TRADING",
+            contractType: "PERPETUAL",
+            quoteAsset: "USDT",
             pricePrecision: 5,
             quantityPrecision: 0,
             filters: [
@@ -320,6 +386,9 @@ describe("binance-futures-private signing", () => {
         return new Response(JSON.stringify({
           symbols: [{
             symbol: "DOGEUSDT",
+            status: "TRADING",
+            contractType: "PERPETUAL",
+            quoteAsset: "USDT",
             pricePrecision: 5,
             quantityPrecision: 0,
             filters: [

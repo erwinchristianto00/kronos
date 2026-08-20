@@ -680,6 +680,20 @@ export class BinanceFuturesPrivateClient {
     };
   }
 
+  /**
+   * Public USD-M mark from the SAME selected execution environment.  This must
+   * not be substituted with Binance spot's PEPEUSDT price for multiplier perps.
+   */
+  async getMarkPrice(symbol: string): Promise<number | null> {
+    const parsed = await this.requestPublic("/fapi/v1/premiumIndex", { symbol });
+    const row = parsed as Record<string, unknown> | null;
+    if (!row || typeof row !== "object") {
+      throw new BinanceFuturesPrivateError("invalid_response", `premium index missing for ${symbol}`);
+    }
+    const markPrice = toNum(row.markPrice);
+    return markPrice > 0 ? markPrice : null;
+  }
+
   async getExchangeFilters(): Promise<Map<string, FuturesSymbolFilters>> {
     if (this.exchangeFiltersCache && this.nowMs() - this.exchangeFiltersCacheAtMs < EXCHANGE_FILTERS_TTL_MS) {
       return new Map(this.exchangeFiltersCache);
@@ -691,11 +705,23 @@ export class BinanceFuturesPrivateClient {
     for (const s of symbols) {
       const sym = s as {
         symbol?: string;
+        status?: string;
+        contractType?: string;
+        quoteAsset?: string;
         pricePrecision?: number;
         quantityPrecision?: number;
         filters?: Array<{ filterType?: string; tickSize?: string; stepSize?: string; minQty?: string; notional?: string }>;
       };
-      if (!sym.symbol || !Array.isArray(sym.filters)) continue;
+      // This cache gates executable USD-M symbols.  A symbol merely present in
+      // exchangeInfo is not enough: delivery, settling, inactive, and non-USDT
+      // contracts must be absent so every caller fails closed before sizing.
+      if (
+        !sym.symbol ||
+        sym.status !== "TRADING" ||
+        sym.contractType !== "PERPETUAL" ||
+        sym.quoteAsset !== "USDT" ||
+        !Array.isArray(sym.filters)
+      ) continue;
       const price = sym.filters.find((f) => f.filterType === "PRICE_FILTER");
       const lot = sym.filters.find((f) => f.filterType === "LOT_SIZE");
       const notional = sym.filters.find((f) => f.filterType === "MIN_NOTIONAL");

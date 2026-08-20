@@ -22,6 +22,7 @@ import {
   type ExecutorBasket,
 } from "../src/lib/cross-sectional-executor.js";
 import { CortexRealAttributionStore } from "../src/lib/cortex-real-attribution.js";
+import type { FuturesMarketReference } from "../src/lib/futures-market-reference-cache.js";
 // [CONFLICTING SINGLE-SYMBOL EXPOSURE] test support only (see the describe block near the end of
 // this file) — a REAL AccountExposureCoordinator + a REAL SingleSymbolLaneExecutor, reusing the
 // exact construction idiom already established in account-exposure-coordinator-integration.test.ts,
@@ -283,6 +284,8 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
   releaseExposureReservation?: (reservationId: string, reason: string) => void;
   readPublicQuote?: (symbol: string) => { bid: number | null; ask: number | null; mid: number; atMs: number; venue: string } | null;
   warmPublicQuote?: (symbol: string) => Promise<unknown>;
+  readFuturesMarketReference?: (symbol: string) => FuturesMarketReference | null;
+  warmFuturesMarketReference?: (symbol: string) => Promise<FuturesMarketReference | null>;
 } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
@@ -327,6 +330,8 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     ...(opts.commitExposureReservation ? { commitExposureReservation: opts.commitExposureReservation } : {}),
     ...(opts.releaseExposureReservation ? { releaseExposureReservation: opts.releaseExposureReservation } : {}),
     ...(opts.warmPublicQuote ? { warmPublicQuote: opts.warmPublicQuote } : {}),
+    ...(opts.readFuturesMarketReference ? { readFuturesMarketReference: opts.readFuturesMarketReference } : {}),
+    ...(opts.warmFuturesMarketReference ? { warmFuturesMarketReference: opts.warmFuturesMarketReference } : {}),
   });
   return { executor, client, signalStore, store, storeDir };
 }
@@ -1251,7 +1256,7 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
       outcome: "SKIPPED",
       referencePrices: {},
     });
-    expect(executor.getStatus().entryAttemptAudit.latest?.reason).toContain("requires a live futures mark");
+    expect(executor.getStatus().entryAttemptAudit.latest?.reason).toContain("requires a verified live futures price");
   });
 
   it("[MULTIPLIER CONTRACT] uses the live futures mark for 1000PEPE sizing without treating its unit scale as drift", async () => {
@@ -1260,12 +1265,17 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
       client,
       signalMs: NOW_MS - 5 * 60_000,
       smartBasketEnabled: true,
+      warmFuturesMarketReference: async (symbol) => ({
+        symbol,
+        price: 0.003,
+        atMs: NOW_MS,
+        source: "USD_M_MARK_PRICE",
+      }),
     });
     const signal = signalStore.all[0]!;
     signal.formationMode = "PLAIN_MOM36";
     signal.longLeg[0] = { symbol: "1000PEPEUSDT", entryPrice: 0.000003, exitPrice: null, volatilityAtOpen: 0.01 };
     signal.shortLeg[0]!.volatilityAtOpen = 0.01;
-    client.markPriceBySymbol.set("1000PEPEUSDT", 0.003);
     client.markPriceBySymbol.set("DOGEUSDT", 0.1);
     client.fillPriceBySymbol.set("1000PEPEUSDT", 0.003);
     client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
@@ -1281,17 +1291,17 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(pepe.qty).toBeLessThan(9_000);
   });
 
-  it("[MULTIPLIER CONTRACT] warms a USD-M quote when Binance reports a zero-position mark as zero", async () => {
+  it("[MULTIPLIER CONTRACT] uses a USD-M book fallback when the mark cache misses", async () => {
     const client = new FakeExecClient();
-    let warmed = false;
+    let refreshes = 0;
     const { executor, signalStore, store } = makeExecutor({
       client,
       signalMs: NOW_MS - 5 * 60_000,
       smartBasketEnabled: true,
-      warmPublicQuote: async () => { warmed = true; },
-      readPublicQuote: (symbol) => symbol === "1000PEPEUSDT" && warmed
-        ? { bid: 0.00299, ask: 0.00301, mid: 0.003, atMs: NOW_MS, venue: "BINANCE_USDM_BOOK_TICKER" }
-        : null,
+      warmFuturesMarketReference: async (symbol) => {
+        refreshes += 1;
+        return { symbol, price: 0.003, atMs: NOW_MS, source: "USD_M_BOOK_TICKER" };
+      },
     });
     const signal = signalStore.all[0]!;
     signal.longLeg[0] = { symbol: "1000PEPEUSDT", entryPrice: 0.000003, exitPrice: null, volatilityAtOpen: 0.01 };
@@ -1302,23 +1312,25 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
 
     await executor.tick();
 
-    expect(warmed).toBe(true);
+    expect(refreshes).toBe(1);
     const pepe = store.getState().baskets[0]!.legs.find((leg) => leg.symbol === "1000PEPEUSDT")!;
     expect(pepe.entryPrice).toBeCloseTo(0.003, 9);
     expect(pepe.qty).toBeGreaterThan(8_000);
     expect(pepe.qty).toBeLessThan(9_000);
   });
 
-  it("[MULTIPLIER CONTRACT] rejects a warmed spot quote rather than using its unsafe unit scale", async () => {
+  it("[MULTIPLIER CONTRACT] rejects a spot-scale cache value rather than using its unsafe unit scale", async () => {
     const client = new FakeExecClient();
     const { executor, signalStore, store } = makeExecutor({
       client,
       signalMs: NOW_MS - 5 * 60_000,
       smartBasketEnabled: true,
-      warmPublicQuote: async () => undefined,
-      readPublicQuote: (symbol) => symbol === "1000PEPEUSDT"
-        ? { bid: 0.00000299, ask: 0.00000301, mid: 0.000003, atMs: NOW_MS, venue: "BINANCE_SPOT_BOOK_TICKER" }
-        : null,
+      warmFuturesMarketReference: async (symbol) => ({
+        symbol,
+        price: 0.000003,
+        atMs: NOW_MS,
+        source: "BINANCE_SPOT_BOOK_TICKER",
+      } as unknown as FuturesMarketReference),
     });
     const signal = signalStore.all[0]!;
     signal.longLeg[0] = { symbol: "1000PEPEUSDT", entryPrice: 0.000003, exitPrice: null, volatilityAtOpen: 0.01 };
@@ -1328,7 +1340,63 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
 
     expect(store.getState().baskets).toHaveLength(0);
     expect(client.placed).toHaveLength(0);
-    expect(executor.getStatus().entryAttemptAudit.latest?.reason).toContain("no live futures mark");
+    expect(executor.getStatus().entryAttemptAudit.latest?.reason).toContain("no verified live futures price");
+  });
+
+  it("[FUTURES VALIDATION] keeps a normal active USD-M symbol such as SOLUSDT eligible", async () => {
+    const client = new FakeExecClient();
+    const { executor, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: true,
+    });
+    client.markPriceBySymbol.set("SOLUSDT", 100);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+
+    await executor.tick();
+
+    expect(store.getState().baskets).toHaveLength(1);
+    expect(store.getState().baskets[0]!.status).toBe("COMPLETE");
+    expect(client.placed.map((order) => order.symbol).sort()).toEqual(["DOGEUSDT", "SOLUSDT"]);
+  });
+
+  it("[FUTURES VALIDATION] skips a symbol that does not exist in USD-M exchangeInfo", async () => {
+    const client = new FakeExecClient();
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: false,
+    });
+    signalStore.all[0]!.longLeg[0] = { symbol: "NOTREALUSDT", entryPrice: 1, exitPrice: null };
+
+    await executor.tick();
+
+    expect(store.getState().baskets).toHaveLength(0);
+    expect(client.placed).toHaveLength(0);
+    expect(executor.getStatus().entryAttemptAudit.latest?.reason).toContain("NOTREALUSDT missing exchange filters");
+  });
+
+  it("[FUTURES VALIDATION] does not admit a spot-only symbol when USD-M exchangeInfo omits it", async () => {
+    const client = new FakeExecClient();
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: false,
+      // This simulates a harmless spot observation.  It must not make the futures
+      // candidate tradable when the exact USD-M exchangeInfo symbol is absent.
+      readPublicQuote: (symbol) => symbol === "SPOTONLYUSDT"
+        ? { bid: 42, ask: 42.01, mid: 42.005, atMs: NOW_MS, venue: "BINANCE_SPOT_BOOK_TICKER" }
+        : null,
+    });
+    signalStore.all[0]!.longLeg[0] = { symbol: "SPOTONLYUSDT", entryPrice: 42, exitPrice: null };
+
+    await executor.tick();
+
+    expect(store.getState().baskets).toHaveLength(0);
+    expect(client.placed).toHaveLength(0);
+    expect(executor.getStatus().entryAttemptAudit.latest?.reason).toContain("SPOTONLYUSDT missing exchange filters");
   });
 
   it("[SMART BASKET LIFECYCLE] keeps entry revalidation and provenance for a Plain MOM36 formation", async () => {
