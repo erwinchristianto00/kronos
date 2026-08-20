@@ -142,6 +142,12 @@ type OpenBasketUnrealized = {
   signal: string;
   variant: string;
   openedAt: string;
+  /** Canonical executor deadline; never the later research measurement horizon when a cap exists. */
+  scheduledCloseAtMs?: number | null;
+  executionCapHours?: number | null;
+  deadlineSource?: 'BASKET_POLICY_FINGERPRINT' | 'LEGACY_BASKET_CONTRACT' | 'MEASUREMENT_HORIZON';
+  /** TP/SL/adaptive policy can close a basket before its scheduled HORIZON deadline. */
+  mayExitEarlier?: boolean;
   legs: Array<{
     symbol: string;
     side: 'LONG' | 'SHORT';
@@ -535,7 +541,7 @@ function BasketRows({ baskets, open }: { baskets: XSecBasket[]; open?: boolean }
   </div>)}</>;
 }
 
-function formatDate(ts: string | null | undefined) {
+function formatDate(ts: string | number | null | undefined) {
   return ts ? new Intl.DateTimeFormat('id-ID', {
     dateStyle: 'medium',
     timeStyle: 'medium',
@@ -651,6 +657,11 @@ function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: strin
 function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized }) {
   const long = basket.legs.filter((leg) => leg.side === 'LONG').map((leg) => leg.symbol);
   const short = basket.legs.filter((leg) => leg.side === 'SHORT').map((leg) => leg.symbol);
+  const scheduledCloseAtMs = typeof basket.scheduledCloseAtMs === 'number' && Number.isFinite(basket.scheduledCloseAtMs)
+    ? basket.scheduledCloseAtMs
+    : null;
+  const closeInHours = scheduledCloseAtMs == null ? null : Math.max(0, (scheduledCloseAtMs - Date.now()) / 3_600_000);
+  const deadlineLabel = basket.mayExitEarlier ? 'batas close' : 'tutup';
   const extrema = basket.unrealizedExtrema;
   const summary = [
     ['Gross sekarang', basket.grossUnrealizedUsd],
@@ -664,7 +675,17 @@ function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized })
     <div style={{ padding: '9px 12px', background: C.sub, display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'baseline' }}>
       <strong style={{ color: C.text }}>{basket.basketId}</strong>
       <span style={{ color: C.dim }}>{basket.variant} · {basket.signal}</span>
-      <span style={{ color: C.dim }}>open {formatDate(basket.openedAt)}</span>
+      <span style={{ color: C.dim }}>open {formatDate(basket.openedAt)} Taipei</span>
+      <span
+        style={{ color: scheduledCloseAtMs == null ? C.bad : C.measure }}
+        title={scheduledCloseAtMs == null
+          ? 'Executor tidak memberikan deadline close; UI tidak menebak dari mark atau horizon riset.'
+          : `${basket.deadlineSource ?? 'unknown source'}${basket.mayExitEarlier ? ' · TP/SL/adaptive exit dapat menutup lebih awal' : ''}`}
+      >
+        {scheduledCloseAtMs == null
+          ? 'jadwal close tidak tersedia'
+          : `${deadlineLabel} ${formatDate(scheduledCloseAtMs)} Taipei · ${closeInHours?.toFixed(1)}h lagi${basket.executionCapHours != null ? ` (cap ${basket.executionCapHours}h)` : ''}`}
+      </span>
       <CapitalNote legs={basket.legs} />
       <BasketLiquiditySummary legs={basket.legs} />
     </div>

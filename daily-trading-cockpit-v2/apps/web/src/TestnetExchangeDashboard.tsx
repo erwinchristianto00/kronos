@@ -608,7 +608,7 @@ function positiveFinite(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
 
-function basketHorizonSchedule(basket: XsecOpenBasket, executor: XsecExecStatus | null): {
+export function basketHorizonSchedule(basket: XsecOpenBasket, executor: XsecExecStatus | null): {
   closeAtMs: number | null;
   capHours: number | null;
   source: 'basket fingerprint' | 'legacy basket contract' | 'runtime fallback' | 'measurement fallback';
@@ -629,9 +629,13 @@ function basketHorizonSchedule(basket: XsecOpenBasket, executor: XsecExecStatus 
         : 'measurement fallback';
   const capHours = fingerprintCap ?? legacyCap ?? runtimeCap;
   const openedAtMs = Date.parse(basket.openedAt);
-  const closeAtMs = capHours != null && Number.isFinite(openedAtMs)
+  const capCloseAtMs = capHours != null && Number.isFinite(openedAtMs)
     ? openedAtMs + capHours * 3_600_000
-    : Number.isFinite(basket.closesAtMs) ? basket.closesAtMs : null;
+    : null;
+  const measurementCloseAtMs = Number.isFinite(basket.closesAtMs) ? basket.closesAtMs : null;
+  const closeAtMs = capCloseAtMs != null && measurementCloseAtMs != null
+    ? Math.min(capCloseAtMs, measurementCloseAtMs)
+    : capCloseAtMs ?? measurementCloseAtMs;
   return {
     closeAtMs,
     capHours,
@@ -640,11 +644,29 @@ function basketHorizonSchedule(basket: XsecOpenBasket, executor: XsecExecStatus 
   };
 }
 
+/** Operator-facing timestamps are always explicit about the timezone. */
+export function taipeiDateTime(value: string | number | null | undefined): string | null {
+  const ms = typeof value === 'number'
+    ? value
+    : typeof value === 'string'
+      ? Date.parse(value)
+      : Number.NaN;
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).toLocaleString('en-GB', {
+    timeZone: 'Asia/Taipei',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).replace(',', '');
+}
+
 function horizonDetail(closeAtMs: number | null, source: string, earlyExitPossible: boolean): string {
   if (closeAtMs == null) return `HORIZON source: ${source}; waktu tidak tersedia`;
-  const closeAt = new Date(closeAtMs);
-  if (Number.isNaN(closeAt.getTime())) return `HORIZON source: ${source}; waktu tidak valid`;
-  const taipei = closeAt.toLocaleString('en-GB', { timeZone: 'Asia/Taipei', hour12: false });
+  const taipei = taipeiDateTime(closeAtMs);
+  if (taipei == null) return `HORIZON source: ${source}; waktu tidak valid`;
   return `HORIZON: ${taipei} Taipei · source: ${source}${earlyExitPossible ? ' · TP/SL/emergency may close earlier' : ''}`;
 }
 
@@ -2022,11 +2044,28 @@ export default function TestnetExchangeDashboard() {
   // openBaskets/staleSince state — surface all 3, not just FILTERED, so a stuck TREND or MIXED
   // instance is visible instead of silently invisible. (Unchanged data, just one combined list
   // instead of the old separate xsecInstances array + separate staleSince array.)
-  const xsecInstances: Array<{ label: string; status: XsecExecStatus | null; staleSince: string | null }> = [
-    { label: 'FILTERED', status: xsecExec, staleSince: xsecExecStaleSince },
-    { label: 'TREND', status: xsecExecTrend, staleSince: xsecExecTrendStaleSince },
-    { label: 'MIXED', status: xsecExecMixed, staleSince: xsecExecMixedStaleSince },
+  const xsecInstances: Array<{ label: string; laneId: string; status: XsecExecStatus | null; staleSince: string | null }> = [
+    { label: 'FILTERED', laneId: 'CROSS_SECTIONAL_MARKET_NEUTRAL', status: xsecExec, staleSince: xsecExecStaleSince },
+    { label: 'TREND', laneId: 'CROSS_SECTIONAL_TREND', status: xsecExecTrend, staleSince: xsecExecTrendStaleSince },
+    { label: 'MIXED', laneId: 'CROSS_SECTIONAL_MIXED', status: xsecExecMixed, staleSince: xsecExecMixedStaleSince },
   ];
+  // The exchange account is netted by symbol, while executor state owns the real basket clock.
+  // Match on lane + symbol + side only; if the account is not provably tied to a current executor
+  // leg, render no time rather than assigning another basket's deadline.
+  const openBasketLegSchedules = xsecInstances.flatMap(({ label, laneId, status: xs }) =>
+    (xs?.openBaskets ?? []).flatMap((basket) => {
+      const horizon = basketHorizonSchedule(basket, xs);
+      return basket.legs.map((leg) => ({
+        label,
+        laneId,
+        basketId: basket.basketId,
+        symbol: leg.symbol,
+        side: leg.side,
+        openedAt: basket.openedAt,
+        horizon,
+      }));
+    }),
+  );
   // Display-only mapping of the 3 Tier-1-3 R&D shadow lanes into the shared LaneMaturityTable's
   // row shape (2026-07-23) — no new data, just reshaping `rndLanes` state for the shared component.
   // Renamed per operator ask: disambiguate from the Research dashboard's separate single-symbol lane.
@@ -2489,6 +2528,9 @@ export default function TestnetExchangeDashboard() {
                 // the executor's HORIZON cap; the complete source/time remains available on hover.
                 const horizon = basketHorizonSchedule(b, xs);
                 const hoursLeft = horizon.closeAtMs == null ? null : Math.max(0, (horizon.closeAtMs - Date.now()) / 3600000);
+                const openedAt = taipeiDateTime(b.openedAt);
+                const closesAt = taipeiDateTime(horizon.closeAtMs);
+                const closeLabel = horizon.earlyExitPossible ? 'batas close' : 'tutup';
                 // Stale = the 5-min TP tick hasn't stamped in >15m. A basket younger than
                 // 15m legitimately has no stamp yet — warning there is a false alarm.
                 const oldEnough = Date.now() - new Date(b.openedAt).getTime() > 15 * 60_000;
@@ -2499,11 +2541,13 @@ export default function TestnetExchangeDashboard() {
                     <span>net <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong></span>
                     <span>ke TP <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{xs?.tpDisabled ? 'TP mati' : gap == null ? '—' : `${gap.toFixed(2)}pp (${tp?.toFixed(1)}%)`}</strong></span>
                     <span>ke stop <strong className={slGap != null && slGap <= 0 ? 'tone-critical' : ''}>{sl == null ? 'stop mati' : slGap == null ? '—' : `${slGap.toFixed(2)}pp (-${sl.toFixed(1)}%)`}</strong></span>
+                    <span className="tone-measure">buka {openedAt == null ? '—' : `${openedAt} Taipei`}</span>
                     <span
                       className="tone-measure"
                       title={horizonDetail(horizon.closeAtMs, horizon.source, horizon.earlyExitPossible)}
                     >
-                      tutup {hoursLeft == null ? '—' : `${hoursLeft.toFixed(1)}h lagi`}{horizon.capHours != null ? ` (cap ${horizon.capHours}h)` : ''}
+                      {closeLabel} {closesAt == null ? '—' : `${closesAt} Taipei`}
+                      {hoursLeft == null ? '' : ` · ${hoursLeft.toFixed(1)}h lagi`}{horizon.capHours != null ? ` (cap ${horizon.capHours}h)` : ''}
                     </span>
                     {stale && <span className="tone-warning">stamp basi &gt;15m — cek executor</span>}
                   </div>
@@ -2624,6 +2668,12 @@ export default function TestnetExchangeDashboard() {
                       const unreal = p.basketUnrealizedPnl ?? p.unrealizedPnl;
                       const shareFrac = p.quantity > 0 ? qty / p.quantity : 1;
                       const afterCost = unreal - (p.estimatedCloseCostUsd ?? 0) * Math.min(1, shareFrac);
+                      const basketSchedules = openBasketLegSchedules.filter((schedule) =>
+                        schedule.symbol === p.symbol && schedule.side === side && p.laneIds.includes(schedule.laneId),
+                      );
+                      const basketScheduleStillLoading = basketSchedules.length === 0 && xsecInstances.some(
+                        ({ laneId, status: xs }) => p.laneIds.includes(laneId) && xs == null,
+                      );
                       return (
                         <tr key={`foundation-${p.symbol}`}>
                           <td>Basket</td>
@@ -2637,13 +2687,49 @@ export default function TestnetExchangeDashboard() {
                           <td className="tone-critical">{price(p.liquidationPrice)}</td>
                           <td>—</td>
                           <td>—</td>
-                          <td>basket horizon</td>
+                          <td>
+                            {basketSchedules.length === 0 ? (
+                              <span
+                                className={basketScheduleStillLoading ? 'tone-measure' : 'tone-warning'}
+                                title={basketScheduleStillLoading
+                                  ? 'Menunggu status executor basket untuk memuat jadwal close.'
+                                  : 'Tidak ada open-basket executor yang cocok untuk lane, symbol, dan side ini; waktu close tidak ditebak dari posisi exchange yang netted.'}
+                              >
+                                {basketScheduleStillLoading ? 'schedule loading…' : 'schedule unavailable'}
+                              </span>
+                            ) : basketSchedules.map((schedule) => {
+                              const closesAt = taipeiDateTime(schedule.horizon.closeAtMs);
+                              const hoursLeft = schedule.horizon.closeAtMs == null
+                                ? null
+                                : Math.max(0, (schedule.horizon.closeAtMs - Date.now()) / 3600000);
+                              return (
+                                <span
+                                  key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}`}
+                                  style={{ display: 'block', whiteSpace: 'nowrap' }}
+                                  title={horizonDetail(schedule.horizon.closeAtMs, schedule.horizon.source, schedule.horizon.earlyExitPossible)}
+                                >
+                                  {basketSchedules.length > 1 ? `[${schedule.label}] ` : ''}
+                                  {schedule.horizon.earlyExitPossible ? 'batas close' : 'tutup'} {closesAt == null ? '—' : `${closesAt} Taipei`}
+                                  {hoursLeft == null ? '' : ` · ${hoursLeft.toFixed(1)}h lagi`}
+                                </span>
+                              );
+                            })}
+                          </td>
                           <td className={tone(unreal)}>{signed(unreal)}</td>
                           <td className={tone(afterCost)}>{signed(afterCost)}</td>
                           <td>{p.leverage}x</td>
                           <td>{p.sourceOrderCount}</td>
                           <td>{p.laneIds.length > 0 ? p.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
-                          <td>—</td>
+                          <td>
+                            {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
+                              const openedAt = taipeiDateTime(schedule.openedAt);
+                              return (
+                                <span key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}`} style={{ display: 'block', whiteSpace: 'nowrap' }}>
+                                  {basketSchedules.length > 1 ? `[${schedule.label}] ` : ''}{openedAt == null ? '—' : `${openedAt} Taipei`}
+                                </span>
+                              );
+                            })}
+                          </td>
                           <td>—</td>
                           <td className="tone-measure" title="Menutup satu leg basket akan membuat sisa basket jadi taruhan directional telanjang — tidak ada Close now di sini, sama seperti sebelumnya.">auto-exit only</td>
                         </tr>

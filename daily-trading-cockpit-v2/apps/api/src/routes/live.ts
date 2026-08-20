@@ -97,6 +97,59 @@ const OPERATOR_ALLOCATION_LANE_IDS = [
 
 type LiveAccountSnapshot = Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>>;
 
+type OpenBasketExitPolicy = {
+  executionCapHours?: number | null;
+  takeProfitEnabled?: boolean;
+  stopLossEnabled?: boolean;
+  adaptiveExitsEnabled?: boolean;
+};
+
+type OpenBasketDeadlineInput = {
+  openedAt: string;
+  closesAtMs: number;
+  policyFingerprint?: { execution?: OpenBasketExitPolicy | null } | null;
+};
+
+/**
+ * The persisted `closesAtMs` belongs to the research measurement horizon.  The exchange executor
+ * can have an earlier, frozen hold cap; surface the same minimum that closeDueBaskets() uses so a
+ * report/UI never promises a later close than the engine will actually schedule.
+ */
+export function scheduledOpenBasketDeadline(
+  basket: OpenBasketDeadlineInput,
+  legacyExitPolicy: OpenBasketExitPolicy | null | undefined,
+): {
+  scheduledCloseAtMs: number | null;
+  executionCapHours: number | null;
+  deadlineSource: "BASKET_POLICY_FINGERPRINT" | "LEGACY_BASKET_CONTRACT" | "MEASUREMENT_HORIZON";
+  mayExitEarlier: boolean;
+} {
+  const hasFingerprint = basket.policyFingerprint?.execution != null;
+  const policy = basket.policyFingerprint?.execution ?? legacyExitPolicy ?? null;
+  const rawCapHours = policy?.executionCapHours;
+  const executionCapHours = typeof rawCapHours === "number" && Number.isFinite(rawCapHours) && rawCapHours > 0
+    ? rawCapHours
+    : null;
+  const openedAtMs = Date.parse(basket.openedAt);
+  const cappedCloseAtMs = executionCapHours != null && Number.isFinite(openedAtMs)
+    ? openedAtMs + executionCapHours * 3_600_000
+    : null;
+  const measurementCloseAtMs = Number.isFinite(basket.closesAtMs) ? basket.closesAtMs : null;
+  const scheduledCloseAtMs = cappedCloseAtMs != null && measurementCloseAtMs != null
+    ? Math.min(cappedCloseAtMs, measurementCloseAtMs)
+    : cappedCloseAtMs ?? measurementCloseAtMs;
+  return {
+    scheduledCloseAtMs,
+    executionCapHours,
+    deadlineSource: hasFingerprint
+      ? "BASKET_POLICY_FINGERPRINT"
+      : policy != null
+        ? "LEGACY_BASKET_CONTRACT"
+        : "MEASUREMENT_HORIZON",
+    mayExitEarlier: Boolean(policy?.takeProfitEnabled || policy?.stopLossEnabled || policy?.adaptiveExitsEnabled),
+  };
+}
+
 const DASHBOARD_ACCOUNT_CACHE_TTL_MS = 15_000;
 const DASHBOARD_ACCOUNT_RATE_LIMIT_BACKOFF_MS = 60_000;
 
@@ -2674,7 +2727,8 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
       ...(opts.innovationBasketExecutors?.() ?? []).map((executor, i) => ({ label: `INNOVATION_${i + 1}`, executor })),
     ];
     const filteredExecutor = opts.crossSectionalExecutor?.() ?? null;
-    const filteredOpenBaskets = filteredExecutor?.getStatus().openBaskets.filter((basket) => inReportEra(basket.openedAt)) ?? [];
+    const filteredStatus = filteredExecutor?.getStatus() ?? null;
+    const filteredOpenBaskets = filteredStatus?.openBaskets.filter((basket) => inReportEra(basket.openedAt)) ?? [];
     const filteredClosedBaskets = filteredExecutor
       ? closedBasketRealizedBreakdown(filteredExecutor.getClosedBaskets()).filter((basket) => inReportEra(basket.openedAt))
       : [];
@@ -2850,6 +2904,7 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
     // real (negative) estimated close cost.  Return that honest baseline until
     // the first durable observation is written.
     const responseOpenBaskets = filteredOpenBaskets.map((basket) => {
+      const deadline = scheduledOpenBasketDeadline(basket, filteredStatus?.legacyExitPolicy);
       const current = openBasketUnrealized.get(basket.basketId) ?? null;
       const legs = (openBasketLegs.get(basket.basketId) ?? basket.legs
         .filter((leg) => leg.exitOrderId === null)
@@ -2889,6 +2944,10 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
         signal: basket.signal,
         variant: basket.variant,
         openedAt: basket.openedAt,
+        scheduledCloseAtMs: deadline.scheduledCloseAtMs,
+        executionCapHours: deadline.executionCapHours,
+        deadlineSource: deadline.deadlineSource,
+        mayExitEarlier: deadline.mayExitEarlier,
         grossUnrealizedUsd: current?.grossUsd ?? null,
         unrealizedAfterEstimatedCloseCostUsd: current?.afterEstimatedCloseCostUsd ?? null,
         unrealizedExtrema: extrema,
