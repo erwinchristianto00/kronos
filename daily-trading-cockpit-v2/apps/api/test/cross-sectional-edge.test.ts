@@ -40,6 +40,8 @@ import {
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { clusterOf } from "../src/lib/correlation-clusters.js";
+import type { SymbolReliabilitySnapshot } from "../src/lib/cross-sectional-symbol-reliability.js";
 
 function mkCandle(close: number): Candle {
   return { openTime: 0, open: close, high: close, low: close, close, volume: 1 };
@@ -55,6 +57,7 @@ function freshStore(): CrossSectionalStore {
 }
 const T0 = "2099-01-02T00:00:00.000Z";
 const T0ms = new Date(T0).getTime();
+const DAY_MS = 24 * 60 * 60_000;
 
 function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T): T {
   const previous = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
@@ -64,6 +67,22 @@ function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T):
       else process.env[key] = value;
     }
     return fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+async function withEnvAsync<T>(overrides: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const previous = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  try {
+    for (const [key, value] of Object.entries(overrides)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return await fn();
   } finally {
     for (const [key, value] of previous) {
       if (value === undefined) delete process.env[key];
@@ -628,6 +647,149 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     const filtered = buildCrossSectionalReport(store, T0ms, { variant: "FILTERED" });
     expect(filtered.closed).toBe(1);
     expect(filtered.netAvgReturn).toBeCloseTo(0.5, 9);
+  });
+});
+
+// ── Symbol Reliability V1 formation wiring ─────────────────────────────────
+
+const RELIABILITY_TEST_UNIVERSE = [
+  "ETHUSDT", "SOLUSDT", "OPUSDT", "BNBUSDT", "ADAUSDT", "SUIUSDT", "1000PEPEUSDT",
+  "WLDUSDT", "DOGEUSDT", "SEIUSDT", "ARBUSDT", "XRPUSDT", "LINKUSDT", "WIFUSDT", "AAVEUSDT",
+];
+
+function reliabilityCandles(score: number): Candle[] {
+  const start = 100;
+  const end = start * (1 + score);
+  return Array.from({ length: 30 }, (_, index) => {
+    const fraction = index < 5 ? 0 : (index - 5) / 24;
+    return mkCandle(start + (end - start) * fraction);
+  });
+}
+
+const RELIABILITY_TEST_SCORES: Record<string, number> = {
+  ETHUSDT: 0.16, SOLUSDT: 0.14, OPUSDT: 0.12, BNBUSDT: 0.10, ADAUSDT: 0.08, SUIUSDT: 0.06, "1000PEPEUSDT": 0.04,
+  WLDUSDT: -0.16, DOGEUSDT: -0.14, SEIUSDT: -0.12, ARBUSDT: -0.10, XRPUSDT: -0.08, LINKUSDT: -0.06, WIFUSDT: -0.04, AAVEUSDT: -0.02,
+};
+
+function reliabilitySnapshot(quarantined: Array<{ symbol: string; side: "LONG" | "SHORT" }> = []): SymbolReliabilitySnapshot {
+  return {
+    version: "SYMBOL_RELIABILITY_V1",
+    enabled: true,
+    evidenceContract: "ACTUAL_NO_TP_HOLD_36H_INDEPENDENT_EPISODES_V1",
+    evaluatedAt: T0,
+    evaluationId: "sr-v1-test",
+    evaluationCycle: 1,
+    evidenceChanged: false,
+    independentEpisodes: 0,
+    eligibleBaskets: 0,
+    excludedBaskets: {},
+    minimumIndependentEpisodes: 8,
+    statuses: [
+      { symbol: "ETHUSDT", side: "LONG", status: "HEALTHY" },
+      { symbol: "SOLUSDT", side: "LONG", status: "QUARANTINED" },
+      { symbol: "OPUSDT", side: "LONG", status: "DEGRADED" },
+      { symbol: "WLDUSDT", side: "SHORT", status: "INSUFFICIENT_DATA" },
+    ] as SymbolReliabilitySnapshot["statuses"],
+    quarantined: quarantined.map((row) => ({ ...row, reason: "strict two-cycle evidence" })),
+    lastFormationDecision: null,
+  };
+}
+
+async function runReliabilityFormation(
+  snapshot: SymbolReliabilitySnapshot | null,
+  now: number,
+): Promise<{ store: CrossSectionalStore; decisions: NonNullable<CrossSectionalObservation["symbolReliability"]>[] }> {
+  const store = freshStore();
+  const decisions: NonNullable<CrossSectionalObservation["symbolReliability"]>[] = [];
+  await runCrossSectionalCycle({
+    store,
+    universe: RELIABILITY_TEST_UNIVERSE,
+    now,
+    fetchCandles: async (symbol) => reliabilityCandles(RELIABILITY_TEST_SCORES[symbol]!),
+    symbolReliabilitySnapshotGetter: () => snapshot,
+    symbolReliabilityDecisionRecorder: (decision) => decisions.push(decision),
+  });
+  return { store, decisions };
+}
+
+function filteredShape(store: CrossSectionalStore): { long: Array<{ symbol: string; score: number | undefined; weight: number | null | undefined }>; short: Array<{ symbol: string; score: number | undefined; weight: number | null | undefined }>; scoreGap: number | null | undefined } {
+  const basket = store.all.find((row) => row.variant === "FILTERED")!;
+  return {
+    long: basket.longLeg.map((leg) => ({ symbol: leg.symbol, score: leg.scoreAtOpen, weight: leg.weight })),
+    short: basket.shortLeg.map((leg) => ({ symbol: leg.symbol, score: leg.scoreAtOpen, weight: leg.weight })),
+    scoreGap: basket.scoreGap,
+  };
+}
+
+describe("[SYMBOL-RELIABILITY] Plain MOM36 formation gate", () => {
+  const formationEnv = {
+    CROSS_SECTIONAL_ADAPTIVE_DISABLED: "1",
+    CROSS_SECTIONAL_FILTERED_DISABLED: "0",
+    CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+    CROSS_SECTIONAL_REGIME_SKEW_ENABLED: "0",
+    CROSS_SECTIONAL_STAND_DOWN_14D_PCT: undefined,
+  };
+
+  it("keeps scores, universe, selection, gap, and weights bit-for-bit unchanged for HEALTHY/DEGRADED/INSUFFICIENT_DATA", async () => {
+    await withEnvAsync({ ...formationEnv, CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: undefined }, async () => {
+      const baseline = await runReliabilityFormation(null, T0ms + 10 * DAY_MS);
+      await withEnvAsync({ CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "1" }, async () => {
+        const observed = await runReliabilityFormation(reliabilitySnapshot(), T0ms + 11 * DAY_MS);
+        expect(filteredShape(observed.store)).toEqual(filteredShape(baseline.store));
+        const basket = observed.store.all.find((row) => row.variant === "FILTERED")!;
+        expect(basket.symbolReliability?.quarantined).toEqual([]);
+        expect(basket.formationMode).toBe("PLAIN_MOM36");
+      });
+    });
+  });
+
+  it("removes only a QUARANTINED LONG, reselects a full hedge, and records exact provenance", async () => {
+    await withEnvAsync({ ...formationEnv, CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "1" }, async () => {
+      const baseline = await runReliabilityFormation(reliabilitySnapshot(), T0ms + 12 * DAY_MS);
+      const observed = await runReliabilityFormation(reliabilitySnapshot([{ symbol: "SOLUSDT", side: "LONG" }]), T0ms + 13 * DAY_MS);
+      const basket = observed.store.all.find((row) => row.variant === "FILTERED")!;
+      const before = filteredShape(baseline.store);
+      const after = filteredShape(observed.store);
+
+      expect(before.long.map((leg) => leg.symbol)).toContain("SOLUSDT");
+      expect(after.long.map((leg) => leg.symbol)).not.toContain("SOLUSDT");
+      expect(after.short).toEqual(before.short); // LONG quarantine cannot rewrite the short hedge
+      expect(after.long).toHaveLength(3);
+      expect(after.short).toHaveLength(3);
+      expect(after.scoreGap).toBeGreaterThanOrEqual(0.02);
+      expect(basket.longLeg.reduce((sum, leg) => sum + (leg.weight ?? 0), 0)).toBeCloseTo(0.5, 12);
+      expect(basket.shortLeg.reduce((sum, leg) => sum + (leg.weight ?? 0), 0)).toBeCloseTo(0.5, 12);
+      for (const side of [basket.longLeg, basket.shortLeg]) {
+        const byCluster = new Map<string, number>();
+        for (const leg of side) byCluster.set(clusterOf(leg.symbol), (byCluster.get(clusterOf(leg.symbol)) ?? 0) + 1);
+        expect([...byCluster.entries()].every(([cluster, count]) => cluster === "MAJORS" || count <= 2)).toBe(true);
+      }
+      expect(basket.symbolReliability).toMatchObject({
+        decision: "PASS",
+        selectedBefore: { LONG: before.long.map((leg) => leg.symbol), SHORT: before.short.map((leg) => leg.symbol) },
+        selectedAfter: { LONG: after.long.map((leg) => leg.symbol), SHORT: after.short.map((leg) => leg.symbol) },
+        scoreGapBefore: before.scoreGap,
+        scoreGapAfter: after.scoreGap,
+      });
+      expect(basket.symbolReliability?.replacements).toContainEqual({ side: "LONG", removed: "SOLUSDT", replacement: "BNBUSDT" });
+      expect(observed.decisions).toHaveLength(1);
+    });
+  });
+
+  it("fails closed to NO_TRADE when quarantine leaves fewer than 3 LONG candidates, while preserving the audit record", async () => {
+    await withEnvAsync({ ...formationEnv, CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "1" }, async () => {
+      const result = await runReliabilityFormation(reliabilitySnapshot([
+        { symbol: "ETHUSDT", side: "LONG" }, { symbol: "SOLUSDT", side: "LONG" }, { symbol: "OPUSDT", side: "LONG" },
+        { symbol: "BNBUSDT", side: "LONG" }, { symbol: "ADAUSDT", side: "LONG" }, { symbol: "SUIUSDT", side: "LONG" }, { symbol: "1000PEPEUSDT", side: "LONG" },
+      ]), T0ms + 14 * DAY_MS);
+      expect(result.store.all.some((row) => row.variant === "FILTERED")).toBe(false);
+      expect(result.decisions).toHaveLength(1);
+      expect(result.decisions[0]).toMatchObject({
+        decision: "NO_TRADE_INSUFFICIENT_ELIGIBLE",
+        selectedAfter: { LONG: [], SHORT: [] },
+        scoreGapAfter: null,
+      });
+    });
   });
 });
 

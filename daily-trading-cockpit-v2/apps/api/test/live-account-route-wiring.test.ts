@@ -146,6 +146,42 @@ describe("registerLiveRoutes — /api/live/account wires ALL 5 executor instance
   });
 });
 
+describe("GET /api/live/cross-sectional-executor — Symbol Reliability V1 runtime truth", () => {
+  it("returns the API-owned reliability snapshot beside the executor status, never a dashboard/env reconstruction", async () => {
+    const snapshot = {
+      version: "SYMBOL_RELIABILITY_V1",
+      enabled: true,
+      evidenceContract: "ACTUAL_NO_TP_HOLD_36H_INDEPENDENT_EPISODES_V1",
+      evaluatedAt: "2026-08-20T00:00:00.000Z",
+      evaluationId: "sr-v1-test",
+      evaluationCycle: 1,
+      evidenceChanged: false,
+      independentEpisodes: 0,
+      eligibleBaskets: 0,
+      excludedBaskets: {},
+      minimumIndependentEpisodes: 8,
+      statuses: [],
+      quarantined: [],
+      lastFormationDecision: null,
+    } as const;
+    const executor = fakeXsecExecutor("CROSS_SECTIONAL_MARKET_NEUTRAL", "AUSDT");
+    (executor as unknown as { getRegimeSkewCounterfactual: () => null }).getRegimeSkewCounterfactual = () => null;
+    app = Fastify();
+    await registerLiveRoutes(app, null, {
+      crossSectionalExecutor: () => executor,
+      symbolReliabilitySnapshotGetter: () => snapshot as never,
+    });
+    await app.ready();
+
+    const res = await app.inject({ method: "GET", url: "/api/live/cross-sectional-executor" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL",
+      symbolReliability: snapshot,
+    });
+  });
+});
+
 describe("[operator close] /api/live/cross-sectional-close stays scoped to one market-neutral basket", () => {
   const basket = (basketId: string): ExecutorBasket => ({
     basketId, sourceObservationId: "o1", signal: "MOM24", variant: "FILTERED",

@@ -42,7 +42,8 @@ import {
   crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
 import { crossSectionalExecTickMs } from "./lib/cross-sectional-policy.js";
-import { buildCrossSectionalReport, CROSS_SECTIONAL_FILTERED_SIGNAL, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import { buildCrossSectionalReport, CROSS_SECTIONAL_FILTERED_SIGNAL, CROSS_SECTIONAL_UNIVERSE, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import { CrossSectionalSymbolReliabilityStore } from "./lib/cross-sectional-symbol-reliability.js";
 import {
   SingleSymbolLaneExecutor,
   SingleSymbolLaneExecutorStore,
@@ -1081,6 +1082,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   let probeFuturesReferenceHealth:
     | ((symbols: string[]) => Promise<FuturesReferenceHealthSnapshot | null>)
     | null = null;
+  let crossSectionalExecutorStore: CrossSectionalExecutorStore | null = null;
+  const crossSectionalSymbolReliabilityStore = new CrossSectionalSymbolReliabilityStore();
+  const currentSymbolReliabilitySnapshot = () => crossSectionalSymbolReliabilityStore.evaluate({
+    baskets: crossSectionalExecutorStore?.getState().baskets ?? [],
+    universe: [...CROSS_SECTIONAL_UNIVERSE],
+    nowMs: Date.now(),
+  });
   // 2026-07-08: two more instances mirroring TREND_BETA_VOL / MIXED_MEAN_REVERSION, alongside the
   // FILTERED foundation instance above (see cross-sectional-executor.ts's targetVariant/laneId).
   let crossSectionalTrendExecutor: CrossSectionalExecutor | null = null;
@@ -1236,6 +1244,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         shortBlocklist: blocks.filter((block) => block.side === "SHORT").map((block) => block.symbol),
       };
     },
+    symbolReliabilitySnapshotGetter: currentSymbolReliabilitySnapshot,
+    symbolReliabilityDecisionRecorder: (decision) => crossSectionalSymbolReliabilityStore.recordFormationDecision(decision),
     kronosClient,
     fourBrainMetricsGetter: () => fourBrainMetricsRef?.summary() ?? null,
     fourBrainRecentDecisionsGetter: () => fourBrainRecentDecisionsRef?.getAll() ?? null,
@@ -2239,10 +2249,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // trade real money. Consumes the same store the measurement lane writes.
     if (isCrossSectionalExecEnabled()) {
       const engineForGate = liveEngine;
+      crossSectionalExecutorStore = new CrossSectionalExecutorStore();
       crossSectionalExecutor = new CrossSectionalExecutor({
         client: liveClient,
         signalStore: getCrossSectionalStore(),
-        store: new CrossSectionalExecutorStore(),
+        store: crossSectionalExecutorStore,
         // 2026-07-20 real-money audit fix (round 2): the first pass only swapped canOpenNewEntries()
         // for the manual-directional-blind variant, but every isAllowed() branch still ANDed
         // laneSelectionAllowsLane()/allowsCrossSectionalLane() — both of which ALSO route through
@@ -4586,6 +4597,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   await registerLiveRoutes(app, liveEngine, {
     configErrors: liveConfig.enabled ? liveConfig.configErrors : [],
     crossSectionalExecutor: () => crossSectionalExecutor,
+    symbolReliabilitySnapshotGetter: currentSymbolReliabilitySnapshot,
     crossSectionalTrendExecutor: () => crossSectionalTrendExecutor,
     crossSectionalMixedExecutor: () => crossSectionalMixedExecutor,
     directionalRegimeDecision: () => crossSectionalDirectionalDecisionRef(),

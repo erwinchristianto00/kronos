@@ -2606,6 +2606,28 @@ describe("fill-price confirmation (honest fills, no silent avgPrice=0 masking)",
 });
 
 describe("executor variant targeting", () => {
+  it("[SYMBOL-RELIABILITY] never admits a pre-deploy unannotated FILTERED signal once V1 is enabled", async () => {
+    const prior = process.env.CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED;
+    process.env.CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED = "1";
+    try {
+      const { executor, client, store } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000 });
+      await executor.tick();
+
+      expect(client.placed).toHaveLength(0);
+      expect(store.getState().baskets).toHaveLength(0);
+      expect(store.getState().lastSeenSignalMs).toBe(NOW_MS - 5 * 60_000);
+      expect(executor.getStatus().entryAttemptAudit.latest).toMatchObject({
+        stage: "RELIABILITY",
+        outcome: "SKIPPED",
+        watermarkAdvanced: true,
+        reason: expect.stringContaining("predates SYMBOL_RELIABILITY_V1"),
+      });
+    } finally {
+      if (prior === undefined) delete process.env.CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED;
+      else process.env.CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED = prior;
+    }
+  });
+
   it("ignores RAW signals by default (executes only the FILTERED variant)", async () => {
     const client = new FakeExecClient();
     const signalStore = new CrossSectionalStore(resolve(os.tmpdir(), `xsec-exec-${process.pid}-raw`));

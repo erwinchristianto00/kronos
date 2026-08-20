@@ -542,17 +542,17 @@ describe("[ADVERSARIAL-I] identical policy across every real integration point",
     expect(paperEligibleBlock).toMatch(/^\s*getCanonicalMarketRegimeSnapshot,\s*$/m);
   });
 
-  it("[I3, structural] exactly 5 call sites of canonicalMarketRegimeExecutionPolicy( and exactly 2 of edgeMemoryLabelForCanonicalFamily( exist in app.ts, and every one of the 5 reads its snapshot from the shared accessor (deps.getCanonicalMarketRegimeSnapshot() or the bare closure-captured getCanonicalMarketRegimeSnapshot()) — never an independent, differently-named getter. (2026-08: was 4 before the manual-directional canonical-regime enforcement fix added buildManualDirectionalRegimeSafetyGate's own call — see that factory's doc comment in app.ts. The count growing by exactly 1, matching the SAME shared-accessor shape, is proof the new gate is real and shares the one canonical function; a jump by more than 1, or a call not sourced from the shared accessor, would mean an independent reimplementation and must still fail this test.)", () => {
+  it("[I3, structural] exactly 6 call sites of canonicalMarketRegimeExecutionPolicy( and exactly 2 of edgeMemoryLabelForCanonicalFamily( exist in app.ts, and every one of the 6 reads its snapshot from the shared accessor (deps.getCanonicalMarketRegimeSnapshot() or the bare closure-captured getCanonicalMarketRegimeSnapshot()) — never an independent, differently-named getter. The sixth is the explicit innovation-testnet admission check; this assertion is deliberately exact so any future independent reimplementation still fails.", () => {
     const text = readAppTsSource();
-    expect(countMatches(text, /canonicalMarketRegimeExecutionPolicy\(/g)).toBe(5);
+    expect(countMatches(text, /canonicalMarketRegimeExecutionPolicy\(/g)).toBe(6);
     expect(countMatches(text, /edgeMemoryLabelForCanonicalFamily\(/g)).toBe(2);
 
     // Every canonicalMarketRegimeExecutionPolicy({ call is immediately followed by a snapshot: line
     // reading one of the two accepted forms — collected via a single regex over the whole file so a
     // 6th, differently-sourced call site would be caught by the count assertion above, and a
-    // MIS-sourced one of the 5 would be caught here.
+    // MIS-sourced one of the 6 would be caught here.
     const callBlocks = text.match(/canonicalMarketRegimeExecutionPolicy\(\{\s*\n\s*snapshot: [^\n]+,/g) ?? [];
-    expect(callBlocks).toHaveLength(5);
+    expect(callBlocks).toHaveLength(6);
     for (const block of callBlocks) {
       expect(block).toMatch(/snapshot: (deps\.)?getCanonicalMarketRegimeSnapshot\(\),/);
     }
