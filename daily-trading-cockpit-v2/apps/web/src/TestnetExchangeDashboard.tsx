@@ -539,12 +539,36 @@ function localMonthInput(date = new Date()): string {
   return localDateInput(date).slice(0, 7);
 }
 
+type XsecExitPolicy = {
+  executionCapHours?: number | null;
+  takeProfitEnabled?: boolean;
+  stopLossEnabled?: boolean;
+  adaptiveExitsEnabled?: boolean;
+};
+
+type XsecBasketPolicyFingerprint = {
+  execution?: XsecExitPolicy | null;
+};
+
+type XsecOpenBasket = {
+  basketId: string;
+  openedAt: string;
+  /** Measurement horizon, not necessarily the executor's earlier HORIZON cap. */
+  closesAtMs: number;
+  policyFingerprint?: XsecBasketPolicyFingerprint | null;
+  lastNetReturn?: number | null;
+  lastNetAt?: string | null;
+  legs: Array<{ symbol: string; side: string; exitOrderId: string | null }>;
+};
+
 type XsecExecStatus = {
   enabled: boolean;
   tpNetReturnPct?: number | null;
   tpDisabled?: boolean;
   stopNetReturnPct?: number | null;
   maxHoldHours?: number | null;
+  /** Frozen compatibility contract applied to baskets created before fingerprints existed. */
+  legacyExitPolicy?: XsecExitPolicy | null;
   dailyRealizedUsd?: number;
   dailyMaxLossUsd?: number;
   openHalted?: string | null;
@@ -572,15 +596,52 @@ type XsecExecStatus = {
     autoSwitch: false;
     metrics: Array<{ model: string; samples: number; meanNetReturnPct: number | null; winRatePct: number | null; worstNetReturnPct: number | null }>;
   };
-  openBaskets?: Array<{
-    basketId: string;
-    openedAt: string;
-    closesAtMs: number;
-    lastNetReturn?: number | null;
-    lastNetAt?: string | null;
-    legs: Array<{ symbol: string; side: string; exitOrderId: string | null }>;
-  }>;
+  openBaskets?: XsecOpenBasket[];
 };
+
+function positiveFinite(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function basketHorizonSchedule(basket: XsecOpenBasket, executor: XsecExecStatus | null): {
+  closeAtMs: number | null;
+  capHours: number | null;
+  source: 'basket fingerprint' | 'legacy basket contract' | 'runtime fallback' | 'measurement fallback';
+  earlyExitPossible: boolean;
+} {
+  const fingerprintPolicy = basket.policyFingerprint?.execution ?? null;
+  const legacyPolicy = executor?.legacyExitPolicy ?? null;
+  const fingerprintCap = positiveFinite(fingerprintPolicy?.executionCapHours);
+  const legacyCap = positiveFinite(legacyPolicy?.executionCapHours);
+  const runtimeCap = positiveFinite(executor?.maxHoldHours);
+  const policy = fingerprintPolicy ?? legacyPolicy;
+  const source = fingerprintCap != null
+    ? 'basket fingerprint'
+    : legacyCap != null
+      ? 'legacy basket contract'
+      : runtimeCap != null
+        ? 'runtime fallback'
+        : 'measurement fallback';
+  const capHours = fingerprintCap ?? legacyCap ?? runtimeCap;
+  const openedAtMs = Date.parse(basket.openedAt);
+  const closeAtMs = capHours != null && Number.isFinite(openedAtMs)
+    ? openedAtMs + capHours * 3_600_000
+    : Number.isFinite(basket.closesAtMs) ? basket.closesAtMs : null;
+  return {
+    closeAtMs,
+    capHours,
+    source,
+    earlyExitPossible: Boolean(policy?.takeProfitEnabled || policy?.stopLossEnabled || policy?.adaptiveExitsEnabled),
+  };
+}
+
+function horizonDetail(closeAtMs: number | null, source: string, earlyExitPossible: boolean): string {
+  if (closeAtMs == null) return `HORIZON source: ${source}; waktu tidak tersedia`;
+  const closeAt = new Date(closeAtMs);
+  if (Number.isNaN(closeAt.getTime())) return `HORIZON source: ${source}; waktu tidak valid`;
+  const taipei = closeAt.toLocaleString('en-GB', { timeZone: 'Asia/Taipei', hour12: false });
+  return `HORIZON: ${taipei} Taipei · source: ${source}${earlyExitPossible ? ' · TP/SL/emergency may close earlier' : ''}`;
+}
 
 type SingleSymbolLanePosition = {
   laneId: string;
@@ -2387,15 +2448,11 @@ export default function TestnetExchangeDashboard() {
                 const gap = tp != null && net != null ? tp - net : null;
                 const sl = xs?.stopNetReturnPct ?? null;
                 const slGap = sl != null && net != null ? net + sl : null;
-                // 2026-08-18: the countdown must respect CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS, which closes a
-                // basket BEFORE closesAtMs. Reading closesAtMs alone made the panel promise 20h left on a
-                // basket that actually had 8 — the cap shortened the trade but not the number on screen.
-                // Mirrors the executor's own Math.min so the two can never disagree.
-                const capMs = xs?.maxHoldHours != null ? xs.maxHoldHours * 3600000 : null;
-                const effectiveClose = capMs != null
-                  ? Math.min(b.closesAtMs, new Date(b.openedAt).getTime() + capMs)
-                  : b.closesAtMs;
-                const hoursLeft = Math.max(0, (effectiveClose - Date.now()) / 3600000);
+                // Keep the established compact row layout, but derive its countdown from the policy
+                // frozen for this basket. `closesAtMs` is the research measurement horizon, not always
+                // the executor's HORIZON cap; the complete source/time remains available on hover.
+                const horizon = basketHorizonSchedule(b, xs);
+                const hoursLeft = horizon.closeAtMs == null ? null : Math.max(0, (horizon.closeAtMs - Date.now()) / 3600000);
                 // Stale = the 5-min TP tick hasn't stamped in >15m. A basket younger than
                 // 15m legitimately has no stamp yet — warning there is a false alarm.
                 const oldEnough = Date.now() - new Date(b.openedAt).getTime() > 15 * 60_000;
@@ -2406,7 +2463,12 @@ export default function TestnetExchangeDashboard() {
                     <span>net <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong></span>
                     <span>ke TP <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{xs?.tpDisabled ? 'TP mati' : gap == null ? '—' : `${gap.toFixed(2)}pp (${tp?.toFixed(1)}%)`}</strong></span>
                     <span>ke stop <strong className={slGap != null && slGap <= 0 ? 'tone-critical' : ''}>{sl == null ? 'stop mati' : slGap == null ? '—' : `${slGap.toFixed(2)}pp (-${sl.toFixed(1)}%)`}</strong></span>
-                    <span className="tone-measure">tutup {hoursLeft.toFixed(1)}h lagi{xs?.maxHoldHours != null ? ` (cap ${xs.maxHoldHours}h)` : ''}</span>
+                    <span
+                      className="tone-measure"
+                      title={horizonDetail(horizon.closeAtMs, horizon.source, horizon.earlyExitPossible)}
+                    >
+                      tutup {hoursLeft == null ? '—' : `${hoursLeft.toFixed(1)}h lagi`}{horizon.capHours != null ? ` (cap ${horizon.capHours}h)` : ''}
+                    </span>
                     {stale && <span className="tone-warning">stamp basi &gt;15m — cek executor</span>}
                   </div>
                 );
