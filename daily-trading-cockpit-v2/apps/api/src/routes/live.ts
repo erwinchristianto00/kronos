@@ -43,6 +43,7 @@ import {
 } from "../lib/innovation-testnet-execution.js";
 import type { InnovationCampaignDiagnostics } from "../lib/innovation-campaign.js";
 import type { SingleSymbolPriceTimelineService } from "../lib/single-symbol-price-timeline.js";
+import type { FuturesReferenceHealthSnapshot } from "../lib/futures-reference-health.js";
 import { REGIME_AUTOPILOT_PRESETS, type RegimeAutopilot } from "../lib/regime-autopilot.js";
 import { getShortFadeStore, buildShortFadeReport, SF_PAPER_LANE_ID } from "../lib/short-fade-edge.js";
 import { getIntradayMomentumStore, buildIntradayMomentumReport, IM_PAPER_LANE_ID } from "../lib/intraday-momentum-edge.js";
@@ -973,6 +974,10 @@ export async function registerLiveRoutes(
     unifiedOrchestrator?: () => UnifiedTestnetOrchestrator | null;
     unifiedProposalStore?: () => UnifiedTestnetProposalStore | null;
     singleSymbolPriceTimeline?: () => SingleSymbolPriceTimelineService | null;
+    /** Read-only USD-M sizing-reference diagnostics. Never reaches any order route. */
+    futuresReferenceHealth?: () => FuturesReferenceHealthSnapshot | null;
+    /** Optional, bounded public-USD-M refresh for a diagnostic watch list. */
+    probeFuturesReferenceHealth?: (symbols: string[]) => Promise<FuturesReferenceHealthSnapshot | null>;
     /** Test seam only. Production uses durable data-dir backed defaults. */
     copySecurity?: {
       secret?: string;
@@ -1033,6 +1038,32 @@ export async function registerLiveRoutes(
       unifiedOrchestrator: opts.unifiedOrchestrator?.()?.getStatus() ?? null,
       unifiedProposalSource: opts.unifiedProposalStore?.()?.getStatus() ?? null,
     };
+  });
+
+  app.get("/api/live/futures-reference-health", async (request, reply) => {
+    const query = request.query as { symbols?: unknown };
+    const raw = Array.isArray(query.symbols)
+      ? query.symbols.map((value) => String(value)).join(",")
+      : typeof query.symbols === "string"
+        ? query.symbols
+        : "";
+    const symbols = Array.from(new Set(
+      (raw ? raw.split(",") : ["1000PEPEUSDT", "SOLUSDT", "PEPEUSDT"])
+        .map((symbol) => symbol.trim().toUpperCase())
+        .filter((symbol) => /^[A-Z0-9]{4,30}$/.test(symbol)),
+    )).slice(0, 12);
+    const report = opts.probeFuturesReferenceHealth
+      ? await opts.probeFuturesReferenceHealth(symbols)
+      : opts.futuresReferenceHealth?.() ?? null;
+    if (!report) {
+      reply.code(503);
+      return {
+        enabled: false,
+        reason: "USD-M reference health unavailable because live futures runtime is disabled",
+        sourceChain: ["USD_M_MARK_PRICE", "USD_M_BOOK_TICKER", "POSITION_RISK", "FAIL_CLOSED"],
+      };
+    }
+    return report;
   });
 
   app.get("/api/live/allocation-lanes", async () => ({

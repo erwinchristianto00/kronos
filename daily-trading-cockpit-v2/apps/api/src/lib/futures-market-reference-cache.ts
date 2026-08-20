@@ -7,6 +7,7 @@
  * USD-M premium-index mark.  Only when that public mark is temporarily absent
  * do we use the midpoint of the USD-M execution book for the exact same symbol.
  */
+import type { FuturesReferenceCacheEvent } from "./futures-reference-health.js";
 
 export type FuturesMarketReferenceSource = "USD_M_MARK_PRICE" | "USD_M_BOOK_TICKER";
 
@@ -27,6 +28,8 @@ export interface FuturesMarketReferenceCacheOptions {
   /** A sizing reference must be very recent.  Expired entries are never returned. */
   maxAgeMs?: number;
   maxSymbols?: number;
+  /** Observability only. Failures in this callback can never change pricing behavior. */
+  onEvent?: (event: FuturesReferenceCacheEvent) => void;
 }
 
 const DEFAULT_MAX_AGE_MS = 10_000;
@@ -72,6 +75,7 @@ export class FuturesMarketReferenceCache {
   private readonly nowMs: () => number;
   private readonly maxAgeMs: number;
   private readonly maxSymbols: number;
+  private readonly onEvent: ((event: FuturesReferenceCacheEvent) => void) | null;
 
   constructor(
     private readonly client: FuturesMarketReferenceClient,
@@ -84,16 +88,24 @@ export class FuturesMarketReferenceCache {
     this.maxSymbols = Number.isFinite(opts.maxSymbols) && opts.maxSymbols! > 0
       ? Math.floor(opts.maxSymbols!)
       : DEFAULT_MAX_SYMBOLS;
+    this.onEvent = opts.onEvent ?? null;
   }
 
   /** Returns a fresh exact-symbol USD-M reference, never a stale cache value. */
   read(symbol: string): FuturesMarketReference | null {
     const canonical = canonicalSymbol(symbol);
+    const reference = this.freshReference(canonical);
+    if (reference) this.emit({ type: "CACHE_HIT", symbol: canonical, atMs: this.nowMs() });
+    return reference;
+  }
+
+  private freshReference(canonical: string): FuturesMarketReference | null {
     const reference = this.references.get(canonical);
     if (!reference) return null;
     const ageMs = this.nowMs() - reference.atMs;
     if (ageMs < 0 || ageMs > this.maxAgeMs) {
       this.references.delete(canonical);
+      this.emit({ type: "STALE_CACHE_REJECTED", symbol: canonical, atMs: this.nowMs(), ageMs });
       return null;
     }
     return reference;
@@ -106,12 +118,16 @@ export class FuturesMarketReferenceCache {
    */
   async refresh(symbol: string): Promise<FuturesMarketReference | null> {
     const canonical = canonicalSymbol(symbol);
-    const fresh = this.read(canonical);
-    if (fresh) return fresh;
+    const fresh = this.freshReference(canonical);
+    if (fresh) {
+      this.emit({ type: "CACHE_HIT", symbol: canonical, atMs: this.nowMs() });
+      return fresh;
+    }
 
     const alreadyFetching = this.inFlight.get(canonical);
     if (alreadyFetching) return alreadyFetching;
 
+    this.emit({ type: "CACHE_MISS", symbol: canonical, atMs: this.nowMs() });
     const refresh = this.fetchFresh(canonical);
     this.inFlight.set(canonical, refresh);
     try {
@@ -130,25 +146,48 @@ export class FuturesMarketReferenceCache {
     return reference;
   }
 
+  private emit(event: FuturesReferenceCacheEvent): void {
+    try {
+      this.onEvent?.(event);
+    } catch {
+      // Health accounting is strictly observational and must never disturb sizing.
+    }
+  }
+
+  private failureReason(value: unknown, fallback: string): string {
+    const message = value instanceof Error ? value.message : String(value ?? "");
+    return message.trim().slice(0, 180) || fallback;
+  }
+
   private async fetchFresh(symbol: string): Promise<FuturesMarketReference | null> {
+    let markFailure = "premiumIndex returned no positive mark";
     try {
       const markPrice = await this.client.getMarkPrice(symbol);
       if (positiveFinite(markPrice)) {
         return this.remember({ symbol, price: markPrice, atMs: this.nowMs(), source: "USD_M_MARK_PRICE" });
       }
-    } catch {
-      // Mark endpoint degraded.  Continue to the tightly-scoped USD-M book fallback.
+    } catch (error) {
+      markFailure = this.failureReason(error, "premiumIndex unavailable");
     }
+    this.emit({ type: "MARK_UNAVAILABLE", symbol, atMs: this.nowMs(), reason: markFailure });
 
+    let bookFailure = "USD-M book has no safe two-sided midpoint";
     try {
       const book = await this.client.getBookTicker(symbol);
       const mid = executableBookMid(book);
       if (mid !== null) {
         return this.remember({ symbol, price: mid, atMs: this.nowMs(), source: "USD_M_BOOK_TICKER" });
       }
-    } catch {
-      // No safe futures source was available; caller must fail closed.
+    } catch (error) {
+      bookFailure = this.failureReason(error, "USD-M book unavailable");
     }
+    this.emit({ type: "BOOK_UNAVAILABLE", symbol, atMs: this.nowMs(), reason: bookFailure });
+    this.emit({
+      type: "PUBLIC_REFERENCE_UNAVAILABLE",
+      symbol,
+      atMs: this.nowMs(),
+      reason: `mark: ${markFailure}; book: ${bookFailure}`,
+    });
     return null;
   }
 }

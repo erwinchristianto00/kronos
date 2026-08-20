@@ -23,6 +23,7 @@ import {
 } from "../src/lib/cross-sectional-executor.js";
 import { CortexRealAttributionStore } from "../src/lib/cortex-real-attribution.js";
 import type { FuturesMarketReference } from "../src/lib/futures-market-reference-cache.js";
+import { FuturesReferenceHealthTracker } from "../src/lib/futures-reference-health.js";
 // [CONFLICTING SINGLE-SYMBOL EXPOSURE] test support only (see the describe block near the end of
 // this file) — a REAL AccountExposureCoordinator + a REAL SingleSymbolLaneExecutor, reusing the
 // exact construction idiom already established in account-exposure-coordinator-integration.test.ts,
@@ -286,6 +287,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
   warmPublicQuote?: (symbol: string) => Promise<unknown>;
   readFuturesMarketReference?: (symbol: string) => FuturesMarketReference | null;
   warmFuturesMarketReference?: (symbol: string) => Promise<FuturesMarketReference | null>;
+  futuresReferenceHealth?: FuturesReferenceHealthTracker;
 } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
@@ -332,6 +334,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     ...(opts.warmPublicQuote ? { warmPublicQuote: opts.warmPublicQuote } : {}),
     ...(opts.readFuturesMarketReference ? { readFuturesMarketReference: opts.readFuturesMarketReference } : {}),
     ...(opts.warmFuturesMarketReference ? { warmFuturesMarketReference: opts.warmFuturesMarketReference } : {}),
+    ...(opts.futuresReferenceHealth ? { futuresReferenceHealth: opts.futuresReferenceHealth } : {}),
   });
   return { executor, client, signalStore, store, storeDir };
 }
@@ -1261,10 +1264,12 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
 
   it("[MULTIPLIER CONTRACT] uses the live futures mark for 1000PEPE sizing without treating its unit scale as drift", async () => {
     const client = new FakeExecClient();
+    const futuresReferenceHealth = new FuturesReferenceHealthTracker({ nowMs: () => NOW_MS });
     const { executor, signalStore, store } = makeExecutor({
       client,
       signalMs: NOW_MS - 5 * 60_000,
       smartBasketEnabled: true,
+      futuresReferenceHealth,
       warmFuturesMarketReference: async (symbol) => ({
         symbol,
         price: 0.003,
@@ -1289,15 +1294,18 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     // $25 / 0.003 is thousands, not the old spot-scale millions.
     expect(pepe.qty).toBeGreaterThan(8_000);
     expect(pepe.qty).toBeLessThan(9_000);
+    expect(futuresReferenceHealth.snapshot().counters.usdMMarkUsed).toBe(1);
   });
 
   it("[MULTIPLIER CONTRACT] uses a USD-M book fallback when the mark cache misses", async () => {
     const client = new FakeExecClient();
+    const futuresReferenceHealth = new FuturesReferenceHealthTracker({ nowMs: () => NOW_MS });
     let refreshes = 0;
     const { executor, signalStore, store } = makeExecutor({
       client,
       signalMs: NOW_MS - 5 * 60_000,
       smartBasketEnabled: true,
+      futuresReferenceHealth,
       warmFuturesMarketReference: async (symbol) => {
         refreshes += 1;
         return { symbol, price: 0.003, atMs: NOW_MS, source: "USD_M_BOOK_TICKER" };
@@ -1317,14 +1325,45 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(pepe.entryPrice).toBeCloseTo(0.003, 9);
     expect(pepe.qty).toBeGreaterThan(8_000);
     expect(pepe.qty).toBeLessThan(9_000);
+    expect(futuresReferenceHealth.snapshot().counters.bookFallback).toBe(1);
   });
 
-  it("[MULTIPLIER CONTRACT] rejects a spot-scale cache value rather than using its unsafe unit scale", async () => {
+  it("[MULTIPLIER CONTRACT] records same-environment positionRisk only after mark/book are unavailable", async () => {
     const client = new FakeExecClient();
+    const futuresReferenceHealth = new FuturesReferenceHealthTracker({ nowMs: () => NOW_MS });
     const { executor, signalStore, store } = makeExecutor({
       client,
       signalMs: NOW_MS - 5 * 60_000,
       smartBasketEnabled: true,
+      futuresReferenceHealth,
+      warmFuturesMarketReference: async () => null,
+    });
+    const signal = signalStore.all[0]!;
+    signal.longLeg[0] = { symbol: "1000PEPEUSDT", entryPrice: 0.000003, exitPrice: null, volatilityAtOpen: 0.01 };
+    signal.shortLeg[0]!.volatilityAtOpen = 0.01;
+    client.markPriceBySymbol.set("1000PEPEUSDT", 0.003);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.fillPriceBySymbol.set("1000PEPEUSDT", 0.003);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+
+    await executor.tick();
+
+    expect(store.getState().baskets).toHaveLength(1);
+    expect(futuresReferenceHealth.snapshot().counters).toMatchObject({
+      usdMMarkUsed: 0,
+      bookFallback: 0,
+      positionRiskFallback: 1,
+    });
+  });
+
+  it("[MULTIPLIER CONTRACT] rejects a spot-scale cache value rather than using its unsafe unit scale", async () => {
+    const client = new FakeExecClient();
+    const futuresReferenceHealth = new FuturesReferenceHealthTracker({ nowMs: () => NOW_MS });
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: true,
+      futuresReferenceHealth,
       warmFuturesMarketReference: async (symbol) => ({
         symbol,
         price: 0.000003,
@@ -1341,6 +1380,10 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(store.getState().baskets).toHaveLength(0);
     expect(client.placed).toHaveLength(0);
     expect(executor.getStatus().entryAttemptAudit.latest?.reason).toContain("no verified live futures price");
+    expect(futuresReferenceHealth.snapshot().counters).toMatchObject({
+      scaleGuardRejected: 1,
+      referenceUnavailable: 1,
+    });
   });
 
   it("[FUTURES VALIDATION] keeps a normal active USD-M symbol such as SOLUSDT eligible", async () => {
