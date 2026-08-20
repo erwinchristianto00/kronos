@@ -162,6 +162,7 @@ class FakeExecClient implements CrossSectionalExecClient {
       ["SOLUSDT", f(0.01, 0.01)],
       ["ADAUSDT", f(1, 1)],
       ["DOGEUSDT", f(1, 1)],
+      ["1000PEPEUSDT", f(1, 1)],
       ["RNDRUSDT", f(0.1, 0.1)],
     ]);
   }
@@ -1223,6 +1224,58 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
       stage: "SMART_ENTRY_REVALIDATION",
       outcome: "SKIPPED",
     });
+  });
+
+  it("[MULTIPLIER CONTRACT] never sizes 1000PEPE from the bare-spot signal price without a futures mark", async () => {
+    const client = new FakeExecClient();
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      // The sizing guard must hold even if an operator later disables Smart Basket lifecycle.
+      smartBasketEnabled: false,
+    });
+    const signal = signalStore.all[0]!;
+    signal.longLeg[0] = { symbol: "1000PEPEUSDT", entryPrice: 0.000003, exitPrice: null };
+    // No 1000PEPE futures mark: the old path would have submitted ~1000x too much quantity.
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+
+    await executor.tick();
+
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().baskets).toHaveLength(0);
+    expect(executor.getStatus().entryAttemptAudit.latest).toMatchObject({
+      stage: "SIZING",
+      outcome: "SKIPPED",
+      referencePrices: {},
+    });
+    expect(executor.getStatus().entryAttemptAudit.latest?.reason).toContain("requires a live futures mark");
+  });
+
+  it("[MULTIPLIER CONTRACT] uses the live futures mark for 1000PEPE sizing without treating its unit scale as drift", async () => {
+    const client = new FakeExecClient();
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: true,
+    });
+    const signal = signalStore.all[0]!;
+    signal.formationMode = "PLAIN_MOM36";
+    signal.longLeg[0] = { symbol: "1000PEPEUSDT", entryPrice: 0.000003, exitPrice: null, volatilityAtOpen: 0.01 };
+    signal.shortLeg[0]!.volatilityAtOpen = 0.01;
+    client.markPriceBySymbol.set("1000PEPEUSDT", 0.003);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.fillPriceBySymbol.set("1000PEPEUSDT", 0.003);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+
+    await executor.tick();
+
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("COMPLETE");
+    const pepe = basket.legs.find((leg) => leg.symbol === "1000PEPEUSDT")!;
+    expect(pepe.entryPrice).toBeCloseTo(0.003, 9);
+    // $25 / 0.003 is thousands, not the old spot-scale millions.
+    expect(pepe.qty).toBeGreaterThan(8_000);
+    expect(pepe.qty).toBeLessThan(9_000);
   });
 
   it("[SMART BASKET LIFECYCLE] keeps entry revalidation and provenance for a Plain MOM36 formation", async () => {

@@ -75,6 +75,16 @@ import {
 export function isCrossSectionalMakerEntryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED === "1";
 }
+
+/**
+ * The measurement lane deliberately fetches bare spot candles for Binance's
+ * 1000x perpetual contracts (e.g. PEPEUSDT for 1000PEPEUSDT), because returns
+ * are scale-invariant.  Their raw candle *price* is therefore unsafe as an
+ * order-sizing reference: only a live futures mark is in the contract's unit.
+ */
+export function isCrossSectionalMultiplierContract(symbol: string): boolean {
+  return symbol.startsWith("1000");
+}
 /** How long a post-only leg may rest before it is cancelled and crossed. */
 export function crossSectionalMakerWaitMs(env: NodeJS.ProcessEnv = process.env): number {
   const n = Number.parseInt(env.CROSS_SECTIONAL_MAKER_WAIT_MS ?? "", 10);
@@ -2782,8 +2792,24 @@ export class CrossSectionalExecutor {
     for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
       for (const leg of legs) {
         const mark = marks.get(leg.symbol);
-        if (!(typeof mark === "number" && Number.isFinite(mark) && mark > 0 && leg.entryPrice > 0)) continue;
+        const hasLiveMark = typeof mark === "number" && Number.isFinite(mark) && mark > 0;
+        if (!hasLiveMark) {
+          if (isCrossSectionalMultiplierContract(leg.symbol)) {
+            return {
+              allowed: false,
+              reason: `smart entry refresh: ${leg.symbol} has no live futures mark; refusing spot-scale sizing fallback`,
+              at: this.nowIso(),
+              referencePrices,
+            };
+          }
+          continue;
+        }
         referencePrices[leg.symbol] = mark;
+        // `leg.entryPrice` is intentionally a bare-spot price for this contract family.  Do not
+        // compare that number to a futures mark as an adverse drift (it is ~1000x by definition);
+        // the futures mark above is the only safe sizing reference and carries no selection change.
+        if (isCrossSectionalMultiplierContract(leg.symbol)) continue;
+        if (!(leg.entryPrice > 0)) continue;
         const adverseMove = side === "LONG"
           ? (mark - leg.entryPrice) / leg.entryPrice
           : (leg.entryPrice - mark) / leg.entryPrice;
@@ -4470,7 +4496,18 @@ export class CrossSectionalExecutor {
     for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
       for (const leg of legs) {
         const f = filters.get(leg.symbol);
-        const referencePrice = smartEntry.referencePrices[leg.symbol] ?? leg.entryPrice;
+        const liveReferencePrice = smartEntry.referencePrices[leg.symbol];
+        if (isCrossSectionalMultiplierContract(leg.symbol) && !(liveReferencePrice > 0)) {
+          releasePlannedSoFar("MULTIPLIER_LIVE_MARK_UNAVAILABLE");
+          this.skipSignal(
+            signal,
+            "SIZING",
+            `${leg.symbol} requires a live futures mark; refusing spot-scale sizing fallback`,
+            smartEntry.referencePrices,
+          );
+          return;
+        }
+        const referencePrice = liveReferencePrice ?? leg.entryPrice;
         if (!f || !(referencePrice > 0)) {
           releasePlannedSoFar("SIBLING_LEG_MISSING_FILTERS");
           this.skipSignal(
