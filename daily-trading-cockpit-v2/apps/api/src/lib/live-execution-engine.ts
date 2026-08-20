@@ -1201,7 +1201,7 @@ export type LivePrivateClient = Pick<
   | "cancelAllAlgoOrders"
   | "getUserTrades"
   | "getIncomeHistory"
->;
+> & Partial<Pick<BinanceFuturesPrivateClient, "getRateLimitStatus">>;
 
 /** Same as sumLiveIntentReportingExclusions but scoped to ONE UTC day, so a "today" headline can be
  *  corrected without also subtracting voids from earlier days. Matches how dailyLedger rolls. */
@@ -2536,6 +2536,21 @@ export class LiveExecutionEngine {
     }
   }
 
+  /**
+   * A USD-M 418 means Binance has told this account's transport to stop.  This gate is deliberately
+   * independent from strategy/manual selection: it blocks only NEW exposure while preserving the
+   * existing fail-closed behaviour for reconciliation and exits.  Once the client cooldown ends,
+   * the normal strategy gate decides again; nothing is auto-opened from this status alone.
+   */
+  private transportAvailabilityGate(): LiveNewEntryGateDecision {
+    const rateLimit = this.client.getRateLimitStatus?.();
+    if (!rateLimit?.coolingDown) return { allowed: true, reason: null };
+    return {
+      allowed: false,
+      reason: `Binance USD-M transport is cooling down after HTTP ${rateLimit.lastHttpStatus ?? 418} until ${rateLimit.retryAt ?? "an unknown time"}`,
+    };
+  }
+
   /** Single source of truth for BOTH canOpenNewEntries()'s boolean and newEntryBlockReason()'s
    *  explanation, so the two can never drift apart — see live-executor-wiring.ts's
    *  newExecutorLaneGate header comment for the exact incident class (a hand-maintained mirror of a
@@ -2552,6 +2567,8 @@ export class LiveExecutionEngine {
     if (this.isNewEntryDrainActive()) {
       return { allowed: false, reason: "new-entry drain is active (operator paused new entries)" };
     }
+    const transport = this.transportAvailabilityGate();
+    if (!transport.allowed) return transport;
     // Testnet collect-all still honours arm/disarm, the kill switch, and an
     // operator drain. It deliberately does not inherit strategy admission.
     if (this.config.mirrorAllPaperOrders) return { allowed: true, reason: null };
@@ -2603,6 +2620,7 @@ export class LiveExecutionEngine {
     const st = this.store.getState();
     if (!this.armed || st.killedAt) return false;
     if (this.isNewEntryDrainActive()) return false;
+    if (!this.transportAvailabilityGate().allowed) return false;
     if (this.config.mirrorAllPaperOrders) return true;
     return this.strategyEntryGate().allowed;
   }
@@ -2696,6 +2714,7 @@ export class LiveExecutionEngine {
         lastTickAt: this.lastTickAt,
         lastTickError: this.lastTickError,
         lastDisarm: this.lastDisarm,
+        rateLimit: this.client.getRateLimitStatus?.() ?? null,
       },
       controller,
       reconcileIssues: this.reconcileIssues.slice(-10),
@@ -3339,6 +3358,14 @@ export class LiveExecutionEngine {
     this.ticking = true;
     this.lastTickError = null;
     try {
+      const rateLimit = this.client.getRateLimitStatus?.();
+      if (rateLimit?.coolingDown) {
+        this.healthyTickStreak = 0;
+        this.lastTickError =
+          `Binance USD-M transport cooldown after HTTP ${rateLimit.lastHttpStatus ?? 418}; ` +
+          `no request sent until ${rateLimit.retryAt ?? "the cooldown expires"}`;
+        return;
+      }
       await this.client.ensureTimeSync();
 
       // 1. Kill-switch evaluation FIRST (uses persisted ledger; no exchange call needed).

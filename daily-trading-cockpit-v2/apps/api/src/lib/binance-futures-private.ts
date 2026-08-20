@@ -63,6 +63,15 @@ export const MAX_CLOCK_SKEW_MS = 4_000;
 const GET_MAX_RETRIES = 2;
 // Sync every 60 s so the offset stays fresh even on hosts with fast clock drift.
 const TIME_SYNC_TTL_MS = 60_000;
+/**
+ * HTTP 418 is an IP-ban response, not a hint to retry shortly.  Binance does not always send a
+ * Retry-After header, so keep the transport quiet for a conservative two minutes when no explicit
+ * expiry is supplied.  This protects the account-wide client shared by the engine, basket
+ * executors, and dashboard from extending its own ban.
+ */
+const HTTP_418_FALLBACK_COOLDOWN_MS = 2 * 60_000;
+/** A plain 429 may be a short endpoint throttle; honour it too, but do not turn it into a ban. */
+const HTTP_429_FALLBACK_COOLDOWN_MS = 5_000;
 // Re-fetch exchange filters (tickSize/stepSize/minQty/minNotional) periodically instead of caching
 // them for the process lifetime. Binance occasionally updates a symbol's LOT_SIZE/PRICE_FILTER/
 // MIN_NOTIONAL specs; without a TTL, a long-running process (days between restarts) would keep
@@ -87,17 +96,20 @@ export class BinanceFuturesPrivateError extends Error {
   readonly httpStatus: number | null;
   /** Binance error code (e.g. -2019 margin insufficient), when present. */
   readonly binanceCode: number | null;
+  /** ISO time at which the client may safely attempt the endpoint again, if rate-limited. */
+  readonly retryAt: string | null;
 
   constructor(
     failureType: LiveRequestFailureType,
     message: string,
-    opts: { httpStatus?: number | null; binanceCode?: number | null } = {},
+    opts: { httpStatus?: number | null; binanceCode?: number | null; retryAt?: string | null } = {},
   ) {
     super(message);
     this.name = "BinanceFuturesPrivateError";
     this.failureType = failureType;
     this.httpStatus = opts.httpStatus ?? null;
     this.binanceCode = opts.binanceCode ?? null;
+    this.retryAt = opts.retryAt ?? null;
   }
 }
 
@@ -470,6 +482,42 @@ export interface FuturesExecutionBookTicker {
   time: number | null;
 }
 
+/** Current local circuit state. Purely diagnostic; it never invents exchange health. */
+export interface BinanceFuturesRateLimitStatus {
+  coolingDown: boolean;
+  retryAt: string | null;
+  lastHttpStatus: 418 | 429 | null;
+  lastFailure: string | null;
+}
+
+function parseRetryAfterMs(raw: string | null, nowMs: number): number | null {
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1_000);
+  const atMs = Date.parse(raw);
+  return Number.isFinite(atMs) ? Math.max(0, atMs - nowMs) : null;
+}
+
+/** Binance -1003 bodies commonly say "IP banned until <unix-ms>". Parse that if present. */
+function parseBanUntilMs(bodyText: string): number | null {
+  let message = bodyText;
+  try {
+    const parsed = JSON.parse(bodyText) as { msg?: unknown; retryAfter?: unknown; retryAfterMs?: unknown };
+    const explicit = Number(parsed.retryAfterMs ?? parsed.retryAfter);
+    if (Number.isFinite(explicit) && explicit > 0) {
+      return explicit < 100_000_000_000 ? Math.round(explicit * 1_000) : Math.round(explicit);
+    }
+    if (typeof parsed.msg === "string") message = parsed.msg;
+  } catch {
+    // Keep the raw body as the best available message to inspect for a ban-until timestamp.
+  }
+  const match = message.match(/\b(?:ban(?:ned)?\s+until|until)\D*(\d{10,13})\b/i);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed < 100_000_000_000 ? Math.round(parsed * 1_000) : Math.round(parsed);
+}
+
 export class BinanceFuturesPrivateClient {
   private readonly apiKey: string;
   private readonly apiSecret: string;
@@ -483,6 +531,13 @@ export class BinanceFuturesPrivateClient {
   private lastMeasuredSkewMs = 0;
   private exchangeFiltersCache: Map<string, FuturesSymbolFilters> | null = null;
   private exchangeFiltersCacheAtMs = 0;
+  /** Coalesces a cold-start time sync shared by concurrent signed reads. */
+  private timeSyncInFlight: Promise<void> | null = null;
+  /** Serialises actual HTTP dispatch, so a Promise.all cannot race several requests past a new 418. */
+  private transportTail: Promise<void> = Promise.resolve();
+  private rateLimitCooldownUntilMs = 0;
+  private lastRateLimitHttpStatus: 418 | 429 | null = null;
+  private lastRateLimitFailure: string | null = null;
 
   constructor(options: BinanceFuturesPrivateClientOptions) {
     this.apiKey = options.apiKey;
@@ -496,6 +551,71 @@ export class BinanceFuturesPrivateClient {
   // ── raw transport ──────────────────────────────────────────────────────────
 
   private async rawRequest(method: "GET" | "POST" | "DELETE", url: string, signed: boolean): Promise<unknown> {
+    // Reads are the burst source (dashboard/account/reconcile snapshots) and are safe to queue.
+    // Never queue a risk-reducing POST/DELETE behind a slow read: it still respects an already-open
+    // 418 circuit, but an operator/engine close keeps its normal immediate dispatch priority.
+    if (method === "GET") {
+      return this.withTransportSlot(() => this.dispatchRawRequest(method, url, signed));
+    }
+    this.assertRateLimitCircuitClosed();
+    return this.dispatchRawRequest(method, url, signed);
+  }
+
+  /**
+   * Queue read dispatches, rather than merely retrying callers independently: a concurrent
+   * balance/positions/orders snapshot must not send a second request while the first one is
+   * learning that Binance has banned this IP. POST/DELETE intentionally bypass this queue so an
+   * exit never waits behind a slow observability read.
+   */
+  private async withTransportSlot<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.transportTail;
+    let release = (): void => {};
+    this.transportTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      this.assertRateLimitCircuitClosed();
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private assertRateLimitCircuitClosed(): void {
+    const now = this.nowMs();
+    if (this.rateLimitCooldownUntilMs <= now) return;
+    const retryAt = new Date(this.rateLimitCooldownUntilMs).toISOString();
+    throw new BinanceFuturesPrivateError(
+      "429",
+      `rate limited (HTTP ${this.lastRateLimitHttpStatus ?? 418}); transport cooldown until ${retryAt}`,
+      { httpStatus: this.lastRateLimitHttpStatus ?? 418, retryAt },
+    );
+  }
+
+  private registerRateLimit(response: Response, bodyText: string): BinanceFuturesPrivateError {
+    const now = this.nowMs();
+    const status = response.status === 418 ? 418 : 429;
+    const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"), now);
+    const banUntilMs = parseBanUntilMs(bodyText);
+    const fallbackMs = status === 418 ? HTTP_418_FALLBACK_COOLDOWN_MS : HTTP_429_FALLBACK_COOLDOWN_MS;
+    const retryUntilMs = Math.max(
+      now + fallbackMs,
+      retryAfterMs === null ? 0 : now + retryAfterMs,
+      banUntilMs ?? 0,
+    );
+    this.rateLimitCooldownUntilMs = Math.max(this.rateLimitCooldownUntilMs, retryUntilMs);
+    this.lastRateLimitHttpStatus = status;
+    this.lastRateLimitFailure = `rate limited (HTTP ${status})`;
+    const retryAt = new Date(this.rateLimitCooldownUntilMs).toISOString();
+    return new BinanceFuturesPrivateError(
+      "429",
+      `rate limited (HTTP ${status}); transport cooldown until ${retryAt}`,
+      { httpStatus: status, retryAt },
+    );
+  }
+
+  private async dispatchRawRequest(method: "GET" | "POST" | "DELETE", url: string, signed: boolean): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let response: Response;
@@ -517,7 +637,7 @@ export class BinanceFuturesPrivateClient {
 
     const bodyText = await response.text().catch(() => "");
     if (response.status === 429 || response.status === 418) {
-      throw new BinanceFuturesPrivateError("429", `rate limited (HTTP ${response.status})`, { httpStatus: response.status });
+      throw this.registerRateLimit(response, bodyText);
     }
     let parsed: unknown = null;
     try {
@@ -627,19 +747,40 @@ export class BinanceFuturesPrivateClient {
 
   async ensureTimeSync(): Promise<void> {
     if (this.nowMs() - this.lastTimeSyncAtMs < TIME_SYNC_TTL_MS) return;
+    if (this.timeSyncInFlight) return this.timeSyncInFlight;
+    const task = (async (): Promise<void> => {
+      try {
+        await this.forceTimeSync();
+      } catch (error) {
+        // 2026-07-12 fix: this ran unconditionally before EVERY signed request, uncaught — a single
+        // transient hiccup hitting the public /fapi/v1/time endpoint aborted the request outright with
+        // ZERO retry, even for the GET path which otherwise retries several times. Binance's own
+        // recvWindow/signature check (and assertClockSkewOk below, using the LAST successfully measured
+        // skew) are the actual safety net against a truly-drifted clock, so a periodic-refresh miss is
+        // safe to ride out on the stale-but-recent offset. Only fail closed when there has NEVER been a
+        // successful sync (lastTimeSyncAtMs still 0): lastMeasuredSkewMs's 0 default would otherwise
+        // silently pass assertClockSkewOk() as if skew were known-good when it is actually unknown.
+        if (this.lastTimeSyncAtMs === 0) throw error;
+      }
+    })();
+    this.timeSyncInFlight = task;
     try {
-      await this.forceTimeSync();
-    } catch (error) {
-      // 2026-07-12 fix: this ran unconditionally before EVERY signed request, uncaught — a single
-      // transient hiccup hitting the public /fapi/v1/time endpoint aborted the request outright with
-      // ZERO retry, even for the GET path which otherwise retries several times. Binance's own
-      // recvWindow/signature check (and assertClockSkewOk below, using the LAST successfully measured
-      // skew) are the actual safety net against a truly-drifted clock, so a periodic-refresh miss is
-      // safe to ride out on the stale-but-recent offset. Only fail closed when there has NEVER been a
-      // successful sync (lastTimeSyncAtMs still 0): lastMeasuredSkewMs's 0 default would otherwise
-      // silently pass assertClockSkewOk() as if skew were known-good when it is actually unknown.
-      if (this.lastTimeSyncAtMs === 0) throw error;
+      await task;
+    } finally {
+      if (this.timeSyncInFlight === task) {
+        this.timeSyncInFlight = null;
+      }
     }
+  }
+
+  getRateLimitStatus(): BinanceFuturesRateLimitStatus {
+    const now = this.nowMs();
+    return {
+      coolingDown: this.rateLimitCooldownUntilMs > now,
+      retryAt: this.rateLimitCooldownUntilMs > now ? new Date(this.rateLimitCooldownUntilMs).toISOString() : null,
+      lastHttpStatus: this.lastRateLimitHttpStatus,
+      lastFailure: this.lastRateLimitFailure,
+    };
   }
 
   private async forceTimeSync(): Promise<void> {

@@ -817,6 +817,41 @@ describe("LiveExecutionEngine", () => {
     });
   });
 
+  it("HTTP 418 transport cooldown blocks new exposure while keeping the engine armed and observable", async () => {
+    const client = new FakeLiveClient() as FakeLiveClient & {
+      getRateLimitStatus: () => {
+        coolingDown: boolean;
+        retryAt: string | null;
+        lastHttpStatus: 418 | 429 | null;
+        lastFailure: string | null;
+      };
+    };
+    client.getRateLimitStatus = () => ({
+      coolingDown: true,
+      retryAt: "2099-01-02T12:02:00.000Z",
+      lastHttpStatus: 418,
+      lastFailure: "rate limited (HTTP 418)",
+    });
+    const { engine } = makeEngine({ client, paper: makePaperStore([paperOrder()]) });
+    expect((await engine.arm()).ok).toBe(true);
+
+    expect(engine.canOpenNewEntries()).toBe(false);
+    expect(engine.canOpenNewEntriesIgnoringManualDirectional()).toBe(false);
+    expect(engine.getStatus()).toMatchObject({
+      armed: true,
+      newEntries: {
+        allowed: false,
+        blockReason: expect.stringContaining("HTTP 418"),
+      },
+      health: {
+        rateLimit: {
+          coolingDown: true,
+          retryAt: "2099-01-02T12:02:00.000Z",
+        },
+      },
+    });
+  });
+
   it("new-entry drain does not stop lifecycle settlement for an already-open position", async () => {
     const order = paperOrder({ variantExitRule: "tp1_full" });
     const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });

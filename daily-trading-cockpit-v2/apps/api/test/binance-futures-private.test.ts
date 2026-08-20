@@ -100,6 +100,67 @@ describe("binance-futures-private signing", () => {
     expect(urls.filter((url) => url.includes("/fapi/v2/balance"))).toHaveLength(1);
   });
 
+  it("opens one client-wide 418 circuit, coalesces cold-start time sync, and resumes only after its expiry", async () => {
+    const urls: string[] = [];
+    let nowMs = 1_700_000_000_000;
+    const bannedUntilMs = nowMs + 5 * 60_000;
+    let balanceAttempts = 0;
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      urls.push(value);
+      if (value.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+      }
+      if (value.includes("/fapi/v2/balance")) {
+        balanceAttempts += 1;
+        return new Response(JSON.stringify({ code: -1003, msg: `Way too much request weight used; IP banned until ${bannedUntilMs}.` }), { status: 418 });
+      }
+      if (value.includes("/fapi/v2/positionRisk")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (value.includes("/fapi/v1/openOrders")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      throw new Error(`unexpected URL ${value}`);
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "mainnet",
+      fetchImpl,
+      nowMs: () => nowMs,
+    });
+
+    // All three signed reads start from a cold clock. They share one /time request and the
+    // transport queues the remaining physical dispatches behind the balance response.
+    const [balance, positions, openOrders] = await Promise.allSettled([
+      client.getBalances(),
+      client.getPositions(),
+      client.getOpenOrders(),
+    ]);
+    expect(balance.status).toBe("rejected");
+    expect(positions.status).toBe("rejected");
+    expect(openOrders.status).toBe("rejected");
+    expect(balanceAttempts).toBe(1);
+    expect(urls.filter((url) => url.includes("/fapi/v1/time"))).toHaveLength(1);
+    expect(urls.filter((url) => url.includes("/fapi/v2/positionRisk"))).toHaveLength(0);
+    expect(urls.filter((url) => url.includes("/fapi/v1/openOrders"))).toHaveLength(0);
+    expect(client.getRateLimitStatus()).toMatchObject({
+      coolingDown: true,
+      lastHttpStatus: 418,
+      retryAt: new Date(bannedUntilMs).toISOString(),
+    });
+
+    // The client must not probe Binance during the ban, even for a different endpoint.
+    await expect(client.getPositions()).rejects.toMatchObject({ failureType: "429", httpStatus: 418 });
+    expect(urls.filter((url) => url.includes("/fapi/v2/positionRisk"))).toHaveLength(0);
+
+    nowMs = bannedUntilMs;
+    await expect(client.getPositions()).resolves.toEqual([]);
+    expect(urls.filter((url) => url.includes("/fapi/v2/positionRisk"))).toHaveLength(1);
+    expect(client.getRateLimitStatus().coolingDown).toBe(false);
+  });
+
   it("accepts only actively trading USD-M perpetual filters", async () => {
     const fetchImpl = (async (url: RequestInfo | URL) => {
       expect(String(url)).toContain("/fapi/v1/exchangeInfo");

@@ -131,6 +131,12 @@ function isBinanceRateLimit(error: unknown): boolean {
   return error instanceof BinanceFuturesPrivateError && error.failureType === "429";
 }
 
+/** Prefer the transport's observed Binance expiry over a dashboard-local guess. */
+function rateLimitRetryAfterMs(error: unknown, nowMs: number, fallbackMs: number): number {
+  const retryAt = error instanceof BinanceFuturesPrivateError ? Date.parse(error.retryAt ?? "") : Number.NaN;
+  return Number.isFinite(retryAt) && retryAt > nowMs ? retryAt : nowMs + fallbackMs;
+}
+
 function dashboardAccountFailure(error: unknown, fallback: string): {
   statusCode: 502 | 503;
   body: { ok: false; reason: string; retryAt?: string | null };
@@ -203,7 +209,7 @@ function createDashboardAccountSnapshotReader(
         const message = error instanceof Error ? error.message : "account snapshot failed";
         lastFailure = message;
         if (isBinanceRateLimit(error)) {
-          retryAfterMs = Math.max(retryAfterMs, nowMs() + rateLimitBackoffMs);
+          retryAfterMs = Math.max(retryAfterMs, rateLimitRetryAfterMs(error, nowMs(), rateLimitBackoffMs));
         }
         if (cache) return cached("LAST_GOOD_USD_M_PRIVATE_CACHE", true);
         throw new DashboardAccountSnapshotUnavailableError(message, {
