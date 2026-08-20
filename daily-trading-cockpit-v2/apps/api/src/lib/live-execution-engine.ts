@@ -2979,10 +2979,14 @@ export class LiveExecutionEngine {
     const positions = rawPositions.filter((position) => Math.abs(position.positionAmt) > 1e-12);
     const openIntents = liveState.intents.filter((intent) => OPEN_INTENT_STATES.has(intent.state));
     const paperById = this.paperOrderById();
-    const activeSymbols = Array.from(new Set(openIntents.map((intent) => intent.symbol)));
-    const openAlgoOrders = (
-      await Promise.all(activeSymbols.map((symbol) => this.client.getOpenAlgoOrders(symbol)))
-    ).flat();
+    // `openAlgoOrders` accepts no symbol and returns the complete USD-M account set (the same
+    // shape already used by the emergency-flatten path).  The dashboard previously made one
+    // signed request PER open intent merely to count these orders.  Besides under-reporting an
+    // external algo order, that fanned a normal account refresh into N requests and was a direct
+    // contributor to HTTP 418 bans when several /live panels polled together.
+    const openAlgoOrders = openIntents.length > 0
+      ? await this.client.getOpenAlgoOrders()
+      : [];
     const intentBySymbol = new Map(openIntents.map((intent) => [intent.symbol, intent]));
     const laneMap = new Map<string, {
       sourceOrderCount: number;

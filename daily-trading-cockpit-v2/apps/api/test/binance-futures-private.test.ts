@@ -77,6 +77,29 @@ describe("binance-futures-private signing", () => {
     expect(urls[0]).toContain("testnet.binancefuture.com/fapi/v1/premiumIndex?symbol=1000PEPEUSDT");
   });
 
+  it("does not amplify an HTTP 418 IP ban with immediate signed GET retries", async () => {
+    const urls: string[] = [];
+    const nowMs = 1_700_000_000_000;
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      urls.push(value);
+      if (value.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ code: -1003, msg: "Too many requests" }), { status: 418 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "mainnet",
+      fetchImpl,
+      nowMs: () => nowMs,
+    });
+
+    await expect(client.getBalances()).rejects.toMatchObject({ failureType: "429", httpStatus: 418 });
+    expect(urls.filter((url) => url.includes("/fapi/v2/balance"))).toHaveLength(1);
+  });
+
   it("accepts only actively trading USD-M perpetual filters", async () => {
     const fetchImpl = (async (url: RequestInfo | URL) => {
       expect(String(url)).toContain("/fapi/v1/exchangeInfo");

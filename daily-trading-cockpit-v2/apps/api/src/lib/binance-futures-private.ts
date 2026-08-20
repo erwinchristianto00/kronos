@@ -10,7 +10,8 @@
  *  - testnet/mainnet is an explicit constructor choice (resolveLiveBinanceBaseUrl).
  *  - Server-time sync with a hard clock-skew guard: signed requests REFUSE to fire when
  *    |local+offset − server| was measured beyond MAX_CLOCK_SKEW_MS at last sync.
- *  - GET requests retry on timeout/429/network (idempotent). Order-mutating requests
+ *  - GET requests retry on timeout/429/network (idempotent), but never immediately retry an
+ *    HTTP 418 IP ban: repeating that request only extends the ban. Order-mutating requests
  *    (POST/DELETE) NEVER auto-retry — double-submit is worse than a missed attempt; the
  *    engine passes newClientOrderId so a retry-by-engine is exchange-side idempotent.
  *  - This module performs NO strategy logic and NO sizing. It is a transport.
@@ -105,6 +106,18 @@ const RETRYABLE_GET_FAILURES: ReadonlySet<LiveRequestFailureType> = new Set([
   "429",
   "network",
 ]);
+
+/**
+ * A Binance 418 is an explicit IP-ban signal, not an ordinary transient 429.  The old generic
+ * GET retry loop turned one rejected dashboard/account read into three immediate signed reads;
+ * that is exactly the wrong response while Binance asks this IP to stop.  Keep ordinary 429
+ * retries (they can be a short-lived per-endpoint throttle), but surface 418 to the caller so
+ * the dashboard-level cooldown can serve its last verified snapshot instead.
+ */
+function shouldRetryGet(error: unknown): boolean {
+  if (!(error instanceof BinanceFuturesPrivateError)) return true;
+  return RETRYABLE_GET_FAILURES.has(error.failureType) && error.httpStatus !== 418;
+}
 
 // ─── public shapes ───────────────────────────────────────────────────────────
 
@@ -542,8 +555,7 @@ export class BinanceFuturesPrivateClient {
         return await this.rawRequest("GET", url, false);
       } catch (error) {
         lastError = error;
-        const type = error instanceof BinanceFuturesPrivateError ? error.failureType : "network";
-        if (!RETRYABLE_GET_FAILURES.has(type) || attempt === GET_MAX_RETRIES) throw error;
+        if (!shouldRetryGet(error) || attempt === GET_MAX_RETRIES) throw error;
         await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
       }
     }
@@ -573,7 +585,6 @@ export class BinanceFuturesPrivateClient {
           return await this.rawRequest("GET", buildSignedUrl(), true);
         } catch (error) {
           lastError = error;
-          const type = error instanceof BinanceFuturesPrivateError ? error.failureType : "network";
           if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021 && attempt < GET_MAX_RETRIES) {
             // 2026-07-12 fix: forceTimeSync() itself hits the network (/fapi/v1/time) and can throw —
             // previously that throw escaped this catch block uncaught, aborting the ENTIRE retry loop
@@ -589,7 +600,7 @@ export class BinanceFuturesPrivateClient {
             await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
             continue;
           }
-          if (!RETRYABLE_GET_FAILURES.has(type) || attempt === GET_MAX_RETRIES) throw error;
+          if (!shouldRetryGet(error) || attempt === GET_MAX_RETRIES) throw error;
           await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
         }
       }

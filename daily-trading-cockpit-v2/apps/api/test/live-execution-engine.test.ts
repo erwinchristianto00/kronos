@@ -120,6 +120,7 @@ export class FakeLiveClient {
   leverageCalls: Array<{ symbol: string; leverage: number }> = [];
   canceled: Array<{ symbol: string; orderId: string }> = [];
   cancelAllSymbols: string[] = [];
+  openAlgoOrderSymbols: Array<string | undefined> = [];
   positionsBySymbol = new Map<string, number>();
   markPriceBySymbol = new Map<string, number>();
   unrealizedPnlBySymbol = new Map<string, number>();
@@ -197,7 +198,8 @@ export class FakeLiveClient {
   async getOpenOrders() {
     return [];
   }
-  async getOpenAlgoOrders() {
+  async getOpenAlgoOrders(symbol?: string) {
+    this.openAlgoOrderSymbols.push(symbol);
     return [];
   }
   async queryAlgoOrder(_algoId: string): Promise<FuturesAlgoOrder> {
@@ -1777,6 +1779,21 @@ describe("LiveExecutionEngine", () => {
     expect(account.positions[0]!.targetTpGapPct).toBeCloseTo(5, 9);
     expect(account.positions[0]!.liquidationPrice).toBe(1500);
     expect(account.lanes.map((lane) => lane.laneId)).toEqual(["LANE_A"]);
+  });
+
+  it("getAccountSnapshot reads open algo orders once for the complete USD-M account, not once per intent", async () => {
+    const { engine, client, store } = makeEngine();
+    // The snapshot only needs `state` and `symbol` for these rows because the fake exchange has no
+    // positions. This deliberately simulates multiple active intents without invoking entry logic.
+    store.getState().intents.push(
+      { state: "OPEN", symbol: "ETHUSDT" } as never,
+      { state: "OPEN", symbol: "BTCUSDT" } as never,
+      { state: "OPEN", symbol: "SOLUSDT" } as never,
+    );
+
+    await engine.getAccountSnapshot();
+
+    expect(client.openAlgoOrderSymbols).toEqual([undefined]);
   });
 
   it("testnet mirror-all accepts a diagnostic source outside the operator lane selection", async () => {

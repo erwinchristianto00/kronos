@@ -3,6 +3,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 
 import { registerLiveRoutes } from "../src/routes/live.js";
 import type { LiveExecutionEngine } from "../src/lib/live-execution-engine.js";
+import { BinanceFuturesPrivateError } from "../src/lib/binance-futures-private.js";
 import type { CrossSectionalExecutor, ExecutorBasket } from "../src/lib/cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor, SingleSymbolPosition } from "../src/lib/single-symbol-lane-executor.js";
 
@@ -109,6 +110,16 @@ async function buildApp(): Promise<FastifyInstance> {
   return app;
 }
 
+async function buildSnapshotApp(
+  engine: LiveExecutionEngine,
+  dashboardAccountSnapshot?: { nowMs?: () => number; cacheTtlMs?: number; rateLimitBackoffMs?: number },
+): Promise<FastifyInstance> {
+  app = Fastify();
+  await registerLiveRoutes(app, engine, { dashboardAccountSnapshot });
+  await app.ready();
+  return app;
+}
+
 describe("registerLiveRoutes — /api/live/account wires ALL 5 executor instances, not just the first", () => {
   it("annotates the AUSDT position with all 3 cross-sectional laneIds (FILTERED + TREND + MIXED)", async () => {
     const a = await buildApp();
@@ -117,6 +128,12 @@ describe("registerLiveRoutes — /api/live/account wires ALL 5 executor instance
     const body = res.json();
     const row = body.positions.find((p: { symbol: string }) => p.symbol === "AUSDT");
     expect(row.laneIds.sort()).toEqual(["CROSS_SECTIONAL_MARKET_NEUTRAL", "CROSS_SECTIONAL_MIXED", "CROSS_SECTIONAL_TREND"]);
+
+    // The second response is served from the short dashboard cache. Attribution remains exactly
+    // once per executor; cache reuse must not retain /api/live/account's mutable annotations.
+    const again = await a.inject({ method: "GET", url: "/api/live/account" });
+    const againRow = again.json().positions.find((p: { symbol: string }) => p.symbol === "AUSDT");
+    expect(againRow.sourceOrderCount).toBe(row.sourceOrderCount);
   });
 
   it("annotates the BUSDT position with both single-symbol-executor laneIds (SHORT_FADE + INTRADAY_MOMENTUM)", async () => {
@@ -143,6 +160,96 @@ describe("registerLiveRoutes — /api/live/account wires ALL 5 executor instance
     expect(res.statusCode).toBe(200);
     const row = res.json().positions.find((p: { symbol: string }) => p.symbol === "AUSDT");
     expect(row.laneIds).toEqual(["CROSS_SECTIONAL_MARKET_NEUTRAL"]);
+  });
+});
+
+describe("registerLiveRoutes — dashboard account snapshot pressure guard", () => {
+  it("coalesces concurrent dashboard routes onto one USD-M account read", async () => {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const engine = {
+      getAccountSnapshot: async () => {
+        calls += 1;
+        await gate;
+        return fakeAccountSnapshot();
+      },
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+      laneSelectionWeightPctForLane: () => 0,
+    } as unknown as LiveExecutionEngine;
+    const a = await buildSnapshotApp(engine);
+
+    const account = a.inject({ method: "GET", url: "/api/live/account" });
+    const positions = a.inject({ method: "GET", url: "/api/live/single-symbol/positions" });
+    const evaluation = a.inject({ method: "GET", url: "/api/live/lane-evaluation" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toBe(1);
+
+    release();
+    const [accountResponse, positionsResponse, evaluationResponse] = await Promise.all([account, positions, evaluation]);
+    expect(accountResponse.statusCode).toBe(200);
+    expect(positionsResponse.statusCode).toBe(200);
+    expect(evaluationResponse.statusCode).toBe(200);
+    expect(calls).toBe(1);
+  });
+
+  it("returns an explicitly stale last-good snapshot during a 418 cooldown without another exchange read", async () => {
+    let nowMs = 1_000;
+    let calls = 0;
+    const engine = {
+      getAccountSnapshot: async () => {
+        calls += 1;
+        if (calls === 1) return fakeAccountSnapshot();
+        throw new BinanceFuturesPrivateError("429", "rate limited (HTTP 418)", { httpStatus: 418 });
+      },
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+      laneSelectionWeightPctForLane: () => 0,
+    } as unknown as LiveExecutionEngine;
+    const a = await buildSnapshotApp(engine, {
+      nowMs: () => nowMs,
+      cacheTtlMs: 10,
+      rateLimitBackoffMs: 1_000,
+    });
+
+    const first = await a.inject({ method: "GET", url: "/api/live/account" });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().accountSnapshot).toMatchObject({ source: "USD_M_PRIVATE_ACCOUNT", stale: false });
+
+    nowMs += 11;
+    const stale = await a.inject({ method: "GET", url: "/api/live/account" });
+    expect(stale.statusCode).toBe(200);
+    expect(stale.json().accountSnapshot).toMatchObject({
+      source: "LAST_GOOD_USD_M_PRIVATE_CACHE",
+      stale: true,
+      lastFailure: "rate limited (HTTP 418)",
+    });
+    expect(calls).toBe(2);
+
+    nowMs += 1;
+    const positions = await a.inject({ method: "GET", url: "/api/live/single-symbol/positions" });
+    expect(positions.statusCode).toBe(200);
+    expect(calls).toBe(2);
+  });
+
+  it("fails closed on the first 418, then enforces the cooldown without retrying Binance", async () => {
+    let calls = 0;
+    const engine = {
+      getAccountSnapshot: async () => {
+        calls += 1;
+        throw new BinanceFuturesPrivateError("429", "rate limited (HTTP 418)", { httpStatus: 418 });
+      },
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+      laneSelectionWeightPctForLane: () => 0,
+    } as unknown as LiveExecutionEngine;
+    const a = await buildSnapshotApp(engine, { rateLimitBackoffMs: 1_000 });
+
+    const first = await a.inject({ method: "GET", url: "/api/live/account" });
+    expect(first.statusCode).toBe(503);
+    expect(first.json()).toMatchObject({ ok: false, reason: "rate limited (HTTP 418)" });
+
+    const second = await a.inject({ method: "GET", url: "/api/live/lane-evaluation" });
+    expect(second.statusCode).toBe(503);
+    expect(calls).toBe(1);
   });
 });
 

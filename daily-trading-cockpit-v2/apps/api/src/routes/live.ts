@@ -16,6 +16,7 @@ import { buildInstrumentationReport } from "../lib/instrumentation-report.js";
 import { rejectedBasketLogPath } from "../lib/rejected-basket-recorder.js";
 import type { FastifyInstance } from "fastify";
 
+import { BinanceFuturesPrivateError } from "../lib/binance-futures-private.js";
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
 import { fullyCostedNetPnlUsd, fullyCostedFeeUsd } from "../lib/fully-costed-net-pnl.js";
 import { poolReconciliationPlan } from "../lib/symbol-pool-reconciliation.js";
@@ -95,6 +96,138 @@ const OPERATOR_ALLOCATION_LANE_IDS = [
 ];
 
 type LiveAccountSnapshot = Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>>;
+
+const DASHBOARD_ACCOUNT_CACHE_TTL_MS = 15_000;
+const DASHBOARD_ACCOUNT_RATE_LIMIT_BACKOFF_MS = 60_000;
+
+/**
+ * Account data is observability-only here.  Never feed this cache into entry, exit, reconciliation,
+ * or order logic: it exists solely to make several dashboard panels share one verified USD-M
+ * account read and to keep displaying an explicitly stale last-good snapshot during a Binance ban.
+ */
+type DashboardAccountSnapshot = {
+  snapshot: LiveAccountSnapshot;
+  source: "USD_M_PRIVATE_ACCOUNT" | "USD_M_PRIVATE_CACHE" | "LAST_GOOD_USD_M_PRIVATE_CACHE";
+  fetchedAt: string;
+  ageMs: number;
+  stale: boolean;
+  retryAt: string | null;
+  lastFailure: string | null;
+};
+
+class DashboardAccountSnapshotUnavailableError extends Error {
+  readonly retryAt: string | null;
+  readonly rateLimited: boolean;
+
+  constructor(message: string, opts: { retryAt?: string | null; rateLimited?: boolean } = {}) {
+    super(message);
+    this.name = "DashboardAccountSnapshotUnavailableError";
+    this.retryAt = opts.retryAt ?? null;
+    this.rateLimited = opts.rateLimited ?? false;
+  }
+}
+
+function isBinanceRateLimit(error: unknown): boolean {
+  return error instanceof BinanceFuturesPrivateError && error.failureType === "429";
+}
+
+function dashboardAccountFailure(error: unknown, fallback: string): {
+  statusCode: 502 | 503;
+  body: { ok: false; reason: string; retryAt?: string | null };
+} {
+  const message = error instanceof Error ? error.message : fallback;
+  if (error instanceof DashboardAccountSnapshotUnavailableError) {
+    return {
+      statusCode: error.rateLimited ? 503 : 502,
+      body: { ok: false, reason: message, retryAt: error.retryAt },
+    };
+  }
+  return { statusCode: 502, body: { ok: false, reason: message } };
+}
+
+function createDashboardAccountSnapshotReader(
+  engine: LiveExecutionEngine,
+  options: {
+    nowMs?: () => number;
+    cacheTtlMs?: number;
+    rateLimitBackoffMs?: number;
+  } = {},
+): () => Promise<DashboardAccountSnapshot> {
+  const nowMs = options.nowMs ?? (() => Date.now());
+  const cacheTtlMs = options.cacheTtlMs ?? DASHBOARD_ACCOUNT_CACHE_TTL_MS;
+  const rateLimitBackoffMs = options.rateLimitBackoffMs ?? DASHBOARD_ACCOUNT_RATE_LIMIT_BACKOFF_MS;
+  let cache: { snapshot: LiveAccountSnapshot; fetchedAtMs: number } | null = null;
+  let retryAfterMs = 0;
+  let lastFailure: string | null = null;
+  let inFlight: Promise<DashboardAccountSnapshot> | null = null;
+
+  const cached = (
+    source: DashboardAccountSnapshot["source"],
+    stale: boolean,
+  ): DashboardAccountSnapshot => {
+    if (!cache) throw new Error("dashboard account cache unexpectedly empty");
+    const now = nowMs();
+    return {
+      snapshot: cache.snapshot,
+      source,
+      fetchedAt: new Date(cache.fetchedAtMs).toISOString(),
+      ageMs: Math.max(0, now - cache.fetchedAtMs),
+      stale,
+      retryAt: retryAfterMs > now ? new Date(retryAfterMs).toISOString() : null,
+      lastFailure,
+    };
+  };
+
+  return async (): Promise<DashboardAccountSnapshot> => {
+    const now = nowMs();
+    if (cache && now - cache.fetchedAtMs < cacheTtlMs) {
+      return cached("USD_M_PRIVATE_CACHE", false);
+    }
+    if (retryAfterMs > now) {
+      if (cache) return cached("LAST_GOOD_USD_M_PRIVATE_CACHE", true);
+      throw new DashboardAccountSnapshotUnavailableError(
+        "Binance USD-M account snapshot is cooling down after rate limit",
+        { retryAt: new Date(retryAfterMs).toISOString(), rateLimited: true },
+      );
+    }
+    if (inFlight) return inFlight;
+
+    inFlight = (async (): Promise<DashboardAccountSnapshot> => {
+      try {
+        const snapshot = await engine.getAccountSnapshot();
+        cache = { snapshot, fetchedAtMs: nowMs() };
+        retryAfterMs = 0;
+        lastFailure = null;
+        return cached("USD_M_PRIVATE_ACCOUNT", false);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "account snapshot failed";
+        lastFailure = message;
+        if (isBinanceRateLimit(error)) {
+          retryAfterMs = Math.max(retryAfterMs, nowMs() + rateLimitBackoffMs);
+        }
+        if (cache) return cached("LAST_GOOD_USD_M_PRIVATE_CACHE", true);
+        throw new DashboardAccountSnapshotUnavailableError(message, {
+          retryAt: retryAfterMs > nowMs() ? new Date(retryAfterMs).toISOString() : null,
+          rateLimited: isBinanceRateLimit(error),
+        });
+      } finally {
+        inFlight = null;
+      }
+    })();
+    return inFlight;
+  };
+}
+
+/** The account route adds report-only executor attribution. Keep that mutation out of the shared
+ * dashboard cache, or a second caller inside the TTL would double-count its lane totals. */
+function cloneLiveAccountSnapshot(snapshot: LiveAccountSnapshot): LiveAccountSnapshot {
+  return {
+    ...snapshot,
+    positions: snapshot.positions.map((position) => ({ ...position, laneIds: [...position.laneIds] })),
+    lanes: snapshot.lanes.map((lane) => ({ ...lane, symbols: [...lane.symbols] })),
+    closedLanes: snapshot.closedLanes.map((lane) => ({ ...lane, symbols: [...lane.symbols] })),
+  };
+}
 
 type CrossSectionalUnrealizedExtrema = {
   grossHighUsd: number;
@@ -978,6 +1111,12 @@ export async function registerLiveRoutes(
     futuresReferenceHealth?: () => FuturesReferenceHealthSnapshot | null;
     /** Optional, bounded public-USD-M refresh for a diagnostic watch list. */
     probeFuturesReferenceHealth?: (symbols: string[]) => Promise<FuturesReferenceHealthSnapshot | null>;
+    /** Test seam only. Production uses a 15s shared read and a 60s HTTP-418 cooldown. */
+    dashboardAccountSnapshot?: {
+      nowMs?: () => number;
+      cacheTtlMs?: number;
+      rateLimitBackoffMs?: number;
+    };
     /** Test seam only. Production uses durable data-dir backed defaults. */
     copySecurity?: {
       secret?: string;
@@ -992,6 +1131,9 @@ export async function registerLiveRoutes(
   const copyReplayGuard = opts.copySecurity?.replayGuard ?? new CopyReplayGuard(copySecurityDataDir);
   const copyAuditLogger = opts.copySecurity?.auditLogger ?? new CopyAuditLogger(copySecurityDataDir);
   const copyNowMs = (): number => opts.copySecurity?.nowMs?.() ?? Date.now();
+  const readDashboardAccountSnapshot = engine
+    ? createDashboardAccountSnapshotReader(engine, opts.dashboardAccountSnapshot)
+    : null;
   const copyHeader = (headers: Record<string, unknown>, name: string): string | undefined => {
     const value = headers[name];
     return typeof value === "string" ? value : Array.isArray(value) ? String(value[0] ?? "") : undefined;
@@ -1520,7 +1662,7 @@ export async function registerLiveRoutes(
       return { ok: false, reason: "live execution disabled" };
     }
     try {
-      const snapshot = await engine.getAccountSnapshot();
+      const snapshot = (await readDashboardAccountSnapshot!()).snapshot;
       const exchangeBySymbol = new Map<string, SingleSymbolExchangePositionContext>(
         snapshot.positions.map((p) => [p.symbol, {
           direction: p.direction,
@@ -1533,8 +1675,9 @@ export async function registerLiveRoutes(
       const rows = flattenSingleSymbolPositions(allSingleSymbolExecutors(), exchangeBySymbol);
       return { ok: true, positions: rows };
     } catch (err) {
-      reply.code(502);
-      return { ok: false, reason: err instanceof Error ? err.message : "single-symbol positions fetch failed" };
+      const failure = dashboardAccountFailure(err, "single-symbol positions fetch failed");
+      reply.code(failure.statusCode);
+      return failure.body;
     }
   });
 
@@ -1544,7 +1687,7 @@ export async function registerLiveRoutes(
       return { ok: false, reason: "live execution disabled" };
     }
     try {
-      const snapshot = await engine.getAccountSnapshot();
+      const snapshot = (await readDashboardAccountSnapshot!()).snapshot;
       const execStatuses = allSingleSymbolExecutors().map((exec) => exec.getStatus());
       const measuredByLane = buildMeasuredLaneStats();
       const rows = buildLaneEvaluationRows(
@@ -1555,8 +1698,9 @@ export async function registerLiveRoutes(
       );
       return { ok: true, lanes: rows };
     } catch (err) {
-      reply.code(502);
-      return { ok: false, reason: err instanceof Error ? err.message : "lane evaluation fetch failed" };
+      const failure = dashboardAccountFailure(err, "lane evaluation fetch failed");
+      reply.code(failure.statusCode);
+      return failure.body;
     }
   });
 
@@ -2545,7 +2689,7 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
       afterEstimatedCloseCostUsd: number | null;
     }>>();
     if (filteredOpenBaskets.length > 0 && engine) {
-      const account = await engine.getAccountSnapshot();
+      const account = (await readDashboardAccountSnapshot!()).snapshot;
       const markBySymbol = new Map(account.positions.flatMap((position) =>
         position.markPrice != null ? [[position.symbol, position.markPrice] as const] : [],
       ));
@@ -3098,7 +3242,8 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
       return { ok: false, reason: "live execution disabled" };
     }
     try {
-      let snapshot = await engine.getAccountSnapshot();
+      const dashboardSnapshot = await readDashboardAccountSnapshot!();
+      let snapshot = cloneLiveAccountSnapshot(dashboardSnapshot.snapshot);
       for (const executor of allCrossSectionalExecutors()) {
         snapshot = annotateCrossSectionalAccount(snapshot, executor);
       }
@@ -3121,6 +3266,14 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
       return {
         ok: true,
         ...snapshot,
+        accountSnapshot: {
+          source: dashboardSnapshot.source,
+          fetchedAt: dashboardSnapshot.fetchedAt,
+          ageMs: dashboardSnapshot.ageMs,
+          stale: dashboardSnapshot.stale,
+          retryAt: dashboardSnapshot.retryAt,
+          lastFailure: dashboardSnapshot.lastFailure,
+        },
         singleSymbolExecutorRealizedPnlUsd,
         testnetPnlEra: pnlEra && {
           ...pnlEra,
@@ -3128,8 +3281,9 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
         },
       };
     } catch (err) {
-      reply.code(502);
-      return { ok: false, reason: err instanceof Error ? err.message : "account snapshot failed" };
+      const failure = dashboardAccountFailure(err, "account snapshot failed");
+      reply.code(failure.statusCode);
+      return failure.body;
     }
   });
 

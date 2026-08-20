@@ -6,6 +6,11 @@ import { Disclosure, LaneMaturityTable, laneEdgeBadge, type LaneMaturityRow } fr
 import CrossSectionalReportCard from './CrossSectionalReportCard';
 
 const REFRESH_MS = 5_000;
+// Mainnet account reads fan out to signed USD-M endpoints. Keep the familiar faster testnet
+// presentation cadence, but give LIVE one shared 15s window so a normal open dashboard cannot
+// turn into repeated private-account reads when several panels mount together.
+const LIVE_EXCHANGE_REFRESH_MS = 15_000;
+const LIVE_RATE_LIMIT_BACKOFF_MS = 60_000;
 const TESTNET_API_PREFIX = '/testnet/api';
 // The REAL-MONEY mainnet engine, proxied by Caddy (/live/api/* → 127.0.0.1:3103).
 const LIVE_API_PREFIX = '/live/api';
@@ -1166,11 +1171,25 @@ function LanePerformanceChart({ series }: { series: LanePerformanceSeries | null
   );
 }
 
+class ApiRequestError extends Error {
+  readonly retryAt: string | null;
+
+  constructor(message: string, retryAt?: unknown) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.retryAt = typeof retryAt === 'string' ? retryAt : null;
+  }
+}
+
+function isBinanceRateLimit(error: unknown): error is ApiRequestError {
+  return error instanceof ApiRequestError && /rate limit|HTTP 418|HTTP 429/i.test(error.message);
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const response = await fetch(url, { cache: 'no-store' });
-  const body = await readJsonResponse<T & { ok?: boolean; reason?: string }>(response);
+  const body = await readJsonResponse<T & { ok?: boolean; reason?: string; retryAt?: string | null }>(response);
   if (!response.ok || body?.ok === false) {
-    throw new Error(body?.reason ?? `Request failed (${response.status})`);
+    throw new ApiRequestError(body?.reason ?? `Request failed (${response.status})`, body?.retryAt);
   }
   return body as T;
 }
@@ -1209,6 +1228,7 @@ export default function TestnetExchangeDashboard() {
   const pageSubtitle = isLivePage ? 'Binance mainnet mirror' : 'Binance testnet mirror';
   const pageScope = isLivePage ? 'Exchange-only LIVE view' : 'Exchange-only testnet view';
   const walletLabel = isLivePage ? 'mainnet wallet' : 'testnet wallet';
+  const exchangeRefreshMs = isLivePage ? LIVE_EXCHANGE_REFRESH_MS : REFRESH_MS;
   const allocationLabel = isLivePage ? 'LIVE lane allocation' : 'Testnet lane allocation';
   const [account, setAccount] = useState<LiveAccount | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
@@ -1218,6 +1238,9 @@ export default function TestnetExchangeDashboard() {
   // of the MOST RECENTLY STARTED loadExchangeOnly() call is ever applied, so a slower older
   // request can't resolve after a newer one and overwrite fresher wallet/position/P&L state.
   const exchangeLoadSeqRef = useRef(0);
+  // Server-side cache/coalescing protects Binance too, but this client guard stops a cold-start
+  // 418 from continually repainting the same error until the server's advertised cooldown ends.
+  const liveRateLimitUntilRef = useRef(0);
   // 2026-07-12 fix: same race class as exchangeLoadSeqRef above — the 15s auto-refresh poll and a
   // manual close's own post-close refresh call loadSingleSymbolPositions() independently, with no
   // guard against an in-flight poll (started BEFORE the close) resolving AFTER the post-close
@@ -1499,6 +1522,7 @@ export default function TestnetExchangeDashboard() {
   }
 
   async function loadExchangeOnly() {
+    if (isLivePage && Date.now() < liveRateLimitUntilRef.current) return;
     const seq = ++exchangeLoadSeqRef.current;
     try {
       const anchor =
@@ -1528,9 +1552,19 @@ export default function TestnetExchangeDashboard() {
       setLaneSeries(nextLaneSeries);
       setMfeRolloutSeries(nextMfeRolloutSeries);
       setError(null);
+      liveRateLimitUntilRef.current = 0;
       setLastLoadedAt(new Date().toISOString());
     } catch (nextError) {
       if (seq !== exchangeLoadSeqRef.current) return;
+      if (isLivePage && isBinanceRateLimit(nextError)) {
+        const advertisedRetryMs = nextError.retryAt ? Date.parse(nextError.retryAt) : Number.NaN;
+        const retryAtMs = Number.isFinite(advertisedRetryMs)
+          ? advertisedRetryMs
+          : Date.now() + LIVE_RATE_LIMIT_BACKOFF_MS;
+        liveRateLimitUntilRef.current = retryAtMs;
+        setError(`Binance sedang membatasi pembacaan akun; dashboard menunggu sampai ${new Date(retryAtMs).toLocaleTimeString('id-ID')} sebelum mencoba lagi.`);
+        return;
+      }
       setError(nextError instanceof Error ? nextError.message : `Unable to load Binance ${isLivePage ? 'mainnet' : 'testnet'} mirror`);
     }
   }
@@ -1629,6 +1663,7 @@ export default function TestnetExchangeDashboard() {
   // per lane's OWN position on a symbol, not summed across lanes, so each can be inspected/closed
   // independently.
   async function loadSingleSymbolPositions() {
+    if (isLivePage && Date.now() < liveRateLimitUntilRef.current) return;
     const seq = ++singleSymbolLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/live/single-symbol/positions`, { cache: 'no-store' });
@@ -1649,6 +1684,7 @@ export default function TestnetExchangeDashboard() {
   // Evaluation section for the lanes being validated on testnet (2026-07-10) — merges each lane's
   // paper/shadow measurement stats with its real testnet-money execution stats in one table.
   async function loadLaneEvaluation() {
+    if (isLivePage && Date.now() < liveRateLimitUntilRef.current) return;
     const seq = ++laneEvaluationLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/live/lane-evaluation`, { cache: 'no-store' });
@@ -1852,9 +1888,9 @@ export default function TestnetExchangeDashboard() {
     if (!autoRefresh) return undefined;
     const timer = window.setInterval(() => {
       void loadExchangeOnly();
-    }, REFRESH_MS);
+    }, exchangeRefreshMs);
     return () => window.clearInterval(timer);
-  }, [autoRefresh, performanceView, performanceDay, performanceMonth, performanceYear, performanceRegime]);
+  }, [autoRefresh, performanceView, performanceDay, performanceMonth, performanceYear, performanceRegime, exchangeRefreshMs]);
 
   // Regime panel loads on its own cadence, independent of the exchange fetches (so it shows
   // on /live even if a live endpoint hiccups). Refreshes every 15s.
@@ -1914,7 +1950,7 @@ export default function TestnetExchangeDashboard() {
     loadManualDirectionalAllocation();
   }, [status]);
 
-  const stale = lastLoadedAt ? Date.now() - new Date(lastLoadedAt).getTime() > REFRESH_MS * 2.5 : true;
+  const stale = lastLoadedAt ? Date.now() - new Date(lastLoadedAt).getTime() > exchangeRefreshMs * 2.5 : true;
   const healthTone = status?.armed ? 'tone-healthy' : status?.health?.lastTickError ? 'tone-warning' : 'tone-measure';
   const totalSourceEntries = account?.positions.reduce((sum, position) => sum + position.sourceOrderCount, 0) ?? 0;
   const regimeOptions = laneSeries?.regimeOptions ?? FALLBACK_REGIME_OPTIONS;
