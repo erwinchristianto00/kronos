@@ -54,6 +54,71 @@ def piso(s):
     try: return datetime.strptime(str(s)[:19],"%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception: return None
 
+TAIPEI = timezone(timedelta(hours=8), "Asia/Taipei")
+
+def basket_execution_policy(basket, executor):
+    """Return the exit contract frozen for this basket, never just the current env.
+
+    A deployment may change the current policy while an older basket remains open.  New rows
+    carry their policy fingerprint; pre-fingerprint rows retain the executor's explicit legacy
+    contract.  The runtime max-hold value is a last-resort display fallback only.
+    """
+    fingerprint=basket.get("policyFingerprint") if isinstance(basket,dict) else None
+    execution=fingerprint.get("execution") if isinstance(fingerprint,dict) else None
+    if isinstance(execution,dict):
+        return execution,"fingerprint basket"
+    legacy=executor.get("legacyExitPolicy") if isinstance(executor,dict) else None
+    if isinstance(legacy,dict):
+        return legacy,"kontrak legacy basket"
+    cap=executor.get("maxHoldHours") if isinstance(executor,dict) else None
+    return {"executionCapHours":cap},"fallback runtime (kontrak basket tidak tersedia)"
+
+def basket_horizon_close(basket, executor, now=None):
+    """Scheduled HORIZON timestamp and remaining time for an open basket.
+
+    This is deliberately a scheduled horizon, not a promise that a TP/SL/emergency exit cannot
+    happen earlier.  The executor still makes the actual exit on its next tick and reconciles it.
+    """
+    now=now or datetime.now(timezone.utc)
+    opened=piso((basket or {}).get("openedAt"))
+    policy,source=basket_execution_policy(basket or {},executor or {})
+    cap=policy.get("executionCapHours") if isinstance(policy,dict) else None
+    if not (opened and fin(cap) and cap>0):
+        return {"openedAt":opened,"capHours":cap,"source":source,"dueAt":None,"remainingSeconds":None,
+                "policy":policy if isinstance(policy,dict) else {}}
+    due=opened+timedelta(hours=float(cap))
+    return {"openedAt":opened,"capHours":float(cap),"source":source,"dueAt":due,
+            "remainingSeconds":(due-now).total_seconds(),"policy":policy}
+
+def horizon_remaining_text(seconds):
+    if not fin(seconds): return NA
+    if seconds<=0: return "sudah jatuh tempo; menunggu tick executor"
+    total=int(seconds)
+    days,rest=divmod(total,86400); hours,rest=divmod(rest,3600); minutes=rest//60
+    pieces=[]
+    if days: pieces.append("%dh"%days)
+    if hours or days: pieces.append("%dj"%hours)
+    pieces.append("%dm"%minutes)
+    return "sisa "+" ".join(pieces)
+
+def horizon_close_detail(info, executor):
+    """Short, source-labelled human text for the Open Baskets card."""
+    due=info.get("dueAt")
+    if not due: return "waktu HORIZON tidak tersedia (%s)"%info.get("source")
+    local=due.astimezone(TAIPEI)
+    tick=((executor.get("effectiveRuntime") or {}).get("executorTick") or {}).get("effectiveMs")
+    tick_text="tick runtime tidak tersedia"
+    if fin(tick) and tick>0: tick_text="dicek tiap %.0f dtk"%(tick/1000.0)
+    policy=info.get("policy") or {}
+    early=[]
+    if policy.get("takeProfitEnabled"): early.append("TP")
+    if policy.get("stopLossEnabled"): early.append("SL")
+    if policy.get("adaptiveExitsEnabled"): early.append("exit adaptif")
+    early_text=("; %s legacy bisa menutup lebih awal"%"/".join(early)) if early else ""
+    return ("%s Taipei · %s UTC · %s · %s · sumber %s%s"%(
+        local.strftime("%d %b %Y %H:%M:%S"),due.strftime("%d %b %Y %H:%M:%S"),
+        horizon_remaining_text(info.get("remainingSeconds")),tick_text,info.get("source"),early_text))
+
 def clamp(v,lo=0.0,hi=100.0): return max(lo,min(hi,v))
 def fin(v): return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
 
@@ -1177,7 +1242,7 @@ def tab_positions(R):
         for b in obs:
             any_open=True
             op=piso(b.get("openedAt")); age=(now-op).total_seconds()/3600.0 if op else None
-            capH=ex.get("maxHoldHours"); legs=b.get("legs") or []
+            horizon=basket_horizon_close(b,ex,now); capH=horizon.get("capHours"); legs=b.get("legs") or []
             notion=sum(abs((l.get("qty") or 0)*(l.get("entryPrice") or 0)) for l in legs)
             lnr=b.get("lastNetReturn"); sb=b.get("smartBasket") or {}
             bs=basket_scores(b,thr,sfi,R.get("dist")); usd=(lnr or 0)*notion/2 if fin(lnr) else None
@@ -1186,6 +1251,7 @@ def tab_positions(R):
                 friendly(b.get("basketId")),esc(str(b.get("openedAt"))[:16]),pct(100*lnr,3) if fin(lnr) else "",money(usd,3) if fin(usd) else ""))
             o.append("<div class='grid' style='margin-top:9px'>")
             o.append(card("Umur / batas","%.1f / %s jam"%(age,capH) if age is not None else "–","sisa %.1f jam"%(capH-age) if age is not None and capH else ""))
+            o.append(card("Close HORIZON","%sh · %s"%(num(capH,2),horizon.get("dueAt").astimezone(TAIPEI).strftime("%d %b %H:%M:%S Taipei")) if horizon.get("dueAt") else "–",horizon_close_detail(horizon,ex)))
             o.append(card("Nilai posisi",money(notion,0),("%.0f%% ekuitas"%(100*notion/eq)) if eq else ""))
             o.append(card("HASIL sejauh ini",pct(100*lnr,3) if fin(lnr) else "–",(money(usd,3) if fin(usd) else "")+" · terpisah dari kualitas"))
             o.append(card("Puncak terbaik",pct(100*sb["maxNetReturn"],3) if fin(sb.get("maxNetReturn")) else "–","pada %s"%str(sb.get("maxNetAt"))[:16] if sb.get("maxNetAt") else ""))
@@ -1590,12 +1656,14 @@ def snapshot_md(R):
         for b in R["inst"][k]["ex"].get("openBaskets") or []:
             got=True; lnr=b.get("lastNetReturn")
             bq=basket_scores(b,R["inst"][k]["fc"].get("minScoreGap"),R.get("sfIndex") or {},R.get("dist"))
+            horizon=basket_horizon_close(b,R["inst"][k]["ex"])
             P("- [%s] %s dibuka %s | hasil %s | %s"%(
               R["inst"][k]["label"],friendly(b.get("basketId")),str(b.get("openedAt"))[:16],
               ("%+.3f%%"%(100*lnr)) if fin(lnr) else "n/a",
               ("entry %s / eksekusi %s"%(("%d"%round(bq["entry"]["value"])) if fin(bq["entry"]["value"]) else "n/a",
                                           ("%d"%round(bq["exec"]["value"])) if fin(bq["exec"]["value"]) else "n/a"))))
             P("  %s"%", ".join("%s %s"%(l.get("side"),(l.get("symbol") or "").replace("USDT","")) for l in b.get("legs") or []))
+            P("  HORIZON %sh: %s"%(num(horizon.get("capHours"),2),horizon_close_detail(horizon,R["inst"][k]["ex"])))
             _st,_fire=ghost_chain(b)
             P("  ghost exit: %s"%("AKAN menutup — %s"%", ".join(x["rule"] for x in _st if x["fire"]) if _fire
               else "tidak ada yang menutup (gerbang tesis-batal belum terbuka)"))
