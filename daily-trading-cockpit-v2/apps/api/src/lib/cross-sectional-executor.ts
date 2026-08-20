@@ -2507,6 +2507,8 @@ export class CrossSectionalExecutor {
     /** Realized basket P&L for the current UTC day + the safety-breaker limit (0 = disabled). */
     dailyRealizedUsd: number;
     dailyMaxLossUsd: number;
+    /** Effective per-executor admission capacity. Exposed so the dashboard never substitutes an env guess. */
+    maxOpenBaskets: number;
     /** True while CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH=1 is overriding a FAILING gate. */
     entryHealthBypassed: boolean;
     /** The rolling-evidence gate own verdict, before any bypass. */
@@ -2662,6 +2664,7 @@ export class CrossSectionalExecutor {
       },
       dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),
       dailyMaxLossUsd: this.dailyMaxLossUsdFn(),
+      maxOpenBaskets: this.maxOpenBasketsFn(),
       openHalted: this.openHalted,
       openBasket: openBaskets[0] ?? null,
       openBaskets,

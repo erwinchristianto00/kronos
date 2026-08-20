@@ -276,7 +276,7 @@ class FakeExecClient implements CrossSectionalExecClient {
   }
 }
 
-function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; rawLaneWeightPct?: number; cortexRealAttribution?: CortexRealAttributionStore; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean; entryHealthReason?: string | null; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number; respectSignalRiskGeometry?: boolean;
+function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; rawLaneWeightPct?: number; cortexRealAttribution?: CortexRealAttributionStore; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; maxOpenBaskets?: number; entryHealthAllowed?: boolean; entryHealthReason?: string | null; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number; respectSignalRiskGeometry?: boolean;
   smartBasketEnabled?: boolean; smartMaxAdverseEntryDriftVol?: number; smartMinAdverseEntryDriftPct?: number; smartInvalidationScans?: number; smartMfeArmNetReturn?: number; smartMfeGivebackFraction?: number;
   reserveExposure?: (req: { executorId: string; symbol: string; direction: "LONG" | "SHORT"; requestedNotionalUsd: number; clientOrderId: string; basketId?: string }) => { ok: boolean; reservationId: string | null; reason?: string };
   commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
@@ -304,6 +304,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     fillConfirmRetryDelayMs: 0,
     // Injected (not process.env) — env mutation in tests leaks across vitest worker threads.
     ...(opts.dailyMaxLossUsd !== undefined ? { dailyMaxLossUsd: () => opts.dailyMaxLossUsd! } : {}),
+    ...(opts.maxOpenBaskets !== undefined ? { maxOpenBaskets: () => opts.maxOpenBaskets! } : {}),
     ...(opts.entryHealthAllowed !== undefined
       ? { entryHealthGate: () => ({ allowed: opts.entryHealthAllowed!, reason: opts.entryHealthAllowed ? null : (opts.entryHealthReason ?? "rolling edge negative") }) }
       : {}),
@@ -3102,6 +3103,11 @@ describe("TP-gap stamping + daily basket loss breaker (safety net, never a profi
     expect(status.openHalted).toMatch(/breaker/);
     expect(status.dailyRealizedUsd).toBeCloseTo(-6, 6);
     expect(status.dailyMaxLossUsd).toBe(5);
+  });
+
+  it("[STATUS] exposes the effective basket admission capacity for dashboard consumers", () => {
+    const { executor } = makeExecutor({ maxOpenBaskets: 12 });
+    expect(executor.getStatus().maxOpenBaskets).toBe(12);
   });
 
   it("[BREAKER] open baskets still run their own exits while halted — it only blocks NEW opens", async () => {
