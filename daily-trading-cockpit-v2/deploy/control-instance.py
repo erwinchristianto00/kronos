@@ -14,9 +14,11 @@ from datetime import datetime, timezone, timedelta
 PORT = 3104
 INST = {
  "live":    {"api":"http://127.0.0.1:3103","label":"LIVE","long":"LIVE · mainnet","port":3103,"id":"3103",
+             "pm2":"dtc-api-live",
              "rel":"/root/kronos-live-releases/migrate-20260818T060000Z/daily-trading-cockpit-v2",
              "store":"/root/kronos-live/daily-trading-cockpit-v2/apps/api/data/cross-sectional-edge.json"},
  "testnet": {"api":"http://127.0.0.1:3102","label":"TESTNET","long":"TESTNET · uang demo","port":3102,"id":"3102",
+             "pm2":"dtc-api-testnet",
              "rel":"/root/kronos-testnet-releases/history-fb-lock-20260814T130500Z/daily-trading-cockpit-v2",
              "store":"/root/kronos-testnet-releases/128b09f/daily-trading-cockpit-v2/apps/api/data/cross-sectional-edge.json"},
 }
@@ -32,6 +34,17 @@ def get(u,t=12):
 def sh(c,t=25):
     try: return subprocess.run(c,shell=True,capture_output=True,text=True,timeout=t).stdout.strip()
     except Exception as e: return "ERR %s"%str(e)[:60]
+
+def active_release(pm2_name,fallback):
+    """Follow PM2's actual run-api.sh instead of leaving /control pinned to an old release."""
+    try:
+        for p in json.loads(sh("pm2 jlist") or "[]"):
+            if p.get("name")!=pm2_name: continue
+            run=(p.get("pm2_env") or {}).get("pm_exec_path") or ""
+            if run.endswith("/deploy/run-api.sh"):
+                return os.path.dirname(os.path.dirname(run))
+    except Exception: pass
+    return fallback
 
 def age_h(p):
     try: return (time.time()-os.path.getmtime(p))/3600.0
@@ -304,6 +317,8 @@ def collect():
     if _c["d"] is not None and time.time()-_c["at"]<TTL: return _c["d"]
     now=datetime.now(timezone.utc)
     R={"generatedAt":now.isoformat(),"inst":{}}
+    for cfg in INST.values():
+        cfg["rel"]=active_release(cfg["pm2"],cfg["rel"])
     for k,cfg in INST.items():
         ex=get(cfg["api"]+"/api/live/cross-sectional-executor")
         rep=get(cfg["api"]+"/api/shadow/cross-sectional-report")
@@ -371,7 +386,7 @@ def collect():
         except Exception: pass
         R["inst"][k]["flags"]=fl
     # execution economics from the leg records the executor now writes
-    mk=tk=0.0; mkq=tkq=0; drift=[]
+    mk=tk=0.0; mkq=tkq=0; drift=[]; shortfall=[]; imbalance=[]; exit_duration=[]
     for k in INST:
         ex=R["inst"][k]["ex"]
         for b in (ex.get("recent") or [])+(ex.get("openBaskets") or []):
@@ -381,6 +396,10 @@ def collect():
                 if fin(q) and q>0 and fin(p_): mk+=q*p_; mkq+=1
                 if fin(fq) and fq>0 and fin(fp): tk+=fq*fp; tkq+=1
                 if fin(p_) and fin(fp) and p_>0: drift.append(abs(fp/p_-1))
+                xe=l.get("exitExecution") or {}
+                if fin(xe.get("implementationShortfallUsd")): shortfall.append(xe["implementationShortfallUsd"])
+                if fin(xe.get("temporaryImbalanceUsd")): imbalance.append(xe["temporaryImbalanceUsd"])
+                if fin(xe.get("durationMs")): exit_duration.append(xe["durationMs"])
     tot=mk+tk
     R["exitEcon"]={"makerNotional":mk,"takerNotional":tk,
                    "makerPct":(100*mk/tot) if tot>0 else None,
@@ -388,7 +407,10 @@ def collect():
                    "legsMaker":mkq,"legsTaker":tkq,
                    "feePaid":(mk*0.0002+tk*0.0005) if tot>0 else None,
                    "feeSaved":(mk*0.0003) if mk>0 else None,
-                   "exitDrift":(100*sum(drift)/len(drift)) if drift else None}
+                   "exitDrift":(100*sum(drift)/len(drift)) if drift else None,
+                   "implementationShortfall":sum(shortfall) if shortfall else None,
+                   "temporaryImbalance":max(imbalance) if imbalance else None,
+                   "durationSec":(sum(exit_duration)/len(exit_duration)/1000.0) if exit_duration else None}
     R["account"]=get(INST["live"]["api"]+"/api/live/account")
     R["axis"]=get(INST["live"]["api"]+"/api/shadow/regime-axis-timeline")
     R["dir"]=get(INST["live"]["api"]+"/api/live/cross-sectional-directional-regime")
@@ -716,6 +738,10 @@ def alerts_of(R):
         if ex.get("__error__"): A.append((0,"block","%s tidak merespons"%L,ex["__error__"]))
         if ex.get("lastError"): A.append((0,"block","%s melaporkan error"%L,str(ex["lastError"])[:120]))
         if ex.get("configErrors"): A.append((0,"block","%s konfigurasi bermasalah"%L,str(ex["configErrors"])[:120]))
+        runtime=ex.get("effectiveRuntime") or {}
+        for mismatch in runtime.get("mismatches") or []:
+            A.append((0,"block","%s CONFIG INEFFECTIVE"%L,
+                      "%s — %s"%(mismatch.get("key") or "runtime",mismatch.get("reason") or "nilai env tidak dipakai runtime")))
         if "OK:" not in (i["envPolicy"] or ""): A.append((0,"block","%s menyimpang dari kebijakan konfigurasi"%L,i["envPolicy"][:120]))
         if ex.get("orphanedLegs"): A.append((1,"block","%s punya kaki yatim"%L,"%d posisi tanpa basket induk"%len(ex["orphanedLegs"])))
         if ex.get("entryHealthBypassed"): A.append((1,"override","%s: gerbang bukti di-override operator"%L,
@@ -752,7 +778,14 @@ def tab_overview(R):
         i=R["inst"][k]; ex=i["ex"]; adm=i["adm"]; g=i["gate"]
         run = (ex.get("enabled") is not False) and not ex.get("__error__")
         byp = bool(ex.get("entryHealthBypassed"))
+        runtime=ex.get("effectiveRuntime") or {}; tick=runtime.get("executorTick") or {}; maker=runtime.get("makerExit") or {}
+        tick_ok=tick.get("state")=="EFFECTIVE"; maker_ok=bool(maker.get("effective")); maker_bad=maker.get("state")=="CONFIG_INEFFECTIVE"
         rows=[status_row("Eksekusi","ok" if run else "block","BERJALAN" if run else "MATI",""),
+              status_row("Tick executor","ok" if tick_ok else "block",("%s ms"%tick.get("effectiveMs")) if tick_ok else "CONFIG INEFFECTIVE",
+                         "scheduler actual; env %s"%(tick.get("configured") if tick.get("configured") is not None else "tidak diset")),
+              status_row("Exit HORIZON","ok" if maker_ok else ("block" if maker_bad else "off"),
+                         "MAKER-FIRST" if maker_ok else ("CONFIG INEFFECTIVE" if maker_bad else "MARKET"),
+                         "maker configured=%s; stop/darurat tetap MARKET"%bool(maker.get("configured"))),
               status_row("Kesehatan bukti","ok" if g["pass"] else "block","LOLOS" if g["pass"] else "GAGAL",
                          "8 terakhir %s · 30 terakhir %s"%(pct(g.get("last8"),3),pct(g.get("last30"),3))),
               status_row("Override operator","override" if byp else "off","AKTIF" if byp else "TIDAK AKTIF",
@@ -769,6 +802,9 @@ def tab_overview(R):
     o.append(card("Keyakinan edge",num(sc["edge"]["value"],0),"%s · t terkoreksi %s"%(rate(sc["edge"]["value"]),num(R["edge"]["tEff"],2))))
     o.append(card("Kekuatan bukti",num(sc["evidence"]["value"],0),"%d episode independen"%R["edge"]["episodes"]))
     o.append(card("Performa keseluruhan",num(sc["overall"]["value"],0),rate(sc["overall"]["value"])))
+    cohort=liv["ex"].get("currentPolicyForwardCohort") or {}
+    o.append(card("Forward cohort LIVE","%s valid / %s excluded"%(cohort.get("validCohortN",0),cohort.get("excludedN",0)),
+                  "%s episode independen · policy %s"%(cohort.get("independentEpisodes",0),(liv["ex"].get("currentPolicyFingerprint") or {}).get("policyId") or "–")))
     o.append("</div>")
     o.append("<h2>Peringatan</h2>")
     if not A: o.append("<div class='card'>%s Tidak ada peringatan aktif.</div>"%DOT["ok"])
@@ -791,6 +827,13 @@ FEATURES=[("MOM36","Peringkat momentum 36 jam — inti alpha-nya. Berapa persen 
 def tab_strategy(R):
     liv=R["inst"]["live"]; ex=liv["ex"]; fc=liv["fc"]; cnt=(liv["pool"] or {}).get("counts") or {}
     eq=(R["account"] or {}).get("accountEquity"); leg=ex.get("legUsd")
+    runtime=ex.get("effectiveRuntime") or {}; maker_runtime=runtime.get("makerExit") or {}; tick_runtime=runtime.get("executorTick") or {}
+    policy=ex.get("currentPolicyFingerprint") or {}; policy_exec=policy.get("execution") or {}; legacy_policy=ex.get("legacyExitPolicy") or {}
+    cohort=ex.get("currentPolicyForwardCohort") or {}; accounting=ex.get("accountingCounts") or {}
+    mex=bool(maker_runtime.get("effective")); tick_sec=(tick_runtime.get("effectiveMs") or 0)/1000.0
+    adaptive=bool((runtime.get("adaptiveExits") or {}).get("effective"))
+    tp_text="OFF" if ex.get("tpDisabled") else ("%s%%"%ex.get("tpNetReturnPct"))
+    stop_text="OFF" if ex.get("stopNetReturnPct") is None else ("%s%%"%ex.get("stopNetReturnPct"))
     gross=(leg*6) if fin(leg) else None
     o=[lead("ok","Momentum relatif lintas-simbol, netral pasar",
         "Bot memeringkat seluruh universe menurut momentum 36 jam, membeli 3 terkuat dan menjual 3 terlemah. Yang dikejar bukan arah pasar, melainkan <b>selisih</b> antara yang kuat dan yang lemah — kalau pasar naik atau turun bersama, keduanya saling meniadakan.")]
@@ -801,7 +844,7 @@ def tab_strategy(R):
       ("3 · Gerbang scoreGap","Selisih rata-rata skor long dan short harus ≥ <b>%s</b>. Di bawah itu basket ditolak sepenuhnya, betapapun bagus kombinasinya — cross-section yang rapat berarti tak ada yang bisa dipanen."%fc.get("minScoreGap")),
       ("4 · Revalidasi entry","Tepat sebelum order dikirim, cek apakah harga sudah lari melawan sejak sinyal dibentuk. Kalau sudah, batalkan daripada mengejar."),
       ("5 · Smart Basket / Ghost","Setelah basket hidup, tiga aturan adaptif <b>mengevaluasi</b> apakah alasan masuknya masih berlaku. Eksekusinya dimatikan; evaluasinya tetap jalan sehingga bisa diukur tanpa menyentuh uang."),
-      ("6 · Batas 36 jam / stop / TP","Yang benar-benar menutup posisi: batas waktu keras %s jam, atau stop/TP simetris ±%s%%/%s%%."%(ex.get("maxHoldHours"),ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct")))]
+      ("6 · Eksekusi exit","Measurement horizon %s%s, execution cap %s jam; stop %s, TP %s. Basket baru menyimpan policy ini saat masuk."%(ex.get("measurementHorizonBars"),ex.get("measurementInterval") or "h",ex.get("maxHoldHours"),stop_text,tp_text))]
     o.append("<div class='flow'>"+"<span class='a'>→</span>".join("<span class='n'>%s</span>"%x[0] for x in steps)+"</div>")
     o.append("<table><tr><th>tahap</th><th>yang terjadi</th></tr>%s</table>"%"".join(
         "<tr><td><b>%s</b></td><td class='dim' style='white-space:normal'>%s</td></tr>"%(a,b) for a,b in steps))
@@ -809,8 +852,8 @@ def tab_strategy(R):
     o.append(card("Universe","%s simbol"%cnt.get("universe"),"pool long %s · short layak %s"%(cnt.get("poolLong"),cnt.get("shortEligible"))))
     o.append(card("Struktur","3 long / 3 short","bobot dari peringkat skor, dibatasi"))
     o.append(card("Ukuran per kaki",money(leg,0),"kotor %s%s"%(money(gross,0),(" · %.0f%% ekuitas"%(100*gross/eq)) if gross and eq else "")))
-    o.append(card("Batas tahan","%s jam"%ex.get("maxHoldHours"),"horizon sinyalnya sendiri 48 jam"))
-    o.append(card("Stop / ambil untung","±%s%% / %s%%"%(ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct")),"atas nilai basket"))
+    o.append(card("Execution cap","%s jam"%ex.get("maxHoldHours"),"measurement horizon %s%s"%(ex.get("measurementHorizonBars"),ex.get("measurementInterval") or "h")))
+    o.append(card("Stop / ambil untung","%s / %s"%(stop_text,tp_text),"policy basket baru"))
     o.append(card("Ambang pemisahan",num(fc.get("minScoreGap"),3),"basket ditolak di bawah ini"))
     o.append("</div>")
     fl0=liv.get("flags") or {}
@@ -830,44 +873,63 @@ def tab_strategy(R):
     if not rerank:
         o.append("<div class='note'>Baris bertanda ⚪ masih muncul di tab Formasi dan di skor kualitas entry sebagai <b>diagnostik</b>. Mereka menggambarkan basketnya, bukan alasan ia terpilih.</div>")
     fl=liv.get("flags") or {}
-    mex=fl.get("CROSS_SECTIONAL_MAKER_EXIT_ENABLED")=="1"
+    maker_state=maker_runtime.get("state") or "CONFIG INEFFECTIVE"
+    maker_label="maker-first + taker fallback" if mex else ("CONFIG INEFFECTIVE" if maker_state=="CONFIG_INEFFECTIVE" else "taker penuh")
+    maker_dot=DOT["ok"] if mex else (DOT["block"] if maker_state=="CONFIG_INEFFECTIVE" else DOT["off"])
     ee=R.get("exitEcon") or {}
     o.append("<h2>Mode produksi yang benar-benar berjalan</h2><table>"
       "<tr><th>hal</th><th>status</th><th class='dim'>dasar</th></tr>"
       "<tr><td>Mode formasi</td><td>%s <b>%s</b></td><td class='dim'>peringkat MOM36 + cluster cap sebagai pagar konsentrasi</td></tr>"
       "<tr><td>Re-ranking Smart Formation</td><td>%s <b>%s</b></td><td class='dim'>fastSupport / adverseExtension / counter-axis / penalti klaster</td></tr>"
-      "<tr><td>Exit adaptif</td><td>%s <b>MATI · Ghost AKTIF</b></td><td class='dim'>penghitung scan tetap berjalan, eksekusinya tidak</td></tr>"
+      "<tr><td>Exit adaptif</td><td>%s <b>%s</b></td><td class='dim'>ghost tetap dicatat walau eksekusi OFF</td></tr>"
       "<tr><td>Eksekusi exit</td><td>%s <b>%s</b></td><td class='dim'>%s</td></tr>"
-      "<tr><td>Interval tick executor</td><td>⚪ <b>%s detik</b></td><td class='dim'>sinyal segar dilihat lebih cepat; gerbang tidak berubah</td></tr>"
+      "<tr><td>Interval tick executor</td><td>%s <b>%s detik</b></td><td class='dim'>nilai efektif dari scheduler, bukan env yang belum dipakai</td></tr>"
       "</table>"%(
         DOT["ok"],"MOM36 rank + cluster guardrail",
         DOT["off"] if not rerank else DOT["watch"],"OFF" if not rerank else "ON",
-        DOT["off"],
-        DOT["ok"] if mex else DOT["off"],"maker-first + taker fallback" if mex else "taker penuh",
+        DOT["ok"] if adaptive else DOT["off"],"ON" if adaptive else "OFF · Ghost AKTIF",
+        maker_dot,maker_label,
         "hanya untuk penutupan terjadwal (HORIZON); stop/darurat tetap MARKET langsung",
-        int(fl.get("CROSS_SECTIONAL_EXEC_TICK_MS","300000") or 300000)//1000))
+        DOT["ok"] if tick_runtime.get("state")=="EFFECTIVE" else DOT["block"],tick_sec))
     o.append("<h2>Ekonomi eksekusi exit</h2><div class='grid'>")
     o.append(card("Porsi maker",("%.0f%%"%ee["makerPct"]) if fin(ee.get("makerPct")) else NA,"%d kaki pasif"%(ee.get("legsMaker") or 0)))
     o.append(card("Porsi fallback taker",("%.0f%%"%ee["fallbackPct"]) if fin(ee.get("fallbackPct")) else NA,"%d kaki menyeberang"%(ee.get("legsTaker") or 0)))
     o.append(card("Biaya dibayar",money(ee.get("feePaid"),4),"maker 2bps + taker 5bps"))
     o.append(card("Biaya dihemat",money(ee.get("feeSaved"),4),"3bps atas notional yang pasif"))
     o.append(card("Selisih harga exit",("%.3f%%"%ee["exitDrift"]) if fin(ee.get("exitDrift")) else NA,"fallback vs harga maker"))
+    o.append(card("Implementation shortfall",money(ee.get("implementationShortfall"),4),"decision price vs fill aktual"))
+    o.append(card("Imbalance sementara",money(ee.get("temporaryImbalance"),4),"maksimum saat maker/fallback exit"))
     lat=[v for v in (R.get("exec") or {}).get("latency",{}).values() if fin(v)]
     o.append(card("Latensi sinyal→order",("%.0f detik"%(sum(lat)/len(lat))) if lat else NA,"percobaan terakhir tiap instance"))
     o.append("</div>")
     if not fin(ee.get("makerPct")):
         o.append("<div class='note'>Belum ada penutupan terjadwal sejak exit maker-first dinyalakan, jadi porsi maker dan biaya yang dihemat %s. Angkanya akan terisi setelah basket pertama tutup di batas 36 jam.</div>"%NA.lower())
+    o.append("<h2>Policy fingerprint &amp; cohort forward</h2><div class='grid'>")
+    o.append(card("Policy ID","<code>%s</code>"%esc(policy.get("policyId") or "–"),"SHA %s"%esc((policy.get("strategy") or {}).get("sourceSha") or "–")))
+    o.append(card("Cohort valid","%s"%cohort.get("validCohortN",0),"%s episode independen"%cohort.get("independentEpisodes",0)))
+    o.append(card("Excluded","%s"%cohort.get("excludedN",0),esc(", ".join("%s=%s"%(k,v) for k,v in (cohort.get("excludedReasons") or {}).items()) or "tidak ada")))
+    o.append(card("Accounting","clean %s · quarantine %s · reject %s"%(accounting.get("cleanN",0),accounting.get("quarantinedN",0),accounting.get("rejectedN",0)),"hanya clean/current-policy masuk evidence"))
+    o.append("</div>")
+    legacy_open=sum(1 for basket in (ex.get("openBaskets") or []) if not basket.get("policyFingerprint"))
+    if legacy_open:
+        legacy_tp="OFF" if not legacy_policy.get("takeProfitEnabled") else "%s%%"%(100*(legacy_policy.get("takeProfitNetReturn") or 0))
+        legacy_stop="OFF" if not legacy_policy.get("stopLossEnabled") else "%s%%"%(100*(legacy_policy.get("stopLossNetReturn") or 0))
+        o.append("<div class='note'><b>%d basket lama masih terbuka.</b> Mereka tetap memakai kontrak legacy yang dibekukan saat cutover: cap %s jam, stop %s, TP %s, maker exit %s. Policy baru tidak mengubah atau menutupnya.</div>"%(
+            legacy_open,legacy_policy.get("executionCapHours"),legacy_stop,legacy_tp,"ON" if legacy_policy.get("makerExitEnabled") else "OFF"))
+    mismatches=runtime.get("mismatches") or []
+    if mismatches:
+        o.append("<div class='lead' style='border-left-color:#e5686d'><div class='c'>🔴 CONFIG INEFFECTIVE</div><div class='r'>%s</div></div>"%esc("; ".join("%s: %s"%(m.get("key"),m.get("reason")) for m in mismatches)))
     o.append("<h2>Smart Basket — mengelola basket setelah dibentuk</h2>")
-    o.append("<div class='note'>Eksekusi exit adaptif <b>DIMATIKAN</b>; evaluasinya tetap berjalan. Penghitung scan terus bertambah, jadi tab Posisi bisa menunjukkan apa yang <i>akan</i> terjadi tanpa aturan itu menyentuh uang.</div>")
+    o.append("<div class='note'>Eksekusi exit adaptif <b>%s</b>; evaluasi ghost tetap berjalan dan disimpan terpisah dari order nyata.</div>"%("AKTIF" if adaptive else "DIMATIKAN"))
     o.append("<table><tr><th>mekanisme</th><th>status</th><th>parameter</th><th>artinya</th></tr>")
     for nm,stt,par,mean in [("Revalidasi entry","ok · aktif","drift merugikan sebelum order dikirim","Membatalkan kalau harga sudah lari melawan sejak sinyal dibentuk."),
-        ("Regime Loss Exit","off · Eksekusi MATI, ghost AKTIF","kelas regime berubah + rugi ≥0,3% + sisi searah regime baru rugi, 2 scan","Menutup saat pasar berbalik melawan basket."),
-        ("Context Invalidation","off · Eksekusi MATI, ghost AKTIF","≥2 dari 3 kaki satu sisi kehilangan alasan masuknya, 2 scan","Menutup saat alasan pemilihan nama-nama itu hilang."),
-        ("MFE Giveback","off · Eksekusi MATI, ghost AKTIF","puncak ≥0,2% lalu turun ke ≤50% puncak","Mengunci laba yang mulai menguap."),
+        ("Regime Loss Exit",("ok · aktif" if adaptive else "off · Eksekusi MATI, ghost AKTIF"),"kelas regime berubah + rugi ≥0,3% + sisi searah regime baru rugi, 2 scan","Menutup saat pasar berbalik melawan basket."),
+        ("Context Invalidation",("ok · aktif" if adaptive else "off · Eksekusi MATI, ghost AKTIF"),"≥2 dari 3 kaki satu sisi kehilangan alasan masuknya, 2 scan","Menutup saat alasan pemilihan nama-nama itu hilang."),
+        ("MFE Giveback",("ok · aktif" if adaptive else "off · Eksekusi MATI, ghost AKTIF"),"puncak ≥0,2% lalu turun ke ≤50% puncak","Mengunci laba yang mulai menguap."),
         ("Batas waktu keras","ok · aktif","%s jam"%ex.get("maxHoldHours"),"Selalu menutup di sini apa pun keadaannya."),
-        ("Stop / TP","ok · aktif","±%s%% / %s%%"%(ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct")),"Plafon bencana simetris, bukan pengambil untung harian."),
-        ("Cara menutup","ok · maker-first" if (liv.get("flags") or {}).get("CROSS_SECTIONAL_MAKER_EXIT_ENABLED")=="1" else "off · taker penuh",
-         "reduce-only post-only, tunggu %ss, sisanya MARKET"%(int((liv.get("flags") or {}).get("CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS","0") or 0)//1000),
+        ("Stop / TP","ok · aktif" if (stop_text!="OFF" or tp_text!="OFF") else "off · Hold saja","%s / %s"%(stop_text,tp_text),"Policy basket baru; basket lama memakai fingerprint legacy."),
+        ("Cara menutup",("ok · maker-first" if mex else "off · taker penuh"),
+         "reduce-only post-only, tunggu %ss, sisanya MARKET"%((maker_runtime.get("waitMs") or 0)//1000),
          "Hanya untuk penutupan terjadwal. Stop, darurat dan rekonsiliasi paksa tetap menyeberang seketika.")]:
         s=stt.split(" · ")[0]
         o.append("<tr><td>%s</td><td>%s %s</td><td class='dim'>%s</td><td class='dim' style='white-space:normal'>%s</td></tr>"%(
@@ -877,9 +939,11 @@ def tab_strategy(R):
         ("Sinyal","<code>%s</code>"%esc(fc.get("signal"))),
         ("Ambang scoreGap","<code>%s</code> · env <code>CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP</code>"%fc.get("minScoreGap")),
         ("Leg USD / leverage","<code>%s</code> / <code>%s</code>"%(leg,ex.get("leverage"))),
-        ("Batas tahan","<code>%s</code> jam · env <code>CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS</code>"%ex.get("maxHoldHours")),
-        ("Stop / TP","<code>%s</code> / <code>%s</code>"%(ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct"))),
-        ("Exit adaptif","ambang scan dinaikkan ke nilai yang tak terjangkau dalam horizon 48 jam"),
+        ("Measurement / cap","<code>%s%s</code> measurement / <code>%s jam</code> execution cap"%(ex.get("measurementHorizonBars"),ex.get("measurementInterval") or "h",ex.get("maxHoldHours"))),
+        ("Stop / TP","<code>%s</code> / <code>%s</code>"%(stop_text,tp_text)),
+        ("Exit adaptif","<code>%s</code>; ghost tetap observasional"%("ON" if adaptive else "OFF")),
+        ("Effective tick","<code>%s ms</code> · %s"%(tick_runtime.get("effectiveMs"),tick_runtime.get("state"))),
+        ("Effective maker exit","<code>%s</code> · %s"%("ON" if mex else "OFF",maker_runtime.get("state"))),
         ("Allowlist long","<code>%s</code>"%esc(", ".join((fc.get("longAllowlist") or [])[:30]))),
         ("Blocklist short","<code>%s</code>"%esc(", ".join(fc.get("shortBlocklist") or []))),
         ("Bursa","Binance USD-M Futures"),("Funding",NA+" — tidak dibukukan per basket oleh executor")]))
@@ -1338,6 +1402,13 @@ def tab_edge(R):
 
 def tab_research(R):
     o=[];e=R["edge"];thr=R["inst"]["live"]["fc"].get("minScoreGap")
+    o.append("<h2>Cohort forward kebijakan saat ini</h2><div class='scroll'><table><tr><th>lingkungan</th><th>policy fingerprint</th><th class='num'>valid</th><th class='num'>excluded</th><th class='num'>episode independen</th><th>catatan</th></tr>")
+    for k in ("live","testnet"):
+        ex=R["inst"][k]["ex"]; cohort=ex.get("currentPolicyForwardCohort") or {}; policy=ex.get("currentPolicyFingerprint") or {}
+        why=", ".join("%s=%s"%(a,b) for a,b in (cohort.get("excludedReasons") or {}).items()) or "–"
+        o.append("<tr><td>%s</td><td><code>%s</code></td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='dim'>%s</td></tr>"%(
+            R["inst"][k]["long"],esc(policy.get("policyId") or "–"),cohort.get("validCohortN",0),cohort.get("excludedN",0),cohort.get("independentEpisodes",0),esc(why)))
+    o.append("</table></div><div class='note'>Hanya basket CLOSED yang clean, fingerprint-nya cocok, dan bukan operator-close yang boleh dipakai untuk selection / ghost / weighting evidence baru. History lama tetap tampil sebagai history, tetapi bukan sampel model-selection.</div>")
     mm=R.get("mismatch") or []
     if mm:
         o.append(lead("watch","Bukti riset TIDAK persis mewakili kebijakan produksi",
@@ -1428,17 +1499,25 @@ def tab_system(R):
     o.append("</table>")
     o.append("<h2>Perbandingan lingkungan</h2><div class='scroll'><table><tr><th>parameter</th><th>LIVE</th><th>TESTNET</th><th>sama?</th></tr>")
     lv,tn=R["inst"]["live"],R["inst"]["testnet"]
+    lvr=lv["ex"].get("effectiveRuntime") or {}; tnr=tn["ex"].get("effectiveRuntime") or {}
+    lvm=(lvr.get("makerExit") or {}); tnm=(tnr.get("makerExit") or {})
+    lvc=lv["ex"].get("currentPolicyForwardCohort") or {}; tnc=tn["ex"].get("currentPolicyForwardCohort") or {}
     for lbl,a,b in (("Ukuran per kaki",lv["ex"].get("legUsd"),tn["ex"].get("legUsd")),
                     ("Batas tahan (jam)",lv["ex"].get("maxHoldHours"),tn["ex"].get("maxHoldHours")),
                     ("Stop (%)",lv["ex"].get("stopNetReturnPct"),tn["ex"].get("stopNetReturnPct")),
                     ("Ambil untung (%)",lv["ex"].get("tpNetReturnPct"),tn["ex"].get("tpNetReturnPct")),
+                    ("Tick efektif (ms)",(lvr.get("executorTick") or {}).get("effectiveMs"),(tnr.get("executorTick") or {}).get("effectiveMs")),
+                    ("Mode exit HORIZON","MAKER_FIRST" if lvm.get("effective") else ("CONFIG INEFFECTIVE" if lvm.get("state")=="CONFIG_INEFFECTIVE" else "MARKET"),"MAKER_FIRST" if tnm.get("effective") else ("CONFIG INEFFECTIVE" if tnm.get("state")=="CONFIG_INEFFECTIVE" else "MARKET")),
+                    ("Policy fingerprint",(lv["ex"].get("currentPolicyFingerprint") or {}).get("policyId"),(tn["ex"].get("currentPolicyFingerprint") or {}).get("policyId")),
+                    ("Forward cohort valid",lvc.get("validCohortN"),tnc.get("validCohortN")),
+                    ("Accounting clean / quarantine / reject","%s / %s / %s"%( (lv["ex"].get("accountingCounts") or {}).get("cleanN",0),(lv["ex"].get("accountingCounts") or {}).get("quarantinedN",0),(lv["ex"].get("accountingCounts") or {}).get("rejectedN",0)),"%s / %s / %s"%( (tn["ex"].get("accountingCounts") or {}).get("cleanN",0),(tn["ex"].get("accountingCounts") or {}).get("quarantinedN",0),(tn["ex"].get("accountingCounts") or {}).get("rejectedN",0))),
                     ("Ambang pemisahan",lv["fc"].get("minScoreGap"),tn["fc"].get("minScoreGap")),
                     ("Sinyal",lv["fc"].get("signal"),tn["fc"].get("signal")),
                     ("Ukuran universe",len(lv["fc"].get("executionUniverse") or []),len(tn["fc"].get("executionUniverse") or [])),
                     ("Basket bersamaan",lv["ex"].get("maxOpenBaskets"),tn["ex"].get("maxOpenBaskets")),
                     ("Override gerbang bukti",lv["ex"].get("entryHealthBypassed"),tn["ex"].get("entryHealthBypassed"))):
         o.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"%(lbl,esc(a),esc(b),DOT["ok"] if a==b else DOT["watch"]))
-    o.append("</table></div><div class='note'>Perbedaan pada dua baris terakhir disengaja: testnet melonggarkan perlindungan modal karena tidak punya modal untuk dilindungi, sementara parameter strategi dijaga identik agar hasilnya sebanding.</div>")
+    o.append("</table></div><div class='note'>Policy fingerprint dapat berbeda karena cohort mulai pada waktu berbeda; yang harus sama adalah policy fields-nya. Bila salah satu mode berbunyi <b>CONFIG INEFFECTIVE</b>, nilai env tersebut belum boleh dianggap aktif.</div>")
     o.append(tech("host & integritas",[("Waktu host (UTC)",esc(sy["hostTimeUtc"][:19])),
         ("Disk","%s terpakai dari %s, sisa %s"%(sy["disk"]["pct"],sy["disk"]["size"],sy["disk"]["avail"]) if sy.get("disk") else "–"),
         ("Kepatuhan kebijakan","<br>".join("%s: %s"%(R["inst"][k]["long"],esc(R["inst"][k]["envPolicy"][:70])) for k in INST)),

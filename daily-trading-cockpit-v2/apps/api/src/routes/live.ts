@@ -2725,7 +2725,12 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
         return {
           lane: row.label,
           laneId: status.laneId,
+          /** Compatibility alias: this is deliberately report-window scoped. */
           closedBaskets: closed.length,
+          closedBasketsInReportWindow: closed.length,
+          closedBasketsInStore: status.closedCount,
+          accountingCounts: status.accountingCounts,
+          currentPolicyForwardCohort: status.currentPolicyForwardCohort,
           openBaskets: status.openBaskets?.filter((basket) => inReportEra(basket.openedAt)).length ?? 0,
           totalNetPnlUsd: closed.reduce((sum, b) => sum + (b.netPnlUsd ?? 0), 0),
           perToken: Object.entries(
@@ -2747,14 +2752,28 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
       });
     const realizedBeforeSlippageUsd = filteredClosedBaskets.reduce((sum, basket) => sum + (basket.grossPnlUsd ?? 0), 0);
     const netRealizedProfitUsd = filteredClosedBaskets.reduce((sum, basket) => sum + (basket.netPnlUsd ?? 0), 0);
-    const totalClosed = lanes.reduce((sum, l) => sum + l.closedBaskets, 0);
+    const totalClosedInReportWindow = lanes.reduce((sum, lane) => sum + lane.closedBasketsInReportWindow, 0);
+    const totalClosedInStore = lanes.reduce((sum, lane) => sum + lane.closedBasketsInStore, 0);
+    const cleanN = lanes.reduce((sum, lane) => sum + lane.accountingCounts.cleanN, 0);
+    const quarantinedN = lanes.reduce((sum, lane) => sum + lane.accountingCounts.quarantinedN, 0);
+    // The rejection journal is shared by the filtered signal lane, so it must never be summed once
+    // per executor instance.
+    const rejectedN = filteredExecutor?.getStatus().accountingCounts.rejectedN ?? 0;
     return {
       generatedAt: nowIso,
       reportStartAt,
       source: "executor stores (real exchange fills) — NOT the measurement store",
       feeCaveat: "per-leg fees are APPORTIONED from the basket total by notional touched, not measured per leg",
-      totalClosed,
-      reason: totalClosed === 0
+      /** Deprecated compatibility field. It is always the report-window count; use counts for totals. */
+      totalClosed: totalClosedInReportWindow,
+      counts: {
+        reportWindowClosedN: totalClosedInReportWindow,
+        totalStoreClosedN: totalClosedInStore,
+        cleanN,
+        quarantinedN,
+        rejectedN,
+      },
+      reason: totalClosedInReportWindow === 0
         ? "no cross-sectional basket has opened AND closed on the exchange yet — an empty list here means the lane has not traded, not that it broke even"
         : null,
       crossSectionalPnl: {

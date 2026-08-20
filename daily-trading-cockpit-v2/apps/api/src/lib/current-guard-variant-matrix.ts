@@ -4739,6 +4739,29 @@ export function describeIndependentEpisodes(
 }
 
 /**
+ * Backward-compatible partition surface for post-trade research.  It deliberately delegates to
+ * the same EpisodeAccumulator as count/describe so an episode ID assignment cannot drift from the
+ * independent-N reported elsewhere.
+ */
+export function partitionIndependentEpisodes(
+  rows: readonly EpisodeIdentityRow[],
+  blockWidthMs: number,
+): Map<string, number> {
+  const sorted = rows.slice().sort((a, b) => {
+    if (a.episodeMs === null || b.episodeMs === null) {
+      if (a.episodeMs !== b.episodeMs) return a.episodeMs === null ? 1 : -1;
+    } else if (a.episodeMs !== b.episodeMs) return a.episodeMs - b.episodeMs;
+    return a.observationId.localeCompare(b.observationId);
+  });
+  const accumulator = new EpisodeAccumulator(blockWidthMs);
+  const nodeByObservationId = new Map<string, number>();
+  for (const row of sorted) nodeByObservationId.set(row.observationId, accumulator.push(row));
+  const rootByObservationId = new Map<string, number>();
+  for (const [observationId, node] of nodeByObservationId) rootByObservationId.set(observationId, accumulator.rootOf(node));
+  return rootByObservationId;
+}
+
+/**
  * Point 3d — distinctRegimes as independent regime EPISODES, not distinct string labels. Chronological
  * run-length-encoding over `observationRegimeFamilyKey`: an episode boundary is only counted when the
  * FAMILY changes from the immediately-preceding (chronologically-ordered) observation. Many rows drawn

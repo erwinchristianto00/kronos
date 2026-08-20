@@ -109,7 +109,16 @@ function attachSmartFormation(observation: CrossSectionalObservation, invalidate
 }
 
 class FakeExecClient implements CrossSectionalExecClient {
-  placed: Array<{ symbol: string; side: string; quantity: number; reduceOnly?: boolean; newClientOrderId?: string }> = [];
+  placed: Array<{
+    symbol: string;
+    side: string;
+    quantity: number;
+    reduceOnly?: boolean;
+    newClientOrderId?: string;
+    type?: string;
+    timeInForce?: string;
+    price?: number;
+  }> = [];
   leverageCalls: Array<{ symbol: string; leverage: number }> = [];
   failOnSymbol: string | null = null;
   fillPriceBySymbol = new Map<string, number>();
@@ -184,7 +193,16 @@ class FakeExecClient implements CrossSectionalExecClient {
    *  `failOnSymbol` above, which throws a plain, ambiguous Error (simulating a network/timeout
    *  failure where whether the order reached the exchange is genuinely unknown). */
   failOnSymbolWithBinanceError: string | null = null;
-  async placeOrder(params: { symbol: string; side: string; quantity: number; reduceOnly?: boolean; newClientOrderId?: string }) {
+  async placeOrder(params: {
+    symbol: string;
+    side: string;
+    quantity: number;
+    reduceOnly?: boolean;
+    newClientOrderId?: string;
+    type?: string;
+    timeInForce?: string;
+    price?: number;
+  }) {
     if (this.failOnSymbolWithBinanceError === params.symbol && !params.reduceOnly) {
       throw new BinanceFuturesPrivateError("binance_error", `Binance error HTTP 400 code -2019: Margin is insufficient.`, {
         httpStatus: 400,
@@ -1500,6 +1518,215 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(basket.netPnlUsd!).toBeLessThan(basket.grossPnlUsd!);
     const closes = client.placed.filter((p) => p.reduceOnly);
     expect(closes.length).toBe(2);
+  });
+
+  it("[MAKER-EXIT] uses concurrent post-only HORIZON exits, records economics, reconciles flat, and never sends a market fallback after full maker fills", async () => {
+    const prior = {
+      enabled: process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED,
+      waitMs: process.env.CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS,
+      tpDisabled: process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED,
+      stop: process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN,
+    };
+    process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED = "1";
+    process.env.CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS = "1000";
+    process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED = "1";
+    process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN = "0";
+    try {
+      const client = new FakeExecClient() as FakeExecClient & {
+        cancelOrder: (symbol: string, orderId: string) => Promise<void>;
+      };
+      client.cancelOrder = async () => {};
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      const quote = (symbol: string) => ({
+        bid: symbol === "SOLUSDT" ? 99.99 : 0.0999,
+        ask: symbol === "SOLUSDT" ? 100.01 : 0.1001,
+        mid: symbol === "SOLUSDT" ? 100 : 0.1,
+        atMs: Date.now(),
+        venue: "TEST_BOOK",
+      });
+      const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000, readPublicQuote: quote });
+      expect(executor.getStatus().effectiveRuntime.makerExit.effective).toBe(true);
+
+      await executor.tick();
+      const basket = store.getState().baskets[0]!;
+      expect(basket.policyFingerprint?.execution.makerExitEnabled).toBe(true);
+      expect(basket.policyFingerprint?.execution.takeProfitEnabled).toBe(false);
+      expect(basket.policyFingerprint?.execution.stopLossEnabled).toBe(false);
+
+      client.fillPriceBySymbol.set("SOLUSDT", 102);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.099);
+      client.queryOrderAvgPriceBySymbol.set("SOLUSDT", 102);
+      client.queryOrderAvgPriceBySymbol.set("DOGEUSDT", 0.099);
+      basket.closesAtMs = NOW_MS - 1;
+      await executor.tick();
+
+      expect(basket.status).toBe("CLOSED");
+      expect(basket.closeReason).toBe("HORIZON");
+      expect(basket.exitReconciliation?.state).toBe("CONFIRMED");
+      const makerOrders = client.placed.filter((order) => order.timeInForce === "GTX");
+      const marketFallbacks = client.placed.filter((order) => order.reduceOnly && order.type === "MARKET");
+      expect(makerOrders).toHaveLength(2);
+      expect(marketFallbacks).toHaveLength(0);
+      for (const leg of basket.legs) {
+        expect(leg.exitExecution).toMatchObject({ mode: "MAKER_FIRST", makerQty: leg.qty, fallbackQty: 0, reason: "HORIZON" });
+        expect(leg.exitOrderIds).toHaveLength(1);
+        expect(leg.exitFills).toMatchObject([{ qty: leg.qty, liquidity: "MAKER" }]);
+      }
+    } finally {
+      if (prior.enabled === undefined) delete process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED;
+      else process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED = prior.enabled;
+      if (prior.waitMs === undefined) delete process.env.CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS;
+      else process.env.CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS = prior.waitMs;
+      if (prior.tpDisabled === undefined) delete process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED;
+      else process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED = prior.tpDisabled;
+      if (prior.stop === undefined) delete process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN;
+      else process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN = prior.stop;
+    }
+  });
+
+  it("[MAKER-EXIT] cancels a partial maker close and sends MARKET only for each exact remaining quantity", async () => {
+    const prior = {
+      enabled: process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED,
+      waitMs: process.env.CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS,
+      tpDisabled: process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED,
+      stop: process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN,
+    };
+    process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED = "1";
+    process.env.CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS = "1000";
+    process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED = "1";
+    process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN = "0";
+    try {
+      const client = new FakeExecClient() as FakeExecClient & {
+        cancelOrder: (symbol: string, orderId: string) => Promise<void>;
+      };
+      client.cancelOrder = async () => {};
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      client.queryOrder = async (symbol: string, orderId: string): Promise<FuturesOrder> => {
+        const placed = client.placed[Number(orderId) - 100];
+        const requestedQty = placed?.quantity ?? 0;
+        const avgPrice = client.fillPriceBySymbol.get(symbol) ?? 0;
+        return {
+          symbol,
+          orderId,
+          clientOrderId: placed?.newClientOrderId ?? "",
+          status: "CANCELED",
+          type: "LIMIT",
+          side: placed?.side === "SELL" ? "SELL" : "BUY",
+          reduceOnly: Boolean(placed?.reduceOnly),
+          price: placed?.price ?? 0,
+          stopPrice: 0,
+          origQty: requestedQty,
+          executedQty: requestedQty * 0.4,
+          avgPrice,
+          updateTime: 0,
+        };
+      };
+      const quote = (symbol: string) => ({
+        bid: symbol === "SOLUSDT" ? 99.99 : 0.0999,
+        ask: symbol === "SOLUSDT" ? 100.01 : 0.1001,
+        mid: symbol === "SOLUSDT" ? 100 : 0.1,
+        atMs: Date.now(),
+        venue: "TEST_BOOK",
+      });
+      const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000, readPublicQuote: quote });
+      await executor.tick();
+      const basket = store.getState().baskets[0]!;
+      const openedQty = new Map(basket.legs.map((leg) => [leg.symbol, leg.qty]));
+
+      client.fillPriceBySymbol.set("SOLUSDT", 102);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.099);
+      basket.closesAtMs = NOW_MS - 1;
+      await executor.tick();
+
+      expect(basket.status).toBe("CLOSED");
+      expect(basket.exitReconciliation?.state).toBe("CONFIRMED");
+      const makerOrders = client.placed.filter((order) => order.timeInForce === "GTX");
+      const marketFallbacks = client.placed.filter((order) => order.reduceOnly && order.type === "MARKET");
+      expect(makerOrders).toHaveLength(2);
+      expect(marketFallbacks).toHaveLength(2);
+      for (const leg of basket.legs) {
+        const fullQty = openedQty.get(leg.symbol)!;
+        const fallback = marketFallbacks.find((order) => order.symbol === leg.symbol)!;
+        expect(fallback.quantity).toBeCloseTo(fullQty * 0.6, 9);
+        expect(leg.exitExecution).toMatchObject({ mode: "MAKER_FIRST", makerQty: fullQty * 0.4, fallbackQty: fullQty * 0.6, reason: "HORIZON" });
+        expect(leg.exitOrderIds).toHaveLength(2);
+        expect(leg.exitFills).toHaveLength(2);
+      }
+    } finally {
+      if (prior.enabled === undefined) delete process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED;
+      else process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED = prior.enabled;
+      if (prior.waitMs === undefined) delete process.env.CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS;
+      else process.env.CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS = prior.waitMs;
+      if (prior.tpDisabled === undefined) delete process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED;
+      else process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED = prior.tpDisabled;
+      if (prior.stop === undefined) delete process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN;
+      else process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN = prior.stop;
+    }
+  });
+
+  it("[POLICY-FINGERPRINT] keeps a pre-cutover basket on its explicit legacy TP/market contract while new baskets are Hold-only", async () => {
+    const keys = [
+      "CROSS_SECTIONAL_EXEC_TP_DISABLED",
+      "CROSS_SECTIONAL_EXEC_TP_NET_RETURN",
+      "CROSS_SECTIONAL_EXEC_STOP_NET_RETURN",
+      "CROSS_SECTIONAL_LEGACY_EXEC_TP_DISABLED",
+      "CROSS_SECTIONAL_LEGACY_EXEC_TP_NET_RETURN",
+      "CROSS_SECTIONAL_LEGACY_EXEC_STOP_NET_RETURN",
+      "CROSS_SECTIONAL_LEGACY_MAKER_EXIT_ENABLED",
+    ] as const;
+    const prior = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED = "1";
+    process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN = "0.06";
+    process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN = "0";
+    process.env.CROSS_SECTIONAL_LEGACY_EXEC_TP_DISABLED = "0";
+    process.env.CROSS_SECTIONAL_LEGACY_EXEC_TP_NET_RETURN = "0.006";
+    process.env.CROSS_SECTIONAL_LEGACY_EXEC_STOP_NET_RETURN = "0";
+    process.env.CROSS_SECTIONAL_LEGACY_MAKER_EXIT_ENABLED = "0";
+    try {
+      const client = new FakeExecClient();
+      client.markPriceBySymbol.set("SOLUSDT", 104);
+      client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+      client.fillPriceBySymbol.set("SOLUSDT", 104);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      const { executor, store } = makeExecutor({ client });
+      const legacy: ExecutorBasket = {
+        basketId: "xb-pre-cutover",
+        sourceObservationId: "manual:pre-cutover",
+        signal: "MOM36_FILTERED",
+        variant: "FILTERED",
+        openedAt: NOW,
+        closesAtMs: NOW_MS + 48 * 3_600_000,
+        legs: [
+          { symbol: "SOLUSDT", side: "LONG", qty: 0.25, entryPrice: 100, entryOrderId: "legacy-sol", entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null },
+          { symbol: "DOGEUSDT", side: "SHORT", qty: 250, entryPrice: 0.1, entryOrderId: "legacy-doge", entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null },
+        ],
+        status: "COMPLETE",
+        closedAt: null,
+        closeReason: null,
+        grossPnlUsd: null,
+        feeEstimateUsd: null,
+        netPnlUsd: null,
+      };
+      store.getState().baskets.push(legacy);
+      store.save();
+
+      await executor.tick();
+
+      expect(legacy.policyFingerprint).toBeUndefined();
+      expect(legacy.status).toBe("CLOSED");
+      expect(legacy.closeReason).toBe("PROFIT_BANK");
+      expect(client.placed.filter((order) => order.timeInForce === "GTX")).toHaveLength(0);
+      expect(client.placed.filter((order) => order.reduceOnly && order.type === "MARKET")).toHaveLength(2);
+      expect(executor.getStatus().tpDisabled).toBe(true); // reports only the CURRENT new-basket policy
+    } finally {
+      for (const key of keys) {
+        const value = prior[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   // [2026-07-22 bug-hunt fix]: CROSS_SECTIONAL_MARKET_NEUTRAL/TREND/MIXED are full
@@ -2837,7 +3064,7 @@ describe("[BUG 3] a genuine partial MARKET fill is recorded as what actually exe
     expect(sol.qty).not.toBeCloseTo(requestedQty, 6); // sanity: genuinely different from the un-partial-filled qty
   });
 
-  it("exit leg: a partial close fill books only the executed qty and tracks the residual as an orphaned leg", async () => {
+  it("exit leg: a partial close remains open, preserves the original lot, and retries only the exact residual", async () => {
     const client = new FakeExecClient();
     client.fillPriceBySymbol.set("SOLUSDT", 100);
     client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
@@ -2858,16 +3085,19 @@ describe("[BUG 3] a genuine partial MARKET fill is recorded as what actually exe
 
     const basket = store.getState().baskets.find((b) => b.basketId === opened.basketId)!;
     const sol = basket.legs.find((l) => l.symbol === "SOLUSDT")!;
-    // FAIL-WITHOUT-FIX: before the fix, this leg's exitOrderId/exitPrice were set from the
-    // partial fill while qty stayed at the FULL original size — silently understating the real,
-    // still-open remainder with no tracking or recovery path at all.
-    expect(sol.exitOrderId).not.toBeNull(); // the basket's own lifecycle is not blocked
-    expect(sol.qty).toBeCloseTo(solQtyOpened * 0.4, 6); // only the executed portion is booked on this leg
+    // A basket cannot report CLOSED while any exchange quantity remains. The durable exit slice
+    // records exactly what filled, preserves the entry lot for correct final P&L, and avoids the
+    // old orphan + truncated-qty accounting split.
+    expect(basket.status).toBe("COMPLETE");
+    expect(sol.exitOrderId).toBeNull();
+    expect(sol.qty).toBeCloseTo(solQtyOpened, 6);
+    expect(sol.exitFills).toMatchObject([{ qty: solQtyOpened * 0.4, liquidity: "TAKER" }]);
+    expect(store.getState().orphanedLegs).toHaveLength(0);
 
-    const orphans = store.getState().orphanedLegs;
-    expect(orphans).toHaveLength(1);
-    expect(orphans[0]).toMatchObject({ symbol: "SOLUSDT", side: "LONG" });
-    expect(orphans[0]!.qty).toBeCloseTo(solQtyOpened * 0.6, 6); // the un-filled remainder, tracked for retry
+    client.partialFillQtyBySymbol.delete("SOLUSDT");
+    await executor.tick();
+    expect(sol.exitOrderId).not.toBeNull();
+    expect(sol.exitFills!.reduce((sum, fill) => sum + fill.qty, 0)).toBeCloseTo(solQtyOpened, 6);
   });
 });
 

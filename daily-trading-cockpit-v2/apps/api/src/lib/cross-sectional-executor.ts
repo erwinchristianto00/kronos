@@ -22,6 +22,16 @@ import {
   type SubmitRef,
 } from "./submit-reference-quote.js";
 import { makerLimitPrice, resolveMakerLeg } from "./maker-entry-plan.js";
+import {
+  buildCurrentCrossSectionalPolicyFingerprint,
+  crossSectionalMakerExitWaitMs,
+  currentCrossSectionalExitPolicy,
+  effectiveCrossSectionalRuntime,
+  legacyCrossSectionalExitPolicy,
+  type CrossSectionalEffectiveRuntime,
+  type CrossSectionalExitPolicySnapshot,
+  type CrossSectionalPolicyFingerprint,
+} from "./cross-sectional-policy.js";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
@@ -496,6 +506,54 @@ const XSEC_DAILY_MAX_LOSS_USD = () => {
   return Number.isFinite(n) && n > 0 ? n : 0;
 };
 
+export interface ExitFillSlice {
+  orderId: string;
+  qty: number;
+  price: number;
+  priceConfirmed: boolean;
+  liquidity: "MAKER" | "TAKER";
+}
+
+/** Durable maker-first exit audit.  All quantities are actual exchange quantities, never inferred. */
+export interface ExitExecutionRecord {
+  mode: "MAKER_FIRST" | "MARKET";
+  decisionPrice: number | null;
+  makerQty: number;
+  makerPrice: number | null;
+  fallbackQty: number;
+  fallbackPrice: number | null;
+  makerOrderId: string | null;
+  fallbackOrderId: string | null;
+  durationMs: number | null;
+  temporaryImbalanceUsd: number | null;
+  implementationShortfallUsd: number | null;
+  feeEstimateUsd: number | null;
+  reason: string;
+  completedAt: string | null;
+}
+
+/** A post-only exit has to survive a process death just as an entry does. */
+export interface MakerExitAttempt {
+  phase: "PREPARED" | "RESTING" | "FALLBACK_SUBMITTED" | "RECONCILIATION_PENDING";
+  requestedQty: number;
+  clientOrderId: string;
+  makerOrderId: string | null;
+  fallbackClientOrderId: string | null;
+  fallbackOrderId: string | null;
+  makerPrice: number | null;
+  decisionPrice: number | null;
+  reduceOnly: boolean;
+  startedAt: string;
+}
+
+type MakerExitCandidate = {
+  leg: ExecutorLeg;
+  attempt: MakerExitAttempt;
+  decisionPrice: number | null;
+  makerPrice: number;
+  exitSide: "BUY" | "SELL";
+};
+
 export interface ExecutorLeg {
   symbol: string;
   side: "LONG" | "SHORT";
@@ -508,6 +566,8 @@ export interface ExecutorLeg {
   entryPriceConfirmed: boolean;
   exitPrice: number | null;
   exitOrderId: string | null;
+  /** All exit order ids.  A maker partial plus taker remainder is two exchange orders. */
+  exitOrderIds?: string[];
   /** Same caveat as entryPriceConfirmed, for the exit fill. Null while still open. */
   exitPriceConfirmed: boolean | null;
   /** Index into ExecutorBasket.plan this fill resolves — legs are always pushed in strict plan
@@ -543,6 +603,18 @@ export interface ExecutorLeg {
    *  so absence means taker, and readers must render it as such rather than as unknown. Exits are
    *  still MARKET on every path, so there is deliberately no exit counterpart to this field. */
   entryLiquidity?: { makerQty: number; takerQty: number; reason: string } | null;
+  /** Filled portions from a partial maker/taker close.  Used to avoid ever re-closing a filled lot. */
+  exitFills?: ExitFillSlice[];
+  /** Present between durable pre-place and final close for maker-first exits. */
+  makerExitAttempt?: MakerExitAttempt | null;
+  /** Full execution economics for this leg's exit. */
+  exitExecution?: ExitExecutionRecord | null;
+  /** Flat fields retained for control/report readers that predate exitExecution. */
+  exitDecisionPrice?: number | null;
+  exitMakerQty?: number | null;
+  exitMakerPrice?: number | null;
+  exitFallbackQty?: number | null;
+  exitFallbackPrice?: number | null;
 }
 
 export interface SmartBasketRuntime {
@@ -757,16 +829,25 @@ export type FormationEvaluationMetric = {
 };
 
 /** Sizing-only closed-fill counterfactual. It never changes live selection or execution. */
-export function evaluateCrossSectionalFormationCohort(baskets: ExecutorBasket[]): {
+export function evaluateCrossSectionalFormationCohort(
+  baskets: ExecutorBasket[],
+  eligibleBasketIds?: ReadonlySet<string>,
+): {
   activationClosedBaskets: number;
   closedBaskets: number;
   status: "COLLECTING" | "EVALUATING";
   autoSwitch: false;
   metrics: FormationEvaluationMetric[];
 } {
-  const closed = baskets.filter((basket) => basket.status === "CLOSED" && basket.accountingStatus !== "ACCOUNTING_INCOMPLETE" && basket.legs.length > 0 && basket.legs.every((leg) =>
+  const closed = baskets.filter((basket) =>
+    (eligibleBasketIds === undefined || eligibleBasketIds.has(basket.basketId)) &&
+    basket.status === "CLOSED" &&
+    basket.accountingStatus !== "ACCOUNTING_INCOMPLETE" &&
+    !isCrossSectionalBasketReportingExcluded(basket) &&
+    basket.legs.length > 0 && basket.legs.every((leg) =>
     leg.exitPrice !== null && leg.entryPrice > 0 && Number.isFinite(leg.volatilityAtOpen) && leg.volatilityAtOpen! > 0 && Number.isFinite(leg.scoreAtOpen),
-  ));
+    ),
+  );
   const models: FormationEvaluationMetric["model"][] = ["EQUAL_NOTIONAL", "CAPPED_INVERSE_VOL", "CAPPED_INVERSE_VOL_SCORE_TILT"];
   const returns = new Map(models.map((model) => [model, [] as number[]]));
   for (const basket of closed) {
@@ -824,6 +905,8 @@ export interface ExecutorBasket {
   variant: string;
   openedAt: string;
   closesAtMs: number;
+  /** Full policy contract frozen before any entry order is sent. Undefined means legacy. */
+  policyFingerprint?: CrossSectionalPolicyFingerprint | null;
   /** Optional observation-owned basket geometry, enabled only for dedicated innovation executors. */
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
@@ -901,6 +984,12 @@ export interface ExecutorBasket {
    *  basket carrying this flag (`=== "ACCOUNTING_INCOMPLETE"`), never zero-fill it. undefined for
    *  every normal basket — no migration needed, same optional-field convention as feeSource above. */
   accountingStatus?: "ACCOUNTING_INCOMPLETE";
+  /** A basket reaches CLOSED only after its final exchange/ledger reconciliation passes. */
+  exitReconciliation?: {
+    state: "CONFIRMED" | "PENDING";
+    checkedAt: string;
+    residualBySymbol: Array<{ symbol: string; expectedNetQty: number; exchangeNetQty: number }>;
+  } | null;
   /** Stamped by every profit-target check (5-min tick): the basket's CURRENT net return vs the
    *  TP threshold, so the dashboard can show the live TP gap per basket — "tinggal berapa lagi,
    *  bakal nyampe atau engga, ada yang macet atau engga" (2026-07-07 operator ask). */
@@ -941,6 +1030,72 @@ export function isCrossSectionalBasketReportingExcluded(
   basket: Pick<ExecutorBasket, "reportingExclusion">,
 ): boolean {
   return basket.reportingExclusion?.kind === "OPERATOR_VOID";
+}
+
+export type CurrentPolicyForwardCohort = {
+  policyId: string;
+  startedAt: string | null;
+  validCohortN: number;
+  currentOpenN: number;
+  independentEpisodes: number;
+  validBasketIds: string[];
+  excludedN: number;
+  excludedReasons: Record<string, number>;
+};
+
+const isOperatorControlledClose = (reason: string | null): boolean =>
+  /^(?:OPERATOR_|KILL_SWITCH|KILL_OR_DRAIN|DRAIN|MANUAL_)/.test(reason ?? "");
+
+/**
+ * Evidence is deliberately stricter than history.  Historical baskets remain in the ledger, but
+ * only fully accounted, current-policy, non-operator closed baskets may influence formation or
+ * weighting research after this cutover.
+ */
+export function currentPolicyForwardCohort(
+  baskets: readonly ExecutorBasket[],
+  currentPolicy: CrossSectionalPolicyFingerprint,
+): CurrentPolicyForwardCohort {
+  const startedAtMs = currentPolicy.forwardCohortStartedAt ? Date.parse(currentPolicy.forwardCohortStartedAt) : Number.NaN;
+  const valid: ExecutorBasket[] = [];
+  const excludedReasons: Record<string, number> = {};
+  let currentOpenN = 0;
+  const exclude = (reason: string) => { excludedReasons[reason] = (excludedReasons[reason] ?? 0) + 1; };
+
+  for (const basket of baskets) {
+    if (basket.status !== "CLOSED" && basket.status !== "ABORTED") {
+      if (basket.policyFingerprint?.policyId === currentPolicy.policyId) currentOpenN += 1;
+      continue;
+    }
+    if (basket.status === "ABORTED") { exclude("ABORTED"); continue; }
+    if (basket.accountingStatus === "ACCOUNTING_INCOMPLETE") { exclude("ACCOUNTING_INCOMPLETE"); continue; }
+    if (isCrossSectionalBasketReportingExcluded(basket)) { exclude("REPORTING_EXCLUDED"); continue; }
+    if (!basket.policyFingerprint) { exclude("LEGACY_NO_FINGERPRINT"); continue; }
+    if (basket.policyFingerprint.policyId !== currentPolicy.policyId) { exclude("INCOMPATIBLE_POLICY"); continue; }
+    const openedAtMs = Date.parse(basket.openedAt);
+    if (Number.isFinite(startedAtMs) && (!Number.isFinite(openedAtMs) || openedAtMs < startedAtMs)) { exclude("PRE_COHORT_START"); continue; }
+    if (isOperatorControlledClose(basket.closeReason)) { exclude("OPERATOR_CLOSE"); continue; }
+    valid.push(basket);
+  }
+
+  let independentEpisodes = 0;
+  let occupiedUntilMs = Number.NEGATIVE_INFINITY;
+  for (const basket of [...valid].sort((left, right) => Date.parse(left.openedAt) - Date.parse(right.openedAt))) {
+    const openedAtMs = Date.parse(basket.openedAt);
+    const closedAtMs = Date.parse(basket.closedAt ?? basket.openedAt);
+    if (!Number.isFinite(openedAtMs)) continue;
+    if (openedAtMs >= occupiedUntilMs) independentEpisodes += 1;
+    occupiedUntilMs = Math.max(occupiedUntilMs, Number.isFinite(closedAtMs) ? closedAtMs : openedAtMs);
+  }
+  return {
+    policyId: currentPolicy.policyId,
+    startedAt: currentPolicy.forwardCohortStartedAt,
+    validCohortN: valid.length,
+    currentOpenN,
+    independentEpisodes,
+    validBasketIds: valid.map((basket) => basket.basketId),
+    excludedN: Object.values(excludedReasons).reduce((sum, count) => sum + count, 0),
+    excludedReasons,
+  };
 }
 
 export interface CrossSectionalLossReentryBlock {
@@ -2252,6 +2407,16 @@ export class CrossSectionalExecutor {
     }
   }
 
+  /** Rejections live in their own append-only journal so they never become executable baskets. */
+  private rejectedBasketCount(): number {
+    try {
+      const path = process.env.CROSS_SECTIONAL_REJECTED_LOG ?? resolve(process.cwd(), "data", "cross-sectional-rejected.jsonl");
+      return readFileSync(path, "utf8").split("\n").filter((line) => line.trim().length > 0).length;
+    } catch {
+      return 0;
+    }
+  }
+
   getStatus(): {
     enabled: boolean;
     allowed: boolean;
@@ -2270,6 +2435,14 @@ export class CrossSectionalExecutor {
      *  dashboard states the ACTUAL exit contract instead of assuming hold-to-horizon. */
     stopNetReturnPct: number | null;
     maxHoldHours: number | null;
+    measurementHorizonBars: number | null;
+    measurementInterval: string;
+    /** Explicit pre-cutover contract for persisted rows without a fingerprint. */
+    legacyExitPolicy: CrossSectionalExitPolicySnapshot;
+    effectiveRuntime: CrossSectionalEffectiveRuntime;
+    currentPolicyFingerprint: CrossSectionalPolicyFingerprint;
+    currentPolicyForwardCohort: CurrentPolicyForwardCohort;
+    accountingCounts: { cleanN: number; quarantinedN: number; rejectedN: number };
     /** Realized basket P&L for the current UTC day + the safety-breaker limit (0 = disabled). */
     dailyRealizedUsd: number;
     dailyMaxLossUsd: number;
@@ -2343,6 +2516,13 @@ export class CrossSectionalExecutor {
     accountingIncompleteBaskets: ExecutorBasket[];
   } {
     const st = this.store.getState();
+    const currentPolicyFingerprint = buildCurrentCrossSectionalPolicyFingerprint(this.nowIso());
+    const currentPolicyForward = currentPolicyForwardCohort(st.baskets, currentPolicyFingerprint);
+    const effectiveRuntime = effectiveCrossSectionalRuntime(Boolean(
+      this.client.cancelOrder && this.client.queryOrderByClientId && this.readPublicQuoteFn,
+    ));
+    const currentExecutionPolicy = currentCrossSectionalExitPolicy();
+    const legacyExitPolicy = legacyCrossSectionalExitPolicy();
     const closed = st.baskets.filter((b) =>
       b.status === "CLOSED" &&
       b.accountingStatus !== "ACCOUNTING_INCOMPLETE" &&
@@ -2402,10 +2582,23 @@ export class CrossSectionalExecutor {
       allocationWeightPct: this.allocationWeightPct(),
       leverage: this.leverageFn(),
       variant: targetVariant,
-      tpNetReturnPct: TP_DISABLED() ? null : TP_NET_RETURN() * 100,
-      tpDisabled: TP_DISABLED(),
-      stopNetReturnPct: EXEC_STOP_NET_RETURN() > 0 ? EXEC_STOP_NET_RETURN() * 100 : null,
-      maxHoldHours: EXEC_MAX_HOLD_MS() > 0 ? EXEC_MAX_HOLD_MS() / 3_600_000 : null,
+      tpNetReturnPct: currentExecutionPolicy.takeProfitEnabled && currentExecutionPolicy.takeProfitNetReturn !== null
+        ? currentExecutionPolicy.takeProfitNetReturn * 100
+        : null,
+      tpDisabled: !currentExecutionPolicy.takeProfitEnabled,
+      stopNetReturnPct: currentExecutionPolicy.stopLossNetReturn !== null ? currentExecutionPolicy.stopLossNetReturn * 100 : null,
+      maxHoldHours: currentExecutionPolicy.executionCapHours,
+      measurementHorizonBars: currentExecutionPolicy.measurementHorizonBars,
+      measurementInterval: currentExecutionPolicy.measurementInterval,
+      legacyExitPolicy,
+      effectiveRuntime,
+      currentPolicyFingerprint,
+      currentPolicyForwardCohort: currentPolicyForward,
+      accountingCounts: {
+        cleanN: closed.length,
+        quarantinedN: st.baskets.filter((basket) => basket.status === "CLOSED" && (basket.accountingStatus === "ACCOUNTING_INCOMPLETE" || isCrossSectionalBasketReportingExcluded(basket))).length,
+        rejectedN: this.rejectedBasketCount(),
+      },
       dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),
       dailyMaxLossUsd: this.dailyMaxLossUsdFn(),
       openHalted: this.openHalted,
@@ -2420,7 +2613,7 @@ export class CrossSectionalExecutor {
       signalStale: signalAgeMs === null || signalAgeMs > signalMaxAgeMs,
       adaptiveFilters: deriveAdaptiveSymbolFilters(this.signalStore as CrossSectionalStore).provenance,
       adaptiveFiltersDisabled: isCrossSectionalAdaptiveDisabled(),
-      formationEvaluation: evaluateCrossSectionalFormationCohort(closed),
+      formationEvaluation: evaluateCrossSectionalFormationCohort(closed, new Set(currentPolicyForward.validBasketIds)),
       orphanedLegs: st.orphanedLegs ?? [],
       accountingIncompleteBaskets: st.baskets.filter((b) => b.accountingStatus === "ACCOUNTING_INCOMPLETE"),
     };
@@ -2678,6 +2871,9 @@ export class CrossSectionalExecutor {
         }
       }
     }
+    // Ghost state above keeps collecting on every basket.  The explicit runtime switch only governs
+    // whether that observation is allowed to send a real exit order.
+    if (!this.basketExecutionPolicy(basket).adaptiveExitsEnabled) return null;
     if ((smart.consecutiveRegimeLossScans ?? 0) >= this.smartInvalidationScansFn()) return "SMART_REGIME_LOSS_EXIT";
     if (smart.consecutiveInvalidationScans < this.smartInvalidationScansFn()) return null;
     const mfe = smart.maxNetReturn;
@@ -2689,6 +2885,20 @@ export class CrossSectionalExecutor {
       return "SMART_MFE_GIVEBACK";
     }
     return netReturn <= 0 ? "SMART_CONTEXT_INVALIDATION" : null;
+  }
+
+  /** New baskets freeze this at admission; legacy rows read the pre-cutover compatibility contract. */
+  private basketExecutionPolicy(basket: ExecutorBasket): CrossSectionalExitPolicySnapshot {
+    return basket.policyFingerprint?.execution ?? legacyCrossSectionalExitPolicy();
+  }
+
+  private shouldUseMakerExit(basket: ExecutorBasket, reason: string): boolean {
+    // STOP, kill-switch, operator, stale-book reconciliation and unfinished close recovery must
+    // cross immediately.  The normal scheduled hold exit is the only production policy path that
+    // gets a bounded passive attempt; PROFIT_BANK is included for legacy baskets that still have it.
+    if (reason !== "HORIZON" && reason !== "PROFIT_BANK") return false;
+    const policy = this.basketExecutionPolicy(basket);
+    return policy.makerExitEnabled && Boolean(this.client.cancelOrder && this.client.queryOrderByClientId && this.readPublicQuoteFn);
   }
 
   /** Single-flight tick: bank early winners, close due baskets, then consider opening a new one. */
@@ -3029,14 +3239,10 @@ export class CrossSectionalExecutor {
         }
         continue;
       }
-      // 2026-08-18 (operator: "gw mau ini berlaku juga untuk basket yang lagi open"): the stop is
-      // evaluated from THIS tick's netReturn and the env, never from a field stamped at entry, so
-      // switching it on takes effect on baskets that are already open. It is deliberately not gated
-      // on respectSignalRiskGeometry — that flag governs the SIGNAL's own geometry, and this is an
-      // instance-level risk limit that has to hold whether or not a signal supplied one. Checked
-      // before the take-profit branch: at a loss deep enough to stop, no TP threshold can also be
-      // true, and ordering it first keeps the loss path independent of TP configuration.
-      const execStop = EXEC_STOP_NET_RETURN();
+      // New baskets are governed by their frozen policy; a legacy row follows the explicitly
+      // pinned legacy contract.  This avoids a release changing the live exit of an existing hedge.
+      const executionPolicy = this.basketExecutionPolicy(basket);
+      const execStop = executionPolicy.stopLossNetReturn ?? 0;
       if (execStop > 0 && netReturn <= -execStop) {
         try {
           await this.closeBasket(basket, "EXEC_STOP");
@@ -3047,7 +3253,9 @@ export class CrossSectionalExecutor {
       }
       const threshold = this.respectSignalRiskGeometry
         ? basket.takeProfitReturn ?? Number.POSITIVE_INFINITY
-        : TP_NET_RETURN();
+        : executionPolicy.takeProfitEnabled
+          ? executionPolicy.takeProfitNetReturn ?? Number.POSITIVE_INFINITY
+          : Number.POSITIVE_INFINITY;
       if (netReturn >= threshold) {
         // 2026-07-19 real-money audit fix (BUG 2): isolate this basket's close attempt so one
         // wedged basket (repeated throw, e.g. a persistent margin/rate-limit condition) cannot
@@ -3126,10 +3334,10 @@ export class CrossSectionalExecutor {
       // finish or abort it; if it's genuinely stuck (e.g. persistently INCONCLUSIVE reconciliation),
       // it now stays visibly incomplete past its horizon instead of being silently mis-closed.
       if (basket.status !== "COMPLETE") continue;
-      // 2026-08-18: instance-level hold cap that may fire BEFORE the signal's own horizon. Read from
-      // the env and this tick's clock, never from a field stamped at entry, so switching it on binds
-      // on baskets that are already open.
-      const holdCapMs = EXEC_MAX_HOLD_MS();
+      // The cap is frozen per admission.  A policy deployment must never retrospectively shorten
+      // (or lengthen) a basket that was already on the exchange.
+      const holdCapHours = this.basketExecutionPolicy(basket).executionCapHours;
+      const holdCapMs = holdCapHours !== null ? holdCapHours * 3_600_000 : 0;
       const openedMs = Date.parse(basket.openedAt);
       const cappedDue = holdCapMs > 0 && Number.isFinite(openedMs)
         ? Math.min(basket.closesAtMs, openedMs + holdCapMs)
@@ -3161,7 +3369,7 @@ export class CrossSectionalExecutor {
     for (const other of this.store.getState().baskets) {
       if (other === basket || !this.isBasketLive(other)) continue;
       for (const leg of other.legs) {
-        if (leg.symbol === symbol && leg.side !== side && leg.exitOrderId === null) qty += leg.qty;
+        if (leg.symbol === symbol && leg.side !== side && leg.exitOrderId === null) qty += this.exitRemainingQty(leg);
       }
     }
     for (const leg of this.siblingOpenLegs()) {
@@ -3170,90 +3378,503 @@ export class CrossSectionalExecutor {
     return qty;
   }
 
-  private async closeBasket(basket: ExecutorBasket, reason: string): Promise<void> {
-    const failures: string[] = [];
-    let staleBookReconciled = false;
+  /** Sum only durable, exchange-confirmed exit portions. Legacy full exits retain their old shape. */
+  private exitFilledQty(leg: ExecutorLeg): number {
+    if (Array.isArray(leg.exitFills) && leg.exitFills.length > 0) {
+      return leg.exitFills.reduce((sum, fill) => sum + (Number.isFinite(fill.qty) && fill.qty > 0 ? fill.qty : 0), 0);
+    }
+    return leg.exitOrderId !== null ? leg.qty : 0;
+  }
+
+  private exitRemainingQty(leg: ExecutorLeg): number {
+    return Math.max(0, leg.qty - this.exitFilledQty(leg));
+  }
+
+  /**
+   * Stores a close portion before deciding whether a leg is fully flat.  If Binance partially fills
+   * the fallback, the next tick knows the exact remaining quantity and cannot accidentally re-close
+   * the already-filled maker lot.
+   */
+  private recordExitFill(leg: ExecutorLeg, fill: ExitFillSlice): void {
+    if (!(fill.qty > 0) || !(fill.price > 0)) return;
+    const fills = leg.exitFills ?? (leg.exitFills = []);
+    if (!fills.some((existing) => existing.orderId === fill.orderId)) fills.push(fill);
+    const filledQty = this.exitFilledQty(leg);
+    if (filledQty + 1e-9 < leg.qty) {
+      leg.exitOrderId = null;
+      leg.exitPrice = null;
+      leg.exitPriceConfirmed = null;
+      return;
+    }
+    const totalQty = fills.reduce((sum, entry) => sum + entry.qty, 0);
+    const totalNotional = fills.reduce((sum, entry) => sum + entry.qty * entry.price, 0);
+    leg.exitOrderIds = [...new Set(fills.map((entry) => entry.orderId))];
+    leg.exitOrderId = leg.exitOrderIds[leg.exitOrderIds.length - 1] ?? fill.orderId;
+    leg.exitPrice = totalQty > 0 ? totalNotional / totalQty : fill.price;
+    leg.exitPriceConfirmed = fills.every((entry) => entry.priceConfirmed);
+    leg.makerExitAttempt = null;
+  }
+
+  private exitDecisionReference(leg: ExecutorLeg, observeStartMs: number): { decisionPrice: number | null; makerPrice: number | null } {
+    const exitDirection: "LONG" | "SHORT" = leg.side === "LONG" ? "SHORT" : "LONG";
+    const reference = stampSubmitRef(
+      buildSubmitRefBase(this.readPublicQuoteFn ? this.readPublicQuoteFn(leg.symbol) : null, observeStartMs, exitDirection),
+      Date.parse(this.nowIso()),
+    );
+    const makerPrice = this.client.cancelOrder
+      ? makerLimitPrice(exitDirection, reference?.bid ?? null, reference?.ask ?? null)
+      : null;
+    return { decisionPrice: reference?.touch ?? reference?.mid ?? null, makerPrice };
+  }
+
+  private updateExitExecution(
+    leg: ExecutorLeg,
+    update: Partial<ExitExecutionRecord> & Pick<ExitExecutionRecord, "mode" | "reason">,
+  ): void {
+    const previous = leg.exitExecution;
+    const next: ExitExecutionRecord = {
+      mode: update.mode,
+      decisionPrice: update.decisionPrice ?? previous?.decisionPrice ?? null,
+      makerQty: update.makerQty ?? previous?.makerQty ?? 0,
+      makerPrice: update.makerPrice ?? previous?.makerPrice ?? null,
+      fallbackQty: update.fallbackQty ?? previous?.fallbackQty ?? 0,
+      fallbackPrice: update.fallbackPrice ?? previous?.fallbackPrice ?? null,
+      makerOrderId: update.makerOrderId ?? previous?.makerOrderId ?? null,
+      fallbackOrderId: update.fallbackOrderId ?? previous?.fallbackOrderId ?? null,
+      durationMs: update.durationMs ?? previous?.durationMs ?? null,
+      temporaryImbalanceUsd: update.temporaryImbalanceUsd ?? previous?.temporaryImbalanceUsd ?? null,
+      implementationShortfallUsd: update.implementationShortfallUsd ?? previous?.implementationShortfallUsd ?? null,
+      feeEstimateUsd: update.feeEstimateUsd ?? previous?.feeEstimateUsd ?? null,
+      reason: update.reason,
+      completedAt: update.completedAt ?? previous?.completedAt ?? null,
+    };
+    leg.exitExecution = next;
+    leg.exitDecisionPrice = next.decisionPrice;
+    leg.exitMakerQty = next.makerQty;
+    leg.exitMakerPrice = next.makerPrice;
+    leg.exitFallbackQty = next.fallbackQty;
+    leg.exitFallbackPrice = next.fallbackPrice;
+  }
+
+  private async closeLegMarket(
+    basket: ExecutorBasket,
+    leg: ExecutorLeg,
+    reason: string,
+    opts: { decisionPrice?: number | null; makerQty?: number; makerPrice?: number | null; makerOrderId?: string | null; startedAtMs?: number; clientOrderId?: string } = {},
+  ): Promise<{ staleBookReconciled: boolean }> {
+    let remainingQty = this.exitRemainingQty(leg);
+    if (remainingQty <= 1e-9) return { staleBookReconciled: false };
+    const exitSide = leg.side === "LONG" ? "SELL" : "BUY";
+    const reduceOnly = this.siblingOppositeUnexitedQty(basket, leg.symbol, leg.side) < remainingQty - 1e-9;
+    try {
+      let clientOrderId = opts.clientOrderId ?? `xsec-${basket.basketId.slice(-12)}-x${basket.legs.indexOf(leg)}-${this.exitFilledQty(leg).toFixed(8).replace(".", "")}`;
+      let order: FuturesOrder | null = null;
+      // A fallback id is persisted before POST. On restart query it first: submitting the same
+      // market fallback a second time is the one failure mode that can reverse a just-closed leg.
+      if (opts.clientOrderId && this.client.queryOrderByClientId) {
+        try {
+          const previous = await this.client.queryOrderByClientId(leg.symbol, clientOrderId);
+          if (!["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(previous.status).toUpperCase())) {
+            throw new Error(`${leg.symbol}: previous MARKET fallback ${clientOrderId} is still non-terminal; refusing duplicate fallback`);
+          }
+          const previousExecutedQty = Number.isFinite(previous.executedQty) && previous.executedQty > 0
+            ? Math.min(previous.executedQty, remainingQty)
+            : 0;
+          if (previousExecutedQty > 0) {
+            const previousResolved = await this.resolveFillPrice(leg.symbol, previous.orderId, previous.avgPrice, opts.decisionPrice ?? leg.entryPrice);
+            this.recordExitFill(leg, {
+              orderId: previous.orderId,
+              qty: previousExecutedQty,
+              price: previousResolved.price,
+              priceConfirmed: previousResolved.confirmed,
+              liquidity: "TAKER",
+            });
+          }
+          if (this.exitRemainingQty(leg) <= 1e-9) return { staleBookReconciled: false };
+          remainingQty = this.exitRemainingQty(leg);
+          // A terminal non-fill/partial fill cannot safely reuse its client id. Persist a new
+          // retry identity before it leaves this process; the old quantity has already been
+          // recorded above, so only the exact residual can be crossed.
+          clientOrderId = `${clientOrderId.slice(0, 32)}r${Math.max(1, Math.round(this.exitFilledQty(leg) * 1e8)) % 1000}`;
+          if (leg.makerExitAttempt) {
+            leg.makerExitAttempt.fallbackClientOrderId = clientOrderId;
+            leg.makerExitAttempt.fallbackOrderId = previous.orderId;
+          }
+          this.store.save();
+        } catch (error) {
+          if (!this.isOrderNotFound(error)) throw error;
+        }
+      }
+      order ??= await this.client.placeOrder({
+        symbol: leg.symbol,
+        side: exitSide,
+        type: "MARKET",
+        quantity: remainingQty,
+        ...(reduceOnly ? { reduceOnly: true } : {}),
+        newClientOrderId: clientOrderId,
+      });
+      if (leg.makerExitAttempt?.fallbackClientOrderId === clientOrderId) {
+        leg.makerExitAttempt.fallbackOrderId = order.orderId;
+      }
+      const resolved = await this.resolveFillPrice(leg.symbol, order.orderId, order.avgPrice, opts.decisionPrice ?? leg.entryPrice);
+      const executedQty = Number.isFinite(order.executedQty) && order.executedQty > 0
+        ? Math.min(order.executedQty, remainingQty)
+        : remainingQty;
+      this.recordExitFill(leg, {
+        orderId: order.orderId,
+        qty: executedQty,
+        price: resolved.price,
+        priceConfirmed: resolved.confirmed,
+        liquidity: "TAKER",
+      });
+      const makerQty = opts.makerQty ?? 0;
+      const makerPrice = opts.makerPrice ?? null;
+      const decisionPrice = opts.decisionPrice ?? null;
+      const finalExitPrice = leg.exitPrice ?? resolved.price;
+      const totalExitQty = makerQty + executedQty;
+      const implementationShortfallUsd = decisionPrice !== null && finalExitPrice > 0
+        ? (leg.side === "LONG" ? decisionPrice - finalExitPrice : finalExitPrice - decisionPrice) * totalExitQty
+        : null;
+      const feeEstimateUsd =
+        (makerQty * (makerPrice ?? 0) * 0.0002) +
+        (executedQty * resolved.price * 0.0005);
+      this.updateExitExecution(leg, {
+        mode: makerQty > 0 ? "MAKER_FIRST" : "MARKET",
+        reason,
+        decisionPrice,
+        makerQty,
+        makerPrice,
+        makerOrderId: opts.makerOrderId ?? null,
+        fallbackQty: executedQty,
+        fallbackPrice: resolved.price,
+        fallbackOrderId: order.orderId,
+        durationMs: opts.startedAtMs === undefined ? null : Math.max(0, Date.now() - opts.startedAtMs),
+        implementationShortfallUsd,
+        feeEstimateUsd,
+        completedAt: leg.exitOrderId !== null ? this.nowIso() : null,
+      });
+      this.store.save();
+      return { staleBookReconciled: false };
+    } catch (error) {
+      const message = (error as Error).message;
+      if (reduceOnly && /(?:code\s*)?-2022|ReduceOnly Order is rejected/i.test(message)) {
+        try {
+          const positions = await this.client.getPositions(leg.symbol);
+          const positionAmt = positions.find((position) => position.symbol === leg.symbol)?.positionAmt ?? 0;
+          const expectedSign = leg.side === "LONG" ? 1 : -1;
+          if (Math.abs(positionAmt) <= 1e-9 || Math.sign(positionAmt) !== expectedSign) {
+            leg.exitOrderId = "POSITION_ALREADY_FLAT";
+            leg.exitPrice = null;
+            leg.exitPriceConfirmed = false;
+            this.store.save();
+            return { staleBookReconciled: true };
+          }
+        } catch {
+          // Preserve the original close error when exchange reconciliation is unavailable.
+        }
+      }
+      throw error;
+    }
+  }
+
+  private basketTemporaryImbalanceUsd(basket: ExecutorBasket): number {
+    let longUsd = 0;
+    let shortUsd = 0;
     for (const leg of basket.legs) {
-      if (leg.exitOrderId !== null) continue; // already closed (retry path)
-      const exitSide = leg.side === "LONG" ? "SELL" : "BUY";
-      // reduceOnly is the default guard against over-closing stale basket state — but with
-      // overlapping baskets the NETTED account position can carry the opposite sign (e.g. this
-      // basket long SOL while two siblings are short SOL ⇒ account net short), and Binance then
-      // rejects the reduce-only close with -2022, wedging the basket half-closed forever
-      // (2026-07-07: testnet basket xb-mr7zdpiz stuck exactly this way for hours). Drop the flag
-      // ONLY when sibling baskets' un-exited opposite exposure fully covers this leg — the one
-      // case where a plain market close is provably just bookkeeping between our own baskets.
-      const reduceOnly = this.siblingOppositeUnexitedQty(basket, leg.symbol, leg.side) < leg.qty - 1e-9;
+      const notional = this.exitRemainingQty(leg) * leg.entryPrice;
+      if (leg.side === "LONG") longUsd += notional;
+      else shortUsd += notional;
+    }
+    return Math.abs(longUsd - shortUsd);
+  }
+
+  private isOrderNotFound(error: unknown): boolean {
+    return error instanceof BinanceFuturesPrivateError && error.binanceCode === -2013;
+  }
+
+  private async queryMakerExitAttempt(leg: ExecutorLeg, attempt: MakerExitAttempt): Promise<FuturesOrder | null> {
+    try {
+      if (attempt.makerOrderId) return await this.client.queryOrder(leg.symbol, attempt.makerOrderId);
+      if (!this.client.queryOrderByClientId) throw new Error("maker exit recovery unavailable: queryOrderByClientId is not wired");
+      return await this.client.queryOrderByClientId(leg.symbol, attempt.clientOrderId);
+    } catch (error) {
+      if (this.isOrderNotFound(error)) return null;
+      throw error;
+    }
+  }
+
+  private async settleMakerExitAttempt(
+    basket: ExecutorBasket,
+    candidate: MakerExitCandidate,
+    reason: string,
+    makerOrder: FuturesOrder | null,
+    startedAtMs: number,
+  ): Promise<{ leg: ExecutorLeg; makerQty: number; makerPrice: number | null; makerOrderId: string | null; decisionPrice: number | null; fallbackClientOrderId: string } | null> {
+    const { leg, attempt } = candidate;
+    if (makerOrder === null) {
+      // Binance explicitly says the post-only client id does not exist.  It is now safe to cross
+      // the original requested quantity; any other query failure remains a hard failure instead.
+      attempt.phase = "FALLBACK_SUBMITTED";
+      attempt.fallbackClientOrderId ??= `${attempt.clientOrderId}f`;
+      this.store.save();
+      return {
+        leg,
+        makerQty: 0,
+        makerPrice: null,
+        makerOrderId: null,
+        decisionPrice: attempt.decisionPrice,
+        fallbackClientOrderId: attempt.fallbackClientOrderId,
+      };
+    }
+    attempt.makerOrderId = makerOrder.orderId;
+    if (!["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(makerOrder.status).toUpperCase())) {
+      try { await this.client.cancelOrder!(leg.symbol, makerOrder.orderId); } catch { /* terminal race; re-query decides */ }
+      makerOrder = await this.client.queryOrder(leg.symbol, makerOrder.orderId);
+    }
+    const decision = resolveMakerLeg(attempt.requestedQty, makerOrder.status, makerOrder.executedQty);
+    if (decision.action === "UNKNOWN_REQUERY") {
+      attempt.phase = "RECONCILIATION_PENDING";
+      this.store.save();
+      throw new Error(`${leg.symbol}: maker exit status is inconclusive (${decision.reason}); no fallback sent`);
+    }
+    let makerPrice: number | null = null;
+    if (decision.filledQty > 0) {
+      const resolved = await this.resolveFillPrice(leg.symbol, makerOrder.orderId, makerOrder.avgPrice, attempt.makerPrice ?? leg.entryPrice);
+      makerPrice = resolved.price;
+      this.recordExitFill(leg, {
+        orderId: makerOrder.orderId,
+        qty: decision.filledQty,
+        price: resolved.price,
+        priceConfirmed: resolved.confirmed,
+        liquidity: "MAKER",
+      });
+    }
+    const temporaryImbalanceUsd = this.basketTemporaryImbalanceUsd(basket);
+    if (decision.action === "DONE") {
+      const exitPrice = leg.exitPrice ?? makerPrice ?? attempt.makerPrice ?? leg.entryPrice;
+      const shortfall = attempt.decisionPrice !== null
+        ? (leg.side === "LONG" ? attempt.decisionPrice - exitPrice : exitPrice - attempt.decisionPrice) * decision.filledQty
+        : null;
+      this.updateExitExecution(leg, {
+        mode: "MAKER_FIRST",
+        reason,
+        decisionPrice: attempt.decisionPrice,
+        makerQty: decision.filledQty,
+        makerPrice,
+        makerOrderId: makerOrder.orderId,
+        fallbackQty: 0,
+        fallbackPrice: null,
+        fallbackOrderId: null,
+        durationMs: Math.max(0, Date.now() - startedAtMs),
+        temporaryImbalanceUsd,
+        implementationShortfallUsd: shortfall,
+        feeEstimateUsd: decision.filledQty * (makerPrice ?? 0) * 0.0002,
+        completedAt: leg.exitOrderId !== null ? this.nowIso() : null,
+      });
+      this.store.save();
+      return null;
+    }
+    attempt.phase = "FALLBACK_SUBMITTED";
+    attempt.fallbackClientOrderId ??= `${attempt.clientOrderId}f`;
+    this.store.save();
+    return {
+      leg,
+      makerQty: decision.filledQty,
+      makerPrice,
+      makerOrderId: makerOrder.orderId,
+      decisionPrice: attempt.decisionPrice,
+      fallbackClientOrderId: attempt.fallbackClientOrderId,
+    };
+  }
+
+  /**
+   * Normal scheduled exits post every leg concurrently, wait once, then cancel and cross ONLY the
+   * confirmed remainder.  STOP/kill/reconciliation routes never call this method.
+   */
+  private async closeBasketMakerFirst(basket: ExecutorBasket, reason: string): Promise<void> {
+    const startedAtMs = Date.now();
+    const liveLegs = basket.legs.filter((leg) => leg.exitOrderId === null && this.exitRemainingQty(leg) > 1e-9);
+    if (liveLegs.length === 0) return;
+
+    // A partial fallback is already an emergency residual: cross only its remaining quantity on
+    // the next retry, never post a new maker order for the lot that already filled.
+    const residual = liveLegs.filter((leg) => Array.isArray(leg.exitFills) && leg.exitFills.length > 0);
+    const residualResults = await Promise.allSettled(residual.map((leg) => this.closeLegMarket(basket, leg, reason, {
+      decisionPrice: leg.makerExitAttempt?.decisionPrice ?? leg.exitDecisionPrice ?? null,
+      makerQty: leg.exitExecution?.makerQty ?? 0,
+      makerPrice: leg.exitExecution?.makerPrice ?? null,
+      makerOrderId: leg.exitExecution?.makerOrderId ?? null,
+      startedAtMs,
+      clientOrderId: leg.makerExitAttempt?.fallbackClientOrderId ?? undefined,
+    })));
+    const residualFailure = residualResults.find((result) => result.status === "rejected");
+    if (residualFailure?.status === "rejected") throw residualFailure.reason;
+
+    const freshLegs = liveLegs.filter((leg) => !residual.includes(leg));
+    if (freshLegs.length === 0) return;
+
+    const preexisting = freshLegs.filter((leg) => leg.makerExitAttempt !== null && leg.makerExitAttempt !== undefined);
+    const fallbacks: Array<{ leg: ExecutorLeg; makerQty: number; makerPrice: number | null; makerOrderId: string | null; decisionPrice: number | null; fallbackClientOrderId: string }> = [];
+    for (const leg of preexisting) {
+      const attempt = leg.makerExitAttempt!;
+      const candidate: MakerExitCandidate = {
+        leg,
+        attempt,
+        decisionPrice: attempt.decisionPrice,
+        makerPrice: attempt.makerPrice ?? leg.entryPrice,
+        exitSide: leg.side === "LONG" ? "SELL" : "BUY",
+      };
+      const makerOrder = await this.queryMakerExitAttempt(leg, attempt);
+      const fallback = await this.settleMakerExitAttempt(basket, candidate, reason, makerOrder, startedAtMs);
+      if (fallback) fallbacks.push(fallback);
+    }
+
+    const fresh = freshLegs.filter((leg) => !preexisting.includes(leg));
+    const observeStartMs = Date.now();
+    if (this.warmPublicQuoteFn) await Promise.allSettled(fresh.map((leg) => this.warmPublicQuoteFn!(leg.symbol)));
+    const makers: MakerExitCandidate[] = [];
+    const noBook: ExecutorLeg[] = [];
+    for (const leg of fresh) {
+      const remainingQty = this.exitRemainingQty(leg);
+      const exitSide: "BUY" | "SELL" = leg.side === "LONG" ? "SELL" : "BUY";
+      const { decisionPrice, makerPrice } = this.exitDecisionReference(leg, observeStartMs);
+      if (makerPrice === null || remainingQty <= 1e-9) {
+        noBook.push(leg);
+        continue;
+      }
+      const reduceOnly = this.siblingOppositeUnexitedQty(basket, leg.symbol, leg.side) < remainingQty - 1e-9;
+      const attempt: MakerExitAttempt = {
+        phase: "PREPARED",
+        requestedQty: remainingQty,
+        clientOrderId: `xsec-${basket.basketId.slice(-12)}-xm${basket.legs.indexOf(leg)}-${Math.floor(startedAtMs % 1_000_000)}`,
+        makerOrderId: null,
+        fallbackClientOrderId: null,
+        fallbackOrderId: null,
+        makerPrice,
+        decisionPrice,
+        reduceOnly,
+        startedAt: this.nowIso(),
+      };
+      leg.makerExitAttempt = attempt;
+      makers.push({ leg, attempt, decisionPrice, makerPrice, exitSide });
+    }
+    this.store.save(); // durable before ANY post-only order leaves this process
+
+    const directResults = await Promise.allSettled(noBook.map((leg) => this.closeLegMarket(basket, leg, reason, { startedAtMs })));
+    const directFailure = directResults.find((result) => result.status === "rejected");
+    if (directFailure?.status === "rejected") throw directFailure.reason;
+
+    await Promise.allSettled(makers.map(async (candidate) => {
+      const { leg, attempt, makerPrice, exitSide } = candidate;
       try {
         const order = await this.client.placeOrder({
           symbol: leg.symbol,
           side: exitSide,
-          type: "MARKET",
-          quantity: leg.qty,
-          ...(reduceOnly ? { reduceOnly: true } : {}),
-          newClientOrderId: `xsec-${basket.basketId.slice(-12)}-x${basket.legs.indexOf(leg)}`,
+          type: "LIMIT",
+          timeInForce: "GTX",
+          price: makerPrice,
+          quantity: attempt.requestedQty,
+          ...(attempt.reduceOnly ? { reduceOnly: true } : {}),
+          newClientOrderId: attempt.clientOrderId,
         });
-        const resolved = await this.resolveFillPrice(leg.symbol, order.orderId, order.avgPrice, leg.entryPrice);
-        // 2026-07-19 real-money audit fix (BUG 3): a genuine partial MARKET fill on the close
-        // order leaves a real, un-closed remainder on the exchange — recording this leg as fully
-        // exited would silently understate the account's true exposure. If executedQty
-        // meaningfully undershoots the requested qty, only the FILLED portion is booked as
-        // closed on this leg (at the confirmed fill price); the un-filled remainder is tracked
-        // via the SAME orphaned-leg retry mechanism as BUG 1 (this basket stays consistent —
-        // exitOrderId is still set, so the basket's own lifecycle isn't blocked — while the
-        // residual keeps getting flattened automatically every tick until it too resolves).
-        // 2026-07-19 real-money audit follow-up: mirror the entry-leg guard's `> 0` check exactly
-        // — Binance's synchronous order ACK can come back with avgPrice=0/executedQty=0 even
-        // though the order fully filled moments later (this file's own resolveFillPrice already
-        // documents and works around this for price; executedQty needs the identical treatment).
-        // Without the `> 0` guard, EVERY unconfirmed-at-ACK exit (a routine, frequent occurrence,
-        // not an edge case) would be misread as a 100% shortfall and spuriously orphaned, even
-        // though the leg is genuinely fully closed — and a retry of that bogus orphan could
-        // succeed against a SIBLING executor's real position on the same symbol (the exact
-        // "netting-blind-closes" bug class this codebase already had to fix once, engine-wide).
-        const executedQty = Number.isFinite(order.executedQty) && order.executedQty > 0 ? order.executedQty : leg.qty;
-        const shortfall = leg.qty - executedQty;
-        if (shortfall > 1e-9) {
-          this.recordOrphanedLeg(
-            basket,
-            { ...leg, qty: shortfall },
-            new Error(`partial close fill: requested ${leg.qty}, executed ${executedQty} — residual ${shortfall} still open`),
-          );
-          leg.qty = executedQty > 0 ? executedQty : leg.qty;
-        }
-        leg.exitOrderId = order.orderId;
-        leg.exitPrice = resolved.price;
-        leg.exitPriceConfirmed = resolved.confirmed;
-      } catch (error) {
-        const message = (error as Error).message;
-        if (reduceOnly && /(?:code\s*)?-2022|ReduceOnly Order is rejected/i.test(message)) {
-          try {
-            const positions = await this.client.getPositions(leg.symbol);
-            const positionAmt = positions.find((position) => position.symbol === leg.symbol)?.positionAmt ?? 0;
-            const expectedSign = leg.side === "LONG" ? 1 : -1;
-            // The exchange no longer carries enough same-side quantity for this book leg. Retrying
-            // without reduceOnly would CREATE opposite exposure. Reconcile as ABORTED (no invented
-            // P&L), continue flattening every other real leg, and remove the stale claim safely.
-            if (Math.abs(positionAmt) <= 1e-9 || Math.sign(positionAmt) !== expectedSign) {
-              leg.exitOrderId = "POSITION_ALREADY_FLAT";
-              leg.exitPrice = null;
-              leg.exitPriceConfirmed = false;
-              staleBookReconciled = true;
-              this.store.save();
-              continue;
-            }
-          } catch {
-            // Position lookup failed: preserve the original error/retry behavior below.
-          }
-        }
-        // Keep attempting the REMAINING legs — aborting mid-loop leaves more naked exposure
-        // stuck open than closing what we can. The basket stays OPEN and retries next tick.
-        failures.push(`${leg.symbol}: ${message}`);
+        attempt.makerOrderId = order.orderId;
+        attempt.phase = "RESTING";
+      } finally {
+        this.store.save();
       }
-      this.store.save(); // persist per leg so a crash/retry mid-close can resume
+    }));
+
+    // One bounded wait for the whole six-leg basket, not N×wait. Polling permits an early exit when
+    // every post-only order reaches a terminal state.
+    const waitMs = crossSectionalMakerExitWaitMs();
+    const deadline = Date.now() + waitMs;
+    while (makers.length > 0 && Date.now() < deadline) {
+      const states = await Promise.allSettled(makers.map((candidate) => this.queryMakerExitAttempt(candidate.leg, candidate.attempt)));
+      const anyResting = states.some((state) => state.status === "fulfilled" && state.value !== null && !["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(state.value.status).toUpperCase()));
+      if (!anyResting) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, Math.min(1_000, Math.max(1, deadline - Date.now()))));
+    }
+
+    await Promise.allSettled(makers.map(async (candidate) => {
+      const order = await this.queryMakerExitAttempt(candidate.leg, candidate.attempt);
+      if (order && !["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(order.status).toUpperCase())) {
+        try { await this.client.cancelOrder!(candidate.leg.symbol, order.orderId); } catch { /* terminal race; re-query below is authoritative */ }
+      }
+    }));
+
+    for (const candidate of makers) {
+      const makerOrder = await this.queryMakerExitAttempt(candidate.leg, candidate.attempt);
+      const fallback = await this.settleMakerExitAttempt(basket, candidate, reason, makerOrder, startedAtMs);
+      if (fallback) fallbacks.push(fallback);
+    }
+    this.store.save(); // fallback identities are durable before any MARKET remainder goes out
+    const fallbackResults = await Promise.allSettled(fallbacks.map((fallback) => this.closeLegMarket(basket, fallback.leg, reason, {
+      decisionPrice: fallback.decisionPrice,
+      makerQty: fallback.makerQty,
+      makerPrice: fallback.makerPrice,
+      makerOrderId: fallback.makerOrderId,
+      startedAtMs,
+      clientOrderId: fallback.fallbackClientOrderId,
+    })));
+    const fallbackFailure = fallbackResults.find((result) => result.status === "rejected");
+    if (fallbackFailure?.status === "rejected") throw fallbackFailure.reason;
+  }
+
+  private async reconcileBasketExit(basket: ExecutorBasket): Promise<boolean> {
+    // Legacy baskets retain their pre-cutover settle contract. New policy baskets must prove that
+    // the exchange's net position equals the remaining sibling-book position before they become CLOSED.
+    if (!basket.policyFingerprint) return true;
+    const relevantSymbols = new Set(basket.legs.map((leg) => leg.symbol));
+    const positions = await this.sharedGetPositions();
+    const exchangeBySymbol = new Map(positions.map((position) => [position.symbol, position.positionAmt]));
+    const expectedBySymbol = new Map<string, number>();
+    const add = (symbol: string, side: "LONG" | "SHORT", qty: number) => {
+      if (!relevantSymbols.has(symbol) || !(qty > 0)) return;
+      expectedBySymbol.set(symbol, (expectedBySymbol.get(symbol) ?? 0) + (side === "LONG" ? qty : -qty));
+    };
+    for (const other of this.store.getState().baskets) {
+      if (other === basket || !this.isBasketLive(other)) continue;
+      for (const leg of other.legs) add(leg.symbol, leg.side, this.exitRemainingQty(leg));
+    }
+    for (const leg of this.siblingOpenLegs()) add(leg.symbol, leg.side, leg.qty);
+    const residualBySymbol = [...relevantSymbols].sort().map((symbol) => ({
+      symbol,
+      expectedNetQty: expectedBySymbol.get(symbol) ?? 0,
+      exchangeNetQty: exchangeBySymbol.get(symbol) ?? 0,
+    }));
+    const confirmed = residualBySymbol.every((row) => Math.abs(row.exchangeNetQty - row.expectedNetQty) <= 1e-8);
+    basket.exitReconciliation = { state: confirmed ? "CONFIRMED" : "PENDING", checkedAt: this.nowIso(), residualBySymbol };
+    this.store.save();
+    return confirmed;
+  }
+
+  private async closeBasket(basket: ExecutorBasket, reason: string): Promise<void> {
+    const failures: string[] = [];
+    let staleBookReconciled = false;
+    if (this.shouldUseMakerExit(basket, reason)) {
+      try {
+        await this.closeBasketMakerFirst(basket, reason);
+      } catch (error) {
+        failures.push((error as Error).message);
+      }
+    } else {
+      // Safety/emergency exits are immediate MARKET and remain per-leg isolated: one failed leg
+      // must not prevent the other legs from being flattened in the same tick.
+      for (const leg of basket.legs) {
+        if (leg.exitOrderId !== null) continue;
+        try {
+          const result = await this.closeLegMarket(basket, leg, reason);
+          staleBookReconciled ||= result.staleBookReconciled;
+        } catch (error) {
+          failures.push(`${leg.symbol}: ${(error as Error).message}`);
+        }
+      }
     }
     if (failures.length > 0) {
       throw new Error(`basket ${basket.basketId} close incomplete, ${failures.length} leg(s) failed: ${failures[0]}`);
+    }
+    if (basket.legs.some((leg) => leg.exitOrderId === null)) {
+      throw new Error(`basket ${basket.basketId} close incomplete: exchange filled only part of one or more legs; retrying remaining quantity without reversing`);
     }
     if (staleBookReconciled) {
       basket.status = "ABORTED";
@@ -3271,6 +3892,9 @@ export class CrossSectionalExecutor {
       this.markFourBrainBasketUnmeasured(basket, "ACCOUNTING_INCOMPLETE_POSITION_ALREADY_FLAT");
       this.store.save();
       return;
+    }
+    if (!(await this.reconcileBasketExit(basket))) {
+      throw new Error(`basket ${basket.basketId} exit reconciliation pending: exchange net does not yet match sibling ledger`);
     }
     // Finalize P&L from the STORED per-leg prices, not a loop-local accumulator: on a retry after
     // a partial close, the already-exited legs are skipped above, and the old accumulator silently
@@ -3310,9 +3934,11 @@ export class CrossSectionalExecutor {
       const ids = orderIdsBySymbol.get(leg.symbol) ?? new Set<string>();
       ids.add(leg.entryOrderId);
       roleBySymbolOrderId.set(roleKey(leg.symbol, leg.entryOrderId), "ENTRY");
-      if (leg.exitOrderId !== null && leg.exitOrderId !== "POSITION_ALREADY_FLAT") {
-        ids.add(leg.exitOrderId);
-        roleBySymbolOrderId.set(roleKey(leg.symbol, leg.exitOrderId), "EXIT");
+      const exitOrderIds = leg.exitOrderIds ?? (leg.exitOrderId !== null ? [leg.exitOrderId] : []);
+      for (const exitOrderId of exitOrderIds) {
+        if (exitOrderId === "POSITION_ALREADY_FLAT") continue;
+        ids.add(exitOrderId);
+        roleBySymbolOrderId.set(roleKey(leg.symbol, exitOrderId), "EXIT");
       }
       orderIdsBySymbol.set(leg.symbol, ids);
     }
@@ -3348,7 +3974,17 @@ export class CrossSectionalExecutor {
     // `feeIsExchangeSourced` already implies `realFees !== null`, but TS cannot narrow through it:
     // `realFees` is a `let` reassigned inside the loop above, which defeats aliased-condition
     // narrowing. The redundant check is for the type checker only and changes no behaviour.
-    const fees = feeIsExchangeSourced && realFees !== null ? realFees : notionalTouched * TAKER_FEE_RATE;
+    const estimatedFees = basket.legs.reduce((sum, leg) => {
+      const entry = leg.entryLiquidity
+        ? leg.entryLiquidity.makerQty * leg.entryPrice * 0.0002 + leg.entryLiquidity.takerQty * leg.entryPrice * TAKER_FEE_RATE
+        : leg.qty * leg.entryPrice * TAKER_FEE_RATE;
+      const exitSlices = leg.exitFills;
+      const exit = Array.isArray(exitSlices) && exitSlices.length > 0
+        ? exitSlices.reduce((sliceSum, slice) => sliceSum + slice.qty * slice.price * (slice.liquidity === "MAKER" ? 0.0002 : TAKER_FEE_RATE), 0)
+        : (leg.exitPrice ?? leg.entryPrice) * leg.qty * TAKER_FEE_RATE;
+      return sum + entry + exit;
+    }, 0);
+    const fees = feeIsExchangeSourced && realFees !== null ? realFees : estimatedFees;
     basket.status = "CLOSED";
     basket.closedAt = this.nowIso();
     basket.closeReason = reason;
@@ -3387,10 +4023,13 @@ export class CrossSectionalExecutor {
     // never convert an estimate or a page-truncated commission set into a supposedly actual R.
     for (const leg of basket.legs) {
       const entryCommission = commissionBySymbolOrderId.get(roleKey(leg.symbol, leg.entryOrderId));
-      const exitCommission =
-        leg.exitOrderId && leg.exitOrderId !== "POSITION_ALREADY_FLAT"
-          ? commissionBySymbolOrderId.get(roleKey(leg.symbol, leg.exitOrderId))
-          : undefined;
+      const exitIds = leg.exitOrderIds ?? (leg.exitOrderId && leg.exitOrderId !== "POSITION_ALREADY_FLAT" ? [leg.exitOrderId] : []);
+      const exitCommission = exitIds.length > 0
+        ? exitIds.reduce<number | undefined>((sum, orderId) => {
+          const commission = commissionBySymbolOrderId.get(roleKey(leg.symbol, orderId));
+          return commission === undefined || sum === undefined ? undefined : sum + commission;
+        }, 0)
+        : undefined;
       const settled =
         feeIsExchangeSourced &&
         !anyPageSaturated &&
@@ -3862,6 +4501,7 @@ export class CrossSectionalExecutor {
       variant: signal.variant ?? "RAW",
       openedAt: this.nowIso(),
       closesAtMs: signal.openedAtMs + signal.horizonMs,
+      policyFingerprint: buildCurrentCrossSectionalPolicyFingerprint(this.nowIso()),
       takeProfitReturn: this.respectSignalRiskGeometry ? signal.takeProfitReturn ?? null : undefined,
       stopLossReturn: this.respectSignalRiskGeometry ? signal.stopLossReturn ?? null : undefined,
       riskDistanceAtOpen: Number.isFinite(signal.riskDistanceAtOpen) && signal.riskDistanceAtOpen! > 0

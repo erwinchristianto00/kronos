@@ -20,16 +20,16 @@
       "why": "+35% return per unit of slot time at statistically identical per-basket return. Lost in a release cutover on 2026-08-05; this file exists because of it."
     },
     "CROSS_SECTIONAL_EXEC_STOP_NET_RETURN": {
-      "value": "0.06",
-      "why": "Symmetric disaster cap, fires on ~4% of baskets. Every TIGHTER stop tested on 364 blocks lost money; a narrow stop looked like a winner on close-only data (t +2.00) and reversed once intra-hour was modelled (t -2.58)."
+      "value": "0",
+      "why": "No new-basket stop. Canonical continuation research keeps NoTP/Hold as the comparator; a stop challenger has not passed robust temporal OOS. Existing pre-cutover baskets keep their separately pinned legacy stop."
     },
     "CROSS_SECTIONAL_EXEC_TP_NET_RETURN": {
       "value": "0.06",
-      "why": "Symmetric partner to the stop. Do NOT lower it: TP 0.45% cost more than the lane earned (no-TP +68.4% vs TP -149.2% on one slot over 2 years, paired t +5.24)."
+      "why": "Retained only as an explicit dormant numeric value. TP is disabled by the separate boolean; deleting this key would silently revive the 0.60% default if that boolean ever drifted."
     },
     "CROSS_SECTIONAL_EXEC_TP_DISABLED": {
-      "value": "0",
-      "why": "Must be explicit. DELETING the numeric TP env does not disable the TP - it silently falls back to 0.60%, which is the losing configuration."
+      "value": "1",
+      "why": "Must be explicit. The numeric key alone never disables TP; new baskets use Hold to the 36h execution cap. Existing pre-cutover baskets keep their separately pinned legacy TP."
     },
     "CROSS_SECTIONAL_SMART_BASKET_V1": {
       "value": "1",
@@ -43,9 +43,37 @@
       "value": "0",
       "why": "Second, explicit layer over the scans threshold. Its own measurement is the weakest of the three (proxy regime classifier, sign-flips out-of-sample), but it contributes to the pair via first-to-fire truncation."
     },
+    "CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED": {
+      "value": "0",
+      "why": "Adaptive exits remain OFF in production. Ghost observation continues, but regime/context/MFE may not send an order until a challenger passes robust forward evidence."
+    },
+    "CROSS_SECTIONAL_K": {
+      "value": "3",
+      "why": "Canonical 3L/3S basket geometry. Explicitly pinned so a release cannot silently change the number of legs per side."
+    },
+    "CROSS_SECTIONAL_INTERVAL": {
+      "value": "1h",
+      "why": "Canonical measurement bar interval."
+    },
+    "CROSS_SECTIONAL_MOMENTUM_BARS": {
+      "value": "36",
+      "why": "Plain MOM36 signal baseline."
+    },
+    "CROSS_SECTIONAL_HORIZON_BARS": {
+      "value": "48",
+      "why": "Measurement horizon remains 48h; execution cap is separately 36h and must never be confused with this research label."
+    },
     "CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP": {
       "value": "0.058",
       "why": "Formation admission gate: long-short separation floor. The code default 0.02 is inert (rejects ~0.2% of baskets). At 0.058 across 48 offsets, mean/basket rises monotonically 0.1634% -> 0.2394%, max drawdown falls -54.47% -> -44.03%, and it improves BOTH out-of-sample halves - turning the losing half from -6.92% to +4.79%. Absolute MOM36 strength and dispersion were tested as alternative gates and have no gradient."
+    },
+    "CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER": {
+      "value": "2",
+      "why": "Concentration guardrail only; it is not claimed as an alpha source."
+    },
+    "CROSS_SECTIONAL_FILTERED_WEIGHTING": {
+      "value": "CAPPED_SCORE_RANK",
+      "why": "Current production weighting; the forward cohort labels every basket so it can be compared without mixing old policies."
     },
     "CROSS_SECTIONAL_EDGE_MAX_STORED_OBSERVATIONS": {
       "value": "15000",
@@ -62,6 +90,30 @@
     "CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS": {
       "value": "20000",
       "why": "How long the reduce-only post-only exit rests before it is cancelled and the remainder crosses. Bounded 1s-120s in code."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_MAX_HOLD_HOURS": {
+      "value": "36",
+      "why": "Exit contract retained for an already-open pre-cutover basket that has no policy fingerprint."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_STOP_NET_RETURN": {
+      "value": "0.06",
+      "why": "Pre-cutover stop retained only for rows with no policy fingerprint; it does not alter a new basket."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_TP_NET_RETURN": {
+      "value": "0.06",
+      "why": "Pre-cutover TP retained only for rows with no policy fingerprint; it does not alter a new basket."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_TP_DISABLED": {
+      "value": "0",
+      "why": "Pre-cutover TP was enabled; keeping it explicit prevents a new release from rewriting an existing basket's exit contract."
+    },
+    "CROSS_SECTIONAL_LEGACY_MAKER_EXIT_ENABLED": {
+      "value": "0",
+      "why": "Maker exit did not exist in the pre-cutover runtime, so an existing basket remains on its original market-exit contract."
+    },
+    "CROSS_SECTIONAL_LEGACY_ADAPTIVE_EXITS_ENABLED": {
+      "value": "0",
+      "why": "Pre-cutover adaptive exits were operationally disabled; legacy rows preserve that behavior."
     },
     "CROSS_SECTIONAL_EXEC_TICK_MS": {
       "value": "60000",

@@ -36,6 +36,7 @@ import {
   isCrossSectionalTrendMixedAdmissionIndependent,
   crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
+import { crossSectionalExecTickMs } from "./lib/cross-sectional-policy.js";
 import { buildCrossSectionalReport, CROSS_SECTIONAL_FILTERED_SIGNAL, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
 import {
   SingleSymbolLaneExecutor,
@@ -2254,11 +2255,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         ...sharedExposureReservation,
       });
-      if (!isTest) {
-        const execTick = () => void crossSectionalExecutor?.tick();
-        setTimeout(execTick, 90_000); // first run after the first cross-sectional cycle
-        setInterval(execTick, 5 * 60_000);
-      }
+      // The same env-backed scheduler runs on testnet and live.  Previously LIVE alone received a
+      // fixed five-minute interval while /control displayed CROSS_SECTIONAL_EXEC_TICK_MS; testnet
+      // had no automatic executor tick at all.  A testnet deployment is now a real smoke of the
+      // same runtime behaviour, not a manual-only approximation.
+      const crossSectionalTickMs = crossSectionalExecTickMs();
+      const scheduleCrossSectionalTick = (delayMs: number, tick: () => void) => {
+        setTimeout(tick, Math.min(delayMs, crossSectionalTickMs));
+        setInterval(tick, crossSectionalTickMs);
+      };
+      scheduleCrossSectionalTick(90_000, () => void crossSectionalExecutor?.tick());
 
       // 2026-07-08 (operator: "wire lane baru ke allocation selection, jangan sampe ada blocker"):
       // two ADDITIONAL executor instances, one per newly-wired cross-sectional variant. Unlike the
@@ -2348,16 +2354,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         ...sharedExposureReservation,
       });
-      if (!isTest) {
-        // Staggered start/interval offsets vs. the FILTERED tick above — purely to avoid dispatching
-        // 3 executors' Binance calls in the exact same event-loop tick, not a correctness requirement.
-        const trendTick = () => void crossSectionalTrendExecutor?.tick();
-        const mixedTick = () => void crossSectionalMixedExecutor?.tick();
-        setTimeout(trendTick, 120_000);
-        setInterval(trendTick, 5 * 60_000);
-        setTimeout(mixedTick, 150_000);
-        setInterval(mixedTick, 5 * 60_000);
-      }
+      // Staggered starts avoid three Binance bursts, while the interval stays the single effective
+      // CROSS_SECTIONAL_EXEC_TICK_MS source of truth for every cross-sectional executor.
+      scheduleCrossSectionalTick(120_000, () => void crossSectionalTrendExecutor?.tick());
+      scheduleCrossSectionalTick(150_000, () => void crossSectionalMixedExecutor?.tick());
     }
 
     // Directional cross-sectional sublanes (testnet only). The selector is mutually exclusive:
