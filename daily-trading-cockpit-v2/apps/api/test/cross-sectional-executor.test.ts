@@ -521,6 +521,174 @@ describe("CrossSectionalExecutor — account-exposure reservation wiring (2026-0
     }
   });
 
+  it("[MAKER-FALLBACK-FEES] retains the filled taker id (not the cancelled maker id) and requires every commission row", async () => {
+    const prior = {
+      makerEntry: process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED,
+      makerWait: process.env.CROSS_SECTIONAL_MAKER_WAIT_MS,
+      makerExit: process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED,
+      tpDisabled: process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED,
+    };
+    process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = "1";
+    process.env.CROSS_SECTIONAL_MAKER_WAIT_MS = "1000";
+    process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED = "0";
+    process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED = "1";
+    try {
+      const client = new FakeExecClient() as FakeExecClient & {
+        cancelOrder: (symbol: string, orderId: string) => Promise<void>;
+      };
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      const orderIdByClientId = new Map<string, string>();
+      let seq = 0;
+      const order = (symbol: string, orderId: string, status: string, avgPrice: number, executedQty: number): FuturesOrder => ({
+        symbol,
+        orderId,
+        clientOrderId: "",
+        status,
+        type: "MARKET",
+        side: "BUY",
+        reduceOnly: false,
+        price: 0,
+        stopPrice: 0,
+        origQty: executedQty,
+        executedQty,
+        avgPrice,
+        updateTime: NOW_MS,
+      });
+      client.placeOrder = async (params) => {
+        client.placed.push(params);
+        const id = `${params.symbol}-${params.type === "LIMIT" ? "maker" : params.reduceOnly ? "exit" : "taker"}-${++seq}`;
+        if (params.newClientOrderId) orderIdByClientId.set(params.newClientOrderId, id);
+        const isMaker = params.type === "LIMIT";
+        const price = client.fillPriceBySymbol.get(params.symbol) ?? 0;
+        return order(params.symbol, id, isMaker ? "NEW" : "FILLED", isMaker ? 0 : price, isMaker ? 0 : params.quantity);
+      };
+      client.cancelOrder = async () => {};
+      client.queryOrder = async (symbol, orderId) => {
+        const isMaker = orderId.includes("-maker-");
+        const price = client.fillPriceBySymbol.get(symbol) ?? 0;
+        return order(symbol, orderId, isMaker ? "CANCELED" : "FILLED", isMaker ? 0 : price, isMaker ? 0 : 1);
+      };
+      client.getUserTrades = async (symbol) => client.placed
+        .filter((p) => p.symbol === symbol && p.type !== "LIMIT")
+        .map((p) => ({
+          orderId: orderIdByClientId.get(p.newClientOrderId ?? "")!,
+          price: client.fillPriceBySymbol.get(symbol) ?? 0,
+          qty: p.quantity,
+          realizedPnl: 0,
+          commission: 0.05,
+          commissionAsset: "USDT",
+          time: NOW_MS,
+        }));
+
+      const { executor, store } = makeExecutor({
+        client,
+        signalMs: NOW_MS - 5 * 60_000,
+        readPublicQuote: (symbol) => ({
+          bid: symbol === "SOLUSDT" ? 99.99 : 0.0999,
+          ask: symbol === "SOLUSDT" ? 100.01 : 0.1001,
+          mid: symbol === "SOLUSDT" ? 100 : 0.1,
+          atMs: NOW_MS,
+          venue: "TEST_BOOK",
+        }),
+      });
+      await executor.tick();
+      const basket = store.getState().baskets[0]!;
+      expect(basket.status).toBe("COMPLETE");
+      // The two GTX orders were cancelled unfilled.  The ledger must identify the two MARKET
+      // fallbacks that actually opened the legs, or their commissions will never be collected.
+      expect(basket.legs.map((leg) => leg.entryOrderId).sort()).toEqual(["DOGEUSDT-taker-4", "SOLUSDT-taker-3"]);
+      expect(basket.legs.map((leg) => leg.entryOrderIds).sort()).toEqual([["DOGEUSDT-taker-4"], ["SOLUSDT-taker-3"]]);
+
+      basket.closesAtMs = NOW_MS - 1;
+      await executor.tick();
+      expect(basket.status).toBe("CLOSED");
+      // 2 actual taker entries + 2 actual exits; the cancelled maker orders have no trade rows.
+      expect(basket.feeSource).toBe("EXCHANGE");
+      expect(basket.feeEstimateUsd).toBeCloseTo(0.2, 9);
+    } finally {
+      if (prior.makerEntry === undefined) delete process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED;
+      else process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = prior.makerEntry;
+      if (prior.makerWait === undefined) delete process.env.CROSS_SECTIONAL_MAKER_WAIT_MS;
+      else process.env.CROSS_SECTIONAL_MAKER_WAIT_MS = prior.makerWait;
+      if (prior.makerExit === undefined) delete process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED;
+      else process.env.CROSS_SECTIONAL_MAKER_EXIT_ENABLED = prior.makerExit;
+      if (prior.tpDisabled === undefined) delete process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED;
+      else process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED = prior.tpDisabled;
+    }
+  });
+
+  it("[MAKER-FALLBACK-RESTART] adopts both a maker partial and its filled taker remainder after a crash", async () => {
+    const client = new FakeExecClient();
+    const exchangeOrder = (orderId: string, executedQty: number, avgPrice: number, status = "FILLED"): FuturesOrder => ({
+      symbol: "SOLUSDT",
+      orderId,
+      clientOrderId: "",
+      status,
+      type: "MARKET",
+      side: "BUY",
+      reduceOnly: false,
+      price: 0,
+      stopPrice: 0,
+      origQty: 10,
+      executedQty,
+      avgPrice,
+      updateTime: NOW_MS,
+    });
+    client.queryOrderByClientIdResponses.set("xsec-restart-e0f", exchangeOrder("fallback-fill", 6, 101));
+    client.queryOrder = async (_symbol, orderId) => {
+      expect(orderId).toBe("maker-fill");
+      return exchangeOrder("maker-fill", 4, 100, "CANCELED");
+    };
+    const { executor, store } = makeExecutor({ client });
+    store.getState().baskets.push({
+      basketId: "maker-partial-restart",
+      sourceObservationId: "xsec:restart",
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      openedAt: NOW,
+      closesAtMs: NOW_MS + 24 * 3_600_000,
+      legs: [],
+      status: "PLACING",
+      plan: [{
+        planIndex: 0,
+        symbol: "SOLUSDT",
+        side: "LONG",
+        requestedQty: 10,
+        refPrice: 100,
+        reservationId: null,
+        entryClientOrderId: "xsec-restart-e0",
+        makerRestingOrderId: "maker-fill",
+        makerRestingPrice: 100,
+        takerFallbackClientOrderId: "xsec-restart-e0f",
+        makerOutcome: { action: "FALLBACK_TAKER", reason: "partial maker then fallback", makerQty: 4, takerQty: 6 },
+        status: "PLACING",
+        failureReason: null,
+      }],
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    });
+    store.save();
+
+    await executor.tick();
+
+    const basket = store.getState().baskets.find((candidate) => candidate.basketId === "maker-partial-restart")!;
+    expect(basket.status).toBe("COMPLETE");
+    expect(basket.legs).toHaveLength(1);
+    expect(basket.legs[0]).toMatchObject({
+      symbol: "SOLUSDT",
+      qty: 10,
+      entryPrice: 100.6,
+      entryOrderId: "maker-fill",
+      entryOrderIds: ["maker-fill", "fallback-fill"],
+      entryLiquidity: { makerQty: 4, takerQty: 6, reason: "partial maker then fallback" },
+    });
+    expect(client.placed).toHaveLength(0); // recovery adopted real fills; it never re-entered.
+  });
+
   it("reserves both legs upfront (same basketId, per-leg clientOrderId matching what placeOrder submits) and commits each from its actual fill", async () => {
     const ledger = makeFakeReservationLedger();
     const client = new FakeExecClient();
@@ -1848,6 +2016,35 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     // Real sum (4 × $0.05 = $0.20), NOT the notional-based estimate.
     expect(basket.feeEstimateUsd).toBeCloseTo(0.2, 9);
     expect(basket.netPnlUsd).toBeCloseTo(basket.grossPnlUsd! - 0.2, 9);
+  });
+
+  it("[FEE-COMPLETENESS] never labels a partial order-id collection as EXCHANGE truth", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+
+    // Return only the two entry rows.  The reduce-only exits genuinely filled, but their rows are
+    // absent from this page; old code still stamped the partial $0.10 as EXCHANGE truth.
+    client.getUserTrades = async (symbol) => client.placed
+      .map((p, index) => ({ p, orderId: String(100 + index) }))
+      .filter(({ p }) => p.symbol === symbol && !p.reduceOnly)
+      .map(({ p, orderId }) => ({
+        orderId,
+        price: client.fillPriceBySymbol.get(symbol) ?? 0,
+        qty: p.quantity,
+        realizedPnl: 0,
+        commission: 0.05,
+        commissionAsset: "USDT",
+        time: NOW_MS,
+      }));
+    basket.closesAtMs = NOW_MS - 1;
+    await executor.tick();
+
+    expect(basket.status).toBe("CLOSED");
+    expect(basket.feeSource).toBe("ESTIMATE_TAKER_FLAT");
   });
 
   // [OOM-FIX-2] lastNetReturn used to only ever be stamped by the periodic mark-price check

@@ -364,7 +364,8 @@ export function isCrossSectionalLossReentryGuardEnabled(env: NodeJS.ProcessEnv =
  * open basket look worse than it is and invites closing a working position early.
  *
  * MEASURED 2026-08-15 on testnet, three independent ways that agree:
- *   1. Code: closeBasket() sums getUserTrades commissions over BOTH entryOrderId and exitOrderId,
+ *   1. Code: closeBasket() sums getUserTrades commissions over every actual entryOrderId
+ *      (including a maker+taker split) and exitOrderId,
  *      so the stored feeEstimateUsd is already a full round trip (unlike the directional lanes,
  *      whose feeEstimateUsd holds only the exit side while entryCommissionUsd goes unbooked).
  *   2. Per-fill exchange records (execution-fills.json, 66 fills, fetchComplete, not truncated):
@@ -560,6 +561,11 @@ export interface ExecutorLeg {
   side: "LONG" | "SHORT";
   qty: number;
   entryPrice: number;
+  /** Every exchange order which contributed to this entry.  A maker partial followed by a
+   * taker remainder has two real entry orders; keeping only one silently drops commission and
+   * can make restart reconciliation lose already-filled exposure.  `entryOrderId` remains the
+   * primary/legacy-compatible id; consumers that need complete economics must use this array. */
+  entryOrderIds?: string[];
   entryOrderId: string;
   /** False when the exchange never confirmed a real fill price (see resolveFillPrice) and
    *  entryPrice fell back to the pre-trade reference price — a signal the recorded entry
@@ -616,6 +622,29 @@ export interface ExecutorLeg {
   exitMakerPrice?: number | null;
   exitFallbackQty?: number | null;
   exitFallbackPrice?: number | null;
+}
+
+/** A restart-reconciled planned entry.  The plural ids are deliberately carried through this
+ * short-lived result so a maker partial plus taker fallback is adopted as one tracked leg, rather
+ * than as only the fallback quantity. */
+type ReconciledPlannedEntry =
+  | {
+      outcome: "FILLED";
+      qty: number;
+      avgPrice: number;
+      orderId: string;
+      entryOrderIds: string[];
+      entryLiquidity?: { makerQty: number; takerQty: number; reason: string };
+    }
+  | { outcome: "NOT_PLACED" | "INCONCLUSIVE" };
+
+/** Legacy rows only persisted a scalar id.  New rows persist all contributing orders. */
+function entryOrderIdsForLeg(leg: ExecutorLeg): string[] {
+  const ids = Array.isArray(leg.entryOrderIds)
+    ? leg.entryOrderIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+    : [];
+  if (ids.length > 0) return Array.from(new Set(ids));
+  return leg.entryOrderId ? [leg.entryOrderId] : [];
 }
 
 export interface SmartBasketRuntime {
@@ -960,19 +989,16 @@ export interface ExecutorBasket {
    *  make a decision). Same contract and same values as SingleSymbolPosition.feeSource in
    *  single-symbol-lane-executor.ts; see that field's doc comment for the full rationale.
    *
-   *    "EXCHANGE"            — summed from getUserTrades commission rows for this basket's own leg
-   *                            order ids.
-   *    "ESTIMATE_TAKER_FLAT" — the notionalTouched × TAKER_FEE_RATE fallback, taken whenever ANY
-   *                            per-symbol fetch threw or no leg order id matched a trade at all.
+   *    "EXCHANGE"            — summed from getUserTrades commission rows for every expected
+   *                            entry and exit order id, with no saturated trade page.
+   *    "ESTIMATE_TAKER_FLAT" — the conservative fallback, taken whenever ANY per-symbol fetch
+   *                            threw, a page was saturated, or an expected order id was missing.
    *    undefined             — basket persisted before this field existed, never closed, or closed
    *                            via the RECONCILED_POSITION_ALREADY_FLAT abort path (which sets
    *                            feeEstimateUsd itself to null). UNKNOWN — never assume exchange-true.
    *
-   *  CAVEAT, same as the single-symbol field: "EXCHANGE" documents the METHOD, not completeness.
-   *  The sum is taken over one 1000-row getUserTrades page per unique symbol; a basket whose legs
-   *  were pushed off that page by unrelated activity still labels EXCHANGE while under-counting.
-   *  Only `sawAnyTrade` (all-or-nothing) is checked today, not per-leg coverage — recording a
-   *  matched-vs-expected leg count would make that detectable and is a worthwhile follow-up. */
+   *  The one-page limitation is fail-closed: a saturated page or a missing expected id cannot be
+   *  called exchange-exact and instead uses the explicit conservative estimate. */
   feeSource?: "EXCHANGE" | "ESTIMATE_TAKER_FLAT";
   netPnlUsd: number | null;
   /** Set ONLY at one site: closeBasket()'s staleBookReconciled branch, when a leg was closed
@@ -1382,6 +1408,14 @@ export class CrossSectionalExecutorStore {
             for (const leg of b.legs ?? []) {
               if (typeof leg.entryOrderId === "number") leg.entryOrderId = String(leg.entryOrderId);
               if (typeof leg.exitOrderId === "number") leg.exitOrderId = String(leg.exitOrderId);
+              if (Array.isArray(leg.entryOrderIds)) {
+                leg.entryOrderIds = Array.from(new Set(
+                  leg.entryOrderIds
+                    .filter((id): id is string | number => typeof id === "string" || typeof id === "number")
+                    .map((id) => String(id))
+                    .filter((id) => id.length > 0),
+                ));
+              }
             }
           }
           // 2026-07-19 real-money audit fix (BUG 1): legacy records persisted before
@@ -2219,7 +2253,7 @@ export class CrossSectionalExecutor {
     side: "BUY" | "SELL",
     refBid: number | null,
     refAsk: number | null,
-  ): Promise<{ orderId: string; avgPrice: number; executedQty: number }> {
+  ): Promise<{ orderId: string; entryOrderIds: string[]; avgPrice: number; executedQty: number }> {
     // Pre-placed by preplaceMakerLegs? Then the order is already resting and the wait already
     // happened — go straight to cancel/re-query/resolve. Placing a second one here would be a
     // duplicate position, which is why this check comes before everything else.
@@ -2235,7 +2269,7 @@ export class CrossSectionalExecutor {
         quantity: planned.requestedQty, newClientOrderId: planned.entryClientOrderId,
       });
       planned.makerOutcome = { action: "NO_BOOK", reason: this.client.cancelOrder ? "no usable submit-time quote" : "client cannot cancel — maker unsafe", makerQty: 0, takerQty: planned.requestedQty };
-      return { orderId: order.orderId, avgPrice: order.avgPrice, executedQty: order.executedQty };
+      return { orderId: order.orderId, entryOrderIds: [order.orderId], avgPrice: order.avgPrice, executedQty: order.executedQty };
     }
 
     const maker = preplaced
@@ -2280,7 +2314,7 @@ export class CrossSectionalExecutor {
       // order's own numbers lets the caller's existing partial-fill handling book exactly what the
       // exchange confirmed and orphan nothing it cannot see.
       this.store.save();
-      return { orderId: maker.orderId, avgPrice: latest.avgPrice, executedQty: latest.executedQty };
+      return { orderId: maker.orderId, entryOrderIds: [maker.orderId], avgPrice: latest.avgPrice, executedQty: latest.executedQty };
     }
 
     // Persist the fallback identity BEFORE submitting it, so a crash in the next few hundred ms
@@ -2326,9 +2360,23 @@ export class CrossSectionalExecutor {
     // 0 rather than inventing one — the same safe degradation as before, but now only after the
     // order that actually filled has been asked.
     const avgPrice = takerPx > 0 && totalQty > 0 ? (makerQty * makerPx + takerQty * takerPx) / totalQty : 0;
-    // The MAKER order id is the leg's identity: it is what planned.entryClientOrderId maps to and
-    // what every existing recovery path already looks up.
-    return { orderId: maker.orderId, avgPrice, executedQty: totalQty };
+    // Persist the ACTUAL quantity, not just the requested fallback amount.  A terminal MARKET
+    // order can have a real partial fill; reporting the requested size here would overstate both
+    // exposure and the modeled fee if exchange trades later prove incomplete.
+    planned.makerOutcome.takerQty = takerQty;
+    // The scalar remains for backwards-compatible readers, but a full fallback must point to the
+    // order that actually filled.  A partial maker+taker entry retains both identities for fees,
+    // per-fill records, and restart recovery.
+    const entryOrderIds = [
+      ...(makerQty > 0 ? [maker.orderId] : []),
+      ...(takerQty > 0 ? [taker.orderId] : []),
+    ];
+    return {
+      orderId: makerQty > 0 ? maker.orderId : taker.orderId,
+      entryOrderIds,
+      avgPrice,
+      executedQty: totalQty,
+    };
   }
 
   private async resolveFillPrice(
@@ -3103,9 +3151,7 @@ export class CrossSectionalExecutor {
     let sweepFrom = idx;
     if (ambiguous.status === "PLACING") {
       sweepFrom = idx + 1;
-      const resolution = ambiguous.takerFallbackClientOrderId
-            ? await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.takerFallbackClientOrderId)
-            : await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.entryClientOrderId);
+      const resolution = await this.reconcilePlannedEntry(ambiguous);
       if (resolution.outcome === "NOT_PLACED") {
         // Unlike recoverIncompleteBaskets' own NOT_PLACED handling (which falls through to placing
         // this leg fresh, reusing the SAME reservation), this basket is being KILLED, not resumed —
@@ -3129,7 +3175,9 @@ export class CrossSectionalExecutor {
           qty: resolution.qty,
           entryPrice: resolution.avgPrice,
           entryOrderId: resolution.orderId,
+          entryOrderIds: resolution.entryOrderIds,
           entryPriceConfirmed: true,
+          ...(resolution.entryLiquidity ? { entryLiquidity: resolution.entryLiquidity } : {}),
           exitPrice: null,
           exitOrderId: null,
           exitPriceConfirmed: null,
@@ -3934,12 +3982,10 @@ export class CrossSectionalExecutor {
     // a partial close, the already-exited legs are skipped above, and the old accumulator silently
     // EXCLUDED them from the basket's final P&L.
     let gross = 0;
-    let notionalTouched = 0;
     for (const leg of basket.legs) {
       const exit = leg.exitPrice ?? leg.entryPrice;
       const dir = leg.side === "LONG" ? 1 : -1;
       gross += dir * (exit - leg.entryPrice) * leg.qty;
-      notionalTouched += leg.entryPrice * leg.qty + exit * leg.qty;
     }
     // 2026-07-12 fee-recording fix: prefer REAL exchange commissions over the flat TAKER_FEE_RATE
     // estimate — one getUserTrades page per unique symbol, filtered to THIS basket's own entry/exit
@@ -3948,7 +3994,6 @@ export class CrossSectionalExecutor {
     // closing bookkeeping-wise this tick), and when no trade matched at all (paranoia: an empty
     // real sum on legs that demonstrably filled means the page missed them, not that they were free).
     let realFees: number | null = 0;
-    let sawAnyTrade = false;
     const orderIdsBySymbol = new Map<string, Set<string>>();
     // 2026-07-27 (RECORDING-ONLY): role lookup for the per-fill recorder. Built from the SAME leg
     // walk that builds orderIdsBySymbol, purely so a matched row can be labelled ENTRY vs EXIT.
@@ -3964,21 +4009,32 @@ export class CrossSectionalExecutor {
     // we already have the userTrades pages in memory; no extra exchange call is introduced.
     const commissionBySymbolOrderId = new Map<string, number>();
     const roleKey = (symbol: string, orderId: string): string => `${symbol}|${orderId}`;
+    // An exchange fee is exact only when every order that actually contributed to the basket has
+    // at least one matching user-trade row.  "One matching row" used to be enough to label a
+    // partial collection EXCHANGE, silently omitting fallback-entry commissions.
+    const expectedOrderKeys = new Set<string>();
     for (const leg of basket.legs) {
       const ids = orderIdsBySymbol.get(leg.symbol) ?? new Set<string>();
-      ids.add(leg.entryOrderId);
-      roleBySymbolOrderId.set(roleKey(leg.symbol, leg.entryOrderId), "ENTRY");
+      for (const entryOrderId of entryOrderIdsForLeg(leg)) {
+        ids.add(entryOrderId);
+        const key = roleKey(leg.symbol, entryOrderId);
+        expectedOrderKeys.add(key);
+        roleBySymbolOrderId.set(key, "ENTRY");
+      }
       const exitOrderIds = leg.exitOrderIds ?? (leg.exitOrderId !== null ? [leg.exitOrderId] : []);
       for (const exitOrderId of exitOrderIds) {
         if (exitOrderId === "POSITION_ALREADY_FLAT") continue;
         ids.add(exitOrderId);
-        roleBySymbolOrderId.set(roleKey(leg.symbol, exitOrderId), "EXIT");
+        const key = roleKey(leg.symbol, exitOrderId);
+        expectedOrderKeys.add(key);
+        roleBySymbolOrderId.set(key, "EXIT");
       }
       orderIdsBySymbol.set(leg.symbol, ids);
     }
     // Per-fill rows for the recorder, collected from the pages this loop ALREADY fetches — no extra
     // exchange call, no extra latency, and the arithmetic below is untouched.
     const matchedFills: ExecutionFill[] = [];
+    const matchedOrderKeys = new Set<string>();
     // RECORDING-ONLY. True as soon as ANY per-symbol page came back FULL, i.e. Binance may have cut
     // rows off its edge. Never consulted by the fee arithmetic below — only by fetchComplete.
     let anyPageSaturated = false;
@@ -3989,8 +4045,8 @@ export class CrossSectionalExecutor {
         for (const t of trades) {
           if (ids.has(t.orderId)) {
             realFees = (realFees ?? 0) + t.commission;
-            sawAnyTrade = true;
             const commissionKey = roleKey(symbol, t.orderId);
+            matchedOrderKeys.add(commissionKey);
             commissionBySymbolOrderId.set(commissionKey, (commissionBySymbolOrderId.get(commissionKey) ?? 0) + t.commission);
             try {
               matchedFills.push(fillFromUserTrade(t, roleBySymbolOrderId.get(roleKey(symbol, t.orderId)) ?? "UNKNOWN"));
@@ -4004,7 +4060,11 @@ export class CrossSectionalExecutor {
         break;
       }
     }
-    const feeIsExchangeSourced = realFees !== null && sawAnyTrade;
+    const allExpectedOrdersMatched = expectedOrderKeys.size > 0 && [...expectedOrderKeys].every((key) => matchedOrderKeys.has(key));
+    // A saturated page can split one expected order's fills across an unseen next page, so it is
+    // not enough merely to observe that order once.  Degrade to the explicit conservative model
+    // rather than persist a partial exchange sum as truth.
+    const feeIsExchangeSourced = realFees !== null && !anyPageSaturated && allExpectedOrdersMatched;
     // `feeIsExchangeSourced` already implies `realFees !== null`, but TS cannot narrow through it:
     // `realFees` is a `let` reassigned inside the loop above, which defeats aliased-condition
     // narrowing. The redundant check is for the type checker only and changes no behaviour.
@@ -4056,7 +4116,13 @@ export class CrossSectionalExecutor {
     // incumbent basket P&L can still use its documented aggregate fallback, but Four-Brain must
     // never convert an estimate or a page-truncated commission set into a supposedly actual R.
     for (const leg of basket.legs) {
-      const entryCommission = commissionBySymbolOrderId.get(roleKey(leg.symbol, leg.entryOrderId));
+      const entryIds = entryOrderIdsForLeg(leg);
+      const entryCommission = entryIds.length > 0
+        ? entryIds.reduce<number | undefined>((sum, orderId) => {
+            const commission = commissionBySymbolOrderId.get(roleKey(leg.symbol, orderId));
+            return commission === undefined || sum === undefined ? undefined : sum + commission;
+          }, 0)
+        : undefined;
       const exitIds = leg.exitOrderIds ?? (leg.exitOrderId && leg.exitOrderId !== "POSITION_ALREADY_FLAT" ? [leg.exitOrderId] : []);
       const exitCommission = exitIds.length > 0
         ? exitIds.reduce<number | undefined>((sum, orderId) => {
@@ -4086,13 +4152,13 @@ export class CrossSectionalExecutor {
     this.recordCortexRealAttribution(basket);
     // Per-fill execution record (2026-07-27, report-only, fail-safe — see its doc comment). Rows
     // come from the getUserTrades pages the fee sum above already fetched. `fetchComplete` requires
-    // BOTH that no per-symbol fetch threw (realFees !== null) AND that no page came back saturated:
-    // a full limit:1000 page may have cut this basket's own rows off its edge, and a short fill list
-    // that claims completeness is the same silent understatement this store exists to eliminate
-    // (2026-07-27 review finding — `realFees !== null` alone detects only a THROWN fetch). A basket
+    // no per-symbol fetch threw, no page came back saturated, and EVERY expected entry/exit id
+    // matched a real row. A full limit:1000 page may have cut this basket's own rows off its edge,
+    // and a short fill list that claims completeness is the same silent understatement this store
+    // exists to eliminate. A basket
     // whose fetch threw on its FIRST symbol records nothing at all (empty list ⇒ no-op), which is
     // honest — no record beats a record that reads as "these were all the fills".
-    this.recordExecutionFills(basket, matchedFills, realFees !== null && !anyPageSaturated);
+    this.recordExecutionFills(basket, matchedFills, feeIsExchangeSourced);
   }
 
   /** Per-fill execution record for one fully closed basket (2026-07-27, report-only). Wrapped so a
@@ -4896,6 +4962,7 @@ export class CrossSectionalExecutor {
               quantity: planned.requestedQty,
               newClientOrderId: planned.entryClientOrderId,
             });
+        const entryOrderIds = "entryOrderIds" in order ? order.entryOrderIds : [order.orderId];
         const resolvedEntry = await this.resolveFillPrice(planned.symbol, order.orderId, order.avgPrice, planned.refPrice);
         // 2026-07-19 real-money audit fix (BUG 3): a genuine partial MARKET fill (realistic on
         // thin-liquidity basket-universe symbols during volatility spikes — exactly what this
@@ -4915,6 +4982,7 @@ export class CrossSectionalExecutor {
           qty: filledQty,
           entryPrice: resolvedEntry.price,
           entryOrderId: order.orderId,
+          entryOrderIds,
           entryPriceConfirmed: resolvedEntry.confirmed,
           ...(submitRef ? { submitRef } : {}),
           ...(planned.makerOutcome
@@ -4952,9 +5020,7 @@ export class CrossSectionalExecutor {
         const isConfirmedRejection = error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error";
 
         if (!isConfirmedRejection) {
-          const resolution = planned.takerFallbackClientOrderId
-            ? await this.reconcilePlannedLeg(planned.symbol, planned.takerFallbackClientOrderId)
-            : await this.reconcilePlannedLeg(planned.symbol, planned.entryClientOrderId);
+          const resolution = await this.reconcilePlannedEntry(planned);
 
           if (resolution.outcome === "FILLED") {
             // Adopt exactly like recoverIncompleteBaskets' own FILLED branch — the order actually
@@ -4970,7 +5036,9 @@ export class CrossSectionalExecutor {
               qty: resolution.qty,
               entryPrice: resolution.avgPrice,
               entryOrderId: resolution.orderId,
+              entryOrderIds: resolution.entryOrderIds,
               entryPriceConfirmed: true,
+              ...(resolution.entryLiquidity ? { entryLiquidity: resolution.entryLiquidity } : {}),
               exitPrice: null,
               exitOrderId: null,
               exitPriceConfirmed: null,
@@ -5118,9 +5186,7 @@ export class CrossSectionalExecutor {
         if (startIndex >= plan.length) continue; // defensive — nothing left to do
         const ambiguous = plan[startIndex]!;
         if (ambiguous.status === "PLACING") {
-          const resolution = ambiguous.takerFallbackClientOrderId
-            ? await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.takerFallbackClientOrderId)
-            : await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.entryClientOrderId);
+          const resolution = await this.reconcilePlannedEntry(ambiguous);
           if (resolution.outcome === "INCONCLUSIVE") continue; // never guess — retry next tick
           if (resolution.outcome === "FILLED") {
             if (ambiguous.reservationId) {
@@ -5132,7 +5198,9 @@ export class CrossSectionalExecutor {
               qty: resolution.qty,
               entryPrice: resolution.avgPrice,
               entryOrderId: resolution.orderId,
+              entryOrderIds: resolution.entryOrderIds,
               entryPriceConfirmed: true,
+              ...(resolution.entryLiquidity ? { entryLiquidity: resolution.entryLiquidity } : {}),
               exitPrice: null,
               exitOrderId: null,
               exitPriceConfirmed: null,
@@ -5209,6 +5277,57 @@ export class CrossSectionalExecutor {
    * the outcome for any status/executedQty combination the existing test suite already covered
    * (confirmed: no existing test paired a terminal-no-fill status with a nonzero executedQty).
    */
+  private async reconcilePlannedEntry(planned: PlannedLeg): Promise<ReconciledPlannedEntry> {
+    const clientOrderId = planned.takerFallbackClientOrderId ?? planned.entryClientOrderId;
+    const resolved = await this.reconcilePlannedLeg(planned.symbol, clientOrderId);
+    if (resolved.outcome !== "FILLED") return resolved;
+
+    // Ordinary MARKET (or full maker) entry: one exchange order is the entire entry.
+    if (!planned.takerFallbackClientOrderId) {
+      return { ...resolved, entryOrderIds: [resolved.orderId] };
+    }
+
+    // A fallback client id is persisted before the fallback submit.  If it filled after a maker
+    // partial and the process died before `basket.legs.push`, reconciling only this order would
+    // make the already-filled maker slice invisible and leave it open at final close.  Query the
+    // durable maker id too, then adopt BOTH real fills as one leg.  If either fact cannot be read,
+    // do not guess: retry next tick with the reservation and plan still intact.
+    if (!planned.makerRestingOrderId) {
+      return { ...resolved, entryOrderIds: [resolved.orderId] };
+    }
+    let maker: FuturesOrder;
+    try {
+      maker = await this.client.queryOrder(planned.symbol, planned.makerRestingOrderId);
+    } catch {
+      return { outcome: "INCONCLUSIVE" };
+    }
+    const makerQty = Number.isFinite(maker.executedQty) && maker.executedQty > 0 ? maker.executedQty : 0;
+    const takerQty = resolved.qty;
+    const makerPrice = maker.avgPrice;
+    const takerPrice = resolved.avgPrice;
+    if (!(takerQty > 0 && takerPrice > 0) || (makerQty > 0 && !(makerPrice > 0))) {
+      return { outcome: "INCONCLUSIVE" };
+    }
+    const qty = makerQty + takerQty;
+    if (!(qty > 0)) return { outcome: "INCONCLUSIVE" };
+    const entryOrderIds = [
+      ...(makerQty > 0 ? [maker.orderId] : []),
+      ...(takerQty > 0 ? [resolved.orderId] : []),
+    ];
+    return {
+      outcome: "FILLED",
+      qty,
+      avgPrice: (makerQty * makerPrice + takerQty * takerPrice) / qty,
+      orderId: makerQty > 0 ? maker.orderId : resolved.orderId,
+      entryOrderIds,
+      entryLiquidity: {
+        makerQty,
+        takerQty,
+        reason: planned.makerOutcome?.reason ?? "maker/taker fallback recovered after restart",
+      },
+    };
+  }
+
   private async reconcilePlannedLeg(
     symbol: string,
     entryClientOrderId: string,
