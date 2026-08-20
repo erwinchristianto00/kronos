@@ -27,6 +27,10 @@ import { registerTradingAssistantRoutes } from "./routes/trading-assistant.js";
 import { BinanceFuturesPrivateClient } from "./lib/binance-futures-private.js";
 import { FuturesMarketReferenceCache } from "./lib/futures-market-reference-cache.js";
 import {
+  FuturesReferenceHealthTracker,
+  type FuturesReferenceHealthSnapshot,
+} from "./lib/futures-reference-health.js";
+import {
   CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
   CROSS_SECTIONAL_TREND_LANE_ID,
   CROSS_SECTIONAL_MIXED_LANE_ID,
@@ -1071,6 +1075,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // the four-brain path never mutates it.
   let liveExecutionStore: LiveExecutionStore | null = null;
   let crossSectionalExecutor: CrossSectionalExecutor | null = null;
+  // Source-chain telemetry is process-local and read-only. It deliberately has
+  // no path to an order, an eligibility override, or an execution setting.
+  let futuresReferenceHealth: FuturesReferenceHealthTracker | null = null;
+  let probeFuturesReferenceHealth:
+    | ((symbols: string[]) => Promise<FuturesReferenceHealthSnapshot | null>)
+    | null = null;
   // 2026-07-08: two more instances mirroring TREND_BETA_VOL / MIXED_MEAN_REVERSION, alongside the
   // FILTERED foundation instance above (see cross-sectional-executor.ts's targetVariant/laneId).
   let crossSectionalTrendExecutor: CrossSectionalExecutor | null = null;
@@ -1278,13 +1288,67 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // Sizing is deliberately separate from the public/spot quote cache above. A
     // multiplier contract's bare spot symbol has a different unit, so only this
     // cache's exact-symbol USD-M mark (or USD-M book midpoint) can price it.
+    const futuresReferenceHealthTracker = new FuturesReferenceHealthTracker();
+    futuresReferenceHealth = futuresReferenceHealthTracker;
     const futuresMarketReferenceCache = new FuturesMarketReferenceCache(
       {
         getMarkPrice: (symbol) => liveClient.getMarkPrice(symbol),
         getBookTicker: (symbol) => liveClient.getBookTicker(symbol),
       },
-      { maxAgeMs: 10_000, maxSymbols: MAX_PUBLIC_QUOTE_SYMBOLS },
+      {
+        maxAgeMs: 10_000,
+        maxSymbols: MAX_PUBLIC_QUOTE_SYMBOLS,
+        onEvent: (event) => futuresReferenceHealthTracker.recordCacheEvent(event),
+      },
     );
+    // This is a GET-only diagnostic probe.  The same getExchangeFilters() path
+    // is what order submission uses to reject inactive/non-perpetual/non-USDT
+    // symbols, so the dashboard never labels a spot-only symbol as futures-ready.
+    probeFuturesReferenceHealth = async (requestedSymbols) => {
+      const symbols = Array.from(new Set(
+        requestedSymbols
+          .map((symbol) => symbol.trim().toUpperCase())
+          .filter((symbol) => /^[A-Z0-9]{4,30}$/.test(symbol)),
+      )).slice(0, 12);
+      let filters: Awaited<ReturnType<typeof liveClient.getExchangeFilters>>;
+      try {
+        filters = await liveClient.getExchangeFilters();
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "USD-M exchangeInfo unavailable";
+        for (const symbol of symbols) futuresReferenceHealthTracker.recordEligibility(symbol, null, reason);
+        return futuresReferenceHealthTracker.snapshot(symbols);
+      }
+      for (const symbol of symbols) {
+        const eligible = filters.has(symbol);
+        futuresReferenceHealthTracker.recordEligibility(
+          symbol,
+          eligible,
+          eligible ? undefined : "not an active USD-M USDT perpetual in exchangeInfo",
+        );
+        if (!eligible) continue;
+        const reference = await futuresMarketReferenceCache.refresh(symbol);
+        if (!reference) {
+          futuresReferenceHealthTracker.recordReferenceUnavailable(
+            symbol,
+            "USD-M mark and two-sided book unavailable after exchangeInfo eligibility passed",
+          );
+          continue;
+        }
+        futuresReferenceHealthTracker.recordReferenceUsed(reference);
+        if (reference.source === "USD_M_MARK_PRICE") {
+          const book = await liveClient.getBookTicker(symbol).catch(() => null);
+          const bid = book?.bid ?? null;
+          const ask = book?.ask ?? null;
+          if (
+            typeof bid === "number" && Number.isFinite(bid) && bid > 0 &&
+            typeof ask === "number" && Number.isFinite(ask) && ask >= bid
+          ) {
+            futuresReferenceHealthTracker.recordMarkBookComparison(symbol, reference.price, (bid + ask) / 2);
+          }
+        }
+      }
+      return futuresReferenceHealthTracker.snapshot(symbols);
+    };
     const currentPublicPrice = async (symbol: string): Promise<number | null> => {
       const executionBookPromise = Promise.race([
         liveClient.getBookTicker(symbol).catch(() => null),
@@ -2213,6 +2277,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         warmPublicQuote: currentPublicPrice,
         readFuturesMarketReference: (symbol) => futuresMarketReferenceCache.read(symbol),
         warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
+        futuresReferenceHealth: futuresReferenceHealthTracker,
         cortexRealAttribution: getCortexRealAttributionStore(),
         // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
         // closeBasket() already fetches one getUserTrades page per unique symbol to sum the real
@@ -2324,6 +2389,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
         readFuturesMarketReference: (symbol) => futuresMarketReferenceCache.read(symbol),
         warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
+        futuresReferenceHealth: futuresReferenceHealthTracker,
         cortexRealAttribution: getCortexRealAttributionStore(),
         // Per-fill execution recorder — see the FILTERED instance above.
         executionFillRecorder: getExecutionFillRecorder(),
@@ -2360,6 +2426,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
         readFuturesMarketReference: (symbol) => futuresMarketReferenceCache.read(symbol),
         warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
+        futuresReferenceHealth: futuresReferenceHealthTracker,
         cortexRealAttribution: getCortexRealAttributionStore(),
         // Per-fill execution recorder — see the FILTERED instance above.
         executionFillRecorder: getExecutionFillRecorder(),
@@ -4540,6 +4607,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     unifiedOrchestrator: () => unifiedOrchestrator,
     unifiedProposalStore: () => unifiedProposalStore,
     singleSymbolPriceTimeline: () => singleSymbolPriceTimeline,
+    futuresReferenceHealth: () => futuresReferenceHealth?.snapshot() ?? null,
+    probeFuturesReferenceHealth: (symbols) =>
+      probeFuturesReferenceHealth ? probeFuturesReferenceHealth(symbols) : Promise.resolve(null),
   });
 
   return app;

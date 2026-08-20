@@ -44,6 +44,7 @@ import {
   verifiedFuturesMarketReferencePrice,
   type FuturesMarketReference,
 } from "./futures-market-reference-cache.js";
+import type { FuturesReferenceHealthTracker } from "./futures-reference-health.js";
 import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
 import type { FourBrainBridgeCandidate, FourBrainBridgeDecision } from "./four-brain-testnet-bridge.js";
 import {
@@ -1592,6 +1593,8 @@ export interface CrossSectionalExecutorOptions {
   readFuturesMarketReference?: (symbol: string) => FuturesMarketReference | null;
   /** Refreshes the selected testnet/mainnet USD-M mark, with a USD-M book-only fallback. */
   warmFuturesMarketReference?: (symbol: string) => Promise<FuturesMarketReference | null>;
+  /** Read-only source-chain telemetry. It cannot alter an entry, a quantity, or a fallback. */
+  futuresReferenceHealth?: FuturesReferenceHealthTracker;
   /** Delay between queryOrder confirmation retries in resolveFillPrice. Default 400ms; tests pass 0. */
   fillConfirmRetryDelayMs?: number;
   /** Daily basket loss breaker limit override (tests inject; default reads
@@ -1751,6 +1754,7 @@ export class CrossSectionalExecutor {
   private readonly warmPublicQuoteFn: CrossSectionalExecutorOptions["warmPublicQuote"] | null;
   private readonly readFuturesMarketReferenceFn: CrossSectionalExecutorOptions["readFuturesMarketReference"] | null;
   private readonly warmFuturesMarketReferenceFn: CrossSectionalExecutorOptions["warmFuturesMarketReference"] | null;
+  private readonly futuresReferenceHealth: FuturesReferenceHealthTracker | null;
   private readonly targetVariant: string;
   private readonly laneId: string;
   private ticking = false;
@@ -1813,6 +1817,7 @@ export class CrossSectionalExecutor {
     this.warmPublicQuoteFn = opts.warmPublicQuote ?? null;
     this.readFuturesMarketReferenceFn = opts.readFuturesMarketReference ?? null;
     this.warmFuturesMarketReferenceFn = opts.warmFuturesMarketReference ?? null;
+    this.futuresReferenceHealth = opts.futuresReferenceHealth ?? null;
     this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
     this.existingNotionalForSymbolFn = opts.existingNotionalForSymbol ?? (() => 0);
     this.maxNotionalPerSymbolAcrossLanesFn = opts.maxNotionalPerSymbolAcrossLanes ?? (() => 0);
@@ -2791,19 +2796,46 @@ export class CrossSectionalExecutor {
    * midpoint; a spot cache value is deliberately not even considered here.
    */
   private async liveMultiplierReferencePrice(symbol: string, mark: unknown = null): Promise<number | null> {
-    const cached = verifiedFuturesMarketReferencePrice(symbol, this.readFuturesMarketReferenceFn?.(symbol));
-    if (cached !== null) return cached;
+    const cachedReference = this.readFuturesMarketReferenceFn?.(symbol);
+    const cached = verifiedFuturesMarketReferencePrice(symbol, cachedReference);
+    if (cached !== null) {
+      this.futuresReferenceHealth?.recordReferenceUsed(cachedReference!);
+      return cached;
+    }
+    if (cachedReference) {
+      this.futuresReferenceHealth?.recordScaleGuardRejected(
+        symbol,
+        "rejected non-USD-M, non-exact-symbol, or non-positive cached sizing reference",
+      );
+    }
     try {
-      const refreshed = await this.warmFuturesMarketReferenceFn?.(symbol);
-      const fresh = verifiedFuturesMarketReferencePrice(symbol, refreshed);
-      if (fresh !== null) return fresh;
+      const refreshedReference = await this.warmFuturesMarketReferenceFn?.(symbol);
+      const fresh = verifiedFuturesMarketReferencePrice(symbol, refreshedReference);
+      if (fresh !== null) {
+        this.futuresReferenceHealth?.recordReferenceUsed(refreshedReference!);
+        return fresh;
+      }
+      if (refreshedReference) {
+        this.futuresReferenceHealth?.recordScaleGuardRejected(
+          symbol,
+          "rejected non-USD-M, non-exact-symbol, or non-positive refreshed sizing reference",
+        );
+      }
     } catch {
       // A missing public futures reference stays a safe refusal at the caller.
     }
     // positionRisk is also a same-environment USD-M source.  It remains a last
     // safe fallback for deployments that have not yet supplied the public cache,
     // but the raw signal/spot price is never reachable from this method.
-    return typeof mark === "number" && Number.isFinite(mark) && mark > 0 ? mark : null;
+    if (typeof mark === "number" && Number.isFinite(mark) && mark > 0) {
+      this.futuresReferenceHealth?.recordPositionRiskFallback(symbol, mark);
+      return mark;
+    }
+    this.futuresReferenceHealth?.recordReferenceUnavailable(
+      symbol,
+      "USD-M mark, USD-M two-sided book, and same-environment positionRisk reference unavailable",
+    );
+    return null;
   }
 
   /**

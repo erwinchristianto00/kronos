@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Kronos control cockpit (3104) — trading + research + decision audit.
 
-READ-ONLY BY CONSTRUCTION: no exchange credentials, no exchange client. It GETs from the
-live/testnet APIs and reads their stores. It cannot place, cancel, or size an order.
+READ-ONLY FOR TRADING: no exchange credentials, no exchange client. It GETs from the
+live/testnet APIs and reads their stores. It cannot place, cancel, or size an order. The
+only local write is an independent Smart Basket E / LOSS_CUT ghost-observation ledger; it
+never feeds back into an executor or exchange action.
 
 Every number is read from runtime or computed here from runtime data. Nothing about measured
 performance is hardcoded. Where runtime has no source the UI says so.
 """
-import json, math, os, statistics as st, subprocess, time, urllib.request
+import json, math, os, statistics as st, subprocess, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone, timedelta
 
-PORT = 3104
+PORT = int(os.environ.get("PORT", "3104"))
 INST = {
  "live":    {"api":"http://127.0.0.1:3103","label":"LIVE","long":"LIVE · mainnet","port":3103,"id":"3103",
              "pm2":"dtc-api-live",
@@ -26,6 +28,23 @@ PROD_SIGNAL = "MOM36_FILTERED"
 NA = "Tidak tersedia"
 _c = {"at":0.0,"d":None}; TTL = 25.0
 
+# Smart Basket E and LOSS_CUT are deliberately observational challengers. These values are
+# frozen research contracts, not executor settings. The state file is separate from every
+# runtime store consumed by the trading processes.
+SMART_E_VERSION = "smart-basket-ghost-monitor-v3"
+SMART_E_STATE_FILE = "/root/kronos-control-data/smart-basket-e-ghost.json"
+SMART_E_ARM_AGE_H = 24.0
+SMART_E_ARM_MFE = 0.010
+SMART_E_GIVEBACK = 0.70
+LOSS_CUT_MIN_AGE_H = 12.0
+LOSS_CUT_MAX_NET_RETURN = -0.010
+LOSS_CUT_MIN_MFE = 0.005
+LOSS_CUT_GIVEBACK = 0.70
+SMART_E_HORIZON_H = 36.0
+SMART_E_MAX_COMPLETED = 2000
+_smart_e_lock = threading.Lock()
+_smart_e_state = None
+
 def get(u,t=12):
     try:
         with urllib.request.urlopen(u,timeout=t) as r: return json.load(r)
@@ -36,14 +55,15 @@ def sh(c,t=25):
     except Exception as e: return "ERR %s"%str(e)[:60]
 
 def active_release(pm2_name,fallback):
-    """Follow PM2's actual run-api.sh instead of leaving /control pinned to an old release."""
+    """Follow PM2 actual run-api.sh instead of showing a stale release path."""
     try:
-        for p in json.loads(sh("pm2 jlist") or "[]"):
-            if p.get("name")!=pm2_name: continue
-            run=(p.get("pm2_env") or {}).get("pm_exec_path") or ""
+        for proc in json.loads(sh("pm2 jlist") or "[]"):
+            if proc.get("name") != pm2_name: continue
+            run=((proc.get("pm2_env") or {}).get("pm_exec_path") or "")
             if run.endswith("/deploy/run-api.sh"):
                 return os.path.dirname(os.path.dirname(run))
-    except Exception: pass
+    except Exception:
+        pass
     return fallback
 
 def age_h(p):
@@ -53,6 +73,71 @@ def age_h(p):
 def piso(s):
     try: return datetime.strptime(str(s)[:19],"%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception: return None
+
+TAIPEI = timezone(timedelta(hours=8), "Asia/Taipei")
+
+def basket_execution_policy(basket, executor):
+    """Return the exit contract frozen for this basket, never just the current env.
+
+    A deployment may change the current policy while an older basket remains open.  New rows
+    carry their policy fingerprint; pre-fingerprint rows retain the executor's explicit legacy
+    contract.  The runtime max-hold value is a last-resort display fallback only.
+    """
+    fingerprint=basket.get("policyFingerprint") if isinstance(basket,dict) else None
+    execution=fingerprint.get("execution") if isinstance(fingerprint,dict) else None
+    if isinstance(execution,dict):
+        return execution,"fingerprint basket"
+    legacy=executor.get("legacyExitPolicy") if isinstance(executor,dict) else None
+    if isinstance(legacy,dict):
+        return legacy,"kontrak legacy basket"
+    cap=executor.get("maxHoldHours") if isinstance(executor,dict) else None
+    return {"executionCapHours":cap},"fallback runtime (kontrak basket tidak tersedia)"
+
+def basket_horizon_close(basket, executor, now=None):
+    """Scheduled HORIZON timestamp and remaining time for an open basket.
+
+    This is deliberately a scheduled horizon, not a promise that a TP/SL/emergency exit cannot
+    happen earlier.  The executor still makes the actual exit on its next tick and reconciles it.
+    """
+    now=now or datetime.now(timezone.utc)
+    opened=piso((basket or {}).get("openedAt"))
+    policy,source=basket_execution_policy(basket or {},executor or {})
+    cap=policy.get("executionCapHours") if isinstance(policy,dict) else None
+    if not (opened and fin(cap) and cap>0):
+        return {"openedAt":opened,"capHours":cap,"source":source,"dueAt":None,"remainingSeconds":None,
+                "policy":policy if isinstance(policy,dict) else {}}
+    due=opened+timedelta(hours=float(cap))
+    return {"openedAt":opened,"capHours":float(cap),"source":source,"dueAt":due,
+            "remainingSeconds":(due-now).total_seconds(),"policy":policy}
+
+def horizon_remaining_text(seconds):
+    if not fin(seconds): return NA
+    if seconds<=0: return "sudah jatuh tempo; menunggu tick executor"
+    total=int(seconds)
+    days,rest=divmod(total,86400); hours,rest=divmod(rest,3600); minutes=rest//60
+    pieces=[]
+    if days: pieces.append("%dh"%days)
+    if hours or days: pieces.append("%dj"%hours)
+    pieces.append("%dm"%minutes)
+    return "sisa "+" ".join(pieces)
+
+def horizon_close_detail(info, executor):
+    """Short, source-labelled human text for the Open Baskets card."""
+    due=info.get("dueAt")
+    if not due: return "waktu HORIZON tidak tersedia (%s)"%info.get("source")
+    local=due.astimezone(TAIPEI)
+    tick=((executor.get("effectiveRuntime") or {}).get("executorTick") or {}).get("effectiveMs")
+    tick_text="tick runtime tidak tersedia"
+    if fin(tick) and tick>0: tick_text="dicek tiap %.0f dtk"%(tick/1000.0)
+    policy=info.get("policy") or {}
+    early=[]
+    if policy.get("takeProfitEnabled"): early.append("TP")
+    if policy.get("stopLossEnabled"): early.append("SL")
+    if policy.get("adaptiveExitsEnabled"): early.append("exit adaptif")
+    early_text=("; %s legacy bisa menutup lebih awal"%"/".join(early)) if early else ""
+    return ("%s Taipei · %s UTC · %s · %s · sumber %s%s"%(
+        local.strftime("%d %b %Y %H:%M:%S"),due.strftime("%d %b %Y %H:%M:%S"),
+        horizon_remaining_text(info.get("remainingSeconds")),tick_text,info.get("source"),early_text))
 
 def clamp(v,lo=0.0,hi=100.0): return max(lo,min(hi,v))
 def fin(v): return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
@@ -312,6 +397,743 @@ def post_trade_verdict(q,net):
     if not fin(q) or not fin(net): return NA,NA
     return ("PROSES BAGUS" if q>=65 else "PROSES SEDANG" if q>=45 else "PROSES LEMAH"),("HASIL UNTUNG" if net>0 else "HASIL RUGI")
 
+# ------------------------------------------------------------------ Smart Basket E · ghost only
+def _e_iso(now):
+    return now.astimezone(timezone.utc).isoformat()
+
+def _e_empty_state(now):
+    at=_e_iso(now)
+    return {"version":SMART_E_VERSION,"monitorStartedAt":at,"lossCutMonitorStartedAt":at,
+            "lastRefreshAt":None,"baskets":{}}
+
+def _e_load_locked(now):
+    """Load only the cockpit-owned ghost ledger. It is intentionally not an executor store."""
+    global _smart_e_state
+    if _smart_e_state is not None: return _smart_e_state
+    try:
+        with open(SMART_E_STATE_FILE) as f: data=json.load(f)
+    except Exception:
+        data=None
+    if not isinstance(data,dict): data=_e_empty_state(now)
+    if not isinstance(data.get("baskets"),dict): data["baskets"]={}
+    # The ledger is cockpit-only data. Upgrade its schema in place without changing an
+    # executor store or making any inference that a pre-monitor trigger was historical truth.
+    data["version"]=SMART_E_VERSION
+    data.setdefault("monitorStartedAt",_e_iso(now))
+    # LOSS_CUT starts only with this v3 observer. Retained E rows are therefore explicitly
+    # left-censored for LOSS_CUT, even if they happened to open after the older E observer.
+    data.setdefault("lossCutMonitorStartedAt",_e_iso(now))
+    data.setdefault("lastRefreshAt",None)
+    _smart_e_state=data
+    return data
+
+def _e_save_locked(data):
+    """Atomically persist first-trigger evidence; this path never touches trading state."""
+    directory=os.path.dirname(SMART_E_STATE_FILE)
+    try:
+        os.makedirs(directory,exist_ok=True)
+        tmp=SMART_E_STATE_FILE+".tmp"
+        with open(tmp,"w") as f:
+            json.dump(data,f,ensure_ascii=False,separators=(",",":"),sort_keys=True)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp,SMART_E_STATE_FILE)
+        data.pop("writeError",None)
+    except Exception as ex:
+        data["writeError"]=str(ex)[:180]
+
+def _e_runtime_flags(cfg):
+    """Read only the executor environment already loaded by the local control host."""
+    supplied=cfg.get("flags") if isinstance(cfg,dict) else None
+    if isinstance(supplied,dict): return supplied
+    flags={}; rel=cfg.get("rel") if isinstance(cfg,dict) else None
+    if not rel: return flags
+    try:
+        for ln in open(rel+"/.env"):
+            if "=" not in ln or ln.lstrip().startswith("#"): continue
+            k,v=ln.split("=",1)
+            if k.startswith("CROSS_SECTIONAL_"): flags[k.strip()]=v.strip()
+    except Exception: pass
+    return flags
+
+def _e_policy(ex,flags=None):
+    """Describe the actual exit contract; NoTP means no TP *and* no other early exit."""
+    hold=ex.get("maxHoldHours")
+    tp=ex.get("tpNetReturnPct")
+    stop=ex.get("stopNetReturnPct")
+    no_tp=ex.get("tpDisabled") is True
+    no_stop=(not fin(stop)) or stop<=0
+    if isinstance(flags,dict) and "CROSS_SECTIONAL_SMART_BASKET_V1" in flags:
+        smart_enabled=str(flags.get("CROSS_SECTIONAL_SMART_BASKET_V1") or "").strip()=="1"
+        try: smart_scans=int(float(flags.get("CROSS_SECTIONAL_SMART_INVALIDATION_SCANS") or "2"))
+        except Exception: smart_scans=2
+        if not smart_enabled: smart_exit_active=False; smart_state="DISABLED"
+        elif smart_scans>=999: smart_exit_active=False; smart_state="INERT (invalidationScans=%d)"%smart_scans
+        else: smart_exit_active=True; smart_state="ACTIVE (invalidationScans=%d)"%smart_scans
+    else:
+        smart_exit_active=None; smart_state="UNVERIFIED"
+    canonical=no_tp and no_stop and smart_exit_active is False and fin(hold) and abs(float(hold)-SMART_E_HORIZON_H)<0.01
+    exact=["tpDisabled=%s"%("true" if no_tp else "false"),
+           "tpNetReturnPct=%s"%(("%.6g"%tp) if fin(tp) else "unknown"),
+           "stopNetReturnPct=%s"%(("%.6g"%stop) if fin(stop) else "off"),
+           "maxHoldHours=%s"%(("%.6g"%hold) if fin(hold) else "unknown"),
+           "smartBasketExit=%s"%smart_state]
+    bits=[]
+    if no_tp: bits.append("NO TP")
+    elif fin(tp): bits.append("TP ACTIVE +%.2f%%"%tp)
+    else: bits.append("TP ACTIVE")
+    if not no_stop: bits.append("STOP ACTIVE −%.2f%%"%stop)
+    if smart_exit_active is True: bits.append("SMART EXIT ACTIVE")
+    elif smart_exit_active is None: bits.append("SMART EXIT UNVERIFIED")
+    bits.append("HOLD %sh"%(("%.2f"%hold).rstrip("0").rstrip(".") if fin(hold) else "?"))
+    return {"canonicalNoTp36":canonical,"tpDisabled":no_tp,"tpNetReturnPct":tp,"stopNetReturnPct":stop,
+            "smartExitActive":smart_exit_active,"smartExitState":smart_state,
+            "maxHoldHours":hold,"exact":"; ".join(exact),
+            "mismatchReason":None if canonical else "; ".join(exact),
+            "label":"NO TP · HOLD 36h" if canonical else "POLICY MISMATCH · "+" · ".join(bits)}
+
+def _e_policy_from_execution(execution,source,identity):
+    """Build the ghost comparator from this basket's frozen exit policy.
+
+    The executor's top-level status describes the policy for a *new* basket.  A
+    legacy basket can legitimately retain a different TP/SL contract through a
+    deployment, so it must never borrow that global NoTP label.
+    """
+    if not isinstance(execution,dict):
+        return {"canonicalNoTp36":False,"tpDisabled":False,"tpNetReturnPct":None,
+                "stopNetReturnPct":None,"smartExitActive":None,"smartExitState":"UNVERIFIED",
+                "maxHoldHours":None,"basketPolicySource":source,"basketPolicyIdentity":identity,
+                "exact":"basket exit contract unavailable",
+                "mismatchReason":"basket exit contract unavailable",
+                "label":"POLICY UNKNOWN / PAUSED"}
+    hold=execution.get("executionCapHours")
+    tp_enabled=execution.get("takeProfitEnabled")
+    tp_raw=execution.get("takeProfitNetReturn")
+    stop_enabled=execution.get("stopLossEnabled")
+    stop_raw=execution.get("stopLossNetReturn")
+    adaptive=execution.get("adaptiveExitsEnabled")
+    no_tp=tp_enabled is False
+    no_stop=stop_enabled is False
+    adaptive_off=adaptive is False
+    tp=100*tp_raw if fin(tp_raw) else None
+    stop=100*stop_raw if fin(stop_raw) else None
+    canonical=no_tp and no_stop and adaptive_off and fin(hold) and abs(float(hold)-SMART_E_HORIZON_H)<0.01
+    exact=["basketPolicySource=%s"%source,
+           "takeProfitEnabled=%s"%("false" if no_tp else "true" if tp_enabled is True else "unknown"),
+           "takeProfitNetReturnPct=%s"%("%.6g"%tp if fin(tp) else "off" if no_tp else "unknown"),
+           "stopLossEnabled=%s"%("false" if no_stop else "true" if stop_enabled is True else "unknown"),
+           "stopLossNetReturnPct=%s"%("%.6g"%stop if fin(stop) else "off" if no_stop else "unknown"),
+           "adaptiveExitsEnabled=%s"%("false" if adaptive_off else "true" if adaptive is True else "unknown"),
+           "executionCapHours=%s"%("%.6g"%hold if fin(hold) else "unknown")]
+    bits=[]
+    if no_tp: bits.append("NO TP")
+    elif fin(tp): bits.append("TP ACTIVE +%.2f%%"%tp)
+    else: bits.append("TP UNVERIFIED")
+    if not no_stop:
+        bits.append("STOP ACTIVE −%.2f%%"%stop if fin(stop) else "STOP UNVERIFIED")
+    if not adaptive_off:
+        bits.append("ADAPTIVE EXIT ACTIVE" if adaptive is True else "ADAPTIVE EXIT UNVERIFIED")
+    bits.append("HOLD %sh"%(("%.2f"%hold).rstrip("0").rstrip(".") if fin(hold) else "?"))
+    return {"canonicalNoTp36":canonical,"tpDisabled":no_tp,"tpNetReturnPct":tp,"stopNetReturnPct":stop,
+            "smartExitActive":None if not isinstance(adaptive,bool) else adaptive,
+            "smartExitState":"OFF" if adaptive_off else "ACTIVE" if adaptive is True else "UNVERIFIED",
+            "maxHoldHours":hold,"basketPolicySource":source,"basketPolicyIdentity":identity,
+            "exact":"; ".join(exact),"mismatchReason":None if canonical else "; ".join(exact),
+            "label":"NO TP · HOLD 36h" if canonical else "POLICY MISMATCH · "+" · ".join(bits)}
+
+def _e_policy_for_basket(ex,flags,basket):
+    """Return the exact frozen policy that governs one open/recent basket."""
+    execution,source=basket_execution_policy(basket or {},ex or {})
+    fingerprint=(basket or {}).get("policyFingerprint") if isinstance(basket,dict) else None
+    identity=(fingerprint.get("policyId") if isinstance(fingerprint,dict) else None) or ("LEGACY" if source=="kontrak legacy basket" else "UNKNOWN")
+    if source.startswith("fallback"):
+        # A fallback can describe the current runtime but cannot prove an old basket's contract.
+        policy=_e_policy(ex,flags)
+        policy.update({"canonicalNoTp36":False,"basketPolicySource":source,"basketPolicyIdentity":identity,
+                       "exact":"basketPolicySource=%s; basket exit contract unavailable"%source,
+                       "mismatchReason":"basket exit contract unavailable",
+                       "label":"POLICY UNKNOWN / PAUSED"})
+        return policy
+    return _e_policy_from_execution(execution,source,identity)
+
+def _e_basket_key(instance,b):
+    bid=b.get("basketId") or b.get("id")
+    return None if not bid else "%s:%s"%(instance,str(bid))
+
+def _e_age_hours(opened_at,now):
+    opened=piso(opened_at)
+    return (now-opened).total_seconds()/3600.0 if opened else None
+
+def _e_notional_usd(b):
+    return sum(abs((l.get("qty") or 0)*(l.get("entryPrice") or 0)) for l in (b.get("legs") or [])
+               if isinstance(l,dict) and fin(l.get("qty")) and fin(l.get("entryPrice")))
+
+def _e_score_gap(b):
+    for src in (b,b.get("smartBasket") or {}):
+        if fin(src.get("scoreGap")): return src.get("scoreGap")
+    plan=b.get("plan") or []
+    longs=[]; shorts=[]
+    for p in plan:
+        if not isinstance(p,dict): continue
+        v=p.get("scoreAtOpen") if fin(p.get("scoreAtOpen")) else p.get("score")
+        if not fin(v): continue
+        if str(p.get("side") or "").upper()=="LONG": longs.append(v)
+        if str(p.get("side") or "").upper()=="SHORT": shorts.append(v)
+    return (sum(longs)/len(longs)-sum(shorts)/len(shorts)) if longs and shorts else None
+
+def _e_usd(rec,net_return):
+    cap=rec.get("capitalUsd")
+    return net_return*cap if fin(net_return) and fin(cap) else None
+
+def _e_condition(age,mfe,net):
+    giveback=(mfe-net)/mfe if fin(mfe) and mfe>0 and fin(net) else None
+    armed=fin(age) and age>=SMART_E_ARM_AGE_H and fin(mfe) and mfe>=SMART_E_ARM_MFE
+    return {"ageHours":age,"mfeNetReturn":mfe,"netReturn":net,"givebackFraction":giveback,
+            "arm":armed,"exit":bool(armed and fin(giveback) and giveback>=SMART_E_GIVEBACK)}
+
+def _e_condition_from_basket(b,now):
+    age=_e_age_hours(b.get("openedAt"),now)
+    net=b.get("lastNetReturn")
+    sb=b.get("smartBasket") or {}; mfe=sb.get("maxNetReturn")
+    if not fin(mfe) and fin(net): mfe=net
+    return _e_condition(age,mfe,net)
+
+def _loss_cut_condition(age,mfe,net):
+    """Frozen LOSS_CUT rule evaluated from the single net whole-basket path."""
+    giveback=(mfe-net)/mfe if fin(mfe) and mfe>0 and fin(net) else None
+    age_ok=fin(age) and age>=LOSS_CUT_MIN_AGE_H
+    pnl_ok=fin(net) and net<=LOSS_CUT_MAX_NET_RETURN
+    mfe_ok=fin(mfe) and mfe>=LOSS_CUT_MIN_MFE
+    giveback_ok=fin(giveback) and giveback>=LOSS_CUT_GIVEBACK
+    return {"ageHours":age,"mfeNetReturn":mfe,"netReturn":net,"givebackFraction":giveback,
+            "ageOk":age_ok,"pnlOk":pnl_ok,"mfeOk":mfe_ok,"givebackOk":giveback_ok,
+            "watching":bool(age_ok),"exit":bool(age_ok and pnl_ok and mfe_ok and giveback_ok)}
+
+def _e_left_censor(started_at,classification,reason,already=None):
+    return {"classification":classification,"reason":reason,"monitorStartedAt":started_at,
+            "conditionAlreadyTrueAtMonitorStart":already,"historicalFirstTriggerUnknown":bool(classification),
+            "firstObservedTriggerAt":None}
+
+def _loss_cut_preexisting(rec,state):
+    opened=piso(rec.get("openedAt"))
+    started=piso(state.get("lossCutMonitorStartedAt"))
+    return (not opened) or (started is None) or opened<=started
+
+def _loss_cut_state(rec):
+    x=rec.get("lossCut")
+    return x if isinstance(x,dict) else {}
+
+def _e_policy_reason(policy):
+    if not isinstance(policy,dict): return "runtime comparator policy unavailable"
+    if policy.get("mismatchReason"): return policy["mismatchReason"]
+    return "tpDisabled=%s; tpNetReturnPct=%s; maxHoldHours=%s"%(
+        "true" if policy.get("tpDisabled") is True else "false",
+        policy.get("tpNetReturnPct"),policy.get("maxHoldHours"))
+
+def _e_comparator_new(policy,at):
+    good=bool(policy.get("canonicalNoTp36"))
+    return {"validAtFirstSeen":good,"validThroughoutObserved":good,
+            "firstMismatchAt":None if good else at,
+            "firstMismatchReason":None if good else _e_policy_reason(policy),
+            "lastObservedPolicy":dict(policy)}
+
+def _e_comparator_update(rec,policy,now):
+    cmp=rec.get("comparator")
+    if not isinstance(cmp,dict):
+        first=rec.get("policyAtFirstSeen") or policy
+        cmp=_e_comparator_new(first,rec.get("firstSeenAt") or _e_iso(now)); rec["comparator"]=cmp
+    cmp["lastObservedPolicy"]=dict(policy)
+    if not policy.get("canonicalNoTp36"):
+        cmp["validThroughoutObserved"]=False
+        if not cmp.get("firstMismatchAt"):
+            cmp["firstMismatchAt"]=_e_iso(now); cmp["firstMismatchReason"]=_e_policy_reason(policy)
+        elif "stopNetReturnPct" not in str(cmp.get("firstMismatchReason") or ""):
+            # Preserve the original mismatch time but upgrade old v1 wording to the complete
+            # current exit-contract diagnosis (TP, stop, horizon, and Smart Basket exit state).
+            cmp["firstMismatchReason"]=_e_policy_reason(policy)
+    return cmp
+
+def _e_bind_basket_policy(rec,policy,now):
+    """Correct pre-fix ghost rows once the executor supplies their frozen policy.
+
+    Older ledger rows stored the instance-wide policy.  That was unsafe for a
+    legacy basket, so replace it only when a stable basket policy identity is
+    observable from the executor response; do not manufacture one for a row
+    that has fallen out of the API's recent window.
+    """
+    identity=policy.get("basketPolicyIdentity") if isinstance(policy,dict) else None
+    if not identity or rec.get("basketPolicyIdentity")==identity:
+        return
+    rec["basketPolicyIdentity"]=identity
+    rec["basketPolicySource"]=policy.get("basketPolicySource")
+    rec["policyAtFirstSeen"]=dict(policy)
+    rec["policyNow"]=dict(policy)
+    rec["comparator"]=_e_comparator_new(policy,rec.get("firstSeenAt") or _e_iso(now))
+
+def _e_left_class(rec):
+    left=rec.get("leftCensor") or {}
+    return left.get("classification")
+
+def _e_cohort_status(rec):
+    left=_e_left_class(rec)
+    if left:
+        reason=(rec.get("leftCensor") or {}).get("reason") or "historical pre-monitor path is unknown"
+        return left,reason
+    if rec.get("lateDiscovery"):
+        return "UNOBSERVED / LATE DISCOVERY","basket was first seen after its path had already elapsed"
+    cmp=rec.get("comparator") or {}
+    if not cmp.get("validThroughoutObserved"):
+        return "COMPARATOR MISMATCH / PAUSED",("runtime mismatch since %s: %s"%(
+            str(cmp.get("firstMismatchAt") or "unknown")[:19],cmp.get("firstMismatchReason") or "unknown"))
+    if not rec.get("forwardEligible"):
+        return "NOT ELIGIBLE","not opened after monitor deployment timestamp"
+    return "VALID FORWARD COHORT","opened after monitor deployment; NoTP + 36h observed throughout"
+
+def _loss_cut_cohort_status(rec):
+    lc=_loss_cut_state(rec); left=lc.get("leftCensor") or {}
+    classification=left.get("classification")
+    if classification:
+        return classification,left.get("reason") or "historical pre-monitor path is unknown"
+    if rec.get("lateDiscovery"):
+        return "UNOBSERVED / LATE DISCOVERY","basket was first discovered after its path had already elapsed"
+    cmp=rec.get("comparator") or {}
+    if not cmp.get("validThroughoutObserved"):
+        return "COMPARATOR MISMATCH / PAUSED",("runtime mismatch since %s: %s"%(
+            str(cmp.get("firstMismatchAt") or "unknown")[:19],cmp.get("firstMismatchReason") or "unknown"))
+    if not rec.get("lossCutForwardEligible"):
+        return "NOT ELIGIBLE","not opened after LOSS_CUT monitor deployment timestamp"
+    return "VALID FORWARD COHORT","opened after LOSS_CUT monitor deployment; NoTP + 36h observed throughout"
+
+def _e_migrate_record(rec,state,policy,now):
+    """Upgrade observer provenance without inventing historical trigger timing."""
+    pre=bool(rec.get("preexistingAtMonitorStart"))
+    if "leftCensor" not in rec:
+        if pre:
+            ghost=rec.get("ghostExit") or {}; first=rec.get("firstSeenAt")
+            age,mfe,net=rec.get("ageHours"),rec.get("maxMfeNetReturn"),rec.get("currentNetReturn")
+            if ghost and ghost.get("observedAt")==first: already=True
+            elif fin(age) and age<SMART_E_ARM_AGE_H: already=False
+            elif fin(mfe) and mfe<SMART_E_ARM_MFE: already=False
+            else: already=None
+            rec["leftCensor"]={"classification":"LEFT-CENSORED / PRE-MONITOR",
+                               "reason":"opened before monitor deployment timestamp; true historical first trigger unknown",
+                               "monitorStartedAt":state.get("monitorStartedAt"),
+                               "conditionAlreadyTrueAtMonitorStart":already,
+                               "historicalFirstTriggerUnknown":True,
+                               "firstObservedTriggerAt":ghost.get("observedAt") if ghost else None}
+        elif rec.get("lateDiscovery"):
+            rec["leftCensor"]={"classification":"UNOBSERVED / LATE DISCOVERY",
+                               "reason":"first discovered after its path had elapsed; exact trigger timing unknown",
+                               "monitorStartedAt":state.get("monitorStartedAt"),
+                               "conditionAlreadyTrueAtMonitorStart":None,
+                               "historicalFirstTriggerUnknown":True,"firstObservedTriggerAt":None}
+        else:
+            rec["leftCensor"]={"classification":None,"reason":None,"monitorStartedAt":state.get("monitorStartedAt"),
+                               "conditionAlreadyTrueAtMonitorStart":None,"historicalFirstTriggerUnknown":False,
+                               "firstObservedTriggerAt":None}
+    # Comparator validity is observed only while a basket is live. A later policy change must
+    # not retroactively invalidate an already completed 36h comparator.
+    if not rec.get("closed") or not isinstance(rec.get("comparator"),dict):
+        _e_comparator_update(rec,policy,now)
+    if "prospectiveFirstGhostTrigger" not in rec:
+        rec["prospectiveFirstGhostTrigger"]=None
+        if not _e_left_class(rec) and rec.get("forwardEligible") and rec.get("ghostExit"):
+            rec["prospectiveFirstGhostTrigger"]=dict(rec["ghostExit"])
+    # LOSS_CUT did not exist in v2. Its own deployment timestamp makes every retained
+    # pre-v3 basket left-censored for this challenger, even where E had exact provenance.
+    lc=_loss_cut_state(rec)
+    if not lc:
+        lc_pre=_loss_cut_preexisting(rec,state)
+        if lc_pre:
+            lc_left=_e_left_censor(state.get("lossCutMonitorStartedAt"),
+                "LEFT-CENSORED / PRE-MONITOR",
+                "opened before LOSS_CUT monitor deployment timestamp; true historical first trigger unknown")
+        elif rec.get("lateDiscovery"):
+            lc_left=_e_left_censor(state.get("lossCutMonitorStartedAt"),
+                "UNOBSERVED / LATE DISCOVERY",
+                "first discovered after its path had elapsed; exact trigger timing unknown")
+        else:
+            lc_left=_e_left_censor(state.get("lossCutMonitorStartedAt"),None,None)
+        lc={"monitorStartedAt":state.get("lossCutMonitorStartedAt"),
+            "preexistingAtMonitorStart":lc_pre,"leftCensor":lc_left,
+            "prospectiveFirstGhostTrigger":None,"ghostExit":None}
+        rec["lossCut"]=lc
+        rec["lossCutForwardEligible"]=not lc_pre and not rec.get("lateDiscovery")
+    else:
+        lc.setdefault("monitorStartedAt",state.get("lossCutMonitorStartedAt"))
+        if not isinstance(lc.get("leftCensor"),dict):
+            lc["leftCensor"]=_e_left_censor(lc.get("monitorStartedAt"),None,None)
+        lc.setdefault("preexistingAtMonitorStart",_loss_cut_preexisting(rec,state))
+        rec.setdefault("lossCutForwardEligible",not lc["preexistingAtMonitorStart"] and not rec.get("lateDiscovery"))
+        lc.setdefault("prospectiveFirstGhostTrigger",None)
+        lc.setdefault("ghostExit",None)
+    return rec
+
+def _e_record(instance,b,policy,state,now,late=False):
+    opened_at=b.get("openedAt")
+    opened=piso(opened_at)
+    monitor_started=piso(state.get("monitorStartedAt"))
+    # A basket that existed before this monitor started is displayed but excluded from forward
+    # aggregation. Its earlier MFE path was not observed prospectively by this ledger.
+    preexisting=(not opened) or (monitor_started is None) or opened<=monitor_started
+    notional=_e_notional_usd(b)
+    snap=_e_condition_from_basket(b,now)
+    if preexisting:
+        left=_e_left_censor(state.get("monitorStartedAt"),"LEFT-CENSORED / PRE-MONITOR",
+                            "opened before monitor deployment timestamp; true historical first trigger unknown",snap["exit"])
+    elif late:
+        left=_e_left_censor(state.get("monitorStartedAt"),"UNOBSERVED / LATE DISCOVERY",
+                            "first discovered after its path had elapsed; exact trigger timing unknown")
+    else:
+        left=_e_left_censor(state.get("monitorStartedAt"),None,None)
+    lc_started=piso(state.get("lossCutMonitorStartedAt"))
+    lc_pre=(not opened) or (lc_started is None) or opened<=lc_started
+    lc_snap=_loss_cut_condition(snap.get("ageHours"),snap.get("mfeNetReturn"),snap.get("netReturn"))
+    if lc_pre:
+        lc_left=_e_left_censor(state.get("lossCutMonitorStartedAt"),"LEFT-CENSORED / PRE-MONITOR",
+                                "opened before LOSS_CUT monitor deployment timestamp; true historical first trigger unknown",
+                                lc_snap["exit"])
+    elif late:
+        lc_left=_e_left_censor(state.get("lossCutMonitorStartedAt"),"UNOBSERVED / LATE DISCOVERY",
+                                "first discovered after its path had elapsed; exact trigger timing unknown")
+    else:
+        lc_left=_e_left_censor(state.get("lossCutMonitorStartedAt"),None,None)
+    at=_e_iso(now)
+    return {"instance":instance,"basketId":str(b.get("basketId") or b.get("id") or ""),
+            "openedAt":opened_at,"openedAtMs":int(opened.timestamp()*1000) if opened else None,
+            "firstSeenAt":at,"lastSeenAt":at,
+            "preexistingAtMonitorStart":preexisting,"lateDiscovery":bool(late),
+            "forwardEligible":not preexisting and not late,"grossNotionalUsd":notional if notional>0 else None,
+            "capitalUsd":notional/2.0 if notional>0 else None,"scoreGap":_e_score_gap(b),
+            "regime":(b.get("smartBasket") or {}).get("regimeClassAtOpen") or b.get("regimeClassAtOpen"),
+            "policyAtFirstSeen":dict(policy),"policyNow":dict(policy),
+            "basketPolicyIdentity":policy.get("basketPolicyIdentity"),
+            "basketPolicySource":policy.get("basketPolicySource"),"maxMfeNetReturn":None,
+            "comparator":_e_comparator_new(policy,at),"leftCensor":left,
+            "prospectiveFirstGhostTrigger":None,"maxMfeAt":None,"armedAt":None,"ghostExit":None,
+            "lossCutForwardEligible":not lc_pre and not late,
+            "lossCut":{"monitorStartedAt":state.get("lossCutMonitorStartedAt"),
+                       "preexistingAtMonitorStart":lc_pre,"leftCensor":lc_left,
+                       "prospectiveFirstGhostTrigger":None,"ghostExit":None},
+            "closed":None}
+
+def _e_observe(rec,b,policy,now,state=None):
+    """Observe one net whole-basket snapshot. No legs are independently evaluated or acted on."""
+    if state is not None: _e_migrate_record(rec,state,policy,now)
+    _e_bind_basket_policy(rec,policy,now)
+    _e_comparator_update(rec,policy,now)
+    rec["lastSeenAt"]=_e_iso(now); rec["policyNow"]=dict(policy)
+    age=_e_age_hours(rec.get("openedAt") or b.get("openedAt"),now)
+    if fin(age): rec["ageHours"]=age
+    score_gap=_e_score_gap(b)
+    if fin(score_gap): rec["scoreGap"]=score_gap
+    regime=(b.get("smartBasket") or {}).get("regimeClassAtOpen") or b.get("regimeClassAtOpen")
+    if regime: rec["regime"]=regime
+    notional=_e_notional_usd(b)
+    if notional>0:
+        rec["grossNotionalUsd"]=notional; rec["capitalUsd"]=notional/2.0
+    net=b.get("lastNetReturn")
+    if not fin(net):
+        pnl=b.get("netPnlUsd"); cap=rec.get("capitalUsd")
+        net=(pnl/cap) if fin(pnl) and fin(cap) and cap else None
+    if fin(net):
+        rec["currentNetReturn"]=net; rec["currentPnlUsd"]=_e_usd(rec,net)
+    sb=b.get("smartBasket") or {}
+    candidates=[rec.get("maxMfeNetReturn"),sb.get("maxNetReturn"),net]
+    mfe=max((x for x in candidates if fin(x)),default=None)
+    if fin(mfe) and (not fin(rec.get("maxMfeNetReturn")) or mfe>rec.get("maxMfeNetReturn")+1e-12):
+        rec["maxMfeNetReturn"]=mfe; rec["maxMfeAt"]=sb.get("maxNetAt") or _e_iso(now)
+    elif fin(mfe):
+        rec["maxMfeNetReturn"]=mfe
+    mfe=rec.get("maxMfeNetReturn")
+    giveback=(mfe-net)/mfe if fin(mfe) and mfe>0 and fin(net) else None
+    if fin(giveback): rec["givebackFraction"]=max(0.0,giveback)
+
+    # Frozen Rule E: arm only after both gates; once armed, freeze the first prospective
+    # observation. A pre-monitor basket never gains a fabricated historical trigger timestamp.
+    if not rec.get("armedAt") and fin(age) and age>=SMART_E_ARM_AGE_H and fin(mfe) and mfe>=SMART_E_ARM_MFE:
+        rec["armedAt"]=_e_iso(now); rec["ageAtArmHours"]=age
+        rec["mfeAtArmNetReturn"]=mfe; rec["mfeAtArmPnlUsd"]=_e_usd(rec,mfe)
+    if rec.get("armedAt") and not rec.get("ghostExit") and fin(mfe) and mfe>0 and fin(net) and fin(giveback) and giveback>=SMART_E_GIVEBACK:
+        rec["ghostExit"]={"observedAt":_e_iso(now),"ageHours":age,"netReturn":net,"pnlUsd":_e_usd(rec,net),
+                          "mfeAtTriggerNetReturn":mfe,"mfeAtTriggerPnlUsd":_e_usd(rec,mfe),
+                          "givebackFraction":giveback,"minNetReturnAfterTrigger":net,
+                          "minPnlUsdAfterTrigger":_e_usd(rec,net)}
+        left=rec.get("leftCensor") or {}
+        if left.get("classification"):
+            left["firstObservedTriggerAt"]=rec["ghostExit"]["observedAt"]
+            left["historicalFirstTriggerUnknown"]=True
+        else:
+            rec["prospectiveFirstGhostTrigger"]=dict(rec["ghostExit"])
+    elif rec.get("ghostExit") and fin(net):
+        # The trigger itself remains immutable. This separate low-water mark quantifies the
+        # maximum post-ghost giveback that E would have avoided while the real basket stayed on.
+        ghost=rec["ghostExit"]
+        prior=ghost.get("minNetReturnAfterTrigger")
+        if not fin(prior) or net<prior:
+            ghost["minNetReturnAfterTrigger"]=net; ghost["minPnlUsdAfterTrigger"]=_e_usd(rec,net)
+
+    # Frozen LOSS_CUT: no leg-level condition and no executor action. The first observed
+    # trigger is immutable. A pre-LOSS_CUT basket is explicitly labeled observed, never true
+    # historical first trigger, because its earlier path was not monitored by this challenger.
+    lc=_loss_cut_state(rec)
+    if lc:
+        lc_cond=_loss_cut_condition(age,mfe,net)
+        lc["lastCondition"]=dict(lc_cond); lc["lastObservedAt"]=_e_iso(now)
+        lc_left=lc.get("leftCensor") or {}
+        if not lc.get("firstObservedAt"):
+            lc["firstObservedAt"]=_e_iso(now)
+            if lc_left.get("classification") and lc_left.get("conditionAlreadyTrueAtMonitorStart") is None:
+                lc_left["conditionAlreadyTrueAtMonitorStart"]=lc_cond["exit"]
+        lc_ghost=lc.get("ghostExit") or {}
+        if lc_cond["exit"] and not lc_ghost:
+            lc_ghost={"observedAt":_e_iso(now),"ageHours":age,"netReturn":net,"pnlUsd":_e_usd(rec,net),
+                      "mfeAtTriggerNetReturn":mfe,"mfeAtTriggerPnlUsd":_e_usd(rec,mfe),
+                      "givebackFraction":lc_cond["givebackFraction"],"minNetReturnAfterTrigger":net,
+                      "minPnlUsdAfterTrigger":_e_usd(rec,net)}
+            lc["ghostExit"]=lc_ghost
+            if lc_left.get("classification"):
+                lc_left["firstObservedTriggerAt"]=lc_ghost["observedAt"]
+                lc_left["historicalFirstTriggerUnknown"]=True
+            else:
+                lc["prospectiveFirstGhostTrigger"]=dict(lc_ghost)
+        elif lc_ghost and fin(net):
+            prior=lc_ghost.get("minNetReturnAfterTrigger")
+            if not fin(prior) or net<prior:
+                lc_ghost["minNetReturnAfterTrigger"]=net
+                lc_ghost["minPnlUsdAfterTrigger"]=_e_usd(rec,net)
+
+def _e_close_comparability(cohort,cohort_reason,reason,hold):
+    if cohort!="VALID FORWARD COHORT":
+        return False,"%s: %s"%(cohort,cohort_reason)
+    if not str(reason).upper().startswith("HORIZON"):
+        return False,"actual close reason %s, not HORIZON"%reason
+    if not fin(hold) or abs(hold-SMART_E_HORIZON_H)>1.0:
+        return False,"actual hold %s h, not the 36h comparator"%(("%.2f"%hold) if fin(hold) else "unknown")
+    return True,"NoTP / 36h comparable"
+
+def _e_finalize(rec,b,policy,now,state=None):
+    if rec.get("closed"): return
+    _e_observe(rec,b,policy,now,state)
+    actual_ret=b.get("lastNetReturn")
+    actual_usd=b.get("netPnlUsd")
+    if not fin(actual_ret) and fin(actual_usd) and fin(rec.get("capitalUsd")) and rec.get("capitalUsd"):
+        actual_ret=actual_usd/rec["capitalUsd"]
+    if not fin(actual_usd): actual_usd=_e_usd(rec,actual_ret)
+    closed_at=b.get("closedAt") or _e_iso(now)
+    opened=piso(rec.get("openedAt")); closed=piso(closed_at)
+    hold=(closed-opened).total_seconds()/3600.0 if opened and closed else None
+    reason=b.get("closeReason") or b.get("exitReason") or "UNKNOWN"
+    cohort,cohort_reason=_e_cohort_status(rec)
+    e_comparable,e_note=_e_close_comparability(cohort,cohort_reason,reason,hold)
+    lc_cohort,lc_cohort_reason=_loss_cut_cohort_status(rec)
+    lc_comparable,lc_note=_e_close_comparability(lc_cohort,lc_cohort_reason,reason,hold)
+    # The forward table uses the common prospective cohort for both challengers. E-only
+    # legacy observations remain in the ledger but are never mixed into LOSS_CUT evidence.
+    comparable=bool(e_comparable and lc_comparable)
+    note="NoTP / 36h comparable" if comparable else "E: %s | LOSS_CUT: %s"%(e_note,lc_note)
+    ghost=rec.get("ghostExit") or {}
+    e_ret=ghost.get("netReturn") if ghost else actual_ret
+    e_usd=ghost.get("pnlUsd") if ghost else actual_usd
+    delta_ret=(e_ret-actual_ret) if fin(e_ret) and fin(actual_ret) else None
+    delta_usd=(e_usd-actual_usd) if fin(e_usd) and fin(actual_usd) else None
+    after_low=ghost.get("minNetReturnAfterTrigger") if ghost else None
+    after_low_usd=ghost.get("minPnlUsdAfterTrigger") if ghost else None
+    if ghost and fin(actual_ret) and (not fin(after_low) or actual_ret<after_low): after_low=actual_ret
+    if ghost and fin(actual_usd) and (not fin(after_low_usd) or actual_usd<after_low_usd): after_low_usd=actual_usd
+    max_avoided=(ghost.get("netReturn")-after_low) if ghost and fin(ghost.get("netReturn")) and fin(after_low) else None
+    max_avoided_usd=(ghost.get("pnlUsd")-after_low_usd) if ghost and fin(ghost.get("pnlUsd")) and fin(after_low_usd) else None
+    e_verdict=("NO EFFECT" if not ghost else "SAVED LOSS" if fin(delta_ret) and delta_ret>1e-12 else
+               "TRUNCATED RECOVERY/WINNER" if fin(delta_ret) and delta_ret<-1e-12 else "NO EFFECT")
+    lc=_loss_cut_state(rec); lc_ghost=lc.get("ghostExit") or {}
+    lc_ret=lc_ghost.get("netReturn") if lc_ghost else actual_ret
+    lc_usd=lc_ghost.get("pnlUsd") if lc_ghost else actual_usd
+    lc_delta_ret=(lc_ret-actual_ret) if fin(lc_ret) and fin(actual_ret) else None
+    lc_delta_usd=(lc_usd-actual_usd) if fin(lc_usd) and fin(actual_usd) else None
+    lc_after_low=lc_ghost.get("minNetReturnAfterTrigger") if lc_ghost else None
+    lc_after_low_usd=lc_ghost.get("minPnlUsdAfterTrigger") if lc_ghost else None
+    if lc_ghost and fin(actual_ret) and (not fin(lc_after_low) or actual_ret<lc_after_low): lc_after_low=actual_ret
+    if lc_ghost and fin(actual_usd) and (not fin(lc_after_low_usd) or actual_usd<lc_after_low_usd): lc_after_low_usd=actual_usd
+    lc_max_avoided=(lc_ghost.get("netReturn")-lc_after_low) if lc_ghost and fin(lc_ghost.get("netReturn")) and fin(lc_after_low) else None
+    lc_max_avoided_usd=(lc_ghost.get("pnlUsd")-lc_after_low_usd) if lc_ghost and fin(lc_ghost.get("pnlUsd")) and fin(lc_after_low_usd) else None
+    lc_verdict=("NO EFFECT" if not lc_ghost else "SAVED LOSS" if fin(lc_delta_ret) and lc_delta_ret>1e-12 else
+                "TRUNCATED RECOVERY/WINNER" if fin(lc_delta_ret) and lc_delta_ret<-1e-12 else "NO EFFECT")
+    rec["closed"]={"closedAt":closed_at,"closeReason":reason,"holdHours":hold,
+                   "actualNetReturn":actual_ret,"actualPnlUsd":actual_usd,
+                   "eNetReturn":e_ret,"ePnlUsd":e_usd,"deltaNetReturn":delta_ret,"deltaUsd":delta_usd,
+                   "mfeThroughCloseNetReturn":rec.get("maxMfeNetReturn"),
+                   "maxGivebackAvoidedNetReturn":max(0.0,max_avoided) if fin(max_avoided) else None,
+                   "maxGivebackAvoidedUsd":max(0.0,max_avoided_usd) if fin(max_avoided_usd) else None,
+                   "winnerTruncated":bool(ghost and fin(actual_ret) and fin(e_ret) and actual_ret>e_ret+1e-12),
+                   "eVerdict":e_verdict,
+                   "lossCutNetReturn":lc_ret,"lossCutPnlUsd":lc_usd,
+                   "lossCutDeltaNetReturn":lc_delta_ret,"lossCutDeltaUsd":lc_delta_usd,
+                   "lossCutMaxGivebackAvoidedNetReturn":max(0.0,lc_max_avoided) if fin(lc_max_avoided) else None,
+                   "lossCutMaxGivebackAvoidedUsd":max(0.0,lc_max_avoided_usd) if fin(lc_max_avoided_usd) else None,
+                   "lossCutWinnerTruncated":bool(lc_ghost and fin(actual_ret) and fin(lc_ret) and actual_ret>lc_ret+1e-12),
+                   "lossCutVerdict":lc_verdict,
+                   "cohortStatus":cohort,"cohortReason":cohort_reason,
+                   "lossCutCohortStatus":lc_cohort,"lossCutCohortReason":lc_cohort_reason,
+                   "eComparable":e_comparable,"lossCutComparable":lc_comparable,
+                   "comparable":comparable,"comparatorNote":note,
+                   "eComparatorNote":e_note,"lossCutComparatorNote":lc_note}
+
+def _e_prune_locked(state):
+    done=[(r.get("closed",{}).get("closedAt") or "",k) for k,r in state["baskets"].items() if r.get("closed")]
+    if len(done)<=SMART_E_MAX_COMPLETED: return
+    done.sort()
+    for _,key in done[:len(done)-SMART_E_MAX_COMPLETED]: state["baskets"].pop(key,None)
+
+def _e_episodes(rows,hours=48.0):
+    free=None; kept=0
+    for r in sorted(rows,key=lambda x:x.get("openedAt") or ""):
+        opened=piso(r.get("openedAt"))
+        if not opened: continue
+        if free is None or opened>=free:
+            kept+=1; free=opened+timedelta(hours=hours)
+    return kept
+
+def _e_evidence_status(n,episodes,mean_delta,median_delta,actual_mean,ghost_mean):
+    # No challenger may be called PROMISING before both basket and de-overlapped episode
+    # thresholds are met. REJECT is intentionally symmetric only after the same threshold.
+    if n<30 or episodes<10: return "INSUFFICIENT"
+    if n>=60 and episodes>=20 and fin(mean_delta) and mean_delta>0 and fin(median_delta) and median_delta>=0 and fin(actual_mean) and fin(ghost_mean) and ghost_mean>=actual_mean:
+        return "PROMISING"
+    if n>=60 and episodes>=20 and fin(mean_delta) and mean_delta<0 and fin(median_delta) and median_delta<=0 and fin(actual_mean) and fin(ghost_mean) and ghost_mean<actual_mean:
+        return "REJECT"
+    return "WATCH"
+
+def _e_challenger_summary(comparable,triggered,result_key,delta_key,delta_usd_key,avoided_key,avoided_usd_key,winner_key,verdict_key,episodes):
+    closed=[r.get("closed") or {} for r in comparable]
+    deltas=[c.get(delta_key) for c in closed if fin(c.get(delta_key))]
+    usd=[c.get(delta_usd_key) for c in closed if fin(c.get(delta_usd_key))]
+    actual=[c.get("actualNetReturn") for c in closed if fin(c.get("actualNetReturn"))]
+    ghost=[c.get(result_key) for c in closed if fin(c.get(result_key))]
+    n=len(comparable)
+    better=[c for c in closed if fin(c.get(delta_key)) and c.get(delta_key)>1e-12]
+    worse=[c for c in closed if fin(c.get(delta_key)) and c.get(delta_key)<-1e-12]
+    saved=[c for c in closed if c.get(verdict_key)=="SAVED LOSS"]
+    truncated=[c for c in closed if c.get(verdict_key)=="TRUNCATED RECOVERY/WINNER"]
+    no_effect=[c for c in closed if c.get(verdict_key)=="NO EFFECT"]
+    mean_delta=sum(deltas)/len(deltas) if deltas else None
+    median_delta=st.median(deltas) if deltas else None
+    actual_mean=sum(actual)/len(actual) if actual else None
+    ghost_mean=sum(ghost)/len(ghost) if ghost else None
+    return {"triggered":len(triggered),"triggerPct":None,
+            "better":len(better),"worse":len(worse),"same":n-len(better)-len(worse),
+            "betterPct":100*len(better)/n if n else None,"worsePct":100*len(worse)/n if n else None,
+            "meanDelta":mean_delta,"medianDelta":median_delta,"totalDeltaUsd":sum(usd) if usd else None,
+            "actualMean":actual_mean,"ghostMean":ghost_mean,
+            "riskSavedNetReturn":sum(c.get(avoided_key) for c in closed if fin(c.get(avoided_key))) if closed else None,
+            "riskSavedUsd":sum(c.get(avoided_usd_key) for c in closed if fin(c.get(avoided_usd_key))) if closed else None,
+            "winnerTruncated":sum(1 for c in closed if c.get(winner_key)),
+            "savedLoss":len(saved),"truncatedRecovery":len(truncated),"noEffect":len(no_effect),
+            "status":_e_evidence_status(n,episodes,mean_delta,median_delta,actual_mean,ghost_mean)}
+
+def _e_aggregate(records):
+    closed=[r for r in records if r.get("closed")]
+    # The dashboard comparison starts at LOSS_CUT deployment. This creates one honest common
+    # prospective cohort instead of mixing older E-only observations with a new challenger.
+    valid_cohort=[r for r in records if _e_cohort_status(r)[0]=="VALID FORWARD COHORT"
+                  and _loss_cut_cohort_status(r)[0]=="VALID FORWARD COHORT"]
+    comparable=[r for r in closed if r["closed"].get("comparable")]
+    episodes=_e_episodes(comparable)
+    e_triggered=[r for r in valid_cohort if r.get("prospectiveFirstGhostTrigger")]
+    lc_triggered=[r for r in valid_cohort if _loss_cut_state(r).get("prospectiveFirstGhostTrigger")]
+    e=_e_challenger_summary(comparable,e_triggered,"eNetReturn","deltaNetReturn","deltaUsd",
+                            "maxGivebackAvoidedNetReturn","maxGivebackAvoidedUsd",
+                            "winnerTruncated","eVerdict",episodes)
+    lc=_e_challenger_summary(comparable,lc_triggered,"lossCutNetReturn","lossCutDeltaNetReturn","lossCutDeltaUsd",
+                             "lossCutMaxGivebackAvoidedNetReturn","lossCutMaxGivebackAvoidedUsd",
+                             "lossCutWinnerTruncated","lossCutVerdict",episodes)
+    e["triggerPct"]=100*len(e_triggered)/len(valid_cohort) if valid_cohort else None
+    lc["triggerPct"]=100*len(lc_triggered)/len(valid_cohort) if valid_cohort else None
+    e_left=[r for r in records if _e_left_class(r)=="LEFT-CENSORED / PRE-MONITOR"]
+    lc_left=[r for r in records if ((_loss_cut_state(r).get("leftCensor") or {}).get("classification")=="LEFT-CENSORED / PRE-MONITOR")]
+    mismatch=[r for r in records if (r.get("comparator") or {}).get("firstMismatchAt")]
+    return {"observedTotal":len(records),"observedCompleted":len(closed),
+            "validForwardCohort":len(valid_cohort),"validForwardOpen":sum(1 for r in valid_cohort if not r.get("closed")),
+            "completed":len(comparable),"excluded":len(closed)-len(comparable),
+            "leftCensored":len({id(r) for r in e_left+lc_left}),
+            "eLeftCensored":len(e_left),"lossCutLeftCensored":len(lc_left),
+            "comparatorMismatch":len(mismatch),"episodes":episodes,
+            "actualMean":e.get("actualMean"),"e":e,"lossCut":lc,
+            # v2 aliases retain a stable API shape for any out-of-tree reader; all now use the
+            # common E/LOSS_CUT forward cohort rather than a mixed population.
+            "triggered":e["triggered"],"better":e["better"],"worse":e["worse"],"same":e["same"],
+            "triggerPct":e["triggerPct"],"betterPct":e["betterPct"],"worsePct":e["worsePct"],
+            "meanDelta":e["meanDelta"],"medianDelta":e["medianDelta"],"totalDeltaUsd":e["totalDeltaUsd"],
+            "ghostMean":e["ghostMean"],"status":e["status"]}
+
+def _e_snapshot_locked(state,instances,open_views,now):
+    out={"version":state.get("version"),"monitorStartedAt":state.get("monitorStartedAt"),
+         "lossCutMonitorStartedAt":state.get("lossCutMonitorStartedAt"),
+         "lastRefreshAt":state.get("lastRefreshAt"),"writeError":state.get("writeError"),"instances":{},
+         "open":open_views,"recent":[]}
+    for key,cfg in instances.items():
+        rows=[r for r in state["baskets"].values() if r.get("instance")==key]
+        out["instances"][key]={"label":cfg.get("long") or cfg.get("label") or key,
+                               "policy":_e_policy((cfg.get("ex") or {}),_e_runtime_flags(cfg)),"summary":_e_aggregate(rows)}
+        out["recent"].extend(r for r in rows if r.get("closed"))
+    out["recent"].sort(key=lambda r:r.get("closed",{}).get("closedAt") or "",reverse=True)
+    return out
+
+def smart_e_refresh(instances,now=None):
+    """Read executor snapshots and update the isolated ghost ledger. No orders, cancels, or config writes."""
+    now=now or datetime.now(timezone.utc)
+    with _smart_e_lock:
+        state=_e_load_locked(now); open_views=[]
+        # Migrate retained rows too, so old dashboard data cannot retain a misleading
+        # “first trigger” label merely because it is no longer in the executor's recent window.
+        for rec in state["baskets"].values():
+            cfg=instances.get(rec.get("instance")) or {}; ex=cfg.get("ex") or {}
+            if not ex.get("__error__"): _e_migrate_record(rec,state,_e_policy(ex,_e_runtime_flags(cfg)),now)
+        for instance,cfg in instances.items():
+            ex=cfg.get("ex") or {}
+            if ex.get("__error__"): continue
+            flags=_e_runtime_flags(cfg)
+            policy=_e_policy(ex,flags)
+            for b in ex.get("openBaskets") or []:
+                if not isinstance(b,dict) or b.get("closedAt"): continue
+                key=_e_basket_key(instance,b)
+                if not key: continue
+                basket_policy=_e_policy_for_basket(ex,flags,b)
+                rec=state["baskets"].get(key)
+                if rec is None:
+                    rec=_e_record(instance,b,basket_policy,state,now); state["baskets"][key]=rec
+                _e_observe(rec,b,basket_policy,now,state)
+                open_views.append({"instance":instance,"label":cfg.get("long") or cfg.get("label") or instance,
+                                   "policy":dict(basket_policy),"record":dict(rec)})
+            for b in ex.get("recent") or []:
+                if not isinstance(b,dict) or not b.get("closedAt"): continue
+                key=_e_basket_key(instance,b)
+                if not key: continue
+                basket_policy=_e_policy_for_basket(ex,flags,b)
+                rec=state["baskets"].get(key)
+                if rec is None:
+                    rec=_e_record(instance,b,basket_policy,state,now,late=True); state["baskets"][key]=rec
+                _e_finalize(rec,b,basket_policy,now,state)
+        state["lastRefreshAt"]=_e_iso(now)
+        _e_prune_locked(state); _e_save_locked(state)
+        return _e_snapshot_locked(state,instances,open_views,now)
+
+def smart_e_monitor_loop():
+    """Keeps the ghost monitor prospective even when nobody has the dashboard open."""
+    while True:
+        try:
+            now=datetime.now(timezone.utc)
+            # Do not let the unattended observer fall back to INST's historical release path.
+            # PM2's actual run-api.sh is the runtime authority, even before a browser request has
+            # called collect() and refreshed the shared display configuration.
+            instances={}
+            for k,cfg in INST.items():
+                runtime_cfg={**cfg,"rel":active_release(cfg["pm2"],cfg["rel"])}
+                instances[k]={**runtime_cfg,"flags":_e_runtime_flags(runtime_cfg),
+                              "ex":get(runtime_cfg["api"]+"/api/live/cross-sectional-executor")}
+            smart_e_refresh(instances,now)
+        except Exception:
+            pass
+        time.sleep(TTL)
+
 # ------------------------------------------------------------------ collector
 def collect():
     if _c["d"] is not None and time.time()-_c["at"]<TTL: return _c["d"]
@@ -323,6 +1145,7 @@ def collect():
         ex=get(cfg["api"]+"/api/live/cross-sectional-executor")
         rep=get(cfg["api"]+"/api/shadow/cross-sectional-report")
         pool=get(cfg["api"]+"/api/live/cross-sectional-pool")
+        futures_health=get(cfg["api"]+"/api/live/futures-reference-health?symbols=1000PEPEUSDT,SOLUSDT,PEPEUSDT")
         fc=(rep or {}).get("filteredConfig") or {}
         rn=((rep or {}).get("filteredReport") or {}).get("recentNetReturns") or []
         gate={"n":len(rn),
@@ -334,7 +1157,7 @@ def collect():
         lat=None
         a_at,a_src=piso(att.get("at")),att.get("sourceOpenedAtMs")
         if a_at and fin(a_src): lat=(a_at.timestamp()*1000-a_src)/1000.0
-        R["inst"][k]={**cfg,"ex":ex,"rep":rep,"pool":pool,"fc":fc,"gate":gate,
+        R["inst"][k]={**cfg,"ex":ex,"rep":rep,"pool":pool,"futuresHealth":futures_health,"fc":fc,"gate":gate,
                       "adm":ex.get("entryAdmission") or {},"attempt":att,
                       "admAudit":ex.get("entryAdmissionAudit") or {},
                       "signalToOrderSec":lat,"rows":load_obs(cfg["store"],PROD_SIGNAL,R.setdefault("corrupt",[])),
@@ -386,7 +1209,7 @@ def collect():
         except Exception: pass
         R["inst"][k]["flags"]=fl
     # execution economics from the leg records the executor now writes
-    mk=tk=0.0; mkq=tkq=0; drift=[]; shortfall=[]; imbalance=[]; exit_duration=[]
+    mk=tk=0.0; mkq=tkq=0; drift=[]; shortfall=[]; imbalance=[]; duration=[]
     for k in INST:
         ex=R["inst"][k]["ex"]
         for b in (ex.get("recent") or [])+(ex.get("openBaskets") or []):
@@ -399,7 +1222,7 @@ def collect():
                 xe=l.get("exitExecution") or {}
                 if fin(xe.get("implementationShortfallUsd")): shortfall.append(xe["implementationShortfallUsd"])
                 if fin(xe.get("temporaryImbalanceUsd")): imbalance.append(xe["temporaryImbalanceUsd"])
-                if fin(xe.get("durationMs")): exit_duration.append(xe["durationMs"])
+                if fin(xe.get("durationMs")): duration.append(xe["durationMs"])
     tot=mk+tk
     R["exitEcon"]={"makerNotional":mk,"takerNotional":tk,
                    "makerPct":(100*mk/tot) if tot>0 else None,
@@ -410,7 +1233,7 @@ def collect():
                    "exitDrift":(100*sum(drift)/len(drift)) if drift else None,
                    "implementationShortfall":sum(shortfall) if shortfall else None,
                    "temporaryImbalance":max(imbalance) if imbalance else None,
-                   "durationSec":(sum(exit_duration)/len(exit_duration)/1000.0) if exit_duration else None}
+                   "durationSec":(sum(duration)/len(duration)/1000.0) if duration else None}
     R["account"]=get(INST["live"]["api"]+"/api/live/account")
     R["axis"]=get(INST["live"]["api"]+"/api/shadow/regime-axis-timeline")
     R["dir"]=get(INST["live"]["api"]+"/api/live/cross-sectional-directional-regime")
@@ -573,6 +1396,10 @@ def collect():
     d=sh("df -h / | tail -1").split()
     R["system"]={"pm2":pm2,"jobs":jobs,"hostTimeUtc":now.isoformat(),
                  "disk":{"size":d[1],"used":d[2],"avail":d[3],"pct":d[4]} if len(d)>5 else None}
+    # This is an independent observer. Its own persistent evidence is never written into the
+    # live/testnet executor stores and is not consumed by any exit or admission path.
+    try: R["smartE"]=smart_e_refresh(R["inst"],now)
+    except Exception as ex: R["smartE"]={"error":str(ex)[:180],"instances":{},"open":[],"recent":[]}
     _c["at"],_c["d"]=time.time(),R
     return R
 
@@ -619,6 +1446,14 @@ code{background:#0b1017;border:1px solid #1e2836;border-radius:4px;padding:1px 5
 .plus{color:#4ec9a0}.minus{color:#e5686d}
 .note{color:#68788a;font-size:11.5px;margin-top:7px}.scroll{overflow-x:auto}
 .pill{display:inline-block;padding:1px 7px;border-radius:10px;font-size:10.5px;border:1px solid #1e2836;color:#8fa3b8}
+.health-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px}
+.reference-chain{display:flex;align-items:center;flex-wrap:wrap;gap:6px;color:#93a5b8;font-size:11.5px;margin-top:9px}
+.reference-chain span{background:#111823;border:1px solid #1e2836;border-radius:12px;padding:3px 8px}.reference-chain b{color:#4c8fd6}
+.health-alert{margin-top:7px;padding:7px 9px;border-radius:5px;border:1px solid #1e2836;font-size:11.5px}
+.health-alert.block{border-left:3px solid #e5686d}.health-alert.watch{border-left:3px solid #d9a441}
+details.observability{background:#111823;border:1px solid #1e2836;border-radius:7px;margin-top:16px}
+details.observability>summary{padding:11px 13px;color:#c9d4e0;font-weight:600;cursor:pointer}
+details.observability>.body{padding:0 13px 13px}
 @media(max-width:640px){.kv{grid-template-columns:1fr}.card .v{font-size:17px}}
 """
 DOT={"ok":"🟢","watch":"🟡","override":"🟠","block":"🔴","off":"⚪"}
@@ -730,6 +1565,359 @@ def scatter(pairs,thr,w=600,h=175):
     o.append("<text x='4' y='%.1f' fill='#68788a' font-size='9'>%.1f%%</text>"%(Y(y0)+3,y0))
     return "".join(o)+"</svg>"
 
+def _e_pp(v,d=3):
+    if not fin(v): return "<span class='dim'>–</span>"
+    return "<span class='%s'>%s%.*f pp</span>"%("pos" if v>0 else "neg" if v<0 else "", "+" if v>0 else "",d,100*v)
+
+def _e_giveback(v):
+    if not fin(v): return "<span class='dim'>–</span>"
+    return "<span class='%s'>%.1f%%</span>"%("neg" if v>=SMART_E_GIVEBACK else "warnc" if v>=.5 else "",100*v)
+
+def _e_time(v):
+    return esc(str(v or "–").replace("T"," ")[:19])
+
+def _e_net_pair(ret,usd,d=3):
+    return "%s <span class='dim'>(%s)</span>"%(money(usd,d),pct(100*ret,d) if fin(ret) else "–")
+
+def smart_e_open_html(R):
+    se=R.get("smartE") or {}; views=se.get("open") or []; o=[]
+    o.append("<h2>Smart Basket E · Ghost</h2>")
+    o.append("<div class='note'>Frozen Rule E, net whole-basket P&amp;L only: arm at age ≥24h and MFE ≥+1.0%%; after arm, ghost exit at giveback ≥70%% of MFE. It sends no order, cancellation, or configuration write.</div>")
+    if se.get("error"):
+        return "".join(o)+"<div class='card'><span class='neg'>Ghost monitor error:</span> %s</div>"%esc(se["error"])
+    if not views:
+        return "".join(o)+"<div class='card dim'>Tidak ada basket terbuka yang sedang dipantau.</div>"
+    for view in views:
+        r=view["record"]; policy=view["policy"]; ghost=r.get("ghostExit") or {}
+        cohort,cohort_reason=_e_cohort_status(r); left=r.get("leftCensor") or {}
+        status="WOULD EXIT" if ghost else "ARMED" if r.get("armedAt") else "NOT ARMED"
+        status_cls="neg" if ghost else "warnc" if r.get("armedAt") else "dim"
+        age=r.get("ageHours"); mfe=r.get("maxMfeNetReturn"); current=r.get("currentNetReturn")
+        age_ok=fin(age) and age>=SMART_E_ARM_AGE_H; mfe_ok=fin(mfe) and mfe>=SMART_E_ARM_MFE
+        o.append("<div class='card' style='margin-top:10px'>")
+        cohort_cls="pos" if cohort=="VALID FORWARD COHORT" else "warnc" if "MISMATCH" in cohort else "neg"
+        o.append("<div style='display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px'><div><b>%s</b> <span class='dim'>· %s · net basket</span></div><div><span class='%s'><b>%s</b></span> <span class='%s'><b>%s</b></span></div></div>"%(
+            esc(friendly(r.get("basketId"))),esc(view.get("label")),cohort_cls,esc(cohort),status_cls,status))
+        o.append("<div class='grid' style='margin-top:9px'>")
+        trigger_note=("first observed after monitor; historical first trigger unknown" if left.get("classification") else
+                      "first prospective trigger is frozen" if ghost else "ghost only")
+        o.append(card("Status","<span class='%s'>%s</span>"%(status_cls,status),trigger_note))
+        o.append(card("Age","%.1fh / 36h"%age if fin(age) else "– / 36h","arm after 24h"))
+        o.append(card("Current P&amp;L",_e_net_pair(current,r.get("currentPnlUsd")),"runtime net whole basket"))
+        o.append(card("MFE",_e_net_pair(mfe,_e_usd(r,mfe)),"at %s"%_e_time(r.get("maxMfeAt"))))
+        o.append(card("Giveback",_e_giveback(r.get("givebackFraction")),"trigger ≥70%% after armed"))
+        o.append("</div>")
+        o.append("<div class='g2' style='margin-top:9px'>")
+        arm_rows=("<div class='card'><div class='k'>Arm condition</div>"
+                  "<div style='margin-top:7px'>%s age ≥24h <span class='dim'>(%s)</span></div>"
+                  "<div>%s MFE ≥+1.0%% <span class='dim'>(%s)</span></div></div>")%(
+                    "<span class='pos'>✓</span>" if age_ok else "<span class='neg'>✕</span>",
+                    ("%.1fh"%age) if fin(age) else "–",
+                    "<span class='pos'>✓</span>" if mfe_ok else "<span class='neg'>✕</span>",
+                    ("%+.3f%%"%(100*mfe)) if fin(mfe) else "–")
+        if ghost:
+            trigger_title="first observed trigger" if left.get("classification") else "first prospective trigger"
+            exit_html=("<div class='card'><div class='k'>Ghost exit · %s</div>"
+                       "<div class='v'>%s</div><div class='s'>time %s · age %s · MFE then %s · giveback %s</div></div>")%(
+                         trigger_title,
+                         _e_net_pair(ghost.get("netReturn"),ghost.get("pnlUsd")),_e_time(ghost.get("observedAt")),
+                         ("%.1fh"%ghost.get("ageHours")) if fin(ghost.get("ageHours")) else "–",
+                         pct(100*ghost.get("mfeAtTriggerNetReturn"),3) if fin(ghost.get("mfeAtTriggerNetReturn")) else "–",
+                         _e_giveback(ghost.get("givebackFraction")))
+        else:
+            exit_html="<div class='card'><div class='k'>Ghost exit</div><div class='v dim'>Belum</div><div class='s'>tidak ada exit yang dikirim</div></div>"
+        o.append(arm_rows+exit_html)
+        o.append("</div>")
+        if left.get("classification"):
+            already=left.get("conditionAlreadyTrueAtMonitorStart")
+            already_text=("✓ condition already true at monitor start" if already is True else
+                          "✕ condition not true at monitor start" if already is False else "? condition at monitor start unavailable")
+            o.append("<div class='card' style='margin-top:9px'><div class='k'>%s</div><div style='margin-top:6px'>%s</div><div class='note'>True historical first trigger is unknown. First observed trigger: %s. Excluded from trigger-timing and forward-quality statistics.</div></div>"%(
+                esc(left.get("classification")),esc(already_text),_e_time(left.get("firstObservedTriggerAt") or ghost.get("observedAt"))))
+        o.append("<div class='note'><b>Cohort</b> · %s <span class='dim'>· %s</span></div>"%(esc(cohort),esc(cohort_reason)))
+        o.append("<div class='note'><b>Actual comparator runtime</b> · %s <span class='dim'>· %s</span></div>"%(esc(policy.get("label")),esc(policy.get("exact") or "")))
+        o.append("</div>")
+    return "".join(o)
+
+def smart_e_summary_html(R):
+    se=R.get("smartE") or {}; o=["<h2>Smart Basket E · Forward</h2>"]
+    o.append("<div class='note'>Valid Forward Evidence is separate from Historical Research. A basket enters E-vs-NoTP only when opened after monitor deployment, runtime is NoTP + hold 36h throughout the observed path, and the actual exit is HORIZON at the 36h comparator. Anything else is retained for diagnosis but excluded from timing and outcome statistics.</div>")
+    for key,info in (se.get("instances") or {}).items():
+        s=info.get("summary") or {}; policy=info.get("policy") or {}; n=s.get("completed") or 0
+        o.append("<h3>%s</h3>"%esc(info.get("label") or key))
+        if not policy.get("canonicalNoTp36"):
+            o.append("<div class='card'><span class='warnc'><b>COMPARATOR PAUSED</b></span> · Runtime reports <b>%s</b><br><span class='dim'>Exact mismatch: %s</span><div class='note'>Ghost observation continues; no basket enters E-vs-NoTP until runtime itself is NoTP + hold 36h.</div></div>"%(esc(policy.get("label")),esc(policy.get("exact") or "")))
+        o.append("<div class='grid' style='margin-top:9px'>")
+        o.append(card("Valid comparable baskets",str(n),"%d valid cohort total · %d still open"%(s.get("validForwardCohort") or 0,s.get("validForwardOpen") or 0)))
+        o.append(card("Left-censored",str(s.get("leftCensored") or 0),"pre-monitor; excluded from trigger timing / quality"))
+        o.append(card("Comparator mismatch",str(s.get("comparatorMismatch") or 0),"runtime not NoTP + 36h at one or more observed scans"))
+        o.append(card("E triggered","%d%s"%(s.get("triggered") or 0,(" (%.0f%%)"%s["triggerPct"]) if fin(s.get("triggerPct")) else ""),"valid forward cohort only"))
+        o.append(card("E better than actual","%d%s"%(s.get("better") or 0,(" (%.0f%%)"%s["betterPct"]) if fin(s.get("betterPct")) else ""),"same %d"%(s.get("same") or 0)))
+        o.append(card("E worse than actual","%d%s"%(s.get("worse") or 0,(" (%.0f%%)"%s["worsePct"]) if fin(s.get("worsePct")) else ""),"not a win-rate claim"))
+        o.append(card("Mean delta",_e_pp(s.get("meanDelta")),"E minus actual valid comparator"))
+        o.append(card("Median delta",_e_pp(s.get("medianDelta")),"E minus actual valid comparator"))
+        o.append(card("Total $ delta",money(s.get("totalDeltaUsd"),3),"valid comparable baskets only"))
+        o.append(card("Actual NoTP mean",pct(100*s.get("actualMean"),3) if fin(s.get("actualMean")) else "–","valid 36h HORIZON comparator"))
+        o.append(card("Ghost E mean",pct(100*s.get("ghostMean"),3) if fin(s.get("ghostMean")) else "–","same cohort; E exit or 36h final"))
+        o.append(card("Independent episodes",str(s.get("episodes") or 0),"48h de-overlap"))
+        status=s.get("status") or "INSUFFICIENT"
+        o.append(card("Evidence status","<span class='%s'>%s</span>"%({"PROMISING":"pos","WATCH":"warnc"}.get(status,"dim"),status),"PROMISING requires positive mean + median, no mean expectancy loss, ≥60 baskets and ≥20 episodes"))
+        o.append("</div>")
+    o.append("<h3>Historical Research · context only</h3><div class='g2'>")
+    o.append(card("NoTP mean","<span class='pos'>+0.3149%</span>","canonical historical harness · N=1693"))
+    o.append(card("E mean","<span class='pos'>+0.3107%</span>","historical research, not forward result"))
+    o.append(card("E OOS delta vs NoTP","<span class='neg'>−0.0334 pp</span>","historical OOS only"))
+    o.append(card("Offsets won","3 / 6","historical robustness only"))
+    o.append("</div><div class='note'>The four cards above are fixed historical benchmark context. They are never combined with Valid Forward Evidence counts or means.</div>")
+    return "".join(o)
+
+def smart_e_recent_html(R):
+    se=R.get("smartE") or {}; rows=(se.get("recent") or [])[:10]
+    o=["<h2>Smart Basket E · Recent Evaluation</h2>"]
+    o.append("<div class='note'>`Avoided after E` is the maximum post-ghost decline captured by the observer through final close; it is not hidden if final P&amp;L later recovers. A left-censored basket never receives a fabricated historical first-trigger time. Non-comparable rows remain diagnostic only.</div>")
+    if not rows: return "".join(o)+"<div class='card dim'>Belum ada basket selesai yang tercatat oleh ledger ghost.</div>"
+    o.append("<div class='scroll'><table><tr><th>basket / opened</th><th>cohort</th><th>regime / scoreGap</th><th>armed</th><th>first E trigger</th><th>MFE / giveback trigger</th><th>actual final</th><th>E delta vs actual</th><th>avoided after E</th><th>winner truncated</th><th>comparator</th></tr>")
+    for r in rows:
+        c=r.get("closed") or {}; g=r.get("ghostExit") or {}; comp=c.get("comparable")
+        cohort,cohort_reason=_e_cohort_status(r); left=r.get("leftCensor") or {}
+        delta=_e_pp(c.get("deltaNetReturn")) if comp else "<span class='dim'>–</span>"
+        avoided=_e_pp(c.get("maxGivebackAvoidedNetReturn")) if comp else "<span class='dim'>–</span>"
+        comp_html=("<span class='pos'>COMPARABLE</span>" if comp else "<span class='warnc'>EXCLUDED</span>")+"<br><span class='dim' style='white-space:normal'>%s</span>"%esc(c.get("comparatorNote") or cohort_reason)
+        if left.get("classification"):
+            trigger_html=("<span class='warnc'>HISTORICAL UNKNOWN</span><br><span class='dim'>first observed %s</span>"%_e_time(left.get("firstObservedTriggerAt") or g.get("observedAt")))
+        elif g:
+            trigger_html=("<span class='pos'>%s</span><br><span class='dim'>age %s · %s</span>"%(
+                _e_time((r.get("prospectiveFirstGhostTrigger") or g).get("observedAt")),
+                ("%.1fh"%g.get("ageHours")) if fin(g.get("ageHours")) else "–",_e_net_pair(g.get("netReturn"),g.get("pnlUsd"))))
+        else:
+            trigger_html="<span class='dim'>not triggered</span>"
+        arm_html=("%s<br><span class='dim'>MFE %s</span>"%(
+            _e_time(r.get("armedAt")),pct(100*r.get("mfeAtArmNetReturn"),3) if fin(r.get("mfeAtArmNetReturn")) else "–")) if r.get("armedAt") else "<span class='dim'>not armed</span>"
+        mfe_trigger=("%s<br><span class='dim'>giveback %s</span>"%(pct(100*g.get("mfeAtTriggerNetReturn"),3),_e_giveback(g.get("givebackFraction")))) if g else "<span class='dim'>–</span>"
+        o.append("<tr><td><b>%s</b><br><span class='dim'>%s · opened %s</span></td><td><span class='%s'>%s</span><br><span class='dim' style='white-space:normal'>%s</span></td><td>%s<br><span class='dim'>gap %s</span></td><td>%s</td><td>%s</td><td>%s</td><td>%s<br><span class='dim'>%s · %s · %s</span></td><td>%s</td><td>%s</td><td>%s</td><td style='white-space:normal'>%s</td></tr>"%(
+            esc(friendly(r.get("basketId"))),esc(r.get("instance") or ""),_e_time(r.get("openedAt")),
+            "pos" if cohort=="VALID FORWARD COHORT" else "warnc" if "MISMATCH" in cohort else "neg",esc(cohort),esc(cohort_reason),
+            esc(r.get("regime") or "–"),num(r.get("scoreGap"),4),arm_html,trigger_html,mfe_trigger,
+            _e_net_pair(c.get("actualNetReturn"),c.get("actualPnlUsd")),_e_time(c.get("closedAt")),esc(str(c.get("closeReason") or "–")),("%.1fh"%c["holdHours"]) if fin(c.get("holdHours")) else "–",
+            delta,avoided,"<span class='neg'>YES</span>" if c.get("winnerTruncated") else "no",comp_html))
+    o.append("</table></div>")
+    return "".join(o)
+
+def smart_e_overview_html(R):
+    return smart_e_open_html(R)+smart_e_summary_html(R)+smart_e_recent_html(R)
+
+# ------------------------------------------------------------------ Smart Basket ghosts v3 presentation
+# Kept below the original v2 presentation so older references remain harmless; these definitions
+# intentionally replace it at runtime with the dual-challenger, common-cohort view.
+def _ghost_status_class(status):
+    return {"WOULD EXIT":"neg","ARMED":"warnc","WATCHING":"warnc",
+            "PROMISING":"pos","WATCH":"warnc","REJECT":"neg"}.get(status,"dim")
+
+def _ghost_check(ok,label,actual,rule):
+    return "%s <b>%s</b> <span class='dim'>%s / %s</span>"%(
+        "<span class='pos'>✓</span>" if ok else "<span class='neg'>✕</span>",
+        esc(label),esc(actual),esc(rule))
+
+def _ghost_censor_box(left,label):
+    if not isinstance(left,dict) or not left.get("classification"): return ""
+    already=left.get("conditionAlreadyTrueAtMonitorStart")
+    already_text=("condition already true at monitor start" if already is True else
+                  "condition not true at monitor start" if already is False else
+                  "condition at monitor start unavailable")
+    return ("<div class='card'><div class='k'>%s · %s</div><div style='margin-top:6px'>%s</div>"
+            "<div class='note'>True historical first trigger unknown. First observed trigger: %s. "
+            "Excluded from trigger-timing and forward-quality statistics.</div></div>")%(
+                esc(label),esc(left.get("classification")),esc(already_text),
+                _e_time(left.get("firstObservedTriggerAt")))
+
+def _ghost_trigger_box(title,ghost,left):
+    if not ghost:
+        return "<div class='s'>Belum terpicu; ghost tidak mengirim exit.</div>"
+    observed=bool((left or {}).get("classification"))
+    label="first observed trigger; historical first unknown" if observed else "first true ghost trigger (frozen)"
+    return ("<div class='s'><b>%s</b><br>time %s · age %s · P&amp;L %s · MFE %s · giveback %s</div>")%(
+        esc(label),_e_time(ghost.get("observedAt")),
+        ("%.1fh"%ghost.get("ageHours")) if fin(ghost.get("ageHours")) else "–",
+        _e_net_pair(ghost.get("netReturn"),ghost.get("pnlUsd")),
+        pct(100*ghost.get("mfeAtTriggerNetReturn"),3) if fin(ghost.get("mfeAtTriggerNetReturn")) else "–",
+        _e_giveback(ghost.get("givebackFraction")))
+
+def smart_e_open_html(R):
+    se=R.get("smartE") or {}; views=se.get("open") or []; o=[]
+    o.append("<h2>Smart Basket · Ghost Monitor</h2>")
+    o.append("<div class='note'><b>GHOST ONLY.</b> Both challengers use net whole-basket 3L/3S P&amp;L. "
+             "They never submit/cancel an order, change a stop/TP, change the hard horizon, Formation, admission, or a position. "
+             "E: age ≥24h, MFE ≥+1.0%%, giveback ≥70%%. LOSS_CUT: age ≥12h, current P&amp;L ≤−1.0%%, prior MFE ≥+0.5%%, giveback ≥70%%.</div>")
+    if se.get("error"):
+        return "".join(o)+"<div class='card'><span class='neg'>Ghost monitor error:</span> %s</div>"%esc(se["error"])
+    if not views:
+        return "".join(o)+"<div class='card dim'>Tidak ada basket terbuka yang sedang dipantau.</div>"
+    for view in views:
+        r=view["record"]; policy=view["policy"] or {}; eghost=r.get("ghostExit") or {}
+        lc=_loss_cut_state(r); lcghost=lc.get("ghostExit") or {}
+        eleft=r.get("leftCensor") or {}; lcleft=lc.get("leftCensor") or {}
+        ecohort,ereason=_e_cohort_status(r); lccohort,lcreason=_loss_cut_cohort_status(r)
+        age=r.get("ageHours"); mfe=r.get("maxMfeNetReturn"); current=r.get("currentNetReturn")
+        econd=_e_condition(age,mfe,current)
+        lccond=lc.get("lastCondition") if isinstance(lc.get("lastCondition"),dict) else _loss_cut_condition(age,mfe,current)
+        estatus="WOULD EXIT" if eghost else "ARMED" if r.get("armedAt") else "NOT ARMED"
+        lcstatus="WOULD EXIT" if lcghost else "WATCHING"
+        edelta=(eghost.get("netReturn")-current) if eghost and fin(eghost.get("netReturn")) and fin(current) else None
+        lcdelta=(lcghost.get("netReturn")-current) if lcghost and fin(lcghost.get("netReturn")) and fin(current) else None
+        o.append("<div class='card' style='margin-top:10px'>")
+        o.append("<div style='display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px'><div><b>%s</b> <span class='dim'>· %s · net whole basket</span></div><div><span class='%s'><b>%s</b></span> <span class='%s'><b>%s</b></span></div></div>"%(
+            esc(friendly(r.get("basketId"))),esc(view.get("label")), _ghost_status_class(estatus),estatus,
+            _ghost_status_class(lcstatus),lcstatus))
+        o.append("<div class='grid' style='margin-top:9px'>")
+        o.append(card("Actual policy",esc(policy.get("label") or "unknown"),
+                      "HOLD CAP %sh · ghost does not alter runtime"%(
+                          ("%.0f"%policy.get("maxHoldHours")) if fin(policy.get("maxHoldHours")) else "?")))
+        o.append(card("Age","%.1fh / 36h"%age if fin(age) else "– / 36h","runtime basket age"))
+        o.append(card("Current P&amp;L",_e_net_pair(current,r.get("currentPnlUsd")),"net whole basket"))
+        o.append(card("Prior MFE",_e_net_pair(mfe,_e_usd(r,mfe)),"at %s"%_e_time(r.get("maxMfeAt"))))
+        o.append(card("Current giveback",_e_giveback(r.get("givebackFraction")),"of prior MFE"))
+        o.append("</div><div class='g2' style='margin-top:9px'>")
+        o.append("<div class='card'><div class='k'>E · Ghost</div><div class='v'><span class='%s'>%s</span></div>"
+                 "<div class='s'>Current delta %s · E vs current Hold path</div>"
+                 "<div style='margin-top:7px'>%s</div><div>%s</div>%s</div>"%(
+                     _ghost_status_class(estatus),estatus,_e_pp(edelta),
+                     _ghost_check(econd.get("ageHours") is not None and econd.get("ageHours")>=SMART_E_ARM_AGE_H,
+                                  "Age",("%.1fh"%age) if fin(age) else "–","min 24h"),
+                     _ghost_check(fin(mfe) and mfe>=SMART_E_ARM_MFE,
+                                  "MFE",("%+.3f%%"%(100*mfe)) if fin(mfe) else "–","min +1.0%"),
+                     _ghost_trigger_box("E",eghost,eleft)))
+        o.append("<div class='card'><div class='k'>LOSS_CUT · Ghost</div><div class='v'><span class='%s'>%s</span></div>"
+                 "<div class='s'>Current delta %s · LOSS_CUT vs current Hold path</div>"
+                 "<div style='margin-top:7px'>%s</div><div>%s</div><div>%s</div><div>%s</div>%s</div>"%(
+                     _ghost_status_class(lcstatus),lcstatus,_e_pp(lcdelta),
+                     _ghost_check(lccond.get("ageOk"),"Age",("%.1fh"%age) if fin(age) else "–","min 12h"),
+                     _ghost_check(lccond.get("pnlOk"),"P&amp;L",("%+.3f%%"%(100*current)) if fin(current) else "–","≤ −1.00%"),
+                     _ghost_check(lccond.get("mfeOk"),"Prior MFE",("%+.3f%%"%(100*mfe)) if fin(mfe) else "–","≥ +0.50%"),
+                     _ghost_check(lccond.get("givebackOk"),"Giveback",
+                                  ("%.1f%%"%(100*lccond.get("givebackFraction"))) if fin(lccond.get("givebackFraction")) else "–","≥ 70%"),
+                     _ghost_trigger_box("LOSS_CUT",lcghost,lcleft)))
+        o.append("</div>")
+        censor="".join(x for x in (_ghost_censor_box(eleft,"E provenance"),_ghost_censor_box(lcleft,"LOSS_CUT provenance")) if x)
+        if censor: o.append("<div class='g2' style='margin-top:9px'>%s</div>"%censor)
+        o.append("<div class='note'><b>E forward record</b> · %s <span class='dim'>· %s</span><br>"
+                 "<b>LOSS_CUT forward record</b> · %s <span class='dim'>· %s</span><br>"
+                 "<b>Actual comparator runtime</b> · %s <span class='dim'>· %s</span></div>"%(
+                     esc(ecohort),esc(ereason),esc(lccohort),esc(lcreason),
+                     esc(policy.get("label") or "unknown"),esc(policy.get("exact") or "")))
+        o.append("</div>")
+    return "".join(o)
+
+def _ghost_metric_row(label,e_value,lc_value):
+    return "<tr><td>%s</td><td class='num'>%s</td><td class='num'>%s</td></tr>"%(label,e_value,lc_value)
+
+def _ghost_status_html(status):
+    return "<span class='%s'><b>%s</b></span>"%(_ghost_status_class(status),esc(status or "INSUFFICIENT"))
+
+def smart_e_summary_html(R):
+    se=R.get("smartE") or {}; o=["<h2>Valid Forward Evidence</h2>"]
+    o.append("<div class='note'>LIVE and TESTNET are separated. The E/LOSS_CUT table uses the common cohort: "
+             "opened after LOSS_CUT monitor deployment, no left-censoring, actual runtime NoTP + hold 36h throughout, "
+             "and a HORIZON close at 36h. Historical research is never merged into these counts.</div>")
+    for key,info in (se.get("instances") or {}).items():
+        s=info.get("summary") or {}; policy=info.get("policy") or {}; e=s.get("e") or {}; lc=s.get("lossCut") or {}
+        o.append("<h3>%s</h3>"%esc(info.get("label") or key))
+        if not policy.get("canonicalNoTp36"):
+            o.append("<div class='card'><span class='warnc'><b>COMPARATOR PAUSED</b></span> · Runtime reports <b>%s</b><br>"
+                     "<span class='dim'>Exact mismatch: %s</span><div class='note'>Ghost observation continues, but both "
+                     "E and LOSS_CUT are excluded from Hold-36h forward comparisons until runtime itself matches NoTP + hold 36h.</div></div>"%(
+                         esc(policy.get("label") or "unknown"),esc(policy.get("exact") or "")))
+        o.append("<div class='grid' style='margin-top:9px'>")
+        o.append(card("Comparable baskets",str(s.get("completed") or 0),
+                      "%d common forward cohort · %d still open"%(s.get("validForwardCohort") or 0,s.get("validForwardOpen") or 0)))
+        o.append(card("Independent episodes",str(s.get("episodes") or 0),"48h de-overlap"))
+        o.append(card("Left-censored",str(s.get("leftCensored") or 0),
+                      "E %d · LOSS_CUT %d; excluded"%(s.get("eLeftCensored") or 0,s.get("lossCutLeftCensored") or 0)))
+        o.append(card("Comparator mismatch",str(s.get("comparatorMismatch") or 0),"not NoTP + hold 36h at observed scan"))
+        o.append(card("Actual Hold mean",pct(100*s.get("actualMean"),3) if fin(s.get("actualMean")) else "–",
+                      "common valid 36h HORIZON cohort"))
+        o.append("</div>")
+        o.append("<div class='scroll'><table><tr><th>metric</th><th class='num'>E</th><th class='num'>LOSS_CUT</th></tr>")
+        o.append(_ghost_metric_row("Triggered","%d%s"%(e.get("triggered") or 0,(" (%.0f%%)"%e["triggerPct"]) if fin(e.get("triggerPct")) else ""),
+                                   "%d%s"%(lc.get("triggered") or 0,(" (%.0f%%)"%lc["triggerPct"]) if fin(lc.get("triggerPct")) else "")))
+        o.append(_ghost_metric_row("Better than Hold","%d%s"%(e.get("better") or 0,(" (%.0f%%)"%e["betterPct"]) if fin(e.get("betterPct")) else ""),
+                                   "%d%s"%(lc.get("better") or 0,(" (%.0f%%)"%lc["betterPct"]) if fin(lc.get("betterPct")) else "")))
+        o.append(_ghost_metric_row("Worse than Hold","%d%s"%(e.get("worse") or 0,(" (%.0f%%)"%e["worsePct"]) if fin(e.get("worsePct")) else ""),
+                                   "%d%s"%(lc.get("worse") or 0,(" (%.0f%%)"%lc["worsePct"]) if fin(lc.get("worsePct")) else "")))
+        o.append(_ghost_metric_row("Mean delta",_e_pp(e.get("meanDelta")),_e_pp(lc.get("meanDelta"))))
+        o.append(_ghost_metric_row("Median delta",_e_pp(e.get("medianDelta")),_e_pp(lc.get("medianDelta"))))
+        o.append(_ghost_metric_row("Total $ delta",money(e.get("totalDeltaUsd"),3),money(lc.get("totalDeltaUsd"),3)))
+        o.append(_ghost_metric_row("Ghost mean",pct(100*e.get("ghostMean"),3) if fin(e.get("ghostMean")) else "–",
+                                   pct(100*lc.get("ghostMean"),3) if fin(lc.get("ghostMean")) else "–"))
+        o.append(_ghost_metric_row("Risk saved",money(e.get("riskSavedUsd"),3),money(lc.get("riskSavedUsd"),3)))
+        o.append(_ghost_metric_row("Winner truncated",str(e.get("winnerTruncated") or 0),str(lc.get("winnerTruncated") or 0)))
+        o.append(_ghost_metric_row("Saved loss / no effect","%d / %d"%(e.get("savedLoss") or 0,e.get("noEffect") or 0),
+                                   "%d / %d"%(lc.get("savedLoss") or 0,lc.get("noEffect") or 0)))
+        o.append(_ghost_metric_row("Evidence status",_ghost_status_html(e.get("status")),_ghost_status_html(lc.get("status"))))
+        o.append("</table></div><div class='note'>PROMISING needs at least 60 comparable baskets and 20 independent episodes, "
+                 "positive mean and median delta, and no mean expectancy loss. It is not inferred from win-rate.</div>")
+    o.append("<h2>Canonical Research · N=1693</h2><div class='g2'>")
+    o.append(card("Actual Hold 36h","<span class='pos'>Mean +0.3149%</span>","PF 1.40 · CVaR5 −4.566%"))
+    o.append(card("LOSS_CUT","<span class='pos'>Mean +0.3295%</span>","PF 1.45 · CVaR5 −4.042% · avg hold 32.7h"))
+    o.append(card("But","<span class='neg'>GHOST ONLY</span>","OOS advantage not robust · only 2/6 OOS offsets positive"))
+    o.append(card("PROFIT_FLOOR / COMBINED","<span class='neg'>REJECTED</span>","expectancy loss too large"))
+    o.append(card("E historical context","Mean +0.3107%","OOS delta vs NoTP −0.0334 pp · offsets won 3/6"))
+    o.append("</div><h3>Why LOSS_CUT is monitored</h3><div class='g2'>")
+    o.append(card("Giveback &gt;70%","continuation mean +0.053%","recovery 31.2% · final mean −0.777%"))
+    o.append(card("Current P&amp;L &lt;−2%","recovery 3.4%","final mean −3.013%"))
+    o.append("</div><div class='note'>Descriptive historical evidence only, not a guarantee or prediction. "
+             "It is separate from Valid Forward Evidence.</div>")
+    return "".join(o)
+
+def _ghost_recent_cell(r,c,which):
+    if which=="E":
+        ghost=r.get("ghostExit") or {}; left=r.get("leftCensor") or {}
+        result_key,usd_key,delta_key,verdict_key="eNetReturn","ePnlUsd","deltaNetReturn","eVerdict"
+        prospective=r.get("prospectiveFirstGhostTrigger")
+    else:
+        lc=_loss_cut_state(r); ghost=lc.get("ghostExit") or {}; left=lc.get("leftCensor") or {}
+        result_key,usd_key,delta_key,verdict_key="lossCutNetReturn","lossCutPnlUsd","lossCutDeltaNetReturn","lossCutVerdict"
+        prospective=lc.get("prospectiveFirstGhostTrigger")
+    if ghost:
+        label="first observed; historical unknown" if left.get("classification") else "first true trigger"
+        trigger="<b>%s</b><br><span class='dim'>%s · age %s · MFE %s · giveback %s</span>"%(
+            esc(label),_e_time((prospective or ghost).get("observedAt")),
+            ("%.1fh"%ghost.get("ageHours")) if fin(ghost.get("ageHours")) else "–",
+            pct(100*ghost.get("mfeAtTriggerNetReturn"),3) if fin(ghost.get("mfeAtTriggerNetReturn")) else "–",
+            _e_giveback(ghost.get("givebackFraction")))
+    elif left.get("classification"):
+        trigger="<span class='warnc'>pre-monitor / historical unknown</span>"
+    else:
+        trigger="<span class='dim'>not triggered</span>"
+    result=_e_net_pair(c.get(result_key),c.get(usd_key)) if fin(c.get(result_key)) else "<span class='dim'>–</span>"
+    delta=_e_pp(c.get(delta_key)) if fin(c.get(delta_key)) else "<span class='dim'>–</span>"
+    verdict=esc(c.get(verdict_key) or "NO EFFECT")
+    return "%s<br><span class='dim'>ghost result %s · delta %s · %s</span>"%(trigger,result,delta,verdict)
+
+def smart_e_recent_html(R):
+    se=R.get("smartE") or {}; rows=(se.get("recent") or [])[:10]
+    o=["<h2>Recent Evaluation · up to 10 baskets</h2>"]
+    o.append("<div class='note'>Actual Hold, E, and LOSS_CUT results are shown separately. Rows outside the common valid cohort "
+             "are diagnostic only; their deltas are not included in forward aggregates.</div>")
+    if not rows: return "".join(o)+"<div class='card dim'>Belum ada basket selesai yang tercatat oleh ledger ghost.</div>"
+    o.append("<div class='scroll'><table><tr><th>basket / regime / scoreGap</th><th>actual</th><th>E trigger / result / delta</th><th>LOSS_CUT trigger / result / delta</th><th>comparable</th><th>verdict</th></tr>")
+    for r in rows:
+        c=r.get("closed") or {}; comp=c.get("comparable")
+        comp_html=("<span class='pos'><b>VALID</b></span>" if comp else "<span class='warnc'><b>EXCLUDED</b></span>")
+        comp_html+="<br><span class='dim' style='white-space:normal'>%s</span>"%esc(c.get("comparatorNote") or "not a 36h Hold comparator")
+        actual="%s<br><span class='dim'>%s · %s · %s</span>"%(
+            _e_net_pair(c.get("actualNetReturn"),c.get("actualPnlUsd")),
+            _e_time(c.get("closedAt")),esc(str(c.get("closeReason") or "–")),
+            ("%.1fh"%c.get("holdHours")) if fin(c.get("holdHours")) else "–")
+        verdict="E: %s<br>LOSS_CUT: %s"%(esc(c.get("eVerdict") or "NO EFFECT"),esc(c.get("lossCutVerdict") or "NO EFFECT"))
+        o.append("<tr><td><b>%s</b><br><span class='dim'>%s · gap %s · opened %s</span></td><td>%s</td><td style='white-space:normal'>%s</td><td style='white-space:normal'>%s</td><td style='white-space:normal'>%s</td><td>%s</td></tr>"%(
+            esc(friendly(r.get("basketId"))),esc(r.get("regime") or "–"),num(r.get("scoreGap"),4),_e_time(r.get("openedAt")),
+            actual,_ghost_recent_cell(r,c,"E"),_ghost_recent_cell(r,c,"LOSS_CUT"),comp_html,verdict))
+    o.append("</table></div>")
+    return "".join(o)
+
+def smart_e_overview_html(R):
+    return smart_e_open_html(R)+smart_e_summary_html(R)+smart_e_recent_html(R)
+
 def alerts_of(R):
     """BLOCKING -> RISK -> WATCH -> INFO"""
     A=[]
@@ -740,14 +1928,23 @@ def alerts_of(R):
         if ex.get("configErrors"): A.append((0,"block","%s konfigurasi bermasalah"%L,str(ex["configErrors"])[:120]))
         runtime=ex.get("effectiveRuntime") or {}
         for mismatch in runtime.get("mismatches") or []:
-            A.append((0,"block","%s CONFIG INEFFECTIVE"%L,
-                      "%s — %s"%(mismatch.get("key") or "runtime",mismatch.get("reason") or "nilai env tidak dipakai runtime")))
+            A.append((0,"block","%s CONFIG INEFFECTIVE"%L,"%s — %s"%(mismatch.get("key") or "runtime",mismatch.get("reason") or "nilai env tidak dipakai runtime")))
         if "OK:" not in (i["envPolicy"] or ""): A.append((0,"block","%s menyimpang dari kebijakan konfigurasi"%L,i["envPolicy"][:120]))
+        ep=_e_policy(ex,_e_runtime_flags(i))
+        if not ep["canonicalNoTp36"]:
+            A.append((3,"watch","%s belum menjalankan NoTP / 36h"%L,
+                      "%s; Smart Basket E tetap ghost-only dan forward NoTP comparison dikecualikan."%ep["label"]))
         if ex.get("orphanedLegs"): A.append((1,"block","%s punya kaki yatim"%L,"%d posisi tanpa basket induk"%len(ex["orphanedLegs"])))
         if ex.get("entryHealthBypassed"): A.append((1,"override","%s: gerbang bukti di-override operator"%L,
             "Bot membuka basket walau bukti terakhirnya tidak lolos. Keputusan manual, bukan lampu hijau dari data."))
         if ex.get("signalStale"): A.append((2,"watch","%s sinyalnya basi"%L,
             "umur %.0f menit dari batas %.0f menit — tidak ada basket baru sampai segar"%((ex.get("signalAgeMs") or 0)/60000.0,(ex.get("signalMaxAgeMs") or 0)/60000.0)))
+        fh=_fh_report(i)
+        if fh:
+            for alert in fh.get("alerts") or []:
+                severe=alert.get("severity")=="BLOCK"
+                A.append((0 if severe else 2,"block" if severe else "watch","%s Futures Reference Health: %s"%(L,alert.get("code") or "ALERT"),
+                          str(alert.get("message") or "USD-M reference alert")[:160]))
     for j in R["system"]["jobs"]:
         if j["stale"]: A.append((2,"watch","%s berhenti"%j["job"],"terakhir %s"%("tidak pernah" if j["ageHours"] is None else "%.1f jam lalu"%j["ageHours"])))
     for p in R["system"]["pm2"]:
@@ -756,6 +1953,156 @@ def alerts_of(R):
     if d and int(str(d["pct"]).rstrip("%") or 0)>=90: A.append((2,"watch","Disk hampir penuh","%s terpakai, sisa %s"%(d["pct"],d["avail"])))
     if R.get("mismatch"): A.append((3,"watch","Bukti riset tidak sepenuhnya mewakili produksi","%d ketidakcocokan — lihat tab Riset"%len(R["mismatch"])))
     return sorted(A,key=lambda x:x[0])
+
+def runtime_consistency_html(R):
+    """Actual scheduler, exit path and accounting state from executor status, never env intent alone."""
+    o=["<h2>Runtime efektif &amp; cohort forward</h2>",
+       "<div class='scroll'><table><tr><th>lingkungan</th><th>formation aktual</th><th>revalidasi entry</th><th>adaptive exit</th><th>tick aktual</th><th>exit HORIZON aktual</th><th>measurement / cap</th><th>TP / SL baru</th><th>policy fingerprint</th><th>cohort valid / excluded / episode</th><th>clean / quarantine / reject</th><th>status</th></tr>"]
+    for k in ("live","testnet"):
+        i=R["inst"][k]; ex=i["ex"]; flags=i.get("flags") or {}; runtime=ex.get("effectiveRuntime") or {}
+        tick=runtime.get("executorTick") or {}; maker=runtime.get("makerExit") or {}; adaptive=runtime.get("adaptiveExits") or {}
+        policy=ex.get("currentPolicyFingerprint") or {}; cohort=ex.get("currentPolicyForwardCohort") or {}; accounting=ex.get("accountingCounts") or {}
+        bad=list(runtime.get("mismatches") or [])
+        requested_maker=(maker.get("configured") is True) or flags.get("CROSS_SECTIONAL_MAKER_EXIT_ENABLED")=="1"
+        if not runtime: bad.append({"key":"executor runtime","reason":"API tidak mengekspos effectiveRuntime"})
+        formation=runtime.get("formationMode")
+        entry_revalidation=runtime.get("entryRevalidation")
+        adaptive_mode=runtime.get("adaptiveExitMode")
+        if formation not in ("PLAIN_MOM36","SMART_FORMATION_RERANK"):
+            bad.append({"key":"formationMode","reason":"API belum mengekspos mode pemilihan efektif"})
+            formation="CONFIG INEFFECTIVE"
+        if not isinstance(entry_revalidation,bool):
+            bad.append({"key":"entryRevalidation","reason":"API belum mengekspos status lifecycle efektif"})
+            entry_revalidation=None
+        if adaptive_mode not in ("ON","OFF"):
+            bad.append({"key":"adaptiveExitMode","reason":"API belum mengekspos mode exit efektif"})
+            adaptive_mode="CONFIG INEFFECTIVE"
+        tick_text=("%sms"%tick.get("effectiveMs")) if tick.get("effectiveMs") is not None else "–"
+        if not runtime or maker.get("state")=="CONFIG_INEFFECTIVE": exit_text="CONFIG INEFFECTIVE" if requested_maker else "MARKET"
+        elif maker.get("effective"): exit_text="MAKER-FIRST"
+        else: exit_text="MARKET"
+        horizon="%s%s / %sj"%(ex.get("measurementHorizonBars") or "–",ex.get("measurementInterval") or "",ex.get("maxHoldHours") or "–")
+        tp="OFF" if ex.get("tpDisabled") else ("%s%%"%ex.get("tpNetReturnPct"))
+        sl="OFF" if ex.get("stopNetReturnPct") is None else ("%s%%"%ex.get("stopNetReturnPct"))
+        strategy=policy.get("strategy") or {}; source=strategy.get("sourceSha") or "–"
+        status="CONFIG INEFFECTIVE" if bad else "EFFECTIVE"
+        detail="; ".join("%s: %s"%(m.get("key") or "runtime",m.get("reason") or "") for m in bad) or "API runtime path verified"
+        rel=os.path.basename(os.path.dirname(i.get("rel") or ""))
+        o.append("<tr><td><b>%s</b><br><span class='dim'>%s</span></td><td><b>%s</b></td><td>%s</td><td>%s</td><td>%s<br><span class='dim'>env %s</span></td><td>%s<br><span class='dim'>wait %sms</span></td><td>%s</td><td>%s / %s</td><td><code>%s</code><br><span class='dim'>%s</span></td><td>%s / %s / %s</td><td>%s / %s / %s</td><td>%s %s<br><span class='dim'>%s</span></td></tr>"%(
+            esc(i["long"]),esc(rel),esc(formation),esc("ON" if entry_revalidation is True else "OFF" if entry_revalidation is False else "CONFIG INEFFECTIVE"),esc(adaptive_mode),esc(tick_text),esc(tick.get("configured") if tick.get("configured") is not None else flags.get("CROSS_SECTIONAL_EXEC_TICK_MS") or "–"),
+            esc(exit_text),esc(maker.get("waitMs") if maker.get("waitMs") is not None else flags.get("CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS") or "–"),esc(horizon),esc(tp),esc(sl),
+            esc(policy.get("policyId") or "–"),esc(source),cohort.get("validCohortN",0),cohort.get("excludedN",0),cohort.get("independentEpisodes",0),
+            accounting.get("cleanN",0),accounting.get("quarantinedN",0),accounting.get("rejectedN",0),DOT["block"] if bad else DOT["ok"],esc(status),esc(detail)))
+    o.append("</table></div>")
+    ee=R.get("exitEcon") or {}
+    o.append("<div class='grid'>"+card("Maker participation",("%.0f%%"%ee["makerPct"]) if fin(ee.get("makerPct")) else NA,"notional exit historis")+card("Fallback taker",("%.0f%%"%ee["fallbackPct"]) if fin(ee.get("fallbackPct")) else NA,"hanya sisa qty")+card("Fee saved",money(ee.get("feeSaved"),4),"maker 2bps vs taker 5bps")+card("Exit drift",("%.3f%%"%ee["exitDrift"]) if fin(ee.get("exitDrift")) else NA,"fallback vs maker")+card("Implementation shortfall",money(ee.get("implementationShortfall"),4),"decision vs fill")+card("Imbalance sementara",money(ee.get("temporaryImbalance"),4),"maksimum antar-leg")+"</div>")
+    return "".join(o)
+
+def _fh_report(i):
+    r=i.get("futuresHealth") or {}
+    return r if isinstance(r,dict) and r.get("enabled") is True and isinstance(r.get("counters"),dict) else None
+
+def _fh_counter(i,key):
+    r=_fh_report(i)
+    return (r.get("counters") or {}).get(key) if r else None
+
+def _fh_number(v):
+    return "–" if not fin(v) else str(int(v))
+
+def _fh_percent(v):
+    return "–" if not fin(v) else "%.0f%%"%v
+
+def _fh_pair(R,key,percent=False):
+    f=_fh_percent if percent else _fh_number
+    return "LIVE %s · TESTNET %s"%(f(_fh_counter(R["inst"]["live"],key)),f(_fh_counter(R["inst"]["testnet"],key)))
+
+def _fh_source(source):
+    return {"USD_M_MARK_PRICE":"USD-M premiumIndex mark","USD_M_BOOK_TICKER":"USD-M book midpoint",
+            "POSITION_RISK":"same-env positionRisk","NONE":"–"}.get(str(source),str(source or "–"))
+
+def _fh_status(status):
+    return {"HEALTHY":"ok","FALLBACK":"watch","ALERT":"watch","NOT_ELIGIBLE":"off",
+            "UNAVAILABLE":"block","SCALE_GUARD_REJECTED":"block","UNVERIFIED":"watch"}.get(str(status),"watch")
+
+def futures_reference_health_html(R,detail=False):
+    reports=[(k,_fh_report(R["inst"][k])) for k in ("live","testnet")]
+    usable=[(k,r) for k,r in reports if r]
+    o=["<h2>Futures Reference Health</h2>"]
+    if not usable:
+        errors=[]
+        for k in ("live","testnet"):
+            raw=R["inst"][k].get("futuresHealth") or {}
+            errors.append("%s: %s"%(R["inst"][k]["label"],esc(raw.get("__error__") or raw.get("reason") or "endpoint belum tersedia")))
+        return "".join(o)+("<div class='card'><b>Belum tersedia</b><div class='s'>%s</div></div>"%" · ".join(errors))
+    o.append("<div class='health-grid'>")
+    o.append(card("USD-M Mark Used",_fh_pair(R,"usdMMarkUsed"),"resolusi dari premiumIndex mark"))
+    o.append(card("Book Fallback",_fh_pair(R,"bookFallback"),"fallback USD-M midpoint saja"))
+    o.append(card("positionRisk Fallback",_fh_pair(R,"positionRiskFallback"),"same-environment, urutan terakhir"))
+    o.append(card("Reference Unavailable",_fh_pair(R,"referenceUnavailable"),"final FAIL CLOSED"))
+    o.append(card("Scale Guard Rejected",_fh_pair(R,"scaleGuardRejected"),"source/alias/scale ditolak sebelum sizing"))
+    o.append(card("Stale Cache Rejected",_fh_pair(R,"staleCacheRejected"),"stale tidak pernah dipakai ulang"))
+    o.append(card("Cache Hit Rate",_fh_pair(R,"cacheHitRatePct",True),"hit / (hit + refresh miss)"))
+    o.append("</div>")
+    o.append("<div class='reference-chain'><span>USD-M premiumIndex mark</span><b>→</b><span>USD-M book midpoint</span><b>→</b><span>same-env positionRisk</span><b>→</b><span>FAIL CLOSED</span><span><b>tanpa spot fallback</b></span></div>")
+    alerts=[]
+    for k,r in usable:
+        for a in r.get("alerts") or []:
+            alerts.append((k,a))
+    if alerts:
+        for k,a in alerts:
+            sev="block" if a.get("severity")=="BLOCK" else "watch"
+            o.append("<div class='health-alert %s'>%s <b>%s</b> · %s</div>"%(sev,DOT[sev],esc(a.get("code") or "ALERT"),esc(a.get("message") or "")))
+    failures=[]
+    for k,r in usable:
+        f=r.get("lastFailure") or {}
+        if f: failures.append("%s · %s: %s"%(R["inst"][k]["label"],esc(f.get("symbol") or "–"),esc(f.get("reason") or "–")))
+    o.append("<div class='note'><b>Last failure:</b> %s</div>"%(" | ".join(failures) if failures else "tidak ada sejak proses mulai"))
+    rows=[]
+    for k,r in usable:
+        for s in r.get("symbols") or []:
+            rows.append((k,s))
+    if rows:
+        o.append("<div class='scroll'><table><tr><th>environment</th><th>symbol</th><th>futures eligible</th><th>reference</th><th>price</th><th>status</th><th>diagnostic</th></tr>")
+        for k,s in rows:
+            eligible=s.get("eligible")
+            eligible_text="true" if eligible is True else "false" if eligible is False else "unverified"
+            price=s.get("price")
+            price_text=("%.8g"%price) if fin(price) else "–"
+            status=s.get("status") or "UNVERIFIED"
+            diag=s.get("lastFailure") or (("mark/book %.3f%%"%s.get("markBookDivergencePct")) if fin(s.get("markBookDivergencePct")) else "–")
+            o.append("<tr><td>%s</td><td><b>%s</b></td><td>%s</td><td>%s</td><td class='num'>%s</td><td>%s <b>%s</b></td><td class='dim'>%s</td></tr>"%(
+                esc(R["inst"][k]["label"]),esc(s.get("symbol") or "–"),esc(eligible_text),esc(_fh_source(s.get("reference"))),
+                esc(price_text),DOT[_fh_status(status)],esc(status),esc(diag)))
+        o.append("</table></div>")
+    o.append("<div class='note'>Counter sejak proses API mulai. Probe dashboard hanya GET public USD-M exchangeInfo / mark / book; tidak mengubah order, posisi, universe, atau sizing.</div>")
+    return "".join(o)
+
+def runtime_overview_html(R):
+    o=["<h2>Runtime efektif</h2><div class='g2'>"]
+    for k in ("live","testnet"):
+        i=R["inst"][k]; ex=i["ex"]; runtime=ex.get("effectiveRuntime") or {}; policy=ex.get("currentPolicyFingerprint") or {}
+        tick=runtime.get("executorTick") or {}; maker=runtime.get("makerExit") or {}
+        formation=runtime.get("formationMode") or "CONFIG INEFFECTIVE"
+        entry=runtime.get("entryRevalidation")
+        entry_text="ON" if entry is True else "OFF" if entry is False else "UNVERIFIED"
+        exit_text="MAKER-FIRST" if maker.get("effective") else "MARKET"
+        line="formation %s · entry revalidation %s · %s · tick %sms"%(
+            formation,entry_text,exit_text,tick.get("effectiveMs") or "–")
+        o.append("<div class='card'><div class='k'>%s</div><div class='v'>%s</div><div class='s'>%s<br>policy <code>%s</code></div></div>"%(
+            esc(i["long"]),DOT["ok"] if not (runtime.get("mismatches") or []) else DOT["block"],
+            esc(line),esc(policy.get("policyId") or "–")))
+    o.append("</div><div class='note'>Detail lengkap runtime, policy fingerprint, cohort, accounting clean/quarantine/reject, dan mismatch ada di Sistem.</div>")
+    return "".join(o)
+
+def ghost_overview_html(R):
+    se=R.get("smartE") or {}; open_rows=se.get("open") or []; instances=se.get("instances") or {}
+    live=(instances.get("live") or {}).get("summary") or {}; test=(instances.get("testnet") or {}).get("summary") or {}
+    return ("<h2>Observability</h2><div class='grid'>"+
+            card("Ghost E / LOSS_CUT","GHOST ONLY","%d basket terbuka dipantau; tidak mengubah exit / entry / order"%len(open_rows))+
+            card("Forward cohort LIVE",str(live.get("validForwardCohort") or 0),"%d completed comparator"%(live.get("completed") or 0))+
+            card("Forward cohort TESTNET",str(test.get("validForwardCohort") or 0),"%d completed comparator"%(test.get("completed") or 0))+
+            card("Evidence ledger","terpisah","detail Ghost E / LOSS_CUT dipindahkan ke Sistem agar Ringkasan tetap ringkas")+
+            "</div>")
 
 def tab_overview(R):
     a=R["account"]; liv=R["inst"]["live"]; tst=R["inst"]["testnet"]
@@ -778,23 +2125,7 @@ def tab_overview(R):
         i=R["inst"][k]; ex=i["ex"]; adm=i["adm"]; g=i["gate"]
         run = (ex.get("enabled") is not False) and not ex.get("__error__")
         byp = bool(ex.get("entryHealthBypassed"))
-        runtime=ex.get("effectiveRuntime") or {}; tick=runtime.get("executorTick") or {}; maker=runtime.get("makerExit") or {}
-        tick_ok=tick.get("state")=="EFFECTIVE"; maker_ok=bool(maker.get("effective")); maker_bad=maker.get("state")=="CONFIG_INEFFECTIVE"
-        formation_mode=runtime.get("formationMode") or "CONFIG INEFFECTIVE"
-        adaptive_mode=runtime.get("adaptiveExitMode") or "CONFIG INEFFECTIVE"
-        entry_revalidation=bool(runtime.get("entryRevalidation"))
         rows=[status_row("Eksekusi","ok" if run else "block","BERJALAN" if run else "MATI",""),
-              status_row("Mode formasi","ok" if formation_mode!="CONFIG INEFFECTIVE" else "block",formation_mode,
-                         "mode efektif dari executor; bukan pembacaan env langsung"),
-              status_row("Revalidasi entry","ok" if entry_revalidation else "off","ON" if entry_revalidation else "OFF",
-                         "lifecycle Smart Basket, terpisah dari mode formasi"),
-              status_row("Exit adaptif","ok" if adaptive_mode=="ON" else ("off" if adaptive_mode=="OFF" else "block"),adaptive_mode,
-                         "ghost tetap berjalan saat eksekusi OFF"),
-              status_row("Tick executor","ok" if tick_ok else "block",("%s ms"%tick.get("effectiveMs")) if tick_ok else "CONFIG INEFFECTIVE",
-                         "scheduler actual; env %s"%(tick.get("configured") if tick.get("configured") is not None else "tidak diset")),
-              status_row("Exit HORIZON","ok" if maker_ok else ("block" if maker_bad else "off"),
-                         "MAKER-FIRST" if maker_ok else ("CONFIG INEFFECTIVE" if maker_bad else "MARKET"),
-                         "maker configured=%s; stop/darurat tetap MARKET"%bool(maker.get("configured"))),
               status_row("Kesehatan bukti","ok" if g["pass"] else "block","LOLOS" if g["pass"] else "GAGAL",
                          "8 terakhir %s · 30 terakhir %s"%(pct(g.get("last8"),3),pct(g.get("last30"),3))),
               status_row("Override operator","override" if byp else "off","AKTIF" if byp else "TIDAK AKTIF",
@@ -805,16 +2136,16 @@ def tab_overview(R):
                          "TERBUKA" if adm.get("tier")=="GREEN" and not ex.get("signalStale") else "TERTUTUP","")]
         o.append("<div class='card'><div class='k'>%s</div><table style='margin-top:6px'>%s</table></div>"%(i["long"],"".join(rows)))
     o.append("</div>")
+    o.append(futures_reference_health_html(R))
+    o.append(runtime_overview_html(R))
     o.append("<h2>Posisi &amp; keyakinan</h2><div class='grid'>")
     o.append(card("Basket terbuka","%d live · %d testnet"%(len(ob_l),len(ob_t)),"batas %s / %s"%(liv["ex"].get("maxOpenBaskets") or "–",tst["ex"].get("maxOpenBaskets") or "–")))
     sc=R["scores"]
     o.append(card("Keyakinan edge",num(sc["edge"]["value"],0),"%s · t terkoreksi %s"%(rate(sc["edge"]["value"]),num(R["edge"]["tEff"],2))))
     o.append(card("Kekuatan bukti",num(sc["evidence"]["value"],0),"%d episode independen"%R["edge"]["episodes"]))
     o.append(card("Performa keseluruhan",num(sc["overall"]["value"],0),rate(sc["overall"]["value"])))
-    cohort=liv["ex"].get("currentPolicyForwardCohort") or {}
-    o.append(card("Forward cohort LIVE","%s valid / %s excluded"%(cohort.get("validCohortN",0),cohort.get("excludedN",0)),
-                  "%s episode independen · policy %s"%(cohort.get("independentEpisodes",0),(liv["ex"].get("currentPolicyFingerprint") or {}).get("policyId") or "–")))
     o.append("</div>")
+    o.append(ghost_overview_html(R))
     o.append("<h2>Peringatan</h2>")
     if not A: o.append("<div class='card'>%s Tidak ada peringatan aktif.</div>"%DOT["ok"])
     else:
@@ -837,16 +2168,13 @@ def tab_strategy(R):
     liv=R["inst"]["live"]; ex=liv["ex"]; fc=liv["fc"]; cnt=(liv["pool"] or {}).get("counts") or {}
     eq=(R["account"] or {}).get("accountEquity"); leg=ex.get("legUsd")
     runtime=ex.get("effectiveRuntime") or {}; maker_runtime=runtime.get("makerExit") or {}; tick_runtime=runtime.get("executorTick") or {}
-    policy=ex.get("currentPolicyFingerprint") or {}; policy_exec=policy.get("execution") or {}; legacy_policy=ex.get("legacyExitPolicy") or {}
-    cohort=ex.get("currentPolicyForwardCohort") or {}; accounting=ex.get("accountingCounts") or {}
-    mex=bool(maker_runtime.get("effective")); tick_sec=(tick_runtime.get("effectiveMs") or 0)/1000.0
-    formation_mode=runtime.get("formationMode") or (policy.get("formation") or {}).get("formationMode") or "CONFIG INEFFECTIVE"
+    formation_mode=runtime.get("formationMode") or "CONFIG INEFFECTIVE"
     rerank=formation_mode=="SMART_FORMATION_RERANK"
-    adaptive_mode=runtime.get("adaptiveExitMode") or ((runtime.get("adaptiveExits") or {}).get("effective") and "ON") or "OFF"
-    adaptive=adaptive_mode=="ON"
-    entry_revalidation=bool(runtime.get("entryRevalidation"))
-    tp_text="OFF" if ex.get("tpDisabled") else ("%s%%"%ex.get("tpNetReturnPct"))
-    stop_text="OFF" if ex.get("stopNetReturnPct") is None else ("%s%%"%ex.get("stopNetReturnPct"))
+    entry_revalidation=runtime.get("entryRevalidation")
+    adaptive_mode=runtime.get("adaptiveExitMode") or "CONFIG INEFFECTIVE"
+    mex=bool(maker_runtime.get("effective")); maker_state=maker_runtime.get("state") or "CONFIG_INEFFECTIVE"; adaptive=adaptive_mode=="ON"
+    tick_sec=(tick_runtime.get("effectiveMs") or 0)/1000.0
+    stop_text="OFF" if ex.get("stopNetReturnPct") is None else ("%s%%"%ex.get("stopNetReturnPct")); tp_text="OFF" if ex.get("tpDisabled") else ("%s%%"%ex.get("tpNetReturnPct"))
     gross=(leg*6) if fin(leg) else None
     o=[lead("ok","Momentum relatif lintas-simbol, netral pasar",
         "Bot memeringkat seluruh universe menurut momentum 36 jam, membeli 3 terkuat dan menjual 3 terlemah. Yang dikejar bukan arah pasar, melainkan <b>selisih</b> antara yang kuat dan yang lemah — kalau pasar naik atau turun bersama, keduanya saling meniadakan.")]
@@ -856,7 +2184,7 @@ def tab_strategy(R):
       ("3 · Gerbang scoreGap","Selisih rata-rata skor long dan short harus ≥ <b>%s</b>. Di bawah itu basket ditolak sepenuhnya, betapapun bagus kombinasinya — cross-section yang rapat berarti tak ada yang bisa dipanen."%fc.get("minScoreGap")),
       ("4 · Revalidasi entry","Tepat sebelum order dikirim, cek apakah harga sudah lari melawan sejak sinyal dibentuk. Kalau sudah, batalkan daripada mengejar."),
       ("5 · Smart Basket / Ghost","Setelah basket hidup, tiga aturan adaptif <b>mengevaluasi</b> apakah alasan masuknya masih berlaku. Eksekusinya dimatikan; evaluasinya tetap jalan sehingga bisa diukur tanpa menyentuh uang."),
-      ("6 · Eksekusi exit","Measurement horizon %s%s, execution cap %s jam; stop %s, TP %s. Basket baru menyimpan policy ini saat masuk."%(ex.get("measurementHorizonBars"),ex.get("measurementInterval") or "h",ex.get("maxHoldHours"),stop_text,tp_text))]
+      ("6 · Exit policy","Measurement horizon %s%s, execution cap %s jam; stop %s, TP %s."%(ex.get("measurementHorizonBars") or "–",ex.get("measurementInterval") or "",ex.get("maxHoldHours"),stop_text,tp_text))]
     o.append("<div class='flow'>"+"<span class='a'>→</span>".join("<span class='n'>%s</span>"%x[0] for x in steps)+"</div>")
     o.append("<table><tr><th>tahap</th><th>yang terjadi</th></tr>%s</table>"%"".join(
         "<tr><td><b>%s</b></td><td class='dim' style='white-space:normal'>%s</td></tr>"%(a,b) for a,b in steps))
@@ -864,7 +2192,7 @@ def tab_strategy(R):
     o.append(card("Universe","%s simbol"%cnt.get("universe"),"pool long %s · short layak %s"%(cnt.get("poolLong"),cnt.get("shortEligible"))))
     o.append(card("Struktur","3 long / 3 short","bobot dari peringkat skor, dibatasi"))
     o.append(card("Ukuran per kaki",money(leg,0),"kotor %s%s"%(money(gross,0),(" · %.0f%% ekuitas"%(100*gross/eq)) if gross and eq else "")))
-    o.append(card("Execution cap","%s jam"%ex.get("maxHoldHours"),"measurement horizon %s%s"%(ex.get("measurementHorizonBars"),ex.get("measurementInterval") or "h")))
+    o.append(card("Execution cap","%s jam"%ex.get("maxHoldHours"),"measurement horizon %s%s"%(ex.get("measurementHorizonBars") or "–",ex.get("measurementInterval") or "")))
     o.append(card("Stop / ambil untung","%s / %s"%(stop_text,tp_text),"policy basket baru"))
     o.append(card("Ambang pemisahan",num(fc.get("minScoreGap"),3),"basket ditolak di bawah ini"))
     o.append("</div>")
@@ -882,7 +2210,6 @@ def tab_strategy(R):
             esc(b)) for a,b in FEATURES))
     if not rerank:
         o.append("<div class='note'>Baris bertanda ⚪ tidak menjadi selector. Revalidasi entry dan ghost tetap memakai harga, score, dan volatilitas kaki yang dibekukan, tanpa menjalankan utility rerank.</div>")
-    maker_state=maker_runtime.get("state") or "CONFIG INEFFECTIVE"
     maker_label="maker-first + taker fallback" if mex else ("CONFIG INEFFECTIVE" if maker_state=="CONFIG_INEFFECTIVE" else "taker penuh")
     maker_dot=DOT["ok"] if mex else (DOT["block"] if maker_state=="CONFIG_INEFFECTIVE" else DOT["off"])
     ee=R.get("exitEcon") or {}
@@ -897,11 +2224,12 @@ def tab_strategy(R):
       "</table>"%(
         DOT["ok"] if formation_mode!="CONFIG INEFFECTIVE" else DOT["block"],formation_mode,
         DOT["off"] if not rerank else DOT["watch"],"OFF" if not rerank else "ON",
-        DOT["ok"] if entry_revalidation else DOT["off"],"ON" if entry_revalidation else "OFF",
+        DOT["ok"] if entry_revalidation is True else (DOT["off"] if entry_revalidation is False else DOT["block"]),"ON" if entry_revalidation is True else "OFF" if entry_revalidation is False else "CONFIG INEFFECTIVE",
         DOT["ok"] if adaptive else DOT["off"],"ON" if adaptive else "OFF · Ghost AKTIF",
         maker_dot,maker_label,
         "hanya untuk penutupan terjadwal (HORIZON); stop/darurat tetap MARKET langsung",
         DOT["ok"] if tick_runtime.get("state")=="EFFECTIVE" else DOT["block"],tick_sec))
+    o.append(runtime_consistency_html(R))
     o.append("<h2>Ekonomi eksekusi exit</h2><div class='grid'>")
     o.append(card("Porsi maker",("%.0f%%"%ee["makerPct"]) if fin(ee.get("makerPct")) else NA,"%d kaki pasif"%(ee.get("legsMaker") or 0)))
     o.append(card("Porsi fallback taker",("%.0f%%"%ee["fallbackPct"]) if fin(ee.get("fallbackPct")) else NA,"%d kaki menyeberang"%(ee.get("legsTaker") or 0)))
@@ -909,38 +2237,24 @@ def tab_strategy(R):
     o.append(card("Biaya dihemat",money(ee.get("feeSaved"),4),"3bps atas notional yang pasif"))
     o.append(card("Selisih harga exit",("%.3f%%"%ee["exitDrift"]) if fin(ee.get("exitDrift")) else NA,"fallback vs harga maker"))
     o.append(card("Implementation shortfall",money(ee.get("implementationShortfall"),4),"decision price vs fill aktual"))
-    o.append(card("Imbalance sementara",money(ee.get("temporaryImbalance"),4),"maksimum saat maker/fallback exit"))
+    o.append(card("Imbalance sementara",money(ee.get("temporaryImbalance"),4),"maksimum antar-leg"))
+    o.append(card("Durasi exit",("%.1f detik"%ee["durationSec"]) if fin(ee.get("durationSec")) else NA,"maker wait + fallback"))
     lat=[v for v in (R.get("exec") or {}).get("latency",{}).values() if fin(v)]
     o.append(card("Latensi sinyal→order",("%.0f detik"%(sum(lat)/len(lat))) if lat else NA,"percobaan terakhir tiap instance"))
     o.append("</div>")
     if not fin(ee.get("makerPct")):
         o.append("<div class='note'>Belum ada penutupan terjadwal sejak exit maker-first dinyalakan, jadi porsi maker dan biaya yang dihemat %s. Angkanya akan terisi setelah basket pertama tutup di batas 36 jam.</div>"%NA.lower())
-    o.append("<h2>Policy fingerprint &amp; cohort forward</h2><div class='grid'>")
-    o.append(card("Policy ID","<code>%s</code>"%esc(policy.get("policyId") or "–"),"SHA %s"%esc((policy.get("strategy") or {}).get("sourceSha") or "–")))
-    o.append(card("Cohort valid","%s"%cohort.get("validCohortN",0),"%s episode independen"%cohort.get("independentEpisodes",0)))
-    o.append(card("Excluded","%s"%cohort.get("excludedN",0),esc(", ".join("%s=%s"%(k,v) for k,v in (cohort.get("excludedReasons") or {}).items()) or "tidak ada")))
-    o.append(card("Accounting","clean %s · quarantine %s · reject %s"%(accounting.get("cleanN",0),accounting.get("quarantinedN",0),accounting.get("rejectedN",0)),"hanya clean/current-policy masuk evidence"))
-    o.append("</div>")
-    legacy_open=sum(1 for basket in (ex.get("openBaskets") or []) if not basket.get("policyFingerprint"))
-    if legacy_open:
-        legacy_tp="OFF" if not legacy_policy.get("takeProfitEnabled") else "%s%%"%(100*(legacy_policy.get("takeProfitNetReturn") or 0))
-        legacy_stop="OFF" if not legacy_policy.get("stopLossEnabled") else "%s%%"%(100*(legacy_policy.get("stopLossNetReturn") or 0))
-        o.append("<div class='note'><b>%d basket lama masih terbuka.</b> Mereka tetap memakai kontrak legacy yang dibekukan saat cutover: cap %s jam, stop %s, TP %s, maker exit %s. Policy baru tidak mengubah atau menutupnya.</div>"%(
-            legacy_open,legacy_policy.get("executionCapHours"),legacy_stop,legacy_tp,"ON" if legacy_policy.get("makerExitEnabled") else "OFF"))
-    mismatches=runtime.get("mismatches") or []
-    if mismatches:
-        o.append("<div class='lead' style='border-left-color:#e5686d'><div class='c'>🔴 CONFIG INEFFECTIVE</div><div class='r'>%s</div></div>"%esc("; ".join("%s: %s"%(m.get("key"),m.get("reason")) for m in mismatches)))
     o.append("<h2>Smart Basket — mengelola basket setelah dibentuk</h2>")
-    o.append("<div class='note'>Eksekusi exit adaptif <b>%s</b>; evaluasi ghost tetap berjalan dan disimpan terpisah dari order nyata.</div>"%("AKTIF" if adaptive else "DIMATIKAN"))
+    o.append("<div class='note'>Eksekusi exit adaptif <b>DIMATIKAN</b>; evaluasinya tetap berjalan. Penghitung scan terus bertambah, jadi tab Posisi bisa menunjukkan apa yang <i>akan</i> terjadi tanpa aturan itu menyentuh uang.</div>")
     o.append("<table><tr><th>mekanisme</th><th>status</th><th>parameter</th><th>artinya</th></tr>")
-    for nm,stt,par,mean in [("Revalidasi entry",("ok · aktif" if entry_revalidation else "off · MATI"),"drift merugikan sebelum order dikirim","Membatalkan kalau harga sudah lari melawan sejak sinyal dibentuk."),
-        ("Regime Loss Exit",("ok · aktif" if adaptive else "off · Eksekusi MATI, ghost AKTIF"),"kelas regime berubah + rugi ≥0,3% + sisi searah regime baru rugi, 2 scan","Menutup saat pasar berbalik melawan basket."),
-        ("Context Invalidation",("ok · aktif" if adaptive else "off · Eksekusi MATI, ghost AKTIF"),"≥2 dari 3 kaki satu sisi kehilangan alasan masuknya, 2 scan","Menutup saat alasan pemilihan nama-nama itu hilang."),
-        ("MFE Giveback",("ok · aktif" if adaptive else "off · Eksekusi MATI, ghost AKTIF"),"puncak ≥0,2% lalu turun ke ≤50% puncak","Mengunci laba yang mulai menguap."),
+    for nm,stt,par,mean in [("Revalidasi entry",("ok · aktif" if entry_revalidation is True else "off · MATI" if entry_revalidation is False else "block · CONFIG INEFFECTIVE"),"drift merugikan sebelum order dikirim","Membatalkan kalau harga sudah lari melawan sejak sinyal dibentuk."),
+        ("Regime Loss Exit","off · Eksekusi MATI, ghost AKTIF","kelas regime berubah + rugi ≥0,3% + sisi searah regime baru rugi, 2 scan","Menutup saat pasar berbalik melawan basket."),
+        ("Context Invalidation","off · Eksekusi MATI, ghost AKTIF","≥2 dari 3 kaki satu sisi kehilangan alasan masuknya, 2 scan","Menutup saat alasan pemilihan nama-nama itu hilang."),
+        ("MFE Giveback","off · Eksekusi MATI, ghost AKTIF","puncak ≥0,2% lalu turun ke ≤50% puncak","Mengunci laba yang mulai menguap."),
         ("Batas waktu keras","ok · aktif","%s jam"%ex.get("maxHoldHours"),"Selalu menutup di sini apa pun keadaannya."),
-        ("Stop / TP","ok · aktif" if (stop_text!="OFF" or tp_text!="OFF") else "off · Hold saja","%s / %s"%(stop_text,tp_text),"Policy basket baru; basket lama memakai fingerprint legacy."),
-        ("Cara menutup",("ok · maker-first" if mex else "off · taker penuh"),
-         "reduce-only post-only, tunggu %ss, sisanya MARKET"%((maker_runtime.get("waitMs") or 0)//1000),
+        ("Stop / TP",("ok · aktif" if (ex.get("stopNetReturnPct") is not None or not ex.get("tpDisabled")) else "off · OFF"),"%s / %s"%(stop_text,tp_text),"Policy basket baru; legacy basket tetap menyimpan kontraknya."),
+        ("Cara menutup",("ok · maker-first" if mex else ("block · CONFIG INEFFECTIVE" if maker_state=="CONFIG_INEFFECTIVE" else "off · taker penuh")),
+         "reduce-only post-only, tunggu %ss, sisanya MARKET" % int((maker_runtime.get("waitMs") or 0)/1000),
          "Hanya untuk penutupan terjadwal. Stop, darurat dan rekonsiliasi paksa tetap menyeberang seketika.")]:
         s=stt.split(" · ")[0]
         o.append("<tr><td>%s</td><td>%s %s</td><td class='dim'>%s</td><td class='dim' style='white-space:normal'>%s</td></tr>"%(
@@ -950,13 +2264,9 @@ def tab_strategy(R):
         ("Sinyal","<code>%s</code>"%esc(fc.get("signal"))),
         ("Ambang scoreGap","<code>%s</code> · env <code>CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP</code>"%fc.get("minScoreGap")),
         ("Leg USD / leverage","<code>%s</code> / <code>%s</code>"%(leg,ex.get("leverage"))),
-        ("Measurement / cap","<code>%s%s</code> measurement / <code>%s jam</code> execution cap"%(ex.get("measurementHorizonBars"),ex.get("measurementInterval") or "h",ex.get("maxHoldHours"))),
-        ("Stop / TP","<code>%s</code> / <code>%s</code>"%(stop_text,tp_text)),
-        ("Mode formasi efektif","<code>%s</code>"%formation_mode),
-        ("Revalidasi entry efektif","<code>%s</code>"%("ON" if entry_revalidation else "OFF")),
-        ("Exit adaptif efektif","<code>%s</code>; ghost tetap observasional"%adaptive_mode),
-        ("Effective tick","<code>%s ms</code> · %s"%(tick_runtime.get("effectiveMs"),tick_runtime.get("state"))),
-        ("Effective maker exit","<code>%s</code> · %s"%("ON" if mex else "OFF",maker_runtime.get("state"))),
+        ("Batas tahan","<code>%s</code> jam · env <code>CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS</code>"%ex.get("maxHoldHours")),
+        ("Stop / TP","<code>%s</code> / <code>%s</code>"%(ex.get("stopNetReturnPct"),ex.get("tpNetReturnPct"))),
+        ("Exit adaptif","ambang scan dinaikkan ke nilai yang tak terjangkau dalam horizon 48 jam"),
         ("Allowlist long","<code>%s</code>"%esc(", ".join((fc.get("longAllowlist") or [])[:30]))),
         ("Blocklist short","<code>%s</code>"%esc(", ".join(fc.get("shortBlocklist") or []))),
         ("Bursa","Binance USD-M Futures"),("Funding",NA+" — tidak dibukukan per basket oleh executor")]))
@@ -966,7 +2276,6 @@ def tab_decision(R):
     o=[]
     for k in ("live","testnet"):
         i=R["inst"][k]; ex=i["ex"]; adm=i["adm"]; g=i["gate"]; att=i["attempt"]; fc=i["fc"]
-        formation_mode=(ex.get("effectiveRuntime") or {}).get("formationMode") or "CONFIG INEFFECTIVE"
         pool=(i["pool"] or {}).get("counts") or {}
         allow=adm.get("tier")=="GREEN" and not ex.get("signalStale")
         o.append("<h2>%s</h2>"%i["long"])
@@ -977,7 +2286,7 @@ def tab_decision(R):
         ls,ss=att.get("longSymbols"),att.get("shortSymbols")
         steps.append(("p" if ls else "o","Kandidat long",", ".join(ls or []) or "tidak tercatat"))
         steps.append(("p" if ss else "o","Kandidat short",", ".join(ss or []) or "tidak tercatat"))
-        steps.append(("p","Batas klaster","maksimum 2 nama sekluster per sisi%s"%(", utility rerank hanya bila mode SMART_FORMATION_RERANK" if formation_mode=="SMART_FORMATION_RERANK" else "; guardrail keras tanpa utility rerank")))
+        steps.append(("p","Batas klaster","maksimum 2 nama sekluster per sisi, dengan penalti kombinasi"))
         steps.append(("Kualitas alpha",None,None))
         gp,thr=att.get("scoreGap"),fc.get("minScoreGap")
         if fin(gp) and fin(thr):
@@ -1177,7 +2486,7 @@ def tab_positions(R):
         for b in obs:
             any_open=True
             op=piso(b.get("openedAt")); age=(now-op).total_seconds()/3600.0 if op else None
-            capH=ex.get("maxHoldHours"); legs=b.get("legs") or []
+            horizon=basket_horizon_close(b,ex,now); capH=horizon.get("capHours"); legs=b.get("legs") or []
             notion=sum(abs((l.get("qty") or 0)*(l.get("entryPrice") or 0)) for l in legs)
             lnr=b.get("lastNetReturn"); sb=b.get("smartBasket") or {}
             bs=basket_scores(b,thr,sfi,R.get("dist")); usd=(lnr or 0)*notion/2 if fin(lnr) else None
@@ -1186,6 +2495,7 @@ def tab_positions(R):
                 friendly(b.get("basketId")),esc(str(b.get("openedAt"))[:16]),pct(100*lnr,3) if fin(lnr) else "",money(usd,3) if fin(usd) else ""))
             o.append("<div class='grid' style='margin-top:9px'>")
             o.append(card("Umur / batas","%.1f / %s jam"%(age,capH) if age is not None else "–","sisa %.1f jam"%(capH-age) if age is not None and capH else ""))
+            o.append(card("Close HORIZON","%sh · %s"%(num(capH,2),horizon.get("dueAt").astimezone(TAIPEI).strftime("%d %b %H:%M:%S Taipei")) if horizon.get("dueAt") else "–",horizon_close_detail(horizon,ex)))
             o.append(card("Nilai posisi",money(notion,0),("%.0f%% ekuitas"%(100*notion/eq)) if eq else ""))
             o.append(card("HASIL sejauh ini",pct(100*lnr,3) if fin(lnr) else "–",(money(usd,3) if fin(usd) else "")+" · terpisah dari kualitas"))
             o.append(card("Puncak terbaik",pct(100*sb["maxNetReturn"],3) if fin(sb.get("maxNetReturn")) else "–","pada %s"%str(sb.get("maxNetAt"))[:16] if sb.get("maxNetAt") else ""))
@@ -1416,14 +2726,7 @@ def tab_edge(R):
     return "".join(o)
 
 def tab_research(R):
-    o=[];e=R["edge"];thr=R["inst"]["live"]["fc"].get("minScoreGap")
-    o.append("<h2>Cohort forward kebijakan saat ini</h2><div class='scroll'><table><tr><th>lingkungan</th><th>policy fingerprint</th><th class='num'>valid</th><th class='num'>excluded</th><th class='num'>episode independen</th><th>catatan</th></tr>")
-    for k in ("live","testnet"):
-        ex=R["inst"][k]["ex"]; cohort=ex.get("currentPolicyForwardCohort") or {}; policy=ex.get("currentPolicyFingerprint") or {}
-        why=", ".join("%s=%s"%(a,b) for a,b in (cohort.get("excludedReasons") or {}).items()) or "–"
-        o.append("<tr><td>%s</td><td><code>%s</code></td><td class='num'>%s</td><td class='num'>%s</td><td class='num'>%s</td><td class='dim'>%s</td></tr>"%(
-            R["inst"][k]["long"],esc(policy.get("policyId") or "–"),cohort.get("validCohortN",0),cohort.get("excludedN",0),cohort.get("independentEpisodes",0),esc(why)))
-    o.append("</table></div><div class='note'>Hanya basket CLOSED yang clean, fingerprint-nya cocok, dan bukan operator-close yang boleh dipakai untuk selection / ghost / weighting evidence baru. History lama tetap tampil sebagai history, tetapi bukan sampel model-selection.</div>")
+    o=[runtime_consistency_html(R)];e=R["edge"];thr=R["inst"]["live"]["fc"].get("minScoreGap")
     mm=R.get("mismatch") or []
     if mm:
         o.append(lead("watch","Bukti riset TIDAK persis mewakili kebijakan produksi",
@@ -1491,6 +2794,8 @@ def tab_system(R):
     bad=[j for j in sy["jobs"] if j["stale"]]+[p for p in sy["pm2"] if p["status"]!="online"]
     o.append(lead("block" if bad else "ok","Infrastruktur sehat" if not bad else "%d komponen perlu perhatian"%len(bad),
         "Kesehatan sistem dinilai terpisah dari kesehatan edge: layanan bisa sempurna sementara strateginya rugi, dan sebaliknya."))
+    o.append(runtime_consistency_html(R))
+    o.append(futures_reference_health_html(R,detail=True))
     o.append("<h2>Kualitas eksekusi</h2><div class='grid'>")
     o.append(card("Harga fill terkonfirmasi",("%.0f%%"%ex["pct"]) if fin(ex["pct"]) else NA,"%d dari %d nilai"%(ex["confirmed"],ex["total"])))
     o.append(card("Galat ukuran kaki",("%.1f%%"%ex["notionalErrPct"]) if fin(ex["notionalErrPct"]) else NA,"simpangan dari nilai rencana (pembulatan lot)"))
@@ -1514,32 +2819,22 @@ def tab_system(R):
     o.append("</table>")
     o.append("<h2>Perbandingan lingkungan</h2><div class='scroll'><table><tr><th>parameter</th><th>LIVE</th><th>TESTNET</th><th>sama?</th></tr>")
     lv,tn=R["inst"]["live"],R["inst"]["testnet"]
-    lvr=lv["ex"].get("effectiveRuntime") or {}; tnr=tn["ex"].get("effectiveRuntime") or {}
-    lvm=(lvr.get("makerExit") or {}); tnm=(tnr.get("makerExit") or {})
-    lvc=lv["ex"].get("currentPolicyForwardCohort") or {}; tnc=tn["ex"].get("currentPolicyForwardCohort") or {}
     for lbl,a,b in (("Ukuran per kaki",lv["ex"].get("legUsd"),tn["ex"].get("legUsd")),
                     ("Batas tahan (jam)",lv["ex"].get("maxHoldHours"),tn["ex"].get("maxHoldHours")),
                     ("Stop (%)",lv["ex"].get("stopNetReturnPct"),tn["ex"].get("stopNetReturnPct")),
                     ("Ambil untung (%)",lv["ex"].get("tpNetReturnPct"),tn["ex"].get("tpNetReturnPct")),
-                    ("Mode formasi efektif",lvr.get("formationMode"),tnr.get("formationMode")),
-                    ("Revalidasi entry efektif",lvr.get("entryRevalidation"),tnr.get("entryRevalidation")),
-                    ("Exit adaptif efektif",lvr.get("adaptiveExitMode"),tnr.get("adaptiveExitMode")),
-                    ("Tick efektif (ms)",(lvr.get("executorTick") or {}).get("effectiveMs"),(tnr.get("executorTick") or {}).get("effectiveMs")),
-                    ("Mode exit HORIZON","MAKER_FIRST" if lvm.get("effective") else ("CONFIG INEFFECTIVE" if lvm.get("state")=="CONFIG_INEFFECTIVE" else "MARKET"),"MAKER_FIRST" if tnm.get("effective") else ("CONFIG INEFFECTIVE" if tnm.get("state")=="CONFIG_INEFFECTIVE" else "MARKET")),
-                    ("Policy fingerprint",(lv["ex"].get("currentPolicyFingerprint") or {}).get("policyId"),(tn["ex"].get("currentPolicyFingerprint") or {}).get("policyId")),
-                    ("Forward cohort valid",lvc.get("validCohortN"),tnc.get("validCohortN")),
-                    ("Accounting clean / quarantine / reject","%s / %s / %s"%( (lv["ex"].get("accountingCounts") or {}).get("cleanN",0),(lv["ex"].get("accountingCounts") or {}).get("quarantinedN",0),(lv["ex"].get("accountingCounts") or {}).get("rejectedN",0)),"%s / %s / %s"%( (tn["ex"].get("accountingCounts") or {}).get("cleanN",0),(tn["ex"].get("accountingCounts") or {}).get("quarantinedN",0),(tn["ex"].get("accountingCounts") or {}).get("rejectedN",0))),
                     ("Ambang pemisahan",lv["fc"].get("minScoreGap"),tn["fc"].get("minScoreGap")),
                     ("Sinyal",lv["fc"].get("signal"),tn["fc"].get("signal")),
                     ("Ukuran universe",len(lv["fc"].get("executionUniverse") or []),len(tn["fc"].get("executionUniverse") or [])),
                     ("Basket bersamaan",lv["ex"].get("maxOpenBaskets"),tn["ex"].get("maxOpenBaskets")),
                     ("Override gerbang bukti",lv["ex"].get("entryHealthBypassed"),tn["ex"].get("entryHealthBypassed"))):
         o.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"%(lbl,esc(a),esc(b),DOT["ok"] if a==b else DOT["watch"]))
-    o.append("</table></div><div class='note'>Policy fingerprint dapat berbeda karena cohort mulai pada waktu berbeda; yang harus sama adalah policy fields-nya. Bila salah satu mode berbunyi <b>CONFIG INEFFECTIVE</b>, nilai env tersebut belum boleh dianggap aktif.</div>")
+    o.append("</table></div><div class='note'>Perbedaan pada dua baris terakhir disengaja: testnet melonggarkan perlindungan modal karena tidak punya modal untuk dilindungi, sementara parameter strategi dijaga identik agar hasilnya sebanding.</div>")
     o.append(tech("host & integritas",[("Waktu host (UTC)",esc(sy["hostTimeUtc"][:19])),
         ("Disk","%s terpakai dari %s, sisa %s"%(sy["disk"]["pct"],sy["disk"]["size"],sy["disk"]["avail"]) if sy.get("disk") else "–"),
         ("Kepatuhan kebijakan","<br>".join("%s: %s"%(R["inst"][k]["long"],esc(R["inst"][k]["envPolicy"][:70])) for k in INST)),
         ("SHA rilis / hash konfigurasi",NA+" — manifest kode tidak mengekspos hash pohon yang bisa dibandingkan lintas-instance")]))
+    o.append("<details class='observability'><summary>Ghost E / LOSS_CUT &amp; forward evidence · observability only</summary><div class='body'>%s</div></details>"%smart_e_overview_html(R))
     return "".join(o)
 
 
@@ -1590,12 +2885,14 @@ def snapshot_md(R):
         for b in R["inst"][k]["ex"].get("openBaskets") or []:
             got=True; lnr=b.get("lastNetReturn")
             bq=basket_scores(b,R["inst"][k]["fc"].get("minScoreGap"),R.get("sfIndex") or {},R.get("dist"))
+            horizon=basket_horizon_close(b,R["inst"][k]["ex"])
             P("- [%s] %s dibuka %s | hasil %s | %s"%(
               R["inst"][k]["label"],friendly(b.get("basketId")),str(b.get("openedAt"))[:16],
               ("%+.3f%%"%(100*lnr)) if fin(lnr) else "n/a",
               ("entry %s / eksekusi %s"%(("%d"%round(bq["entry"]["value"])) if fin(bq["entry"]["value"]) else "n/a",
                                           ("%d"%round(bq["exec"]["value"])) if fin(bq["exec"]["value"]) else "n/a"))))
             P("  %s"%", ".join("%s %s"%(l.get("side"),(l.get("symbol") or "").replace("USDT","")) for l in b.get("legs") or []))
+            P("  HORIZON %sh: %s"%(num(horizon.get("capHours"),2),horizon_close_detail(horizon,R["inst"][k]["ex"])))
             _st,_fire=ghost_chain(b)
             P("  ghost exit: %s"%("AKAN menutup — %s"%", ".join(x["rule"] for x in _st if x["fire"]) if _fire
               else "tidak ada yang menutup (gerbang tesis-batal belum terbuka)"))
@@ -1690,4 +2987,5 @@ class H(BaseHTTPRequestHandler):
             self.send_response(500); self.send_header("Content-Length",str(len(m))); self.end_headers(); self.wfile.write(m)
 
 if __name__=="__main__":
+    threading.Thread(target=smart_e_monitor_loop,name="smart-basket-e-ghost",daemon=True).start()
     HTTPServer(("127.0.0.1",PORT),H).serve_forever()
