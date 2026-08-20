@@ -282,6 +282,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
   commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
   releaseExposureReservation?: (reservationId: string, reason: string) => void;
   readPublicQuote?: (symbol: string) => { bid: number | null; ask: number | null; mid: number; atMs: number; venue: string } | null;
+  warmPublicQuote?: (symbol: string) => Promise<unknown>;
 } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
@@ -325,6 +326,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     ...(opts.reserveExposure ? { reserveExposure: opts.reserveExposure } : {}),
     ...(opts.commitExposureReservation ? { commitExposureReservation: opts.commitExposureReservation } : {}),
     ...(opts.releaseExposureReservation ? { releaseExposureReservation: opts.releaseExposureReservation } : {}),
+    ...(opts.warmPublicQuote ? { warmPublicQuote: opts.warmPublicQuote } : {}),
   });
   return { executor, client, signalStore, store, storeDir };
 }
@@ -1277,6 +1279,56 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     // $25 / 0.003 is thousands, not the old spot-scale millions.
     expect(pepe.qty).toBeGreaterThan(8_000);
     expect(pepe.qty).toBeLessThan(9_000);
+  });
+
+  it("[MULTIPLIER CONTRACT] warms a USD-M quote when Binance reports a zero-position mark as zero", async () => {
+    const client = new FakeExecClient();
+    let warmed = false;
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: true,
+      warmPublicQuote: async () => { warmed = true; },
+      readPublicQuote: (symbol) => symbol === "1000PEPEUSDT" && warmed
+        ? { bid: 0.00299, ask: 0.00301, mid: 0.003, atMs: NOW_MS, venue: "BINANCE_USDM_BOOK_TICKER" }
+        : null,
+    });
+    const signal = signalStore.all[0]!;
+    signal.longLeg[0] = { symbol: "1000PEPEUSDT", entryPrice: 0.000003, exitPrice: null, volatilityAtOpen: 0.01 };
+    signal.shortLeg[0]!.volatilityAtOpen = 0.01;
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.fillPriceBySymbol.set("1000PEPEUSDT", 0.003);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+
+    await executor.tick();
+
+    expect(warmed).toBe(true);
+    const pepe = store.getState().baskets[0]!.legs.find((leg) => leg.symbol === "1000PEPEUSDT")!;
+    expect(pepe.entryPrice).toBeCloseTo(0.003, 9);
+    expect(pepe.qty).toBeGreaterThan(8_000);
+    expect(pepe.qty).toBeLessThan(9_000);
+  });
+
+  it("[MULTIPLIER CONTRACT] rejects a warmed spot quote rather than using its unsafe unit scale", async () => {
+    const client = new FakeExecClient();
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: true,
+      warmPublicQuote: async () => undefined,
+      readPublicQuote: (symbol) => symbol === "1000PEPEUSDT"
+        ? { bid: 0.00000299, ask: 0.00000301, mid: 0.000003, atMs: NOW_MS, venue: "BINANCE_SPOT_BOOK_TICKER" }
+        : null,
+    });
+    const signal = signalStore.all[0]!;
+    signal.longLeg[0] = { symbol: "1000PEPEUSDT", entryPrice: 0.000003, exitPrice: null, volatilityAtOpen: 0.01 };
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+
+    await executor.tick();
+
+    expect(store.getState().baskets).toHaveLength(0);
+    expect(client.placed).toHaveLength(0);
+    expect(executor.getStatus().entryAttemptAudit.latest?.reason).toContain("no live futures mark");
   });
 
   it("[SMART BASKET LIFECYCLE] keeps entry revalidation and provenance for a Plain MOM36 formation", async () => {

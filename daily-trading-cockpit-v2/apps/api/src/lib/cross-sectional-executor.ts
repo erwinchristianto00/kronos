@@ -2771,6 +2771,26 @@ export class CrossSectionalExecutor {
   }
 
   /**
+   * A zero-position row on Binance's positionRisk endpoint can legitimately carry markPrice=0
+   * for a multiplier perpetual, even while that contract is actively tradable.  The measurement
+   * signal's bare-spot price remains unsafe for sizing, so recover only from a freshly warmed
+   * USD-M book quote; a spot fallback is deliberately rejected.
+   */
+  private async liveMultiplierReferencePrice(symbol: string, mark: unknown = null): Promise<number | null> {
+    if (typeof mark === "number" && Number.isFinite(mark) && mark > 0) return mark;
+    try {
+      await this.warmPublicQuoteFn?.(symbol);
+    } catch {
+      // A missing public quote stays a safe refusal at the caller; never substitute spot scale.
+    }
+    const quote = this.readPublicQuoteFn?.(symbol) ?? null;
+    return quote?.venue === "BINANCE_USDM_BOOK_TICKER" &&
+      Number.isFinite(quote.mid) && quote.mid > 0
+      ? quote.mid
+      : null;
+  }
+
+  /**
    * Signals are hourly but the executor may reach them a few minutes later.  Refresh each actual
    * sizing reference from the exchange mark before any reservation/order.  This keeps normal moves
    * executable while refusing only a genuinely run-away, adverse entry; it is intentionally
@@ -2794,9 +2814,11 @@ export class CrossSectionalExecutor {
     const minAdversePct = this.smartMinAdverseEntryDriftPctFn();
     for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
       for (const leg of legs) {
-        const mark = marks.get(leg.symbol);
-        const hasLiveMark = typeof mark === "number" && Number.isFinite(mark) && mark > 0;
-        if (!hasLiveMark) {
+        let mark: number | null | undefined = marks.get(leg.symbol);
+        if (isCrossSectionalMultiplierContract(leg.symbol)) {
+          mark = await this.liveMultiplierReferencePrice(leg.symbol, mark);
+        }
+        if (!(typeof mark === "number" && Number.isFinite(mark) && mark > 0)) {
           if (isCrossSectionalMultiplierContract(leg.symbol)) {
             return {
               allowed: false,
@@ -2807,15 +2829,16 @@ export class CrossSectionalExecutor {
           }
           continue;
         }
-        referencePrices[leg.symbol] = mark;
+        const liveMark = mark;
+        referencePrices[leg.symbol] = liveMark;
         // `leg.entryPrice` is intentionally a bare-spot price for this contract family.  Do not
         // compare that number to a futures mark as an adverse drift (it is ~1000x by definition);
         // the futures mark above is the only safe sizing reference and carries no selection change.
         if (isCrossSectionalMultiplierContract(leg.symbol)) continue;
         if (!(leg.entryPrice > 0)) continue;
         const adverseMove = side === "LONG"
-          ? (mark - leg.entryPrice) / leg.entryPrice
-          : (leg.entryPrice - mark) / leg.entryPrice;
+          ? (liveMark - leg.entryPrice) / leg.entryPrice
+          : (leg.entryPrice - liveMark) / leg.entryPrice;
         const volatility = leg.volatilityAtOpen;
         const adverseVol = Number.isFinite(volatility) && volatility! > 0 ? adverseMove / volatility! : null;
         if (
@@ -4499,7 +4522,14 @@ export class CrossSectionalExecutor {
     for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
       for (const leg of legs) {
         const f = filters.get(leg.symbol);
-        const liveReferencePrice = smartEntry.referencePrices[leg.symbol];
+        let liveReferencePrice = smartEntry.referencePrices[leg.symbol];
+        if (isCrossSectionalMultiplierContract(leg.symbol) && !(liveReferencePrice > 0)) {
+          const recovered = await this.liveMultiplierReferencePrice(leg.symbol);
+          if (recovered !== null) {
+            smartEntry.referencePrices[leg.symbol] = recovered;
+            liveReferencePrice = recovered;
+          }
+        }
         if (isCrossSectionalMultiplierContract(leg.symbol) && !(liveReferencePrice > 0)) {
           releasePlannedSoFar("MULTIPLIER_LIVE_MARK_UNAVAILABLE");
           this.skipSignal(
