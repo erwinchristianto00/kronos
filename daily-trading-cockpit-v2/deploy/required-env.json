@@ -33,7 +33,7 @@
     },
     "CROSS_SECTIONAL_SMART_BASKET_V1": {
       "value": "1",
-      "why": "GUARD, do not set to 0. This is the master switch for BOTH Smart Formation (selection, which is kept) and the lifecycle exits (which are disabled below via SMART_INVALIDATION_SCANS). Turning it off would silently kill the selection too."
+      "why": "Lifecycle guard only: keeps entry revalidation, provenance, and ghost telemetry available for FILTERED baskets. It must not select symbols or enable utility reranking; that is controlled solely by CROSS_SECTIONAL_SMART_FORMATION_RERANK below."
     },
     "CROSS_SECTIONAL_SMART_INVALIDATION_SCANS": {
       "value": "999",
@@ -81,7 +81,7 @@
     },
     "CROSS_SECTIONAL_SMART_FORMATION_RERANK": {
       "value": "0",
-      "why": "Smart Formation's utility re-ranking (fastSupport, adverseExtension, counter-axis, cluster penalty) OFF. Ablation over 12 block offsets across two years: full re-ranking +0.2227%/basket vs +0.2220% for plain MOM36 rank \u2014 0.0007pp, with identical PF, hit rate, quarterly stability and worst quarter. The hard cluster cap stays as a concentration guardrail; candidate diagnostics keep being recorded for the dashboard and ghost evaluation."
+      "why": "Smart Formation's utility re-ranking (fastSupport, adverseExtension, counter-axis, cluster penalty) OFF. Ablation over 12 block offsets across two years: full re-ranking +0.2227%/basket vs +0.2220% for plain MOM36 rank \u2014 0.0007pp, with identical PF, hit rate, quarterly stability and worst quarter. The hard cluster cap stays as a concentration guardrail; entry revalidation and ghost use the frozen selected-leg data without running utility rerank."
     },
     "CROSS_SECTIONAL_MAKER_EXIT_ENABLED": {
       "value": "1",

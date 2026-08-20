@@ -54,6 +54,22 @@ function freshStore(): CrossSectionalStore {
 const T0 = "2099-01-02T00:00:00.000Z";
 const T0ms = new Date(T0).getTime();
 
+function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T): T {
+  const previous = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  try {
+    for (const [key, value] of Object.entries(overrides)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 describe("cross-sectional-edge — market-neutral measurement lane", () => {
   it("[SCORE] momentum score is the N-bar return + latest close", () => {
     const s = crossSectionalMomentumScore(candles([100, 101, 110]), 2); // (110-100)/100
@@ -292,6 +308,90 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     expect(smart.smartFormation).toMatchObject({ version: "SMART_BASKET_V1", axisScore: -0.4 });
     expect(smart.smartFormation!.candidates.find((candidate) => candidate.symbol === "L1")!.selected).toBe(false);
     expect(smart.longLeg.every((leg) => leg.fastReturnAtOpen !== undefined && leg.extensionVolAtOpen !== undefined)).toBe(true);
+  });
+
+  describe("[FORMATION MODE] lifecycle flags never select symbols", () => {
+    const detailed: ScoredSymbol[] = [
+      { symbol: "SOLUSDT", score: 0.2200, price: 100, fastReturn: -0.04, volatility: 0.02, extensionVol: 3 },
+      { symbol: "AVAXUSDT", score: 0.2199, price: 100, fastReturn: 0.04, volatility: 0.02, extensionVol: 0 },
+      { symbol: "SUIUSDT", score: 0.2198, price: 100, fastReturn: 0.04, volatility: 0.02, extensionVol: 0 },
+      { symbol: "UNIUSDT", score: 0.2197, price: 100, fastReturn: 0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "AAVEUSDT", score: 0.2196, price: 100, fastReturn: 0.04, volatility: 0.02, extensionVol: 0 },
+      { symbol: "DOGEUSDT", score: -0.2000, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "1000PEPEUSDT", score: -0.1900, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "XRPUSDT", score: -0.1800, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "WLDUSDT", score: -0.1700, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+    ];
+    const common = {
+      k: 3,
+      now: T0,
+      openedAtMs: T0ms,
+      horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+      minScoreGap: 0.058,
+      maxPerCluster: 2,
+      weightingModel: "CAPPED_SCORE_RANK" as const,
+      longAllowlist: new Set(["SOLUSDT", "AVAXUSDT", "SUIUSDT", "UNIUSDT", "AAVEUSDT"]),
+      shortAllowlist: new Set(["DOGEUSDT", "1000PEPEUSDT", "XRPUSDT", "WLDUSDT"]),
+    };
+    const shape = (basket: NonNullable<ReturnType<typeof buildFilteredCrossSectionalBasket>>) => ({
+      formationMode: basket.formationMode,
+      smartFormation: basket.smartFormation,
+      scoreGap: basket.scoreGap,
+      weightingModel: basket.weightingModel,
+      long: basket.longLeg.map((leg) => ({ symbol: leg.symbol, weight: leg.weight })),
+      short: basket.shortLeg.map((leg) => ({ symbol: leg.symbol, weight: leg.weight })),
+    });
+
+    it("SMART_BASKET_V1=1 plus RERANK=0 is exactly the canonical Plain MOM36 basket", () => {
+      const canonical = buildCrossSectionalBasket(detailed, {
+        ...common,
+        signal: CROSS_SECTIONAL_FILTERED_SIGNAL,
+        variant: "FILTERED",
+        formationMode: "PLAIN_MOM36",
+      })!;
+      const production = withEnv({
+        CROSS_SECTIONAL_SMART_BASKET_V1: "1",
+        CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+      }, () => buildFilteredCrossSectionalBasket(detailed, common)!);
+
+      expect(production.formationMode).toBe("PLAIN_MOM36");
+      expect(production.smartFormation).toBeNull();
+      expect(shape(production)).toEqual(shape(canonical));
+    });
+
+    it("RERANK=1 enters the Smart Formation path even when the lifecycle flag is OFF", () => {
+      const plain = withEnv({
+        CROSS_SECTIONAL_SMART_BASKET_V1: "1",
+        CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+      }, () => buildFilteredCrossSectionalBasket(detailed, common)!);
+      const smart = withEnv({
+        CROSS_SECTIONAL_SMART_BASKET_V1: "0",
+        CROSS_SECTIONAL_SMART_FORMATION_RERANK: "1",
+      }, () => buildFilteredCrossSectionalBasket(detailed, common)!);
+
+      expect(smart.formationMode).toBe("SMART_FORMATION_RERANK");
+      expect(smart.smartFormation).toMatchObject({ version: "SMART_BASKET_V1" });
+      expect(smart.longLeg.map((leg) => leg.symbol)).not.toEqual(plain.longLeg.map((leg) => leg.symbol));
+    });
+
+    it("lifecycle and ghost toggles leave plain symbols, cluster cap, scoreGap, and weights unchanged", () => {
+      const lifecycleOff = withEnv({
+        CROSS_SECTIONAL_SMART_BASKET_V1: "0",
+        CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+        CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED: "0",
+        CROSS_SECTIONAL_SMART_INVALIDATION_SCANS: "2",
+      }, () => buildFilteredCrossSectionalBasket(detailed, common)!);
+      const lifecycleOn = withEnv({
+        CROSS_SECTIONAL_SMART_BASKET_V1: "1",
+        CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+        CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED: "1",
+        CROSS_SECTIONAL_SMART_INVALIDATION_SCANS: "999",
+      }, () => buildFilteredCrossSectionalBasket(detailed, common)!);
+
+      expect(shape(lifecycleOn)).toEqual(shape(lifecycleOff));
+      expect(lifecycleOn.weightingModel).toBe("CAPPED_SCORE_RANK");
+      expect(lifecycleOn.scoreGap).toBeGreaterThanOrEqual(0.058);
+    });
   });
 
   it("[FILTERED-GAP] refuses low-dispersion baskets", () => {

@@ -32,6 +32,7 @@ import {
   type CrossSectionalExitPolicySnapshot,
   type CrossSectionalPolicyFingerprint,
 } from "./cross-sectional-policy.js";
+import type { CrossSectionalFormationMode } from "./cross-sectional-runtime-mode.js";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
@@ -620,6 +621,8 @@ export interface ExecutorLeg {
 export interface SmartBasketRuntime {
   version: "SMART_BASKET_V1";
   sourceOpenedAtMs: number;
+  /** Selection provenance is independent from the Smart Basket lifecycle switch. */
+  formationModeAtOpen?: CrossSectionalFormationMode;
   axisScoreAtOpen: number | null;
   /** Net MFE measured from live marks after the same cost model used by the TP check. */
   maxNetReturn: number | null;
@@ -1671,8 +1674,8 @@ export interface CrossSectionalExecutorOptions {
   idNamespace?: string;
   /** Honor signal-owned basket TP/SL. Off by default so existing live behavior is unchanged. */
   respectSignalRiskGeometry?: boolean;
-  /** Smart Basket v1 is enabled only for the dedicated FILTERED testnet cohort.  The signal must
-   * carry explicit SMART_BASKET_V1 provenance too; either condition missing is a no-op. */
+  /** Smart Basket v1 controls FILTERED lifecycle functions only: entry revalidation, durable
+   * provenance, and ghost telemetry.  It never selects symbols or enables formation reranking. */
   smartBasketEnabled?: () => boolean;
   smartMaxAdverseEntryDriftVol?: () => number;
   smartMinAdverseEntryDriftPct?: () => number;
@@ -2703,8 +2706,7 @@ export class CrossSectionalExecutor {
 
   private isSmartBasketSignal(signal: CrossSectionalObservation): boolean {
     return this.smartBasketEnabledFn() &&
-      (signal.variant ?? "RAW") === "FILTERED" &&
-      signal.smartFormation?.version === "SMART_BASKET_V1";
+      (signal.variant ?? "RAW") === "FILTERED";
   }
 
   /**
@@ -2768,8 +2770,41 @@ export class CrossSectionalExecutor {
     shortReturn: number,
   ): string | null {
     const formation = signal.smartFormation;
-    if (formation?.version !== "SMART_BASKET_V1") return null;
-    const diagnostics = formation.candidates;
+    // Plain MOM36 selection deliberately does not write Smart Formation utility provenance.  The
+    // lifecycle still needs a comparable, selected-leg diagnostic for ghost/context observation;
+    // derive it from the frozen signal legs rather than re-running or influencing selection.
+    const diagnostics: Array<{
+      symbol: string;
+      side: "LONG" | "SHORT";
+      score: number;
+      fastSupport: number | null;
+      selected: boolean;
+    }> = formation?.version === "SMART_BASKET_V1"
+      ? formation.candidates
+      : [
+          ...signal.longLeg.map((leg) => {
+            const fast = Number.isFinite(leg.fastReturnAtOpen) ? leg.fastReturnAtOpen! : null;
+            const vol = Number.isFinite(leg.volatilityAtOpen) && leg.volatilityAtOpen! > 0 ? leg.volatilityAtOpen! : null;
+            return {
+              symbol: leg.symbol,
+              side: "LONG" as const,
+              score: Number.isFinite(leg.scoreAtOpen) ? leg.scoreAtOpen! : 0,
+              fastSupport: fast === null ? null : (vol === null ? fast : fast / vol),
+              selected: true,
+            };
+          }),
+          ...signal.shortLeg.map((leg) => {
+            const fast = Number.isFinite(leg.fastReturnAtOpen) ? leg.fastReturnAtOpen! : null;
+            const vol = Number.isFinite(leg.volatilityAtOpen) && leg.volatilityAtOpen! > 0 ? leg.volatilityAtOpen! : null;
+            return {
+              symbol: leg.symbol,
+              side: "SHORT" as const,
+              score: Number.isFinite(leg.scoreAtOpen) ? leg.scoreAtOpen! : 0,
+              fastSupport: fast === null ? null : -(vol === null ? fast : fast / vol),
+              selected: true,
+            };
+          }),
+        ];
     const evaluateSide = (side: "LONG" | "SHORT", sideReturn: number): string | null => {
       if (!(sideReturn < 0)) return null;
       const sideLegs = basket.legs.filter((leg) => leg.side === side && leg.exitOrderId === null);
@@ -2842,7 +2877,6 @@ export class CrossSectionalExecutor {
     const freshSignals = this.signalStore.all
       .filter((signal) =>
         (signal.variant ?? "RAW") === "FILTERED" &&
-        signal.smartFormation?.version === "SMART_BASKET_V1" &&
         signal.openedAtMs > Math.min(smart.lastInvalidationSignalMs, lastRegimeLossSignalMs) &&
         signal.openedAtMs > smart.sourceOpenedAtMs,
       )
@@ -4511,6 +4545,7 @@ export class CrossSectionalExecutor {
         ? {
             version: "SMART_BASKET_V1",
             sourceOpenedAtMs: signal.openedAtMs,
+            formationModeAtOpen: signal.formationMode ?? (signal.smartFormation?.version === "SMART_BASKET_V1" ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36"),
             axisScoreAtOpen: typeof signal.smartFormation?.axisScore === "number" && Number.isFinite(signal.smartFormation.axisScore)
               ? signal.smartFormation.axisScore
               : null,

@@ -16,6 +16,11 @@ import { dirname, resolve } from "node:path";
 import { clusterOf, isMajorCluster } from "./correlation-clusters.js";
 import { recordRejectedBasket } from "./rejected-basket-recorder.js";
 import { evaluateMarketStandDown, standDownThresholdPct } from "./market-drawdown-standdown.js";
+import {
+  isCrossSectionalSmartBasketLifecycleEnabled,
+  isCrossSectionalSmartFormationRerankEnabled,
+  type CrossSectionalFormationMode,
+} from "./cross-sectional-runtime-mode.js";
 
 function envNumPos(key: string, fallback: number): number {
   const v = Number(process.env[key]);
@@ -160,13 +165,12 @@ export const CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP = envNumNonNeg("CROSS_SECTIO
 // (BTC/ETH majors exempt, same convention as the directional concentration cap). 0 disables.
 export const CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER", 2);
 /**
- * Smart Basket v1 stays deliberately narrow: it only changes which already-eligible FILTERED
- * names form a 3×3 hedge.  It never changes K, the allow/block lists, score-gap admission, or
- * the 50/50 long-short capital split.  The env switch is intentionally off outside the testnet
- * cohort, so a stored SMART_BASKET_V1 observation is explicit evidence of the policy at entry.
+ * Smart Basket v1 is a lifecycle switch, not a formation switch.  It keeps entry revalidation,
+ * durable provenance, and ghost telemetry for FILTERED baskets; formation reranking is controlled
+ * exclusively by CROSS_SECTIONAL_SMART_FORMATION_RERANK.
  */
 export function isCrossSectionalSmartBasketV1Enabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.CROSS_SECTIONAL_SMART_BASKET_V1 === "1";
+  return isCrossSectionalSmartBasketLifecycleEnabled(env);
 }
 const CROSS_SECTIONAL_SMART_CANDIDATE_POOL = Math.max(
   CROSS_SECTIONAL_K,
@@ -559,7 +563,9 @@ export interface CrossSectionalObservation {
    *  basket (the SAME divisor the x-side CORTEX_XSEC_STOP_RETURN uses, kept consistent + config-proof). */
   riskDistanceAtOpen?: number | null;
   regimeFlipExit?: boolean | null;
-  /** Present only on newly formed, testnet-enabled FILTERED baskets. */
+  /** Effective formation that selected the symbols, frozen for audit at the source signal. */
+  formationMode?: CrossSectionalFormationMode;
+  /** Present only when Smart Formation utility reranking actually selected the basket. */
   smartFormation?: CrossSectionalSmartFormation | null;
   exitReason?: CrossSectionalExitReason | null;
   /** Return on deployed capital after market-beta cancels = the cross-sectional dispersion. */
@@ -633,7 +639,9 @@ interface CrossSectionalBasketOpts {
   /** Override the frozen-at-open R-denominator. Defaults to stopLossReturn, else the config stop-unit. */
   riskDistanceAtOpen?: number | null;
   regimeFlipExit?: boolean;
-  /** Soft candidate-combination optimizer for the FILTERED testnet cohort. */
+  /** Explicit effective mode.  The default follows smartFormation for direct/research callers. */
+  formationMode?: CrossSectionalFormationMode;
+  /** Soft candidate-combination optimizer for the FILTERED formation mode only. */
   smartFormation?: { enabled: boolean; axisScore?: number | null } | null;
 }
 
@@ -967,7 +975,9 @@ export function buildCrossSectionalBasket(
   // Ties (the common unskewed 3/3 case) keep the original long-first order unchanged.
   let selectedLongs: ScoredSymbol[];
   let selectedShorts: ScoredSymbol[];
-  const smartEnabled = opts.smartFormation?.enabled === true && (opts.variant ?? "RAW") === "FILTERED" && mode === "MOMENTUM";
+  const requestedFormationMode = opts.formationMode ?? (opts.smartFormation?.enabled === true ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36");
+  const smartEnabled = requestedFormationMode === "SMART_FORMATION_RERANK" && (opts.variant ?? "RAW") === "FILTERED" && mode === "MOMENTUM";
+  const formationMode: CrossSectionalFormationMode = smartEnabled ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36";
   const smartCandidates: CrossSectionalSmartFormationCandidate[] = [];
   let smartObjective = 0;
   if (shortK > longK) {
@@ -1070,6 +1080,7 @@ export function buildCrossSectionalBasket(
     // process-frozen config stop-unit — the SAME quantity CORTEX's x-side uses, so netR is symmetric.
     riskDistanceAtOpen: opts.riskDistanceAtOpen ?? opts.stopLossReturn ?? CROSS_SECTIONAL_BASKET_STOP_LOSS_BPS / 10_000,
     regimeFlipExit: opts.regimeFlipExit ?? false,
+    formationMode,
     smartFormation: smartEnabled
       ? {
           version: "SMART_BASKET_V1",
@@ -1508,6 +1519,10 @@ export function buildFilteredCrossSectionalBasket(
   opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
     Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap">>,
 ): CrossSectionalObservation | null {
+  const rerankEnabled = opts.smartFormation?.enabled === true || (
+    opts.smartFormation === undefined && isCrossSectionalSmartFormationRerankEnabled()
+  );
+  const formationMode = opts.formationMode ?? (rerankEnabled ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36");
   return buildCrossSectionalBasket(scored, {
     ...opts,
     signal: opts.signal ?? CROSS_SECTIONAL_FILTERED_SIGNAL,
@@ -1519,7 +1534,8 @@ export function buildFilteredCrossSectionalBasket(
     minScoreGap: opts.minScoreGap ?? CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
     maxPerCluster: opts.maxPerCluster ?? CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER,
     weightingModel: opts.weightingModel ?? filteredWeightingModel(),
-    smartFormation: opts.smartFormation ?? (isCrossSectionalSmartBasketV1Enabled() ? { enabled: true } : undefined),
+    formationMode,
+    smartFormation: opts.smartFormation ?? { enabled: formationMode === "SMART_FORMATION_RERANK" },
   });
 }
 
@@ -1997,6 +2013,7 @@ export async function runCrossSectionalCycle(opts: {
       result.standDown = true;
       result.standDownMarketReturn = standDown.marketReturn;
     }
+    const rerankEnabled = isCrossSectionalSmartFormationRerankEnabled();
     const basket = (liquidityStarved || standDown.standDown) ? null : buildFilteredCrossSectionalBasket(adaptiveRanked, {
       k: CROSS_SECTIONAL_K,
       longK: skew?.longK,
@@ -2010,9 +2027,11 @@ export async function runCrossSectionalCycle(opts: {
       shortAllowlist: shortAllow,
       shortBlocklist: new Set([...adaptive.shortBlocklist, ...dynamicBlocks.shortBlocklist]),
       volBySymbol,
-      smartFormation: isCrossSectionalSmartBasketV1Enabled()
-        ? { enabled: true, axisScore: opts.axisScore ?? null }
-        : undefined,
+      formationMode: rerankEnabled ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36",
+      smartFormation: {
+        enabled: rerankEnabled,
+        axisScore: opts.axisScore ?? null,
+      },
       onGapReject: recordRejectedBasket,
     });
     if (basket) {

@@ -780,7 +780,16 @@ def tab_overview(R):
         byp = bool(ex.get("entryHealthBypassed"))
         runtime=ex.get("effectiveRuntime") or {}; tick=runtime.get("executorTick") or {}; maker=runtime.get("makerExit") or {}
         tick_ok=tick.get("state")=="EFFECTIVE"; maker_ok=bool(maker.get("effective")); maker_bad=maker.get("state")=="CONFIG_INEFFECTIVE"
+        formation_mode=runtime.get("formationMode") or "CONFIG INEFFECTIVE"
+        adaptive_mode=runtime.get("adaptiveExitMode") or "CONFIG INEFFECTIVE"
+        entry_revalidation=bool(runtime.get("entryRevalidation"))
         rows=[status_row("Eksekusi","ok" if run else "block","BERJALAN" if run else "MATI",""),
+              status_row("Mode formasi","ok" if formation_mode!="CONFIG INEFFECTIVE" else "block",formation_mode,
+                         "mode efektif dari executor; bukan pembacaan env langsung"),
+              status_row("Revalidasi entry","ok" if entry_revalidation else "off","ON" if entry_revalidation else "OFF",
+                         "lifecycle Smart Basket, terpisah dari mode formasi"),
+              status_row("Exit adaptif","ok" if adaptive_mode=="ON" else ("off" if adaptive_mode=="OFF" else "block"),adaptive_mode,
+                         "ghost tetap berjalan saat eksekusi OFF"),
               status_row("Tick executor","ok" if tick_ok else "block",("%s ms"%tick.get("effectiveMs")) if tick_ok else "CONFIG INEFFECTIVE",
                          "scheduler actual; env %s"%(tick.get("configured") if tick.get("configured") is not None else "tidak diset")),
               status_row("Exit HORIZON","ok" if maker_ok else ("block" if maker_bad else "off"),
@@ -831,14 +840,17 @@ def tab_strategy(R):
     policy=ex.get("currentPolicyFingerprint") or {}; policy_exec=policy.get("execution") or {}; legacy_policy=ex.get("legacyExitPolicy") or {}
     cohort=ex.get("currentPolicyForwardCohort") or {}; accounting=ex.get("accountingCounts") or {}
     mex=bool(maker_runtime.get("effective")); tick_sec=(tick_runtime.get("effectiveMs") or 0)/1000.0
-    adaptive=bool((runtime.get("adaptiveExits") or {}).get("effective"))
+    formation_mode=runtime.get("formationMode") or (policy.get("formation") or {}).get("formationMode") or "CONFIG INEFFECTIVE"
+    rerank=formation_mode=="SMART_FORMATION_RERANK"
+    adaptive_mode=runtime.get("adaptiveExitMode") or ((runtime.get("adaptiveExits") or {}).get("effective") and "ON") or "OFF"
+    adaptive=adaptive_mode=="ON"
+    entry_revalidation=bool(runtime.get("entryRevalidation"))
     tp_text="OFF" if ex.get("tpDisabled") else ("%s%%"%ex.get("tpNetReturnPct"))
     stop_text="OFF" if ex.get("stopNetReturnPct") is None else ("%s%%"%ex.get("stopNetReturnPct"))
     gross=(leg*6) if fin(leg) else None
     o=[lead("ok","Momentum relatif lintas-simbol, netral pasar",
         "Bot memeringkat seluruh universe menurut momentum 36 jam, membeli 3 terkuat dan menjual 3 terlemah. Yang dikejar bukan arah pasar, melainkan <b>selisih</b> antara yang kuat dan yang lemah — kalau pasar naik atau turun bersama, keduanya saling meniadakan.")]
-    _rr=(liv.get("flags") or {}).get("CROSS_SECTIONAL_SMART_FORMATION_RERANK","1")!="0"
-    PIPE2_TEXT=(("Ambil 5 kandidat teratas tiap sisi, coba SEMUA kombinasi 3-lawan-3, pilih total utility tertinggi setelah penalti klaster." if _rr else "Ambil 3 teratas tiap sisi menurut peringkat MOM36 dengan cluster cap sebagai batas keras. Re-ranking utility dimatikan — fitur lain tetap dicatat tapi tidak ikut memilih.") + " <b>Tidak membuat sinyal baru</b> — hanya memilih dari peringkat yang sudah ada.")
+    PIPE2_TEXT=(("Ambil 5 kandidat teratas tiap sisi, coba SEMUA kombinasi 3-lawan-3, pilih total utility tertinggi setelah penalti klaster." if rerank else "Ambil 3 teratas tiap sisi menurut peringkat MOM36 dengan cluster cap sebagai batas keras, lalu uji scoreGap dan bentuk bobot CAPPED_SCORE_RANK. Re-ranking utility dimatikan.") + " <b>Tidak membuat sinyal baru</b> — hanya memilih dari peringkat yang sudah ada.")
     steps=[("1 · MOM36","Peringkat momentum 36 jam atas %s simbol universe. Menghasilkan urutan kuat→lemah, belum memutuskan apa pun."%cnt.get("universe")),
       ("2 · Pemilihan basket", PIPE2_TEXT),
       ("3 · Gerbang scoreGap","Selisih rata-rata skor long dan short harus ≥ <b>%s</b>. Di bawah itu basket ditolak sepenuhnya, betapapun bagus kombinasinya — cross-section yang rapat berarti tak ada yang bisa dipanen."%fc.get("minScoreGap")),
@@ -856,23 +868,20 @@ def tab_strategy(R):
     o.append(card("Stop / ambil untung","%s / %s"%(stop_text,tp_text),"policy basket baru"))
     o.append(card("Ambang pemisahan",num(fc.get("minScoreGap"),3),"basket ditolak di bawah ini"))
     o.append("</div>")
-    fl0=liv.get("flags") or {}
-    rerank=fl0.get("CROSS_SECTIONAL_SMART_FORMATION_RERANK","1")!="0"
     o.append("<h2>Bagaimana basket dipilih</h2>")
     if rerank:
         o.append("<div class='lead' style='border-left-color:#8a6fbf'><div class='r'>Formation mengambil peringkat MOM36, memotongnya jadi kolam 5 kandidat teratas per sisi, lalu <b>mencoba semua kombinasi</b> dan memilih yang total utility-nya tertinggi setelah dikurangi penalti klaster. Peringkat mentah dominan; dua faktor lain berbatas.</div></div>")
     else:
-        o.append("<div class='lead' style='border-left-color:#8a6fbf'><div class='r'><b>Re-ranking dimatikan.</b> Pemilihan sekarang murni peringkat MOM36: ambil 3 teratas tiap sisi, dengan cluster cap sebagai batas keras. "
-                 "fastSupport, adverseExtension dan bonus counter-axis <b>tetap dihitung dan dicatat</b> untuk diagnostik dan evaluasi ghost — tapi tidak lagi memengaruhi siapa yang terpilih. "
+        o.append("<div class='lead' style='border-left-color:#8a6fbf'><div class='r'><b>Re-ranking dimatikan.</b> Pemilihan sekarang murni peringkat MOM36: ambil 3 teratas tiap sisi, dengan cluster cap sebagai batas keras, lalu scoreGap dan bobot CAPPED_SCORE_RANK. "
+                 "Lifecycle Smart Basket tetap menjalankan revalidasi entry dan ghost dari data kaki yang dibekukan — tapi tidak lagi memengaruhi siapa yang terpilih. "
                  "Dasarnya: ablasi 12 offset selama 2 tahun memberi +0,2227%/basket dengan re-ranking penuh vs +0,2220% tanpanya — selisih 0,0007pp, dengan PF, hit rate, stabilitas kuartal dan kuartal terburuk yang identik.</div></div>")
     o.append("<table><tr><th>fitur</th><th>peran sekarang</th><th>artinya</th></tr>%s</table>"%"".join(
         "<tr><td><b>%s</b></td><td>%s</td><td class='dim' style='white-space:normal'>%s</td></tr>"%(
             esc(a),
-            ("%s memilih"%DOT["ok"]) if (rerank or a in ("MOM36","rawRank","scoreGap","penalti klaster")) else ("%s cuma dicatat"%DOT["off"]),
+            ("%s memilih"%DOT["ok"]) if (rerank or a in ("MOM36","rawRank","scoreGap")) else (("%s guardrail keras"%DOT["ok"]) if a=="penalti klaster" else ("%s bukan selector"%DOT["off"])),
             esc(b)) for a,b in FEATURES))
     if not rerank:
-        o.append("<div class='note'>Baris bertanda ⚪ masih muncul di tab Formasi dan di skor kualitas entry sebagai <b>diagnostik</b>. Mereka menggambarkan basketnya, bukan alasan ia terpilih.</div>")
-    fl=liv.get("flags") or {}
+        o.append("<div class='note'>Baris bertanda ⚪ tidak menjadi selector. Revalidasi entry dan ghost tetap memakai harga, score, dan volatilitas kaki yang dibekukan, tanpa menjalankan utility rerank.</div>")
     maker_state=maker_runtime.get("state") or "CONFIG INEFFECTIVE"
     maker_label="maker-first + taker fallback" if mex else ("CONFIG INEFFECTIVE" if maker_state=="CONFIG_INEFFECTIVE" else "taker penuh")
     maker_dot=DOT["ok"] if mex else (DOT["block"] if maker_state=="CONFIG_INEFFECTIVE" else DOT["off"])
@@ -881,12 +890,14 @@ def tab_strategy(R):
       "<tr><th>hal</th><th>status</th><th class='dim'>dasar</th></tr>"
       "<tr><td>Mode formasi</td><td>%s <b>%s</b></td><td class='dim'>peringkat MOM36 + cluster cap sebagai pagar konsentrasi</td></tr>"
       "<tr><td>Re-ranking Smart Formation</td><td>%s <b>%s</b></td><td class='dim'>fastSupport / adverseExtension / counter-axis / penalti klaster</td></tr>"
+      "<tr><td>Revalidasi entry</td><td>%s <b>%s</b></td><td class='dim'>lifecycle Smart Basket; tidak mengubah pemilihan simbol</td></tr>"
       "<tr><td>Exit adaptif</td><td>%s <b>%s</b></td><td class='dim'>ghost tetap dicatat walau eksekusi OFF</td></tr>"
       "<tr><td>Eksekusi exit</td><td>%s <b>%s</b></td><td class='dim'>%s</td></tr>"
       "<tr><td>Interval tick executor</td><td>%s <b>%s detik</b></td><td class='dim'>nilai efektif dari scheduler, bukan env yang belum dipakai</td></tr>"
       "</table>"%(
-        DOT["ok"],"MOM36 rank + cluster guardrail",
+        DOT["ok"] if formation_mode!="CONFIG INEFFECTIVE" else DOT["block"],formation_mode,
         DOT["off"] if not rerank else DOT["watch"],"OFF" if not rerank else "ON",
+        DOT["ok"] if entry_revalidation else DOT["off"],"ON" if entry_revalidation else "OFF",
         DOT["ok"] if adaptive else DOT["off"],"ON" if adaptive else "OFF · Ghost AKTIF",
         maker_dot,maker_label,
         "hanya untuk penutupan terjadwal (HORIZON); stop/darurat tetap MARKET langsung",
@@ -922,7 +933,7 @@ def tab_strategy(R):
     o.append("<h2>Smart Basket — mengelola basket setelah dibentuk</h2>")
     o.append("<div class='note'>Eksekusi exit adaptif <b>%s</b>; evaluasi ghost tetap berjalan dan disimpan terpisah dari order nyata.</div>"%("AKTIF" if adaptive else "DIMATIKAN"))
     o.append("<table><tr><th>mekanisme</th><th>status</th><th>parameter</th><th>artinya</th></tr>")
-    for nm,stt,par,mean in [("Revalidasi entry","ok · aktif","drift merugikan sebelum order dikirim","Membatalkan kalau harga sudah lari melawan sejak sinyal dibentuk."),
+    for nm,stt,par,mean in [("Revalidasi entry",("ok · aktif" if entry_revalidation else "off · MATI"),"drift merugikan sebelum order dikirim","Membatalkan kalau harga sudah lari melawan sejak sinyal dibentuk."),
         ("Regime Loss Exit",("ok · aktif" if adaptive else "off · Eksekusi MATI, ghost AKTIF"),"kelas regime berubah + rugi ≥0,3% + sisi searah regime baru rugi, 2 scan","Menutup saat pasar berbalik melawan basket."),
         ("Context Invalidation",("ok · aktif" if adaptive else "off · Eksekusi MATI, ghost AKTIF"),"≥2 dari 3 kaki satu sisi kehilangan alasan masuknya, 2 scan","Menutup saat alasan pemilihan nama-nama itu hilang."),
         ("MFE Giveback",("ok · aktif" if adaptive else "off · Eksekusi MATI, ghost AKTIF"),"puncak ≥0,2% lalu turun ke ≤50% puncak","Mengunci laba yang mulai menguap."),
@@ -941,7 +952,9 @@ def tab_strategy(R):
         ("Leg USD / leverage","<code>%s</code> / <code>%s</code>"%(leg,ex.get("leverage"))),
         ("Measurement / cap","<code>%s%s</code> measurement / <code>%s jam</code> execution cap"%(ex.get("measurementHorizonBars"),ex.get("measurementInterval") or "h",ex.get("maxHoldHours"))),
         ("Stop / TP","<code>%s</code> / <code>%s</code>"%(stop_text,tp_text)),
-        ("Exit adaptif","<code>%s</code>; ghost tetap observasional"%("ON" if adaptive else "OFF")),
+        ("Mode formasi efektif","<code>%s</code>"%formation_mode),
+        ("Revalidasi entry efektif","<code>%s</code>"%("ON" if entry_revalidation else "OFF")),
+        ("Exit adaptif efektif","<code>%s</code>; ghost tetap observasional"%adaptive_mode),
         ("Effective tick","<code>%s ms</code> · %s"%(tick_runtime.get("effectiveMs"),tick_runtime.get("state"))),
         ("Effective maker exit","<code>%s</code> · %s"%("ON" if mex else "OFF",maker_runtime.get("state"))),
         ("Allowlist long","<code>%s</code>"%esc(", ".join((fc.get("longAllowlist") or [])[:30]))),
@@ -953,6 +966,7 @@ def tab_decision(R):
     o=[]
     for k in ("live","testnet"):
         i=R["inst"][k]; ex=i["ex"]; adm=i["adm"]; g=i["gate"]; att=i["attempt"]; fc=i["fc"]
+        formation_mode=(ex.get("effectiveRuntime") or {}).get("formationMode") or "CONFIG INEFFECTIVE"
         pool=(i["pool"] or {}).get("counts") or {}
         allow=adm.get("tier")=="GREEN" and not ex.get("signalStale")
         o.append("<h2>%s</h2>"%i["long"])
@@ -963,7 +977,7 @@ def tab_decision(R):
         ls,ss=att.get("longSymbols"),att.get("shortSymbols")
         steps.append(("p" if ls else "o","Kandidat long",", ".join(ls or []) or "tidak tercatat"))
         steps.append(("p" if ss else "o","Kandidat short",", ".join(ss or []) or "tidak tercatat"))
-        steps.append(("p","Batas klaster","maksimum 2 nama sekluster per sisi, dengan penalti kombinasi"))
+        steps.append(("p","Batas klaster","maksimum 2 nama sekluster per sisi%s"%(", utility rerank hanya bila mode SMART_FORMATION_RERANK" if formation_mode=="SMART_FORMATION_RERANK" else "; guardrail keras tanpa utility rerank")))
         steps.append(("Kualitas alpha",None,None))
         gp,thr=att.get("scoreGap"),fc.get("minScoreGap")
         if fin(gp) and fin(thr):
@@ -1098,8 +1112,9 @@ def _formation_block(R,key,src):
 
 def tab_formation(R):
     o=[];found=False
-    _rrF=(R["inst"]["live"].get("flags") or {}).get("CROSS_SECTIONAL_SMART_FORMATION_RERANK","1")!="0"
-    _leadF=("Pemilihan diputuskan satu angka: <b>utility</b> = peringkat momentum di kolam + konfirmasi cepat (0,22) − penalti mengejar (0,20) + bonus counter-axis (0,08). Tabel di bawah menguraikan tiap suku." if _rrF else "<b>Produksi memilih murni dari peringkat MOM36</b> dengan cluster cap sebagai batas keras — utility sama dengan peringkat itu sendiri. Kolom konfirmasi dan ekstensi tetap ditampilkan sebagai diagnostik dan masih bernilai pada formasi lama; label tiap blok menyebut formasi mana yang mana.")
+    _modeF=((R["inst"]["live"].get("ex") or {}).get("effectiveRuntime") or {}).get("formationMode") or "CONFIG INEFFECTIVE"
+    _rrF=_modeF=="SMART_FORMATION_RERANK"
+    _leadF=("Pemilihan efektif sekarang memakai <b>SMART_FORMATION_RERANK</b>: utility = peringkat momentum di kolam + konfirmasi cepat (0,22) − penalti mengejar (0,20) + bonus counter-axis (0,08). Tabel di bawah menguraikan tiap suku." if _rrF else "<b>Produksi efektif sekarang %s</b>: memilih murni dari peringkat MOM36, dengan cluster cap sebagai batas keras. Rincian kandidat di bawah hanya ada untuk formasi historis yang memang memakai rerank; label tiap blok menyebut formasi mana yang mana."%esc(_modeF))
     o.append(lead("ok","Kenapa simbol ini yang dipilih — dengan angkanya",_leadF))
 
     for key in ("live","testnet"):
@@ -1506,6 +1521,9 @@ def tab_system(R):
                     ("Batas tahan (jam)",lv["ex"].get("maxHoldHours"),tn["ex"].get("maxHoldHours")),
                     ("Stop (%)",lv["ex"].get("stopNetReturnPct"),tn["ex"].get("stopNetReturnPct")),
                     ("Ambil untung (%)",lv["ex"].get("tpNetReturnPct"),tn["ex"].get("tpNetReturnPct")),
+                    ("Mode formasi efektif",lvr.get("formationMode"),tnr.get("formationMode")),
+                    ("Revalidasi entry efektif",lvr.get("entryRevalidation"),tnr.get("entryRevalidation")),
+                    ("Exit adaptif efektif",lvr.get("adaptiveExitMode"),tnr.get("adaptiveExitMode")),
                     ("Tick efektif (ms)",(lvr.get("executorTick") or {}).get("effectiveMs"),(tnr.get("executorTick") or {}).get("effectiveMs")),
                     ("Mode exit HORIZON","MAKER_FIRST" if lvm.get("effective") else ("CONFIG INEFFECTIVE" if lvm.get("state")=="CONFIG_INEFFECTIVE" else "MARKET"),"MAKER_FIRST" if tnm.get("effective") else ("CONFIG INEFFECTIVE" if tnm.get("state")=="CONFIG_INEFFECTIVE" else "MARKET")),
                     ("Policy fingerprint",(lv["ex"].get("currentPolicyFingerprint") or {}).get("policyId"),(tn["ex"].get("currentPolicyFingerprint") or {}).get("policyId")),

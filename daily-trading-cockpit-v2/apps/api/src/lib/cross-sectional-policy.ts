@@ -7,8 +7,16 @@
  * silently change the exit contract of an already-open position.
  */
 import { createHash } from "node:crypto";
+import {
+  crossSectionalAdaptiveExitMode,
+  crossSectionalFormationMode,
+  isCrossSectionalSmartBasketLifecycleEnabled,
+  isCrossSectionalSmartFormationRerankEnabled,
+  type CrossSectionalAdaptiveExitMode,
+  type CrossSectionalFormationMode,
+} from "./cross-sectional-runtime-mode.js";
 
-export const CURRENT_POLICY_FINGERPRINT_SCHEMA = "CURRENT_POLICY_FORWARD_COHORT_V1" as const;
+export const CURRENT_POLICY_FINGERPRINT_SCHEMA = "CURRENT_POLICY_FORWARD_COHORT_V2" as const;
 
 type RuntimeConfigState = "EFFECTIVE" | "CONFIG_INEFFECTIVE";
 
@@ -21,6 +29,7 @@ export type CrossSectionalExitPolicySnapshot = {
   stopLossEnabled: boolean;
   stopLossNetReturn: number | null;
   adaptiveExitsEnabled: boolean;
+  adaptiveExitMode: CrossSectionalAdaptiveExitMode;
   makerEntryEnabled: boolean;
   makerExitEnabled: boolean;
   makerExitWaitMs: number | null;
@@ -49,6 +58,7 @@ export type CrossSectionalPolicyFingerprint = {
     scoreGap: number | null;
     clusterCap: number | null;
     weighting: string;
+    formationMode: CrossSectionalFormationMode;
     smartFormationRerank: boolean;
     entryRevalidationEnabled: boolean;
     entryHealthBypassed: boolean;
@@ -57,6 +67,10 @@ export type CrossSectionalPolicyFingerprint = {
 };
 
 export type CrossSectionalEffectiveRuntime = {
+  /** Direct, effective behaviour labels for API/dashboard consumers. */
+  formationMode: CrossSectionalFormationMode;
+  adaptiveExitMode: CrossSectionalAdaptiveExitMode;
+  entryRevalidation: boolean;
   executorTick: {
     configured: string | null;
     effectiveMs: number;
@@ -108,9 +122,7 @@ export function crossSectionalMakerExitWaitMs(env: NodeJS.ProcessEnv = process.e
 
 /** Explicit switch: ghost observation can continue while adaptive exits are not allowed to trade. */
 export function isCrossSectionalAdaptiveExitEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  // Compatibility default preserves pre-cutover behavior for a deployment that has not declared
-  // the switch. The production release writes an explicit =0, which is what makes OFF auditable.
-  return env.CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED !== "0";
+  return crossSectionalAdaptiveExitMode(env) === "ON";
 }
 
 export function currentCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process.env): CrossSectionalExitPolicySnapshot {
@@ -125,6 +137,7 @@ export function currentCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process
     stopLossEnabled: stopLossNetReturn !== null,
     stopLossNetReturn,
     adaptiveExitsEnabled: isCrossSectionalAdaptiveExitEnabled(env),
+    adaptiveExitMode: crossSectionalAdaptiveExitMode(env),
     makerEntryEnabled: env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED === "1",
     makerExitEnabled: isCrossSectionalMakerExitEnabled(env),
     makerExitWaitMs: isCrossSectionalMakerExitEnabled(env) ? crossSectionalMakerExitWaitMs(env) : null,
@@ -175,8 +188,9 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
       scoreGap: parseFiniteNumber(env.CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP),
       clusterCap: parseFiniteNumber(env.CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER),
       weighting: env.CROSS_SECTIONAL_FILTERED_WEIGHTING?.trim().toUpperCase() || "EQUAL_NOTIONAL",
-      smartFormationRerank: env.CROSS_SECTIONAL_SMART_FORMATION_RERANK === "1",
-      entryRevalidationEnabled: env.CROSS_SECTIONAL_SMART_BASKET_V1 === "1",
+      formationMode: crossSectionalFormationMode(env),
+      smartFormationRerank: isCrossSectionalSmartFormationRerankEnabled(env),
+      entryRevalidationEnabled: isCrossSectionalSmartBasketLifecycleEnabled(env),
       entryHealthBypassed: env.CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH === "1",
     },
     execution: currentCrossSectionalExitPolicy(env),
@@ -212,6 +226,9 @@ export function effectiveCrossSectionalRuntime(
     });
   }
   return {
+    formationMode: crossSectionalFormationMode(env),
+    adaptiveExitMode: crossSectionalAdaptiveExitMode(env),
+    entryRevalidation: isCrossSectionalSmartBasketLifecycleEnabled(env),
     executorTick: {
       configured: rawTick,
       effectiveMs: crossSectionalExecTickMs(env),

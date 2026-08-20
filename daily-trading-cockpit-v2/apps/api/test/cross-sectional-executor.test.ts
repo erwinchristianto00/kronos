@@ -1057,6 +1057,53 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     });
   });
 
+  it("[SMART BASKET LIFECYCLE] keeps entry revalidation and provenance for a Plain MOM36 formation", async () => {
+    const client = new FakeExecClient();
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: true,
+      smartMaxAdverseEntryDriftVol: 0.5,
+      smartMinAdverseEntryDriftPct: 0.001,
+    });
+    const signal = signalStore.all[0]!;
+    signal.formationMode = "PLAIN_MOM36";
+    signal.longLeg[0]!.volatilityAtOpen = 0.01;
+    signal.shortLeg[0]!.volatilityAtOpen = 0.01;
+    client.markPriceBySymbol.set("SOLUSDT", 101); // +1%, 1.0σ adverse for a LONG chase
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+
+    await executor.tick();
+
+    expect(signal.smartFormation).toBeUndefined();
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().baskets).toHaveLength(0);
+    expect(executor.getStatus().entryAttemptAudit.latest).toMatchObject({
+      stage: "SMART_ENTRY_REVALIDATION",
+      outcome: "SKIPPED",
+    });
+  });
+
+  it("[SMART BASKET LIFECYCLE] persists Plain MOM36 as lifecycle provenance without utility reranking", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: true,
+    });
+    signalStore.all[0]!.formationMode = "PLAIN_MOM36";
+
+    await executor.tick();
+
+    expect(store.getState().baskets[0]!.smartBasket).toMatchObject({
+      version: "SMART_BASKET_V1",
+      formationModeAtOpen: "PLAIN_MOM36",
+    });
+    expect(store.getState().baskets[0]!.smartBasket!.axisScoreAtOpen).toBeNull();
+  });
+
   it("[SMART BASKET V1] records a two-scan context invalidation, but leaves the first warning alone", async () => {
     const client = new FakeExecClient();
     client.fillPriceBySymbol.set("SOLUSDT", 100);
