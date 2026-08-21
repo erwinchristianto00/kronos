@@ -253,6 +253,66 @@ interface LiveStatus {
   reason?: string;
 }
 
+interface CopyLeaderTradeEventSummary {
+  sourceEventIds: string[];
+  sourceTimestamp: string | null;
+  firstObservedAt: string | null;
+  completedAt: string | null;
+  sourceReferencePrice: number | null;
+  sourceQty: number | null;
+  testnetFillPrice: number | null;
+  testnetFilledQty: number | null;
+  feeUsd: number | null;
+  clientOrderIds: string[];
+  exchangeOrderIds: string[];
+  fillIds: string[];
+}
+
+interface CopyLeaderOpenPosition {
+  ownerPositionId: string;
+  leaderId: string;
+  leaderName: string;
+  leaderTier: string;
+  symbol: string;
+  direction: 'LONG' | 'SHORT';
+  qty: number;
+  entryPrice: number;
+  status: string;
+  openedAt: string;
+  sourceTrackedQty: number;
+  sourceEntry: CopyLeaderTradeEventSummary | null;
+  reconciliation: {
+    lastCheckedAt: string | null;
+    exchangeQty: number | null;
+    expectedQty: number;
+    state: string;
+    reason: string | null;
+  };
+}
+
+interface CopyLeaderClosedTrade {
+  ownerPositionId: string;
+  leaderId: string;
+  leaderName: string;
+  leaderTier: string;
+  symbol: string;
+  direction: 'LONG' | 'SHORT';
+  qty: number;
+  entryPrice: number;
+  openedAt: string;
+  sourceEntry: CopyLeaderTradeEventSummary | null;
+  closedAt: string;
+  netRealizedPnlUsd: number;
+  grossRealizedPnlUsd: number | null;
+  feesUsd: number | null;
+  sourceExit: CopyLeaderTradeEventSummary | null;
+  closeKind: 'SOURCE_EXIT' | 'EXTERNAL_CONTROL_CLOSE';
+  comparable: boolean;
+  sourcePriceReturnPct: number | null;
+  copyPriceReturnPct: number | null;
+  priceReplicationGapPct: number | null;
+}
+
 interface CopyLeaderStatus {
   strategy: 'COPY_LEADER';
   enabled: boolean;
@@ -294,6 +354,9 @@ interface CopyLeaderStatus {
     status: string;
     leaderId: string;
   }>;
+  openPositions?: CopyLeaderOpenPosition[];
+  closedTradeCount?: number;
+  closedTrades?: CopyLeaderClosedTrade[];
   ownerPnl?: { today: number; allTime: number; feesUsd: number | null };
   lastError?: string | null;
 }
@@ -453,6 +516,23 @@ function percent(value: number | null | undefined): string {
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
 }
 
+function compactId(value: string | null | undefined): string {
+  if (!value) return '—';
+  return value.length <= 18 ? value : `${value.slice(0, 9)}…${value.slice(-6)}`;
+}
+
+/** Positive means the copied entry was less favourable than the leader's
+ * reference price (higher for a long, lower for a short). */
+function copyEntryAdverseGapPct(
+  sourcePrice: number | null | undefined,
+  copyPrice: number | null | undefined,
+  direction: 'LONG' | 'SHORT',
+): number | null {
+  if (sourcePrice == null || copyPrice == null || !Number.isFinite(sourcePrice) || !Number.isFinite(copyPrice) || sourcePrice <= 0) return null;
+  const raw = ((copyPrice - sourcePrice) / sourcePrice) * 100;
+  return direction === 'LONG' ? raw : -raw;
+}
+
 function tone(value: number | null | undefined): string {
   if (value == null || value === 0) return 'tone-measure';
   return value > 0 ? 'tone-healthy' : 'tone-critical';
@@ -468,6 +548,7 @@ function timeAgo(iso: string | null | undefined): string {
 }
 
 function compactLane(laneId: string): string {
+  if (laneId === 'COPY_LEADER') return 'Copy Leader';
   return laneId.replace(/^CG_VARIANT_MATRIX:/, '').replace(/^CG_LONG_VARIANT_MATRIX:/, '');
 }
 
@@ -2048,10 +2129,9 @@ export default function TestnetExchangeDashboard() {
   const healthTone = status?.armed ? 'tone-healthy' : status?.health?.lastTickError ? 'tone-warning' : 'tone-measure';
   const totalSourceEntries = account?.positions.reduce((sum, position) => sum + position.sourceOrderCount, 0) ?? 0;
   const regimeOptions = laneSeries?.regimeOptions ?? FALLBACK_REGIME_OPTIONS;
-  // Testnet is currently scoped to cross-sectional work plus the explicitly approved
-  // XRP/WLD CG_MFE_GIVEBACK rollout. Keep the live page's full history, while the testnet
-  // performance timeline shows the cross-sectional variants and this one approved CG lane.
-  const isTestnetTimelineLane = (laneId: string) => laneId.startsWith('CROSS_SECTIONAL_');
+  // Testnet's timeline intentionally excludes unrelated Kronos lanes but includes
+  // the separately-owned direct Copy Sleeve alongside cross-sectional results.
+  const isTestnetTimelineLane = (laneId: string) => laneId.startsWith('CROSS_SECTIONAL_') || laneId === 'COPY_LEADER';
   // 2026-08-18: dropped the `!isLivePage &&`. The section that renders this chart is already shown
   // on /live (`isLivePage || showTestnetLaneResearch`), so gating the DATA here left live with a
   // permanently empty chart. laneSeries is fetched on both pages; mfeRolloutSeries is testnet-only
@@ -2098,6 +2178,35 @@ export default function TestnetExchangeDashboard() {
   // synthesized count can both read the SAME derived split without recomputing it twice.
   const intentBySymbol = new Map((status?.openIntents ?? []).map((i) => [i.symbol, i]));
   const allPositions = account?.positions ?? [];
+  // Copy Sleeve has its own durable ownership ledger. Join its open rows to
+  // the exchange-account snapshot only for live mark/close-cost telemetry;
+  // never infer leader ownership from an otherwise-unattributed symbol.
+  const copyLeaderPositions = (copyLeaderStatus?.openPositions ?? []).map((owner) => {
+    const exchange = allPositions.find((position) => position.symbol === owner.symbol && position.direction === owner.direction) ?? null;
+    const exchangeQty = exchange ? Math.abs(exchange.quantity) : 0;
+    const share = exchangeQty > 0 ? Math.min(1, owner.qty / exchangeQty) : null;
+    const markPrice = exchange?.markPrice ?? null;
+    const unrealizedPnl = markPrice === null
+      ? null
+      : (markPrice - owner.entryPrice) * owner.qty * (owner.direction === 'LONG' ? 1 : -1);
+    const estimatedCloseCostUsd = exchange?.estimatedCloseCostUsd != null && share !== null
+      ? exchange.estimatedCloseCostUsd * share
+      : null;
+    return {
+      ...owner,
+      exchange,
+      markPrice,
+      unrealizedPnl,
+      estimatedCloseCostUsd,
+      unrealizedAfterEstimatedCloseCostUsd: unrealizedPnl === null || estimatedCloseCostUsd === null
+        ? null
+        : unrealizedPnl - estimatedCloseCostUsd,
+    };
+  });
+  const copyLeaderClosedTrades = copyLeaderStatus?.closedTrades ?? [];
+  const copyLeaderOpenNotionalUsd = copyLeaderPositions.reduce((sum, position) => sum + Math.abs(position.qty * position.entryPrice), 0);
+  const copyLeaderUnrealizedPnl = copyLeaderPositions.reduce((sum, position) => sum + (position.unrealizedPnl ?? 0), 0);
+  const mirroredLaneCount = (account?.lanes.length ?? 0) + (copyLeaderPositions.length > 0 ? 1 : 0);
   const directionalPositions = allPositions.filter((p) => intentBySymbol.has(p.symbol));
   const foundationPositions = allPositions.filter(
     (p) => !isSingleSymbolExecutorPosition(p.laneIds) && ((p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol))),
@@ -2111,7 +2220,7 @@ export default function TestnetExchangeDashboard() {
   const orphanIntents = (status?.openIntents ?? []).filter((i) => !allPositions.some((p) => p.symbol === i.symbol));
   // NEW derived display value (2026-07-23, no new fetch): sum of open positions across all 3
   // real-money books, surfaced as a single zero-click KPI that deep-links to the merged table.
-  const openPositionsCount = directionalPositions.length + foundationPositions.length + singleSymbolLanePositions.length;
+  const openPositionsCount = directionalPositions.length + foundationPositions.length + singleSymbolLanePositions.length + copyLeaderPositions.length;
   // 2026-07-11: the 3 CrossSectionalExecutor instances each have independent halted/error/
   // openBaskets/staleSince state — surface all 3, not just FILTERED, so a stuck TREND or MIXED
   // instance is visible instead of silently invisible. (Unchanged data, just one combined list
@@ -2245,10 +2354,11 @@ export default function TestnetExchangeDashboard() {
             const singleSymbolUnreal = ps
               .filter((p) => isSingleSymbolExecutorPosition(p.laneIds))
               .reduce((s, p) => s + (p.basketUnrealizedPnl ?? 0), 0);
+            const copyUnreal = copyLeaderUnrealizedPnl;
             return (
               <>
                 <strong className={tone(account?.unrealizedPnl)}>{signed(account?.unrealizedPnl)}</strong>
-                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · single-symbol {signed(singleSymbolUnreal)} · {account ? `${account.openPositionCount} pos` : 'loading'}</small>
+                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · single-symbol {signed(singleSymbolUnreal)} · copy {signed(copyUnreal)} · {account ? `${account.openPositionCount} exchange pos` : 'loading'}</small>
               </>
             );
           })()}
@@ -2283,25 +2393,27 @@ export default function TestnetExchangeDashboard() {
             const basketsAllTime = ['CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS_SECTIONAL_TREND', 'CROSS_SECTIONAL_MIXED']
               .reduce((sum, laneId) => sum + (account?.closedLanes?.find((l) => l.laneId === laneId)?.realizedPnlUsd ?? 0), 0);
             const singleSymbolAllTime = account?.singleSymbolExecutorRealizedPnlUsd?.allTime;
-            const allTime = basketsAllTime + (singleSymbolAllTime ?? 0);
+            const copyAllTime = copyLeaderStatus?.ownerPnl?.allTime;
+            const allTime = basketsAllTime + (singleSymbolAllTime ?? 0) + (copyAllTime ?? 0);
             // 2026-07-11: was FILTERED-only (xsecExec?.dailyRealizedUsd) — TREND/MIXED's own daily
             // realized P&L never moved this "today" figure even though basketsAllTime above already
             // correctly folds all 3 in via account.closedLanes.
             const basketsToday = [xsecExec?.dailyRealizedUsd, xsecExecTrend?.dailyRealizedUsd, xsecExecMixed?.dailyRealizedUsd]
               .reduce<number | undefined>((sum, v) => (v != null ? (sum ?? 0) + v : sum), undefined);
             const singleSymbolToday = account?.singleSymbolExecutorRealizedPnlUsd?.today;
-            const today = basketsToday != null || singleSymbolToday != null
-              ? (basketsToday ?? 0) + (singleSymbolToday ?? 0)
+            const copyToday = copyLeaderStatus?.ownerPnl?.today;
+            const today = basketsToday != null || singleSymbolToday != null || copyToday != null
+              ? (basketsToday ?? 0) + (singleSymbolToday ?? 0) + (copyToday ?? 0)
               : undefined;
             return (
               <>
                 <strong className={tone(today)}>{signed(today)}</strong>
                 <small>
-                  today — baskets {signed(basketsToday)} · single-symbol {signed(singleSymbolToday)}
+                  today — baskets {signed(basketsToday)} · single-symbol {signed(singleSymbolToday)} · copy {signed(copyToday)}
                   <br />
-                  all-time — baskets {signed(basketsAllTime)} · single-symbol {signed(singleSymbolAllTime)} · jumlah {signed(allTime)}
+                  all-time — baskets {signed(basketsAllTime)} · single-symbol {signed(singleSymbolAllTime)} · copy {signed(copyAllTime)} · jumlah {signed(allTime)}
                   <br />
-                  <span style={{ opacity: 0.7 }}>mencakup 2 lane ini saja — bukan total akun; kill-switch tetap memakai angka penuh seluruh lane</span>
+                  <span style={{ opacity: 0.7 }}>mencakup basket, single-symbol, dan Copy Sleeve — bukan total akun; kill-switch tetap memakai angka penuh seluruh lane</span>
                 </small>
               </>
             );
@@ -2352,7 +2464,7 @@ export default function TestnetExchangeDashboard() {
         <div>
           <span>Open positions</span>
           <strong><a href="#open-positions" style={{ color: 'inherit' }}>{openPositionsCount}</a></strong>
-          <small>directional + basket + single-symbol</small>
+          <small>directional + basket + single-symbol + copy</small>
         </div>
       </div>
 
@@ -2396,7 +2508,9 @@ export default function TestnetExchangeDashboard() {
           ) : (
             <>
               <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
-                Destination: {copyLeaderStatus.destinationEndpoint ?? 'not configured'} · poll {copyLeaderStatus.pollMs ?? '—'}ms · stale cutoff {copyLeaderStatus.stalenessMs ?? '—'}ms · owner positions {copyLeaderStatus.ownerPositions?.length ?? 0} · P&amp;L {signed(copyLeaderStatus.ownerPnl?.allTime)}.
+                Destination: {copyLeaderStatus.destinationEndpoint ?? 'not configured'} · poll {copyLeaderStatus.pollMs ?? '—'}ms · stale cutoff {copyLeaderStatus.stalenessMs ?? '—'}ms ·{' '}
+                <a href="#open-positions" style={{ color: 'inherit' }}>open copy {copyLeaderStatus.openPositions?.length ?? 0}</a> ·{' '}
+                <a href="#copy-leader-closed" style={{ color: 'inherit' }}>closed {copyLeaderStatus.closedTradeCount ?? copyLeaderStatus.closedTrades?.length ?? 0}</a> · P&amp;L {signed(copyLeaderStatus.ownerPnl?.allTime)}.
               </p>
               {copyLeaderStatus.reason && <p className="tone-warning" style={{ margin: '4px 0' }}>{copyLeaderStatus.reason}</p>}
               {copyLeaderStatus.configErrors?.map((message) => (
@@ -2569,7 +2683,7 @@ export default function TestnetExchangeDashboard() {
           <header><span>Open Positions</span><strong>{openPositionsCount} pos</strong></header>
           <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
             Directional (operator-controlled, engine mirror) + Basket (cross-sectional hedge, automatic exit only) +
-            Single-symbol (stop-protected, own exchange-side stop) in one table. Not every column applies to every
+            Single-symbol (stop-protected, own exchange-side stop) + Copy Leader (source-controlled Testnet mirror) in one table. Not every column applies to every
             book — blank cells are expected, not missing data.
           </p>
           {closeResult && <p className={closeResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{closeResult.message}</p>}
@@ -2672,33 +2786,52 @@ export default function TestnetExchangeDashboard() {
 
           {/* Mirrored-lane P&L rollup: small always-visible strip, full breakdown behind Disclosure. */}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, margin: '6px 0', fontSize: 12 }}>
-            {(account?.lanes ?? []).length === 0 ? (
+            {mirroredLaneCount === 0 ? (
               <span className="tone-measure">No mirrored Binance lane exposure.</span>
-            ) : account!.lanes.map((lane) => (
-              <span key={lane.laneId}>
-                <strong>{compactLane(lane.laneId)}</strong>{' '}
-                notional {plain(lane.notionalUsd, ' USDT')} · unrealized <span className={tone(lane.unrealizedPnl)}>{signed(lane.unrealizedPnl)}</span>
-              </span>
-            ))}
+            ) : <>
+              {(account?.lanes ?? []).map((lane) => (
+                <span key={lane.laneId}>
+                  <strong>{compactLane(lane.laneId)}</strong>{' '}
+                  notional {plain(lane.notionalUsd, ' USDT')} · unrealized <span className={tone(lane.unrealizedPnl)}>{signed(lane.unrealizedPnl)}</span>
+                </span>
+              ))}
+              {copyLeaderPositions.length > 0 && (
+                <span>
+                  <strong>Copy Leader</strong>{' '}
+                  notional {plain(copyLeaderOpenNotionalUsd, ' USDT')} · unrealized <span className={tone(copyLeaderUnrealizedPnl)}>{signed(copyLeaderUnrealizedPnl)}</span>
+                </span>
+              )}
+            </>}
           </div>
-          <Disclosure summary={`Mirrored Lane P&L — full breakdown (${account?.lanes.length ?? 0} lane${(account?.lanes.length ?? 0) === 1 ? '' : 's'}) ▸`}>
+          <Disclosure summary={`Mirrored Lane P&L — full breakdown (${mirroredLaneCount} lane${mirroredLaneCount === 1 ? '' : 's'}) ▸`}>
             <div className="testnet-table-wrap">
               <table>
                 <thead>
                   <tr><th>Lane</th><th>Source entries</th><th>Symbols</th><th>Notional</th><th>Unrealized</th></tr>
                 </thead>
                 <tbody>
-                  {(account?.lanes ?? []).length === 0 ? (
+                  {mirroredLaneCount === 0 ? (
                     <tr><td colSpan={5}>No mirrored Binance lane exposure.</td></tr>
-                  ) : account!.lanes.map((lane) => (
-                    <tr key={lane.laneId}>
-                      <td>{compactLane(lane.laneId)}</td>
-                      <td>{lane.sourceOrderCount}</td>
-                      <td>{lane.symbols.join(', ')}</td>
-                      <td>{plain(lane.notionalUsd, ' USDT')}</td>
-                      <td className={tone(lane.unrealizedPnl)}>{signed(lane.unrealizedPnl)}</td>
-                    </tr>
-                  ))}
+                  ) : <>
+                    {(account?.lanes ?? []).map((lane) => (
+                      <tr key={lane.laneId}>
+                        <td>{compactLane(lane.laneId)}</td>
+                        <td>{lane.sourceOrderCount}</td>
+                        <td>{lane.symbols.join(', ')}</td>
+                        <td>{plain(lane.notionalUsd, ' USDT')}</td>
+                        <td className={tone(lane.unrealizedPnl)}>{signed(lane.unrealizedPnl)}</td>
+                      </tr>
+                    ))}
+                    {copyLeaderPositions.length > 0 && (
+                      <tr>
+                        <td>Copy Leader</td>
+                        <td>{copyLeaderPositions.length}</td>
+                        <td>{copyLeaderPositions.map((position) => position.symbol).join(', ')}</td>
+                        <td>{plain(copyLeaderOpenNotionalUsd, ' USDT')}</td>
+                        <td className={tone(copyLeaderUnrealizedPnl)}>{signed(copyLeaderUnrealizedPnl)}</td>
+                      </tr>
+                    )}
+                  </>}
                 </tbody>
               </table>
             </div>
@@ -2711,13 +2844,13 @@ export default function TestnetExchangeDashboard() {
                   <th>Book</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th>
                   <th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Stop</th><th>R now / peak</th>
                   <th>Basket horizon</th><th>Unrealized</th><th>After fee+slip</th><th>Lev</th><th>Source entries</th><th>Source lane</th><th>Opened</th>
-                  <th>Intent state</th>
+                  <th>Intent state</th><th>Copy source</th><th>Replication</th>
                   <th>Action</th>
                 </tr>
               </thead>
               <tbody>
-                {directionalPositions.length === 0 && foundationPositions.length === 0 && singleSymbolLanePositions.length === 0 ? (
-                  <tr><td colSpan={20}>No open positions across any book.</td></tr>
+                {directionalPositions.length === 0 && foundationPositions.length === 0 && singleSymbolLanePositions.length === 0 && copyLeaderPositions.length === 0 ? (
+                  <tr><td colSpan={22}>No open positions across any book.</td></tr>
                 ) : (
                   <>
                     {directionalPositions.map((p) => {
@@ -2749,6 +2882,8 @@ export default function TestnetExchangeDashboard() {
                           <td>{p.laneIds.length > 0 ? p.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
                           <td>—</td>
                           <td>{intent.state}</td>
+                          <td>—</td>
+                          <td>—</td>
                           <td>
                             <button
                               type="button"
@@ -2845,6 +2980,8 @@ export default function TestnetExchangeDashboard() {
                             })}
                           </td>
                           <td>—</td>
+                          <td>—</td>
+                          <td>—</td>
                           <td className="tone-measure" title="Menutup satu leg basket akan membuat sisa basket jadi taruhan directional telanjang — tidak ada Close now di sini, sama seperti sebelumnya.">auto-exit only</td>
                         </tr>
                       );
@@ -2886,6 +3023,8 @@ export default function TestnetExchangeDashboard() {
                           <td>{compactLane(p.laneId)}</td>
                           <td>{new Date(p.openedAt).toLocaleString()}</td>
                           <td>—</td>
+                          <td>—</td>
+                          <td>—</td>
                           <td>
                             <button
                               type="button"
@@ -2898,8 +3037,126 @@ export default function TestnetExchangeDashboard() {
                         </tr>
                       );
                     })}
+                    {copyLeaderPositions.map((p) => {
+                      const sourceEntry = p.sourceEntry;
+                      const adverseGapPct = copyEntryAdverseGapPct(sourceEntry?.sourceReferencePrice, p.entryPrice, p.direction);
+                      const sourceAt = taipeiDateTime(sourceEntry?.sourceTimestamp);
+                      return (
+                        <tr key={`copy-leader-${p.ownerPositionId}-${p.openedAt}`}>
+                          <td>Copy Leader</td>
+                          <td>{p.symbol}</td>
+                          <td className={p.direction === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{p.direction}</td>
+                          <td>{Number(p.qty.toFixed(8))}</td>
+                          <td>{price(p.entryPrice)}<small style={{ display: 'block' }}>Testnet fill</small></td>
+                          <td>{price(p.markPrice)}</td>
+                          <td>source exit</td>
+                          <td>source-controlled</td>
+                          <td className="tone-critical">{price(p.exchange?.liquidationPrice)}</td>
+                          <td>source exit only</td>
+                          <td>—</td>
+                          <td>no fixed horizon</td>
+                          <td className={tone(p.unrealizedPnl)}>{signed(p.unrealizedPnl)}</td>
+                          <td className={tone(p.unrealizedAfterEstimatedCloseCostUsd)}>
+                            {p.unrealizedAfterEstimatedCloseCostUsd == null ? 'exchange position not bound' : signed(p.unrealizedAfterEstimatedCloseCostUsd)}
+                          </td>
+                          <td>{p.exchange?.leverage == null ? 'exchange position not bound' : `${p.exchange.leverage}x`}</td>
+                          <td>
+                            {sourceEntry ? <>
+                              {sourceEntry.sourceEventIds.length} event · {compactId(sourceEntry.sourceEventIds[0])}
+                            </> : 'legacy source detail unavailable'}
+                          </td>
+                          <td>Binance Copy Trading</td>
+                          <td>{taipeiDateTime(p.openedAt) ?? '—'}</td>
+                          <td className={p.status === 'OPEN' && p.reconciliation.state === 'MATCHED' ? 'tone-healthy' : 'tone-warning'}>
+                            {p.status} · {p.reconciliation.state}
+                          </td>
+                          <td>
+                            <strong>{p.leaderName}</strong>
+                            <small style={{ display: 'block' }}>{p.leaderTier} · {p.leaderId}</small>
+                            <small style={{ display: 'block' }}>source {sourceAt ?? 'n/a'}</small>
+                          </td>
+                          <td>
+                            {sourceEntry?.sourceReferencePrice != null ? <>
+                              source {price(sourceEntry.sourceReferencePrice)} → copy {price(p.entryPrice)}
+                              <small className={tone(adverseGapPct)} style={{ display: 'block' }}>entry adverse gap {percent(adverseGapPct)}</small>
+                            </> : 'source price unavailable'}
+                          </td>
+                          <td className="tone-measure" title="Only a fresh matched leader exit or an account safety control can close this copy-owned position.">source / safety exit</td>
+                        </tr>
+                      );
+                    })}
                   </>
                 )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="copy-leader-closed" className="testnet-panel testnet-wide-panel">
+          <header>
+            <span>Closed Copy Trades</span>
+            <strong className={tone(copyLeaderStatus?.ownerPnl?.allTime)}>
+              {copyLeaderStatus?.closedTradeCount ?? copyLeaderClosedTrades.length} closed · {signed(copyLeaderStatus?.ownerPnl?.allTime)} all-time
+            </strong>
+          </header>
+          <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
+            Hanya posisi yang benar-benar dibuat setelah activation cursor dan sudah reconciled closed di Testnet. Menampilkan {copyLeaderClosedTrades.length} terbaru (maks. 200). “Comparable” berarti source entry dan source exit keduanya tersedia; control/kill/reconciliation close tetap masuk P&amp;L akun tetapi bukan bukti edge leader.
+          </p>
+          <div className="testnet-table-wrap" style={{ marginTop: 10 }}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Leader / copy from</th><th>Symbol</th><th>Side</th><th>Qty</th>
+                  <th>Source entry</th><th>Testnet entry</th><th>Source exit</th><th>Testnet exit</th>
+                  <th>Source / copy return</th><th>Price replication gap</th><th>Realized net</th><th>Fees</th><th>Comparable</th><th>Opened → closed</th><th>Close path</th>
+                </tr>
+              </thead>
+              <tbody>
+                {copyLeaderClosedTrades.length === 0 ? (
+                  <tr><td colSpan={15}>No closed Copy Leader trade yet. Historical leader positions are never replayed into this ledger.</td></tr>
+                ) : copyLeaderClosedTrades.map((trade) => (
+                  <tr key={`copy-closed-${trade.ownerPositionId}-${trade.closedAt}`}>
+                    <td>
+                      <strong>{trade.leaderName}</strong>
+                      <small style={{ display: 'block' }}>Binance Copy Trading · {trade.leaderTier} · {trade.leaderId}</small>
+                    </td>
+                    <td>{trade.symbol}</td>
+                    <td className={trade.direction === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{trade.direction}</td>
+                    <td>{Number(trade.qty.toFixed(8))}</td>
+                    <td>
+                      {trade.sourceEntry?.sourceReferencePrice == null ? 'n/a' : price(trade.sourceEntry.sourceReferencePrice)}
+                      <small style={{ display: 'block' }}>{taipeiDateTime(trade.sourceEntry?.sourceTimestamp) ?? 'source time n/a'}</small>
+                    </td>
+                    <td>
+                      {trade.sourceEntry?.testnetFillPrice == null ? price(trade.entryPrice) : price(trade.sourceEntry.testnetFillPrice)}
+                      <small style={{ display: 'block' }}>{compactId(trade.sourceEntry?.exchangeOrderIds[0])}</small>
+                    </td>
+                    <td>
+                      {trade.sourceExit?.sourceReferencePrice == null ? 'n/a' : price(trade.sourceExit.sourceReferencePrice)}
+                      <small style={{ display: 'block' }}>{taipeiDateTime(trade.sourceExit?.sourceTimestamp) ?? 'source time n/a'}</small>
+                    </td>
+                    <td>
+                      {trade.sourceExit?.testnetFillPrice == null ? 'n/a' : price(trade.sourceExit.testnetFillPrice)}
+                      <small style={{ display: 'block' }}>{compactId(trade.sourceExit?.exchangeOrderIds[0])}</small>
+                    </td>
+                    <td>
+                      source {percent(trade.sourcePriceReturnPct)}
+                      <small style={{ display: 'block' }}>copy {percent(trade.copyPriceReturnPct)}</small>
+                    </td>
+                    <td className={tone(trade.priceReplicationGapPct)}>{percent(trade.priceReplicationGapPct)}</td>
+                    <td className={tone(trade.netRealizedPnlUsd)}>
+                      {signed(trade.netRealizedPnlUsd)}
+                      <small style={{ display: 'block' }}>gross {signed(trade.grossRealizedPnlUsd)}</small>
+                    </td>
+                    <td>{plain(trade.feesUsd, ' USDT')}</td>
+                    <td className={trade.comparable ? 'tone-healthy' : 'tone-warning'}>{trade.comparable ? 'YES' : 'NO — exclude edge'}</td>
+                    <td>
+                      {taipeiDateTime(trade.openedAt) ?? '—'}
+                      <small style={{ display: 'block' }}>{taipeiDateTime(trade.closedAt) ?? '—'}</small>
+                    </td>
+                    <td className={trade.closeKind === 'SOURCE_EXIT' ? 'tone-healthy' : 'tone-warning'}>{trade.closeKind}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
@@ -3295,7 +3552,9 @@ export default function TestnetExchangeDashboard() {
                     <td>{plain(lane.feesUsd, ' USDT')}</td>
                     <td>{lane.regimes.map((regime) => `${regime.bucket.toLowerCase()} ${regime.count}`).join(', ') || 'n/a'}</td>
                     <td>{lane.symbols.join(', ') || 'n/a'}</td>
-                    <td>{timeAgo(account?.closedLanes?.find((cl) => cl.laneId === lane.laneId)?.lastClosedAt)}</td>
+                    <td>{timeAgo(lane.laneId === 'COPY_LEADER'
+                      ? copyLeaderClosedTrades[0]?.closedAt
+                      : account?.closedLanes?.find((cl) => cl.laneId === lane.laneId)?.lastClosedAt)}</td>
                   </tr>
                 ))}
               </tbody>

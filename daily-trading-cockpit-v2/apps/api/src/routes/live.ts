@@ -46,7 +46,10 @@ import {
 import type { InnovationCampaignDiagnostics } from "../lib/innovation-campaign.js";
 import type { SingleSymbolPriceTimelineService } from "../lib/single-symbol-price-timeline.js";
 import type { FuturesReferenceHealthSnapshot } from "../lib/futures-reference-health.js";
-import type { CopyLeaderExecutor } from "../lib/copy-leader-executor.js";
+import {
+  COPY_LEADER_TIMELINE_LANE_ID,
+  type CopyLeaderExecutor,
+} from "../lib/copy-leader-executor.js";
 import { REGIME_AUTOPILOT_PRESETS, type RegimeAutopilot } from "../lib/regime-autopilot.js";
 import { getShortFadeStore, buildShortFadeReport, SF_PAPER_LANE_ID } from "../lib/short-fade-edge.js";
 import { getIntradayMomentumStore, buildIntradayMomentumReport, IM_PAPER_LANE_ID } from "../lib/intraday-momentum-edge.js";
@@ -664,6 +667,96 @@ export function mergeCrossSectionalIntoLaneSeries(
     });
     report.lanes.push({
       laneId,
+      realizedPnlUsd,
+      feesUsd,
+      closedCount,
+      wins,
+      losses,
+      winRatePct: closedCount > 0 ? (wins / closedCount) * 100 : null,
+      symbols: Array.from(symbols).sort(),
+      regimes: [],
+      points,
+    });
+  }
+  report.lanes.sort((left, right) => Math.abs(right.realizedPnlUsd) - Math.abs(left.realizedPnlUsd));
+  return report;
+}
+
+/** Add actual realised Copy Sleeve results to the account timeline.  Copy
+ * events have no Kronos regime label, so they are visible only in the complete
+ * (not regime-filtered) view, the same honest rule used for cross-baskets. */
+export function mergeCopyLeaderIntoLaneSeries(
+  report: LiveLaneSeriesReport,
+  executor: Pick<CopyLeaderExecutor, "getClosedTrades"> | null,
+): LiveLaneSeriesReport {
+  if (!executor || report.regimeFilter !== "all") return report;
+  const sinceMs = new Date(report.since).getTime();
+  const untilMs = new Date(report.until).getTime();
+  const bucketStartsMs = report.bucketStarts.map((value) => new Date(value).getTime());
+  const perBucket = new Map<string, { realizedPnlUsd: number; closedCount: number; wins: number; losses: number }>();
+  let realizedPnlUsd = 0;
+  let feesUsd = 0;
+  let closedCount = 0;
+  let wins = 0;
+  let losses = 0;
+  const symbols = new Set<string>();
+
+  for (const trade of executor.getClosedTrades()) {
+    const closedMs = Date.parse(trade.closedAt);
+    if (!Number.isFinite(closedMs) || closedMs < sinceMs || closedMs >= untilMs) continue;
+    if (!Number.isFinite(trade.netRealizedPnlUsd)) continue;
+    let bucketIdx = -1;
+    for (let index = 0; index < bucketStartsMs.length; index += 1) {
+      if (bucketStartsMs[index]! <= closedMs) bucketIdx = index;
+      else break;
+    }
+    if (bucketIdx < 0) continue;
+    const bucketStart = report.bucketStarts[bucketIdx]!;
+    const bucket = perBucket.get(bucketStart) ?? { realizedPnlUsd: 0, closedCount: 0, wins: 0, losses: 0 };
+    bucket.realizedPnlUsd += trade.netRealizedPnlUsd;
+    bucket.closedCount += 1;
+    if (trade.netRealizedPnlUsd > 0) bucket.wins += 1;
+    if (trade.netRealizedPnlUsd < 0) bucket.losses += 1;
+    perBucket.set(bucketStart, bucket);
+    realizedPnlUsd += trade.netRealizedPnlUsd;
+    feesUsd += trade.feesUsd ?? 0;
+    closedCount += 1;
+    if (trade.netRealizedPnlUsd > 0) wins += 1;
+    if (trade.netRealizedPnlUsd < 0) losses += 1;
+    symbols.add(trade.symbol);
+  }
+  if (closedCount === 0) return report;
+
+  const existing = report.lanes.find((lane) => lane.laneId === COPY_LEADER_TIMELINE_LANE_ID);
+  if (existing) {
+    existing.realizedPnlUsd += realizedPnlUsd;
+    existing.feesUsd += feesUsd;
+    existing.closedCount += closedCount;
+    existing.wins += wins;
+    existing.losses += losses;
+    existing.winRatePct = existing.closedCount > 0 ? (existing.wins / existing.closedCount) * 100 : null;
+    existing.symbols = Array.from(new Set([...existing.symbols, ...symbols])).sort();
+    let cumulative = 0;
+    for (const point of existing.points) {
+      const bucket = perBucket.get(point.bucketStart);
+      if (bucket) {
+        point.realizedPnlUsd += bucket.realizedPnlUsd;
+        point.closedCount += bucket.closedCount;
+        point.wins += bucket.wins;
+        point.losses += bucket.losses;
+      }
+      cumulative += point.realizedPnlUsd;
+      point.cumulativePnlUsd = cumulative;
+    }
+  } else {
+    let cumulative = 0;
+    const points = report.bucketStarts.map((bucketStart) => {
+      const bucket = perBucket.get(bucketStart) ?? { realizedPnlUsd: 0, closedCount: 0, wins: 0, losses: 0 };
+      cumulative += bucket.realizedPnlUsd;
+      return { bucketStart, ...bucket, cumulativePnlUsd: cumulative };
+    });
+    report.lanes.push({
+      laneId: COPY_LEADER_TIMELINE_LANE_ID,
       realizedPnlUsd,
       feesUsd,
       closedCount,
@@ -3505,6 +3598,7 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
         for (const executor of allSingleSymbolExecutors()) {
           series = mergeSingleSymbolIntoLaneSeries(series, executor);
         }
+        series = mergeCopyLeaderIntoLaneSeries(series, opts.copyLeaderExecutor?.() ?? null);
       }
       // The chart is intentionally calendar-scoped: a basket closed on 13 Aug must not be
       // painted into the 14 Aug hourly curve just to make the current view non-zero. Surface the

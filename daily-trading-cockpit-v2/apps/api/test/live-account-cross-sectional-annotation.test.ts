@@ -2,7 +2,11 @@ import { describe, it, expect } from "vitest";
 import { resolve } from "node:path";
 import os from "node:os";
 
-import { annotateCrossSectionalAccount, mergeCrossSectionalIntoLaneSeries } from "../src/routes/live.js";
+import {
+  annotateCrossSectionalAccount,
+  mergeCopyLeaderIntoLaneSeries,
+  mergeCrossSectionalIntoLaneSeries,
+} from "../src/routes/live.js";
 import {
   CrossSectionalExecutor,
   CrossSectionalExecutorStore,
@@ -286,5 +290,52 @@ describe("mergeCrossSectionalIntoLaneSeries — baskets appear on the lane-perfo
     };
     expect(merged.lanes.find((l) => l.laneId === "CROSS_SECTIONAL_MIXED")?.realizedPnlUsd).toBeCloseTo(0.6, 9);
     expect(merged.lanes.find((l) => l.laneId === "CROSS_SECTIONAL_MARKET_NEUTRAL")).toBeUndefined();
+  });
+});
+
+describe("mergeCopyLeaderIntoLaneSeries — actual copied closes appear on the Testnet timeline", () => {
+  function seriesReport(bucketStarts: string[]) {
+    const startsMs = bucketStarts.map((value) => new Date(value).getTime());
+    return {
+      view: "hourly",
+      period: "day",
+      viewLabel: "Hourly",
+      periodLabel: "Today",
+      bucketLabel: "hour",
+      bucketMs: 3_600_000,
+      since: bucketStarts[0]!,
+      until: new Date(startsMs[startsMs.length - 1]! + 3_600_000).toISOString(),
+      anchor: bucketStarts[0]!.slice(0, 10),
+      regimeFilter: "all",
+      regimeOptions: [],
+      bucketStarts,
+      lanes: [],
+    } as never;
+  }
+
+  it("uses realised Testnet P&L and the actual close time, including a control close in account performance", () => {
+    const fakeExecutor = {
+      getClosedTrades: () => [
+        { symbol: "ETHUSDT", closedAt: "2026-07-07T10:20:00.000Z", netRealizedPnlUsd: 1.25, feesUsd: 0.05 },
+        { symbol: "SOLUSDT", closedAt: "2026-07-07T12:40:00.000Z", netRealizedPnlUsd: -0.4, feesUsd: 0.04 },
+        { symbol: "OLDUSDT", closedAt: "2026-07-06T10:00:00.000Z", netRealizedPnlUsd: 99, feesUsd: 1 },
+      ],
+    } as never;
+    const report = seriesReport(["2026-07-07T10:00:00.000Z", "2026-07-07T11:00:00.000Z", "2026-07-07T12:00:00.000Z"]);
+    const merged = mergeCopyLeaderIntoLaneSeries(report, fakeExecutor) as {
+      lanes: Array<{ laneId: string; realizedPnlUsd: number; feesUsd: number; closedCount: number; wins: number; losses: number; symbols: string[]; points: Array<{ realizedPnlUsd: number; cumulativePnlUsd: number }> }>;
+    };
+    const lane = merged.lanes.find((item) => item.laneId === "COPY_LEADER")!;
+    expect(lane).toMatchObject({ realizedPnlUsd: 0.85, feesUsd: 0.09, closedCount: 2, wins: 1, losses: 1 });
+    expect(lane.symbols).toEqual(["ETHUSDT", "SOLUSDT"]);
+    expect(lane.points.map((point) => point.realizedPnlUsd)).toEqual([1.25, 0, -0.4]);
+    expect(lane.points.map((point) => point.cumulativePnlUsd)).toEqual([1.25, 1.25, 0.85]);
+  });
+
+  it("does not paint Copy Sleeve P&L into a Kronos regime-filtered view", () => {
+    const fakeExecutor = { getClosedTrades: () => [{ symbol: "ETHUSDT", closedAt: "2026-07-07T10:20:00.000Z", netRealizedPnlUsd: 1, feesUsd: 0 }] } as never;
+    const report = { ...(seriesReport(["2026-07-07T10:00:00.000Z"]) as object), regimeFilter: "trending" } as never;
+    const merged = mergeCopyLeaderIntoLaneSeries(report, fakeExecutor) as { lanes: Array<{ laneId: string }> };
+    expect(merged.lanes.find((item) => item.laneId === "COPY_LEADER")).toBeUndefined();
   });
 });

@@ -202,6 +202,13 @@ describe("CopyLeaderExecutor", () => {
     expect(submitted[0]!.reduceOnly).not.toBe(true);
     expect(positions.find((position) => position.symbol === "ETHUSDT")?.positionAmt).toBeLessThan(0);
     expect(calls).toMatchObject({ reserve: 1, commit: 1 });
+    const [open] = executor.getOpenPositionReports();
+    expect(open).toMatchObject({
+      leaderName: "Test Leader",
+      symbol: "ETHUSDT",
+      direction: "SHORT",
+      sourceEntry: { sourceReferencePrice: 100, testnetFillPrice: 100 },
+    });
 
     await executor.tick();
     expect(submitted).toHaveLength(1); // same canonical source entry is idempotent
@@ -212,6 +219,17 @@ describe("CopyLeaderExecutor", () => {
     expect(submitted[1]).toMatchObject({ symbol: "ETHUSDT", side: "BUY", reduceOnly: true });
     expect(positions.find((position) => position.symbol === "ETHUSDT")?.positionAmt).toBeCloseTo(0);
     expect(calls.releaseCommitted).toBe(1);
+    const [closed] = executor.getClosedTrades();
+    expect(closed).toMatchObject({
+      leaderName: "Test Leader",
+      symbol: "ETHUSDT",
+      direction: "SHORT",
+      closeKind: "SOURCE_EXIT",
+      comparable: true,
+      netRealizedPnlUsd: 0,
+      sourceEntry: { sourceReferencePrice: 100, testnetFillPrice: 100 },
+      sourceExit: { sourceReferencePrice: 100, testnetFillPrice: 100 },
+    });
   });
 
   it("records stale events and never submits them", async () => {

@@ -28,6 +28,10 @@ import {
 } from "./binance-futures-private.js";
 
 export const COPY_LEADER_STRATEGY = "COPY_LEADER";
+/** Stable reporting lane for the direct Testnet copy sleeve.  It is deliberately
+ * separate from every Kronos strategy lane: this is an execution/accounting
+ * label, never a signal-selection input. */
+export const COPY_LEADER_TIMELINE_LANE_ID = "COPY_LEADER";
 export const COPY_LEADER_DESTINATION_ENDPOINT = "https://testnet.binancefuture.com";
 export const COPY_LEADER_SOURCE_ORDER_HISTORY_ENDPOINT =
   "https://www.binance.com/bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/order-history";
@@ -148,6 +152,10 @@ export interface CopyEventLedgerRow {
   leaderId: string;
   sourceTimestamp: string;
   sourceTimestampMs: number;
+  /** Price/quantity observed on the public leader event.  Optional so the
+   * pre-dashboard ledger remains readable without inventing legacy values. */
+  sourceReferencePrice?: number | null;
+  sourceExecutedQty?: number | null;
   symbol: string;
   direction: CopyDirection | null;
   action: "ENTRY" | "EXIT" | "CURSOR_SEEDED" | "CONTROL_CLOSE";
@@ -206,6 +214,11 @@ export interface CopyOwnedPosition {
   realisedPnlUsd: number;
   feesUsd: number | null;
   lots: CopyOwnedLot[];
+  /** Durable source lineage. New rows write these ids at fill time; older rows
+   * remain displayable but honestly show unavailable source-price detail. */
+  sourceEntryEventIds?: string[];
+  sourceExitEventIds?: string[];
+  lastExitReason?: "EXIT" | "CONTROL_CLOSE" | null;
   reconciliation: {
     lastCheckedAt: string | null;
     exchangeQty: number | null;
@@ -213,6 +226,58 @@ export interface CopyOwnedPosition {
     state: "PENDING" | "MATCHED" | "MISMATCH";
     reason: string | null;
   };
+}
+
+/** One or more source events rolled into a copied entry/exit.  Scaling can
+ * turn one leader position into multiple fills, so reporting aggregates the
+ * exact durable rows instead of pretending there was always one order. */
+export interface CopyLeaderTradeEventSummary {
+  sourceEventIds: string[];
+  sourceTimestamp: string | null;
+  firstObservedAt: string | null;
+  completedAt: string | null;
+  sourceReferencePrice: number | null;
+  sourceQty: number | null;
+  testnetFillPrice: number | null;
+  testnetFilledQty: number | null;
+  feeUsd: number | null;
+  clientOrderIds: string[];
+  exchangeOrderIds: string[];
+  fillIds: string[];
+}
+
+/** Sanitised owner-side view for the Testnet dashboard.  The exchange remains
+ * netted by symbol; this is the Copy Sleeve's durable attribution layer. */
+export interface CopyLeaderOpenPositionReport {
+  ownerPositionId: string;
+  leaderId: string;
+  leaderName: string;
+  leaderTier: string;
+  symbol: string;
+  direction: CopyDirection;
+  qty: number;
+  entryPrice: number;
+  status: CopyOwnedPosition["status"];
+  openedAt: string;
+  sourceTrackedQty: number;
+  sourceEntry: CopyLeaderTradeEventSummary | null;
+  reconciliation: CopyOwnedPosition["reconciliation"];
+}
+
+/** A fully reconciled copy-owned position.  `comparable=false` means the
+ * actual Testnet P&L is still shown, but it was closed by a control path rather
+ * than a matching fresh source exit and must not be used as leader-edge proof. */
+export interface CopyLeaderClosedTradeReport extends Omit<CopyLeaderOpenPositionReport, "status" | "sourceTrackedQty" | "reconciliation"> {
+  closedAt: string;
+  netRealizedPnlUsd: number;
+  grossRealizedPnlUsd: number | null;
+  feesUsd: number | null;
+  sourceExit: CopyLeaderTradeEventSummary | null;
+  closeKind: "SOURCE_EXIT" | "EXTERNAL_CONTROL_CLOSE";
+  comparable: boolean;
+  sourcePriceReturnPct: number | null;
+  copyPriceReturnPct: number | null;
+  priceReplicationGapPct: number | null;
 }
 
 interface PersistedLeader {
@@ -491,6 +556,8 @@ function sourceEventRow(
     leaderId,
     sourceTimestamp: iso(order.sourceTimestampMs),
     sourceTimestampMs: order.sourceTimestampMs,
+    sourceReferencePrice: order.avgPrice,
+    sourceExecutedQty: order.executedQty,
     symbol: order.symbol,
     direction,
     action,
@@ -633,6 +700,147 @@ export class CopyLeaderExecutor {
     return net;
   }
 
+  private definitionForLeader(leaderId: string): CopyLeaderDefinition {
+    return this.leaders.find((leader) => leader.id === leaderId) ?? {
+      id: leaderId,
+      name: leaderId,
+      tier: "B-Low",
+      sleeveShare: 0,
+    };
+  }
+
+  private eventsForIds(ids: readonly string[] | undefined): CopyEventLedgerRow[] {
+    if (!ids || ids.length === 0) return [];
+    const idSet = new Set(ids);
+    return this.store.getState().events
+      .filter((event) => idSet.has(event.sourceEventId))
+      .sort((left, right) => left.sourceTimestampMs - right.sourceTimestampMs || left.createdAt.localeCompare(right.createdAt));
+  }
+
+  private entryEventsForPosition(position: CopyOwnedPosition): CopyEventLedgerRow[] {
+    const explicit = this.eventsForIds(position.sourceEntryEventIds);
+    if (explicit.length > 0) return explicit;
+    // A pre-reporting row did not yet persist source ids.  Open legacy lots do
+    // retain their Testnet client ids, so recover only that safe subset. Closed
+    // legacy rows intentionally remain source-detail unavailable rather than
+    // being heuristically joined to an unrelated later leader event.
+    const legacyClientIds = new Set(position.lots.map((lot) => lot.entryClientOrderId).filter(Boolean));
+    if (legacyClientIds.size === 0) return [];
+    return this.store.getState().events
+      .filter((event) => event.action === "ENTRY" && event.leaderId === position.leaderId && legacyClientIds.has(event.clientOrderId ?? ""))
+      .sort((left, right) => left.sourceTimestampMs - right.sourceTimestampMs || left.createdAt.localeCompare(right.createdAt));
+  }
+
+  private exitEventsForPosition(position: CopyOwnedPosition): CopyEventLedgerRow[] {
+    return this.eventsForIds(position.sourceExitEventIds);
+  }
+
+  private summariseTradeEvents(events: readonly CopyEventLedgerRow[], select: "FIRST" | "LAST"): CopyLeaderTradeEventSummary | null {
+    if (events.length === 0) return null;
+    const sorted = events.slice().sort((left, right) => left.sourceTimestampMs - right.sourceTimestampMs || left.createdAt.localeCompare(right.createdAt));
+    const selected = select === "FIRST" ? sorted[0]! : sorted[sorted.length - 1]!;
+    const weightedPrice = (priceOf: (event: CopyEventLedgerRow) => number | null | undefined, qtyOf: (event: CopyEventLedgerRow) => number | null | undefined): number | null => {
+      let weighted = 0;
+      let qty = 0;
+      for (const event of sorted) {
+        const price = priceOf(event);
+        const weight = qtyOf(event);
+        if (!finitePositive(price) || !finitePositive(weight)) continue;
+        weighted += price * weight;
+        qty += weight;
+      }
+      return qty > 0 ? weighted / qty : null;
+    };
+    const sumKnown = (valueOf: (event: CopyEventLedgerRow) => number | null | undefined): number | null => {
+      if (sorted.some((event) => valueOf(event) === null || valueOf(event) === undefined || !Number.isFinite(valueOf(event)))) return null;
+      return sorted.reduce((sum, event) => sum + Number(valueOf(event)), 0);
+    };
+    const sourceQty = sumKnown((event) => event.sourceExecutedQty);
+    const testnetFilledQty = sumKnown((event) => event.filledQty);
+    return {
+      sourceEventIds: sorted.map((event) => event.sourceEventId),
+      sourceTimestamp: selected.sourceTimestamp,
+      firstObservedAt: sorted.map((event) => event.createdAt).sort()[0] ?? null,
+      completedAt: sorted.map((event) => event.updatedAt).sort().at(-1) ?? null,
+      sourceReferencePrice: weightedPrice((event) => event.sourceReferencePrice, (event) => event.sourceExecutedQty),
+      sourceQty,
+      testnetFillPrice: weightedPrice((event) => event.fillPrice, (event) => event.filledQty),
+      testnetFilledQty,
+      feeUsd: sumKnown((event) => event.feeUsd),
+      clientOrderIds: Array.from(new Set(sorted.map((event) => event.clientOrderId).filter((value): value is string => Boolean(value)))),
+      exchangeOrderIds: Array.from(new Set(sorted.map((event) => event.exchangeOrderId).filter((value): value is string => Boolean(value)))),
+      fillIds: Array.from(new Set(sorted.flatMap((event) => event.exchangeFillIds))),
+    };
+  }
+
+  getOpenPositionReports(): CopyLeaderOpenPositionReport[] {
+    return this.openOwnedPositions().map((position) => {
+      const leader = this.definitionForLeader(position.leaderId);
+      return {
+        ownerPositionId: position.ownerPositionId,
+        leaderId: position.leaderId,
+        leaderName: leader.name,
+        leaderTier: leader.tier,
+        symbol: position.symbol,
+        direction: position.direction,
+        qty: position.qty,
+        entryPrice: position.entryPrice,
+        status: position.status,
+        openedAt: position.openedAt,
+        sourceTrackedQty: position.sourceTrackedQty,
+        sourceEntry: this.summariseTradeEvents(this.entryEventsForPosition(position), "FIRST"),
+        reconciliation: { ...position.reconciliation },
+      };
+    }).sort((left, right) => right.openedAt.localeCompare(left.openedAt) || left.symbol.localeCompare(right.symbol));
+  }
+
+  getClosedTrades(): CopyLeaderClosedTradeReport[] {
+    return this.store.getState().positions
+      .filter((position) => position.status === "CLOSED" && Boolean(position.closedAt))
+      .map((position) => {
+        const leader = this.definitionForLeader(position.leaderId);
+        const entry = this.summariseTradeEvents(this.entryEventsForPosition(position), "FIRST");
+        const exits = this.exitEventsForPosition(position);
+        const exit = this.summariseTradeEvents(exits, "LAST");
+        const latestExit = exits.at(-1) ?? null;
+        const closeKind = position.lastExitReason === "CONTROL_CLOSE" || latestExit?.action === "CONTROL_CLOSE"
+          ? "EXTERNAL_CONTROL_CLOSE" as const
+          : "SOURCE_EXIT" as const;
+        const directionSign = position.direction === "LONG" ? 1 : -1;
+        const sourcePriceReturnPct = finitePositive(entry?.sourceReferencePrice) && finitePositive(exit?.sourceReferencePrice)
+          ? ((exit.sourceReferencePrice - entry.sourceReferencePrice) / entry.sourceReferencePrice) * directionSign * 100
+          : null;
+        const copyPriceReturnPct = finitePositive(entry?.testnetFillPrice) && finitePositive(exit?.testnetFillPrice)
+          ? ((exit.testnetFillPrice - entry.testnetFillPrice) / entry.testnetFillPrice) * directionSign * 100
+          : null;
+        return {
+          ownerPositionId: position.ownerPositionId,
+          leaderId: position.leaderId,
+          leaderName: leader.name,
+          leaderTier: leader.tier,
+          symbol: position.symbol,
+          direction: position.direction,
+          qty: entry?.testnetFilledQty ?? 0,
+          entryPrice: position.entryPrice,
+          openedAt: position.openedAt,
+          sourceEntry: entry,
+          closedAt: position.closedAt!,
+          netRealizedPnlUsd: position.realisedPnlUsd,
+          grossRealizedPnlUsd: position.feesUsd === null ? null : position.realisedPnlUsd + position.feesUsd,
+          feesUsd: position.feesUsd,
+          sourceExit: exit,
+          closeKind,
+          comparable: closeKind === "SOURCE_EXIT" && entry !== null && exit !== null,
+          sourcePriceReturnPct,
+          copyPriceReturnPct,
+          priceReplicationGapPct: sourcePriceReturnPct === null || copyPriceReturnPct === null
+            ? null
+            : copyPriceReturnPct - sourcePriceReturnPct,
+        };
+      })
+      .sort((left, right) => right.closedAt.localeCompare(left.closedAt) || left.symbol.localeCompare(right.symbol));
+  }
+
   realisedPnl(): { today: number; allTime: number; feesUsd: number | null } {
     const now = new Date(this.nowMs());
     const day = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
@@ -653,6 +861,8 @@ export class CopyLeaderExecutor {
   getStatus(): Record<string, unknown> {
     const state = this.store.getState();
     const pnl = this.realisedPnl();
+    const openPositions = this.getOpenPositionReports();
+    const closedTrades = this.getClosedTrades();
     return {
       strategy: COPY_LEADER_STRATEGY,
       enabled: this.config.enabled,
@@ -682,7 +892,12 @@ export class CopyLeaderExecutor {
           ? null
           : state.sleeve.sleeveMarginBudgetUsd * leader.sleeveShare,
       })),
+      /** Raw durable rows kept for existing API consumers/audit export. */
       ownerPositions: state.positions,
+      /** Dashboard-safe projections with source and Testnet fill lineage. */
+      openPositions,
+      closedTradeCount: closedTrades.length,
+      closedTrades: closedTrades.slice(0, 200),
       eventLedger: state.events.slice().sort((a, b) => b.sourceTimestampMs - a.sourceTimestampMs).slice(0, 200),
       ownerPnl: pnl,
       lastError: state.lastError,
@@ -1421,6 +1636,9 @@ export class CopyLeaderExecutor {
         realisedPnlUsd: 0,
         feesUsd: fees.feeUsd,
         lots: [lot],
+        sourceEntryEventIds: [source.sourceEventId],
+        sourceExitEventIds: [],
+        lastExitReason: null,
         reconciliation: {
           lastCheckedAt: null,
           exchangeQty: null,
@@ -1436,6 +1654,7 @@ export class CopyLeaderExecutor {
       position.entryPrice = (position.entryPrice * oldQty + resolution.price * filledQty) / position.qty;
       position.sourceTrackedQty += source.executedQty;
       position.lots.push(lot);
+      position.sourceEntryEventIds = Array.from(new Set([...(position.sourceEntryEventIds ?? []), source.sourceEventId]));
       position.feesUsd = position.feesUsd === null || fees.feeUsd === null ? null : position.feesUsd + fees.feeUsd;
       if (!resolution.confirmed) position.status = "ACCOUNTING_INCOMPLETE";
     }
@@ -1547,6 +1766,8 @@ export class CopyLeaderExecutor {
       const resolution = await resolveConfirmedFillPrice(this.client, position.symbol, order.orderId, order.avgPrice, position.entryPrice);
       const fees = await this.feeForOrder(position.symbol, order.orderId, source.sourceTimestampMs);
       this.applyClosedLots(position, filledQty, resolution.price, fees.feeUsd, controlReason ?? action);
+      position.sourceExitEventIds = Array.from(new Set([...(position.sourceExitEventIds ?? []), source.sourceEventId]));
+      position.lastExitReason = action;
       const fullyFilled = filledQty >= requestedQty - EPS;
       row.status = resolution.confirmed && fullyFilled ? "CLOSED" : "ACCOUNTING_INCOMPLETE";
       row.exchangeOrderId = order.orderId;
