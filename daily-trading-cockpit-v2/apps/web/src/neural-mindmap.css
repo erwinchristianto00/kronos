@@ -2323,6 +2323,281 @@ i.health-diagnostic {
   line-height: 1.55;
 }
 
+/* Copy Trading needs to answer a small set of operator questions at a glance:
+   is it active, how much capital is at risk, and what will be copied.  Keep
+   raw source/feed implementation details behind the disclosure below. */
+.copy-sleeve-panel {
+  grid-column: 1 / -1;
+}
+
+.copy-sleeve-panel > header {
+  align-items: center;
+  padding: 15px 16px;
+  background: linear-gradient(105deg, rgba(92, 228, 166, 0.1), rgba(7, 16, 22, 0) 48%);
+}
+
+.copy-sleeve-panel > header > div:first-child > span {
+  color: #82a7b8;
+}
+
+.copy-sleeve-panel > header > div:first-child > strong {
+  margin-top: 5px;
+  color: #e8f6f1;
+  font: 800 17px/1.25 "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: -0.015em;
+}
+
+.copy-sleeve-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid #314751;
+  border-radius: 999px;
+  color: #d4e3e1;
+  font: 800 11px/1 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.copy-sleeve-status.is-ready {
+  border-color: rgba(92, 228, 166, 0.55);
+  background: rgba(37, 133, 95, 0.16);
+  color: #69efb5;
+}
+
+.copy-sleeve-status.is-waiting {
+  border-color: rgba(243, 191, 90, 0.46);
+  background: rgba(104, 73, 20, 0.16);
+  color: #f2c568;
+}
+
+.copy-sleeve-unavailable,
+.copy-sleeve-notice {
+  margin: 12px 16px !important;
+  padding: 9px 11px;
+  border: 1px solid rgba(243, 191, 90, 0.35);
+  border-radius: 7px;
+  background: rgba(65, 45, 16, 0.22);
+}
+
+.copy-sleeve-overview {
+  display: grid;
+  grid-template-columns: minmax(250px, 1.7fr) repeat(4, minmax(130px, 1fr));
+  gap: 8px;
+  padding: 14px 16px 10px;
+}
+
+.copy-sleeve-primary-card,
+.copy-sleeve-stat {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #243740;
+  border-radius: 8px;
+  background: rgba(5, 13, 18, 0.72);
+}
+
+.copy-sleeve-primary-card {
+  border-color: rgba(92, 228, 166, 0.28);
+  background: linear-gradient(135deg, rgba(61, 181, 128, 0.12), rgba(5, 13, 18, 0.74));
+}
+
+.copy-sleeve-panel .copy-sleeve-overview span,
+.copy-sleeve-panel .copy-sleeve-flow span,
+.copy-sleeve-panel .copy-sleeve-leaders-heading span {
+  display: block;
+  color: #718a95;
+  font: 800 9px/1.25 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+}
+
+.copy-sleeve-panel .copy-sleeve-primary-card strong,
+.copy-sleeve-panel .copy-sleeve-stat strong {
+  display: block;
+  margin-top: 6px;
+  color: #e8f5f0;
+  font: 800 16px/1.25 "IBM Plex Mono", "Cascadia Code", monospace;
+  overflow-wrap: anywhere;
+}
+
+.copy-sleeve-primary-card p,
+.copy-sleeve-stat small {
+  display: block;
+  margin: 6px 0 0;
+  color: #9fb3b9;
+  font: 600 11px/1.45 "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+}
+
+.copy-sleeve-primary-card a {
+  color: #8edecb;
+  text-decoration-color: rgba(142, 222, 203, 0.45);
+}
+
+.copy-sleeve-flow {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 16px;
+  padding: 10px 0 14px;
+  border-bottom: 1px solid #20313a;
+}
+
+.copy-sleeve-flow > div {
+  padding: 10px 11px;
+  border-left: 2px solid #31525c;
+  background: rgba(10, 23, 29, 0.5);
+}
+
+.copy-sleeve-flow > div:first-child {
+  border-left-color: #5ce4a6;
+}
+
+.copy-sleeve-flow > div:nth-child(2) {
+  border-left-color: #6fb7c9;
+}
+
+.copy-sleeve-flow > div:nth-child(3) {
+  border-left-color: #f3bf5a;
+}
+
+.copy-sleeve-panel .copy-sleeve-flow strong {
+  display: block;
+  margin-top: 5px;
+  color: #e1eeeb;
+  font: 800 13px/1.25 "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+}
+
+.copy-sleeve-flow p {
+  margin: 5px 0 0;
+  color: #9bb0b7;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.copy-sleeve-leaders {
+  padding: 14px 16px 12px;
+}
+
+.copy-sleeve-leaders-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 9px;
+}
+
+.copy-sleeve-leaders-heading p {
+  margin: 4px 0 0;
+}
+
+.copy-sleeve-leaders-heading > small {
+  color: #79939c;
+  font: 600 10px/1.35 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-align: right;
+}
+
+.copy-sleeve-leader-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.copy-sleeve-leader-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #29404a;
+  border-radius: 8px;
+  background: rgba(5, 13, 18, 0.64);
+}
+
+.copy-sleeve-leader-card.is-ready {
+  border-color: rgba(92, 228, 166, 0.48);
+  background: linear-gradient(135deg, rgba(42, 139, 98, 0.15), rgba(5, 13, 18, 0.62));
+}
+
+.copy-sleeve-leader-card.is-waiting {
+  border-color: rgba(111, 183, 201, 0.4);
+}
+
+.copy-sleeve-leader-card.is-blocked {
+  border-color: rgba(243, 191, 90, 0.36);
+  background: rgba(52, 38, 16, 0.2);
+}
+
+.copy-sleeve-leader-topline {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.copy-sleeve-panel .copy-sleeve-leader-topline strong {
+  display: block;
+  margin: 0;
+  color: #eef8f4;
+  font: 800 15px/1.2 "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  overflow-wrap: anywhere;
+}
+
+.copy-sleeve-leader-topline small {
+  display: block;
+  margin-top: 3px;
+  color: #8ea7af;
+  font-size: 10px;
+}
+
+.copy-sleeve-leader-topline b {
+  max-width: 150px;
+  color: #f0c56b;
+  font: 800 9px/1.35 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-align: right;
+  text-transform: uppercase;
+}
+
+.copy-sleeve-leader-card.is-ready .copy-sleeve-leader-topline b {
+  color: #6deab2;
+}
+
+.copy-sleeve-leader-card p {
+  min-height: 48px;
+  margin: 9px 0 0;
+  color: #a9bcc1;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.copy-sleeve-leader-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(48, 71, 79, 0.7);
+}
+
+.copy-sleeve-leader-metrics small {
+  color: #7f9aa4;
+  font: 600 9px/1.35 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.copy-sleeve-details {
+  margin: 0 16px 15px;
+  color: #819ba4;
+  font-size: 11px;
+}
+
+.copy-sleeve-details summary {
+  cursor: pointer;
+  color: #8eabb5;
+  font: 700 10px/1.25 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.copy-sleeve-details p {
+  margin: 6px 0 0;
+}
+
 /* Cross-sectional cards have dense inline financial values. Do not inherit the
    dashboard's title-only span/strong layout inside their report body. */
 .cross-sectional-report span,
@@ -2732,6 +3007,16 @@ i.health-diagnostic {
   font-size: 12px;
 }
 
+@media (max-width: 1240px) {
+  .copy-sleeve-overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .copy-sleeve-primary-card {
+    grid-column: 1 / -1;
+  }
+}
+
 @media (max-width: 900px) {
   .testnet-statusbar,
   .testnet-grid,
@@ -2754,5 +3039,25 @@ i.health-diagnostic {
   .testnet-filterbar select,
   .testnet-filterbar input {
     width: 100%;
+  }
+
+  .copy-sleeve-overview,
+  .copy-sleeve-flow,
+  .copy-sleeve-leader-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .copy-sleeve-panel > header,
+  .copy-sleeve-leaders-heading {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .copy-sleeve-leaders-heading > small {
+    text-align: left;
+  }
+
+  .copy-sleeve-leader-card p {
+    min-height: 0;
   }
 }

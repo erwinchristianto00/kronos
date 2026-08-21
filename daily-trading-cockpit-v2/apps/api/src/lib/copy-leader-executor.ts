@@ -77,6 +77,11 @@ const SOURCE_COVERAGE_REFRESH_MS = 5 * 60_000;
 const SOURCE_ORDER_MAX_PAGES = 32;
 const SOURCE_ORDER_RETRY_DELAYS_MS = [750, 1_500, 3_000] as const;
 const EPS = 1e-8;
+const COPY_SLEEVE_MARGIN_FRACTION = 0.1;
+const COPY_SLEEVE_MARGIN_CAP_USD = 500;
+const COPY_TOTAL_GROSS_EQUITY_FRACTION = 0.3;
+const COPY_PER_SYMBOL_GROSS_EQUITY_FRACTION = 0.1;
+const MAX_COPY_LEADER_EXECUTION_LEVERAGE = 3;
 
 export interface CopyLeaderRuntimeConfig {
   enabled: boolean;
@@ -112,9 +117,10 @@ export function parseCopyLeaderRuntimeConfig(env: NodeJS.ProcessEnv = process.en
     pollMs: positiveInteger(env.COPY_LEADER_SOURCE_POLL_MS, 15_000, 5_000, 60_000),
     stalenessMs: positiveInteger(env.COPY_LEADER_SOURCE_STALENESS_MS, 120_000, 1_000, 10 * 60_000),
     sourceLookbackMs: positiveInteger(env.COPY_LEADER_SOURCE_LOOKBACK_MS, SOURCE_CURSOR_LOOKBACK_MS, 120_000, 60 * 60_000),
-    // Fixed 1x makes the stated sleeve limits true margin limits rather than
-    // an assumed leverage conversion.  Source quantity is still proportional.
-    leverage: 1,
+    // This sleeve follows a leader's direction/entry/exit, not its nominal size
+    // or leverage.  A deliberately small Testnet-only ceiling keeps the copy
+    // risk legible and prevents a source's leverage from silently becoming ours.
+    leverage: positiveInteger(env.COPY_LEADER_EXEC_LEVERAGE, 1, 1, MAX_COPY_LEADER_EXECUTION_LEVERAGE),
     configErrors,
   };
 }
@@ -294,13 +300,55 @@ interface PersistedLeader {
   lastPollAt: string | null;
 }
 
-interface CopySleeveSnapshot {
+export interface CopySleeveSnapshot {
   checkedAt: string;
   availableBalanceUsd: number | null;
   equityUsd: number | null;
   sleeveMarginBudgetUsd: number | null;
+  /** Effective leverage used for all new Copy Sleeve entries. */
+  executionLeverage: number;
+  /** Effective maximum notional across the sleeve after both margin and
+   * account-level gross caps have been applied. */
   totalGrossCapUsd: number | null;
   perSymbolGrossCapUsd: number | null;
+}
+
+/**
+ * Copy sizing starts from a small slice of available margin, then converts it
+ * into gross notional using our capped execution leverage.  The separate
+ * equity and per-symbol limits remain hard ceilings.  Keeping this pure makes
+ * the displayed budget and the order-sizing path auditable from one formula.
+ */
+export function deriveCopySleeveSnapshot(input: {
+  checkedAt: string;
+  availableBalanceUsd: number | null;
+  equityUsd: number | null;
+  executionLeverage: number;
+}): CopySleeveSnapshot {
+  const requestedLeverage = Number.isFinite(input.executionLeverage) ? Math.floor(input.executionLeverage) : 1;
+  const executionLeverage = Math.max(1, Math.min(MAX_COPY_LEADER_EXECUTION_LEVERAGE, requestedLeverage));
+  const sleeveMarginBudgetUsd = finitePositive(input.availableBalanceUsd)
+    ? Math.min(input.availableBalanceUsd * COPY_SLEEVE_MARGIN_FRACTION, COPY_SLEEVE_MARGIN_CAP_USD)
+    : null;
+  const marginDerivedGrossCapUsd = sleeveMarginBudgetUsd === null ? null : sleeveMarginBudgetUsd * executionLeverage;
+  const equityDerivedGrossCapUsd = finitePositive(input.equityUsd)
+    ? input.equityUsd * COPY_TOTAL_GROSS_EQUITY_FRACTION
+    : null;
+  const totalGrossCapUsd = marginDerivedGrossCapUsd === null || equityDerivedGrossCapUsd === null
+    ? null
+    : Math.min(marginDerivedGrossCapUsd, equityDerivedGrossCapUsd);
+  const perSymbolGrossCapUsd = totalGrossCapUsd === null || !finitePositive(input.equityUsd)
+    ? null
+    : Math.min(totalGrossCapUsd, input.equityUsd * COPY_PER_SYMBOL_GROSS_EQUITY_FRACTION);
+  return {
+    checkedAt: input.checkedAt,
+    availableBalanceUsd: input.availableBalanceUsd,
+    equityUsd: input.equityUsd,
+    sleeveMarginBudgetUsd,
+    executionLeverage,
+    totalGrossCapUsd,
+    perSymbolGrossCapUsd,
+  };
 }
 
 interface CopyLeaderPersistentState {
@@ -885,12 +933,17 @@ export class CopyLeaderExecutor {
       running: this.running,
       pollMs: this.config.pollMs,
       stalenessMs: this.config.stalenessMs,
+      executionLeverage: this.config.leverage,
+      sizingMode: "AUTO_CAP_PROPORTIONAL",
       sleeve: state.sleeve,
       leaders: this.leaders.map((leader) => ({
         ...state.leaders[leader.id],
         budgetMarginUsd: state.sleeve?.sleeveMarginBudgetUsd === null || state.sleeve?.sleeveMarginBudgetUsd === undefined
           ? null
           : state.sleeve.sleeveMarginBudgetUsd * leader.sleeveShare,
+        budgetGrossCapUsd: state.sleeve?.totalGrossCapUsd === null || state.sleeve?.totalGrossCapUsd === undefined
+          ? null
+          : state.sleeve.totalGrossCapUsd * leader.sleeveShare,
       })),
       /** Raw durable rows kept for existing API consumers/audit export. */
       ownerPositions: state.positions,
@@ -961,14 +1014,12 @@ export class CopyLeaderExecutor {
       0,
     );
     const equity = balance === null ? null : balance + unrealised;
-    this.store.getState().sleeve = {
+    this.store.getState().sleeve = deriveCopySleeveSnapshot({
       checkedAt: this.nowIso(),
       availableBalanceUsd: available,
       equityUsd: equity,
-      sleeveMarginBudgetUsd: available === null ? null : Math.min(available * 0.1, 500),
-      totalGrossCapUsd: equity === null ? null : equity * 0.3,
-      perSymbolGrossCapUsd: equity === null ? null : equity * 0.1,
-    };
+      executionLeverage: this.config.leverage,
+    });
   }
 
   private async tickLeader(leader: CopyLeaderDefinition, filters: Map<string, FuturesSymbolFilters>): Promise<void> {
@@ -1351,8 +1402,8 @@ export class CopyLeaderExecutor {
   }
 
   private sleeveBudget(leader: CopyLeaderDefinition): {
-    sleeve: number;
-    leader: number;
+    sleeveGross: number;
+    leaderGross: number;
     totalGross: number;
     perSymbolGross: number;
   } | null {
@@ -1363,11 +1414,19 @@ export class CopyLeaderExecutor {
       !finitePositive(sleeve.totalGrossCapUsd) ||
       !finitePositive(sleeve.perSymbolGrossCapUsd)
     ) return null;
+    // Old persisted snapshots predate executionLeverage.  Recompute against
+    // the current effective leverage so a process restart can never turn the
+    // old 30%-of-equity display value into unintended gross sizing.
+    const sleeveGross = Math.min(
+      sleeve.totalGrossCapUsd,
+      sleeve.sleeveMarginBudgetUsd * this.config.leverage,
+    );
+    if (!finitePositive(sleeveGross)) return null;
     return {
-      sleeve: sleeve.sleeveMarginBudgetUsd,
-      leader: sleeve.sleeveMarginBudgetUsd * leader.sleeveShare,
-      totalGross: sleeve.totalGrossCapUsd,
-      perSymbolGross: sleeve.perSymbolGrossCapUsd,
+      sleeveGross,
+      leaderGross: sleeveGross * leader.sleeveShare,
+      totalGross: Math.min(sleeve.totalGrossCapUsd, sleeveGross),
+      perSymbolGross: Math.min(sleeve.perSymbolGrossCapUsd, sleeveGross),
     };
   }
 
@@ -1441,7 +1500,10 @@ export class CopyLeaderExecutor {
       return;
     }
     const sourceNotional = source.executedQty * source.avgPrice;
-    const proportionalNotional = sourceNotional * Math.min(1, budget.leader / sourceMarginBalance);
+    // Scale to the leader's allowed *gross* allocation.  The leverage ceiling
+    // is already incorporated in the sleeve gross cap, so the source's own
+    // leverage can never leak into our requested size.
+    const proportionalNotional = sourceNotional * Math.min(1, budget.leaderGross / sourceMarginBalance);
     const [currentGross, currentLeaderGross, currentSymbolGross] = await Promise.all([
       this.currentCopyGrossAtMark(),
       this.currentCopyGrossAtMark({ leaderId: leader.id }),
@@ -1452,8 +1514,8 @@ export class CopyLeaderExecutor {
       return;
     }
     const headroom = Math.min(
-      budget.leader - currentLeaderGross,
-      budget.sleeve - currentGross,
+      budget.leaderGross - currentLeaderGross,
+      budget.sleeveGross - currentGross,
       budget.totalGross - currentGross,
       budget.perSymbolGross - currentSymbolGross,
     );

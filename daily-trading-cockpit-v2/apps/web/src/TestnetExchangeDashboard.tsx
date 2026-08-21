@@ -323,12 +323,16 @@ interface CopyLeaderStatus {
   sourceEndpoint?: string;
   pollMs?: number;
   stalenessMs?: number;
+  /** Exact effective leverage for newly opened Copy Sleeve positions. */
+  executionLeverage?: number;
+  sizingMode?: string;
   configErrors?: string[];
   sleeve?: {
     checkedAt: string;
     availableBalanceUsd: number | null;
     equityUsd: number | null;
     sleeveMarginBudgetUsd: number | null;
+    executionLeverage?: number;
     totalGrossCapUsd: number | null;
     perSymbolGrossCapUsd: number | null;
   } | null;
@@ -340,6 +344,7 @@ interface CopyLeaderStatus {
     state: string;
     stateReason: string | null;
     budgetMarginUsd: number | null;
+    budgetGrossCapUsd?: number | null;
     coverage: {
       sourceEventCount: number;
       eligibleEventCount: number;
@@ -536,6 +541,75 @@ function copyEntryAdverseGapPct(
 function tone(value: number | null | undefined): string {
   if (value == null || value === 0) return 'tone-measure';
   return value > 0 ? 'tone-healthy' : 'tone-critical';
+}
+
+function copyLeaderStatusCopy(state: string, reason: string | null | undefined): {
+  label: string;
+  detail: string;
+  tone: 'ready' | 'waiting' | 'blocked';
+} {
+  switch (state) {
+    case 'ARMED_WAITING_SIGNAL':
+      return {
+        label: 'Siap — menunggu entry',
+        detail: 'Belum ada entry baru yang layak untuk diikuti.',
+        tone: 'ready',
+      };
+    case 'EXECUTING':
+      return {
+        label: 'Ada posisi Copy aktif',
+        detail: 'Arah dan exit posisi ini mengikuti event leader yang sudah diverifikasi.',
+        tone: 'ready',
+      };
+    case 'PENDING_COVERAGE':
+      return {
+        label: 'Sedang dicek',
+        detail: 'Sistem sedang memastikan simbol dan event leader bisa dieksekusi aman di Testnet.',
+        tone: 'waiting',
+      };
+    case 'BLOCKED_SOURCE_EVENT_SEMANTICS':
+      return {
+        label: 'Tidak diikuti — exit tidak bisa diverifikasi',
+        detail: 'Data leader tidak memberi penanda exit yang cukup aman, jadi sistem sengaja tidak membuka Copy.',
+        tone: 'blocked',
+      };
+    case 'BLOCKED_TESTNET_SYMBOL_COVERAGE':
+      return {
+        label: 'Tidak diikuti — simbol Testnet terlalu sedikit',
+        detail: 'Mayoritas trade leader ini tidak tersedia di Binance Testnet, jadi hasilnya tidak akan representatif.',
+        tone: 'blocked',
+      };
+    case 'PAUSED_KRONOS_OVERLAP':
+      return {
+        label: 'Ditahan — bentrok dengan Kronos',
+        detail: 'Copy tidak boleh menambah atau menetralkan posisi yang sedang menjadi domain Kronos.',
+        tone: 'blocked',
+      };
+    case 'PAUSED_RECONCILIATION_REQUIRED':
+      return {
+        label: 'Ditahan — perlu cek posisi',
+        detail: 'Jumlah posisi exchange belum cocok dengan catatan Copy, jadi entry baru dihentikan demi keamanan.',
+        tone: 'blocked',
+      };
+    case 'PAUSED_KILL_SWITCH':
+      return {
+        label: 'Dihentikan oleh kill switch',
+        detail: 'Tidak ada Copy baru sampai kill switch dilepas dan kondisi aman kembali.',
+        tone: 'blocked',
+      };
+    case 'SOURCE_API_ERROR':
+      return {
+        label: 'Menunggu data leader',
+        detail: 'Data publik leader sementara tidak dapat dibaca; sistem tidak akan menebak entry atau exit.',
+        tone: 'waiting',
+      };
+    default:
+      return {
+        label: state ? 'Menunggu kelayakan' : 'Status belum tersedia',
+        detail: reason ?? 'Sistem belum menerima kondisi yang cukup aman untuk membuka Copy.',
+        tone: 'waiting',
+      };
+  }
 }
 
 function timeAgo(iso: string | null | undefined): string {
@@ -2204,6 +2278,9 @@ export default function TestnetExchangeDashboard() {
     };
   });
   const copyLeaderClosedTrades = copyLeaderStatus?.closedTrades ?? [];
+  const copyLeaderOpenCount = copyLeaderPositions.length;
+  const copyLeaderClosedCount = copyLeaderStatus?.closedTradeCount ?? copyLeaderClosedTrades.length;
+  const copyLeaderExecutionLeverage = copyLeaderStatus?.sleeve?.executionLeverage ?? copyLeaderStatus?.executionLeverage ?? 1;
   const copyLeaderOpenNotionalUsd = copyLeaderPositions.reduce((sum, position) => sum + Math.abs(position.qty * position.entryPrice), 0);
   const copyLeaderUnrealizedPnl = copyLeaderPositions.reduce((sum, position) => sum + (position.unrealizedPnl ?? 0), 0);
   const mirroredLaneCount = (account?.lanes.length ?? 0) + (copyLeaderPositions.length > 0 ? 1 : 0);
@@ -2496,44 +2573,112 @@ export default function TestnetExchangeDashboard() {
       </p>
 
       {!isLivePage && (
-        <section className="testnet-panel">
+        <section className="testnet-panel copy-sleeve-panel">
           <header>
-            <span>Copy Leader Sleeve</span>
-            <strong className={copyLeaderStatus?.armed ? 'tone-healthy' : 'tone-warning'}>
-              {copyLeaderStatus?.armed ? 'ARMED / TESTNET' : copyLeaderStatus?.enabled ? 'BLOCKED / WAITING' : 'DISABLED'}
-            </strong>
+            <div>
+              <span>Copy Trading · Testnet</span>
+              <strong>Ikuti arah leader, ukuran tetap terkendali</strong>
+            </div>
+            <div className={`copy-sleeve-status ${copyLeaderStatus?.armed ? 'is-ready' : 'is-waiting'}`}>
+              {copyLeaderStatus?.armed ? 'Aktif · menunggu sinyal' : copyLeaderStatus?.enabled ? 'Menunggu kondisi aman' : 'Tidak aktif'}
+            </div>
           </header>
           {!copyLeaderStatus ? (
-            <p className="tone-warning" style={{ margin: '4px 0' }}>Effective Copy Leader state is unavailable.</p>
+            <p className="copy-sleeve-unavailable">Status Copy Trading belum dapat dibaca. Tidak ada entry yang akan diasumsikan dari tampilan ini.</p>
           ) : (
             <>
-              <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
-                Destination: {copyLeaderStatus.destinationEndpoint ?? 'not configured'} · poll {copyLeaderStatus.pollMs ?? '—'}ms · stale cutoff {copyLeaderStatus.stalenessMs ?? '—'}ms ·{' '}
-                <a href="#open-positions" style={{ color: 'inherit' }}>open copy {copyLeaderStatus.openPositions?.length ?? 0}</a> ·{' '}
-                <a href="#copy-leader-closed" style={{ color: 'inherit' }}>closed {copyLeaderStatus.closedTradeCount ?? copyLeaderStatus.closedTrades?.length ?? 0}</a> · P&amp;L {signed(copyLeaderStatus.ownerPnl?.allTime)}.
-              </p>
-              {copyLeaderStatus.reason && <p className="tone-warning" style={{ margin: '4px 0' }}>{copyLeaderStatus.reason}</p>}
-              {copyLeaderStatus.configErrors?.map((message) => (
-                <p key={message} className="tone-critical" style={{ margin: '4px 0' }}>CONFIG INEFFECTIVE: {message}</p>
-              ))}
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, margin: '6px 0' }}>
-                <small>available {copyLeaderStatus.sleeve?.availableBalanceUsd != null ? `${copyLeaderStatus.sleeve.availableBalanceUsd.toFixed(2)} USDT` : '—'}</small>
-                <small>sleeve cap {copyLeaderStatus.sleeve?.sleeveMarginBudgetUsd != null ? `${copyLeaderStatus.sleeve.sleeveMarginBudgetUsd.toFixed(2)} USDT` : '—'}</small>
-                <small>gross cap {copyLeaderStatus.sleeve?.totalGrossCapUsd != null ? `${copyLeaderStatus.sleeve.totalGrossCapUsd.toFixed(2)} USDT` : '—'}</small>
-                <small>per-symbol cap {copyLeaderStatus.sleeve?.perSymbolGrossCapUsd != null ? `${copyLeaderStatus.sleeve.perSymbolGrossCapUsd.toFixed(2)} USDT` : '—'}</small>
+              <div className="copy-sleeve-overview">
+                <div className="copy-sleeve-primary-card">
+                  <span>Status sekarang</span>
+                  <strong>{copyLeaderStatus.armed ? 'Mencari entry baru yang aman' : 'Tidak ada entry Copy yang sedang dibuka'}</strong>
+                  <p>
+                    <a href="#open-positions">{copyLeaderOpenCount} posisi terbuka</a> ·{' '}
+                    <a href="#copy-leader-closed">{copyLeaderClosedCount} trade selesai</a> · total hasil {signed(copyLeaderStatus.ownerPnl?.allTime)}.
+                  </p>
+                </div>
+                <div className="copy-sleeve-stat">
+                  <span>Modal maksimal</span>
+                  <strong>{plain(copyLeaderStatus.sleeve?.sleeveMarginBudgetUsd, ' USDT')}</strong>
+                  <small>maks. 10% dari saldo tersedia</small>
+                </div>
+                <div className="copy-sleeve-stat">
+                  <span>Leverage eksekusi</span>
+                  <strong>maks. {copyLeaderExecutionLeverage}x</strong>
+                  <small>leverage leader tidak ikut disalin</small>
+                </div>
+                <div className="copy-sleeve-stat">
+                  <span>Nilai posisi total</span>
+                  <strong>{plain(copyLeaderStatus.sleeve?.totalGrossCapUsd, ' USDT')}</strong>
+                  <small>semua leader digabung</small>
+                </div>
+                <div className="copy-sleeve-stat">
+                  <span>Batas per simbol</span>
+                  <strong>{plain(copyLeaderStatus.sleeve?.perSymbolGrossCapUsd, ' USDT')}</strong>
+                  <small>tidak menumpuk di satu coin</small>
+                </div>
               </div>
-              <div style={{ display: 'grid', gap: 4 }}>
-                {copyLeaderStatus.leaders?.map((leader) => (
-                  <div key={leader.id} style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'baseline' }}>
-                    <strong>{leader.name}</strong>
-                    <small>{leader.tier} · {Math.round(leader.sleeveShare * 100)}% · budget {leader.budgetMarginUsd != null ? `${leader.budgetMarginUsd.toFixed(2)} USDT` : '—'}</small>
-                    <span className={leader.state.startsWith('ARMED') || leader.state === 'EXECUTING' ? 'tone-healthy' : 'tone-warning'}>{leader.state}</span>
-                    <small>coverage {leader.coverage?.coveragePct != null ? `${leader.coverage.coveragePct.toFixed(2)}% (${leader.coverage.eligibleEventCount}/${leader.coverage.sourceEventCount})` : 'pending'}</small>
-                    {leader.stateReason && <small className="tone-warning">{leader.stateReason}</small>}
+
+              <div className="copy-sleeve-flow" aria-label="Cara kerja Copy Trading">
+                <div>
+                  <span>1 · Arah</span>
+                  <strong>Ikut leader yang lolos</strong>
+                  <p>Yang disalin adalah arah LONG/SHORT dari leader yang eligible, bukan seluruh portofolionya.</p>
+                </div>
+                <div>
+                  <span>2 · Entry</span>
+                  <strong>Hanya sinyal baru</strong>
+                  <p>Entry lama atau terlambat dilewati. Ukuran dihitung otomatis dari modal dan batas risiko kamu.</p>
+                </div>
+                <div>
+                  <span>3 · Exit</span>
+                  <strong>Ikut exit leader</strong>
+                  <p>Jika data exit tidak aman atau posisi tidak cocok, sistem memilih safety exit dan berhenti membuka Copy baru.</p>
+                </div>
+              </div>
+
+              <div className="copy-sleeve-leaders">
+                <div className="copy-sleeve-leaders-heading">
+                  <div>
+                    <span>Leader yang dipantau</span>
+                    <p>Hanya card hijau yang dapat membuka Copy. Card kuning/merah sengaja tidak ditradingkan.</p>
                   </div>
-                ))}
+                  <small>Size selalu otomatis · nominal source tidak disalin</small>
+                </div>
+                <div className="copy-sleeve-leader-grid">
+                  {copyLeaderStatus.leaders?.map((leader) => {
+                    const presentation = copyLeaderStatusCopy(leader.state, leader.stateReason);
+                    return (
+                      <article key={leader.id} className={`copy-sleeve-leader-card is-${presentation.tone}`}>
+                        <div className="copy-sleeve-leader-topline">
+                          <div>
+                            <strong>{leader.name}</strong>
+                            <small>{leader.tier} · alokasi {Math.round(leader.sleeveShare * 100)}%</small>
+                          </div>
+                          <b>{presentation.label}</b>
+                        </div>
+                        <p>{presentation.detail}</p>
+                        <div className="copy-sleeve-leader-metrics">
+                          <small>modal {plain(leader.budgetMarginUsd, ' USDT')}</small>
+                          <small>maks. posisi {plain(leader.budgetGrossCapUsd, ' USDT')}</small>
+                          <small>simbol Testnet {leader.coverage?.coveragePct != null ? `${leader.coverage.coveragePct.toFixed(0)}% cocok` : 'sedang diperiksa'}</small>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
               </div>
-              {copyLeaderStatus.lastError && <p className="tone-critical" style={{ margin: '6px 0 0' }}>{copyLeaderStatus.lastError}</p>}
+
+              {copyLeaderStatus.reason && <p className="copy-sleeve-notice">{copyLeaderStatus.reason}</p>}
+              {copyLeaderStatus.configErrors?.map((message) => (
+                <p key={message} className="copy-sleeve-notice tone-critical">CONFIG INEFFECTIVE: {message}</p>
+              ))}
+              {copyLeaderStatus.lastError && <p className="copy-sleeve-notice tone-critical">{copyLeaderStatus.lastError}</p>}
+              <details className="copy-sleeve-details">
+                <summary>Detail teknis</summary>
+                <p>
+                  Testnet only · sumber dicek setiap {copyLeaderStatus.pollMs != null ? `${Math.round(copyLeaderStatus.pollMs / 1000)} detik` : '—'} · signal lebih lama dari {copyLeaderStatus.stalenessMs != null ? `${Math.round(copyLeaderStatus.stalenessMs / 1000)} detik` : '—'} dilewati · saldo tersedia {plain(copyLeaderStatus.sleeve?.availableBalanceUsd, ' USDT')}.
+                </p>
+              </details>
             </>
           )}
         </section>

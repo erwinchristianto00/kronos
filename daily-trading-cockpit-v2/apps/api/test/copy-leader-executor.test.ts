@@ -7,6 +7,7 @@ import {
   COPY_LEADER_DESTINATION_ENDPOINT,
   CopyLeaderExecutor,
   CopyLeaderStore,
+  deriveCopySleeveSnapshot,
   parseCopyLeaderRuntimeConfig,
   sourceOrderIdentity,
   type CopyLeaderDefinition,
@@ -69,6 +70,7 @@ function filters(): Map<string, FuturesSymbolFilters> {
 function makeClient(now: () => number) {
   const positions: FuturesPosition[] = [];
   const submitted: Array<{ symbol: string; side: "BUY" | "SELL"; quantity: number; reduceOnly?: boolean; newClientOrderId: string }> = [];
+  const leverageUpdates: Array<{ symbol: string; leverage: number }> = [];
   const orders = new Map<string, FuturesOrder>();
   let serial = 0;
   const client = {
@@ -76,7 +78,7 @@ function makeClient(now: () => number) {
     getPositions: async () => positions.map((position) => ({ ...position })),
     getExchangeFilters: async () => filters(),
     getMarkPrice: async () => 100,
-    setLeverage: async () => undefined,
+    setLeverage: async (symbol: string, leverage: number) => { leverageUpdates.push({ symbol, leverage }); },
     placeOrder: async (params: { symbol: string; side: "BUY" | "SELL"; quantity: number; reduceOnly?: boolean; newClientOrderId: string }) => {
       submitted.push({ ...params });
       const existing = positions.find((position) => position.symbol === params.symbol);
@@ -116,7 +118,7 @@ function makeClient(now: () => number) {
       Array.from(orders.values()).find((order) => order.clientOrderId === clientOrderId)!,
     getUserTrades: async () => [],
   };
-  return { client: client as unknown as CopyLeaderExecutorOptions["client"], positions, submitted };
+  return { client: client as unknown as CopyLeaderExecutorOptions["client"], positions, submitted, leverageUpdates };
 }
 
 function response(body: unknown): Response {
@@ -133,6 +135,32 @@ describe("CopyLeaderExecutor", () => {
     expect(config.enabled).toBe(false);
     expect(config.configErrors).toHaveLength(1);
     expect(COPY_LEADER_DESTINATION_ENDPOINT).toBe("https://testnet.binancefuture.com");
+  });
+
+  it("uses our capped 3x Testnet leverage and derives gross from the small margin sleeve", () => {
+    const config = parseCopyLeaderRuntimeConfig({
+      COPY_LEADER_ENABLED: "1",
+      LIVE_BINANCE_ENV: "testnet",
+      COPY_LEADER_EXEC_LEVERAGE: "3",
+    });
+    expect(config.leverage).toBe(3);
+    expect(parseCopyLeaderRuntimeConfig({
+      COPY_LEADER_ENABLED: "1",
+      LIVE_BINANCE_ENV: "testnet",
+      COPY_LEADER_EXEC_LEVERAGE: "99",
+    }).leverage).toBe(3);
+
+    expect(deriveCopySleeveSnapshot({
+      checkedAt: "2026-08-21T00:00:00.000Z",
+      availableBalanceUsd: 1_000,
+      equityUsd: 1_000,
+      executionLeverage: config.leverage,
+    })).toMatchObject({
+      sleeveMarginBudgetUsd: 100,
+      executionLeverage: 3,
+      totalGrossCapUsd: 300,
+      perSymbolGrossCapUsd: 100,
+    });
   });
 
   it("uses a stable canonical identity even when source-object keys arrive in another order", () => {
@@ -156,7 +184,7 @@ describe("CopyLeaderExecutor", () => {
     const old = sourceOrder({ side: "SELL", at: START - 60_000 });
     const entry = sourceOrder({ side: "SELL", at: START + 500 });
     const exit = sourceOrder({ side: "BUY", at: START + 1_500 });
-    const { client, submitted, positions } = makeClient(() => now);
+    const { client, submitted, positions, leverageUpdates } = makeClient(() => now);
     const calls = { reserve: 0, commit: 0, releaseCommitted: 0 };
     const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
@@ -175,7 +203,7 @@ describe("CopyLeaderExecutor", () => {
       client,
       store: new CopyLeaderStore(tempDir()),
       fetchImpl,
-      env: { COPY_LEADER_ENABLED: "1", LIVE_BINANCE_ENV: "testnet" },
+      env: { COPY_LEADER_ENABLED: "1", LIVE_BINANCE_ENV: "testnet", COPY_LEADER_EXEC_LEVERAGE: "3" },
       leaders: [LEADER],
       nowMs: () => now,
       getKronosUniverse: () => new Set(),
@@ -199,6 +227,7 @@ describe("CopyLeaderExecutor", () => {
     await executor.tick();
     expect(submitted).toHaveLength(1);
     expect(submitted[0]).toMatchObject({ symbol: "ETHUSDT", side: "SELL" });
+    expect(leverageUpdates).toEqual([{ symbol: "ETHUSDT", leverage: 3 }]);
     expect(submitted[0]!.reduceOnly).not.toBe(true);
     expect(positions.find((position) => position.symbol === "ETHUSDT")?.positionAmt).toBeLessThan(0);
     expect(calls).toMatchObject({ reserve: 1, commit: 1 });
