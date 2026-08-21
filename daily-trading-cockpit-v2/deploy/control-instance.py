@@ -1937,14 +1937,23 @@ def symbol_reliability_overview_html(R):
             o.append("<div class='card'><span class='warnc'><b>RUNTIME SNAPSHOT UNAVAILABLE</b></span><br><span class='dim'>API belum mengekspos Symbol Reliability V1; dashboard tidak menginfer status dari env.</span></div>")
             continue
         enabled=bool(snapshot.get("enabled")); statuses=snapshot.get("statuses") or []; quarantined=snapshot.get("quarantined") or []
+        persistence=snapshot.get("persistence") or {}
+        persistence_status=str(persistence.get("status") or "UNAVAILABLE")
+        persistence_class={"HEALTHY":"pos","RECOVERED_FROM_BACKUP":"warnc","UNAVAILABLE":"neg"}.get(persistence_status,"warnc")
+        persistence_detail=persistence.get("reason") or ("primary ledger" if persistence.get("source")=="PRIMARY" else "–")
         o.append("<div class='grid'>")
         o.append(card("Runtime",("<span class='pos'>ENABLED</span>" if enabled else "<span class='dim'>DISABLED</span>"),esc(snapshot.get("version") or "–")))
+        o.append(card("Persistence","<span class='%s'><b>%s</b></span>"%(persistence_class,esc(persistence_status)),esc(persistence_detail)))
         o.append(card("Evidence",str(snapshot.get("independentEpisodes") or 0),"independent episodes · %d eligible baskets"%(snapshot.get("eligibleBaskets") or 0)))
         o.append(card("Minimum",str(snapshot.get("minimumIndependentEpisodes") or "–"),"independent episodes per symbol-side / 90D"))
         o.append(card("Quarantined",str(len(quarantined)),"only these pairs change eligibility"))
         o.append(card("Evaluation",esc(snapshot.get("evaluationId") or "–"),"%s · evidence %s"%(esc(str(snapshot.get("evaluatedAt") or "–")[:19]),"changed" if snapshot.get("evidenceChanged") else "unchanged")))
         o.append(card("Contract",esc(snapshot.get("evidenceContract") or "–"),"actual NoTP + Hold36h only"))
         o.append("</div>")
+        if persistence_status=="UNAVAILABLE":
+            o.append("<div class='card'><span class='neg'><b>NEW V1 FORMATION HELD SAFE</b></span><br><span class='dim'>Reliability ledger tidak dapat dibuktikan durable; ini bukan INSUFFICIENT_DATA. Basket FILTERED baru ditahan sampai primary+backup kembali valid. Posisi yang sudah terbuka tidak disentuh.</span></div>")
+        elif persistence_status=="RECOVERED_FROM_BACKUP":
+            o.append("<div class='card'><span class='warnc'><b>RECOVERED FROM BACKUP</b></span><br><span class='dim'>Primary ledger telah dipulihkan dari backup valid pada %s. Pantau satu siklus berikutnya; tidak ada perubahan score, weight, exit, atau posisi terbuka.</span></div>"%esc(str(persistence.get("recoveredAt") or "–")[:19]))
         if not statuses:
             o.append("<div class='card dim'>Belum ada status symbol-side dari runtime.</div>")
         else:
@@ -1986,6 +1995,15 @@ def alerts_of(R):
         if ex.get("lastError"): A.append((0,"block","%s melaporkan error"%L,str(ex["lastError"])[:120]))
         if ex.get("configErrors"): A.append((0,"block","%s konfigurasi bermasalah"%L,str(ex["configErrors"])[:120]))
         runtime=ex.get("effectiveRuntime") or {}
+        reliability=ex.get("symbolReliability") or {}
+        persistence=reliability.get("persistence") if isinstance(reliability,dict) else {}
+        persistence_status=(persistence or {}).get("status")
+        if persistence_status=="UNAVAILABLE":
+            A.append((0,"block","%s Symbol Reliability persistence unavailable"%L,
+                     str((persistence or {}).get("reason") or "primary+backup ledger tidak valid; basket FILTERED baru ditahan")[:180]))
+        elif persistence_status=="RECOVERED_FROM_BACKUP":
+            A.append((2,"watch","%s Symbol Reliability recovered from backup"%L,
+                     "primary ledger dipulihkan; pantau siklus berikutnya"))
         for mismatch in runtime.get("mismatches") or []:
             A.append((0,"block","%s CONFIG INEFFECTIVE"%L,"%s — %s"%(mismatch.get("key") or "runtime",mismatch.get("reason") or "nilai env tidak dipakai runtime")))
         if "OK:" not in (i["envPolicy"] or ""): A.append((0,"block","%s menyimpang dari kebijakan konfigurasi"%L,i["envPolicy"][:120]))
@@ -2481,27 +2499,137 @@ def _formation_block(R,key,src):
         DOT["ok"] if allm else DOT["block"],"cocok persis" if allm else "TIDAK cocok"))
     return "".join(o)
 
+def _formation_pp(value):
+    """Format a score difference as percentage points, never as a mysterious raw decimal."""
+    return "<span class='dim'>–</span>" if not fin(value) else "%+.2f p.p."%(100*value)
+
+def _active_basket_formation_html(R,key):
+    """Plain-language explanation for the basket that is actually open right now.
+
+    `latestFormation` is useful audit provenance, but it can be a historical Smart Formation
+    observation after production has moved back to Plain MOM36.  Starting the Formasi tab with
+    that historical table made it look as if utility still chose the live symbols.  The executor's
+    open basket is the source of truth for the explanation shown first.
+    """
+    inst=R["inst"][key]
+    ex=inst.get("ex") or {}
+    basket=ex.get("openBasket") or {}
+    if not isinstance(basket,dict) or not basket:
+        return ("<h2>%s · basket aktif</h2>"%esc(inst["long"])+
+                "<div class='note'>Tidak ada basket terbuka saat ini, jadi belum ada enam simbol nyata yang bisa dijelaskan. "
+                "Saat basket berikutnya terbuka, alasan pemilihannya akan tampil di sini.</div>")
+
+    fingerprint=basket.get("policyFingerprint") or {}
+    strategy=fingerprint.get("strategy") or {}
+    formation=fingerprint.get("formation") or {}
+    mode=formation.get("formationMode") or ((ex.get("effectiveRuntime") or {}).get("formationMode")) or "CONFIG INEFFECTIVE"
+    bars=strategy.get("momentumBars") or 36
+    threshold=formation.get("scoreGap")
+    if not fin(threshold): threshold=(inst.get("fc") or {}).get("minScoreGap")
+    cluster_cap=formation.get("clusterCap")
+    weighting=formation.get("weighting") or ex.get("weightingModel") or "–"
+    legs=[leg for leg in (basket.get("legs") or []) if isinstance(leg,dict)]
+    long_legs=[leg for leg in legs if leg.get("side")=="LONG"]
+    short_legs=[leg for leg in legs if leg.get("side")=="SHORT"]
+    long_legs.sort(key=lambda leg: leg.get("scoreAtOpen") if fin(leg.get("scoreAtOpen")) else -float("inf"),reverse=True)
+    short_legs.sort(key=lambda leg: leg.get("scoreAtOpen") if fin(leg.get("scoreAtOpen")) else float("inf"))
+    long_scores=[leg.get("scoreAtOpen") for leg in long_legs if fin(leg.get("scoreAtOpen"))]
+    short_scores=[leg.get("scoreAtOpen") for leg in short_legs if fin(leg.get("scoreAtOpen"))]
+    long_mean=sum(long_scores)/len(long_scores) if long_scores else None
+    short_mean=sum(short_scores)/len(short_scores) if short_scores else None
+    gap=abs(long_mean-short_mean) if fin(long_mean) and fin(short_mean) else None
+    gap_ok=fin(gap) and fin(threshold) and gap>=threshold
+    opened=piso(basket.get("openedAt"))
+    opened_text=opened.astimezone(TAIPEI).strftime("%d %b %Y %H:%M Taipei") if opened else NA
+    rerank=mode=="SMART_FORMATION_RERANK"
+    mode_text=("Smart rerank aktif: utility ikut memilih simbol." if rerank else
+               "Plain MOM36 aktif: hanya peringkat momentum yang memilih simbol.")
+    o=["<h2>%s · alasan basket yang benar-benar terbuka</h2>"%esc(inst["long"]),
+       lead("ok" if mode!="CONFIG INEFFECTIVE" else "block","Ini basket aktif, bukan contoh riset lama",
+            "Dibuka %s. <b>%s</b> %s"%(opened_text,esc(mode),mode_text))]
+    if not legs:
+        o.append("<div class='note'>Executor mencatat basket aktif, tetapi rincian enam kakinya belum tersedia. Tidak ada alasan pemilihan yang dibuat-buat.</div>")
+        return "".join(o)
+
+    o.append("<div class='grid'>")
+    o.append(card("Long yang dipilih",", ".join(esc(str(leg.get("symbol") or "").replace("USDT","")) for leg in long_legs) or NA,
+                  "rata-rata MOM%s %s"%(bars,pct(100*long_mean,2) if fin(long_mean) else NA)))
+    o.append(card("Short yang dipilih",", ".join(esc(str(leg.get("symbol") or "").replace("USDT","")) for leg in short_legs) or NA,
+                  "rata-rata MOM%s %s · short = relatif lebih lemah"%(bars,pct(100*short_mean,2) if fin(short_mean) else NA)))
+    o.append(card("Pemisahan dua sisi",_formation_pp(gap),
+                  "minimum %s · %s"%(_formation_pp(threshold),"LOLOS" if gap_ok else "tidak dapat diverifikasi" if not fin(gap) or not fin(threshold) else "GAGAL")))
+    o.append(card("Cara pembobotan",esc(str(weighting)),
+                  "ukuran dinaikkan sedikit pada sinyal lebih kuat, tetapi dibatasi"))
+    o.append("</div>")
+    o.append("<div class='note'><b>Cara membacanya:</b> LONG berarti tiga nama yang paling kuat relatif terhadap universe selama %s jam. "
+             "SHORT berarti tiga nama yang paling lemah relatif terhadap universe — <b>bukan</b> berarti harganya wajib turun. "
+             "Di pasar yang naik bersama-sama, angka MOM36 short tetap bisa positif.</div>"%bars)
+    o.append("<div class='scroll'><table><tr><th>sisi</th><th>simbol</th><th class='num'>MOM%s</th><th>kenapa masuk</th><th class='num'>ukuran</th></tr>"%bars)
+    for side,side_legs in (("LONG",long_legs),("SHORT",short_legs)):
+        for index,leg in enumerate(side_legs,1):
+            score=leg.get("scoreAtOpen")
+            symbol=esc(str(leg.get("symbol") or "–").replace("USDT",""))
+            if side=="LONG":
+                why="Kuat nomor %d dari %d long terpilih."%(index,len(side_legs))
+            else:
+                why="Lemah nomor %d dari %d short terpilih; relatif lemah, bukan harus merah."%(index,len(side_legs))
+            o.append("<tr><td><b>%s</b></td><td><b>%s</b></td><td class='num'>%s</td><td class='dim'>%s</td><td class='num'>%s</td></tr>"%(
+                side,symbol,pct(100*score,2) if fin(score) else NA,esc(why),money(leg.get("targetNotionalUsd"),2)))
+    o.append("</table></div>")
+    if rerank:
+        o.append("<div class='note'><b>Smart rerank sedang aktif.</b> Peringkat MOM%s tetap yang utama; konfirmasi cepat dan penalti ekstensi hanya memecahkan kandidat yang berdekatan.</div>"%bars)
+    else:
+        o.append("<div class='note'><b>Yang tidak memilih basket ini:</b> utility, konfirmasi cepat, penalti ekstensi, dan bonus counter-axis. "
+                 "Mereka boleh muncul di audit historis di bawah, tetapi <b>tidak</b> boleh mengubah enam simbol pada mode Plain MOM36. "
+                 "Cluster cap %s tetap pagar konsentrasi; scoreGap %s adalah gerbang kelayakan basket.</div>"%(
+                    esc(str(cluster_cap)) if cluster_cap is not None else "–",_formation_pp(threshold)))
+    return "".join(o)
+
+def _formation_terms_html(mode):
+    """Explain selector, guardrail, and diagnostic roles without requiring formula literacy."""
+    rerank=mode=="SMART_FORMATION_RERANK"
+    smart_state=(DOT["watch"]+" dipakai memilih") if rerank else (DOT["off"]+" tidak dipakai memilih")
+    rows=[
+      ("Peringkat momentum (MOM36)",DOT["ok"]+" memilih","Bandingkan perubahan harga %s jam semua simbol. LONG mengambil yang paling kuat; SHORT mengambil yang paling lemah secara relatif."%36),
+      ("scoreGap",DOT["ok"]+" gerbang","Perbedaan rata-rata long dan short harus cukup lebar. Kalau terlalu dekat, tidak ada basket sama sekali."),
+      ("Cluster cap",DOT["ok"]+" pagar risiko","Maksimum dua nama bertema sama per sisi. Ini mencegah enam posisi sebenarnya menjadi satu taruhan tema; bukan sumber alpha tersendiri."),
+      ("CAPPED_SCORE_RANK",DOT["ok"]+" menentukan ukuran","Setelah enam nama sudah dipilih, sinyal yang lebih kuat mendapat ukuran sedikit lebih besar. Batasnya menjaga agar satu nama tidak mendominasi."),
+      ("Revalidasi entry",DOT["ok"]+" cek harga akhir","Setelah simbol selesai dipilih, cek lagi harga tepat sebelum order. Jika harga sudah lari melawan terlalu jauh, tunggu scan berikutnya. Ini tidak mengganti ranking."),
+      ("Konfirmasi cepat",smart_state,"Periksa apakah gerak sangat baru masih searah dengan taruhan. Hanya menjadi pemilih tambahan saat Smart rerank ON; sekarang %s."%("aktif" if rerank else "diagnostik saja")),
+      ("Penalti ekstensi",smart_state,"Kurangi nilai nama yang sudah terlalu jauh berlari sehingga entry berisiko mengejar. Hanya menjadi pemilih tambahan saat Smart rerank ON; sekarang %s."%("aktif" if rerank else "diagnostik saja")),
+      ("Utility",smart_state,"Nilai gabungan: peringkat momentum + sedikit konfirmasi cepat − penalti ekstensi. Ini bukan prediksi profit dan tidak memilih apa pun ketika Plain MOM36 aktif."),
+    ]
+    return ("<h2>Arti istilahnya — mana yang benar-benar memilih</h2>"
+            "<table><tr><th>istilah</th><th>peran sekarang</th><th>bahasa mudah</th></tr>%s</table>"%"".join(
+                "<tr><td><b>%s</b></td><td>%s</td><td class='dim' style='white-space:normal'>%s</td></tr>"%(esc(name),role,esc(desc))
+                for name,role,desc in rows))
+
 def tab_formation(R):
     o=[];found=False
     _modeF=((R["inst"]["live"].get("ex") or {}).get("effectiveRuntime") or {}).get("formationMode") or "CONFIG INEFFECTIVE"
     _rrF=_modeF=="SMART_FORMATION_RERANK"
-    _leadF=("Pemilihan efektif sekarang memakai <b>SMART_FORMATION_RERANK</b>: utility = peringkat momentum di kolam + konfirmasi cepat (0,22) − penalti mengejar (0,20) + bonus counter-axis (0,08). Tabel di bawah menguraikan tiap suku." if _rrF else "<b>Produksi efektif sekarang %s</b>: memilih murni dari peringkat MOM36, dengan cluster cap sebagai batas keras. Rincian kandidat di bawah hanya ada untuk formasi historis yang memang memakai rerank; label tiap blok menyebut formasi mana yang mana."%esc(_modeF))
-    o.append(lead("ok","Kenapa simbol ini yang dipilih — dengan angkanya",_leadF))
+    _leadF=("Produksi saat ini memakai <b>SMART_FORMATION_RERANK</b>. Utility boleh memecahkan kandidat yang berdekatan, tetapi peringkat MOM36 tetap dasar utamanya." if _rrF else "Produksi saat ini memakai <b>%s</b>. Enam simbol dipilih murni dari peringkat MOM36; utility, konfirmasi cepat, dan penalti ekstensi <b>tidak</b> ikut memilih."%esc(_modeF))
+    o.append(lead("ok","Kenapa simbol dipilih — mulai dari basket yang benar-benar berjalan",_leadF))
+    o.append(_active_basket_formation_html(R,"live"))
+    o.append(_active_basket_formation_html(R,"testnet"))
+    o.append(_formation_terms_html(_modeF))
 
+    historical=[]
     for key in ("live","testnet"):
         src=R["inst"][key].get("latestFormation")
-        if not src:
-            o.append("<h2>%s</h2><div class='card dim'>Belum ada formasi dengan rincian kandidat pada penyimpanan instance ini.</div>"%R["inst"][key]["long"])
-            continue
-        found=True; o.append(_formation_block(R,key,src))
-    if not found: return lead("off","Belum ada formasi tercatat","Tidak ada observasi dengan rincian kandidat di kedua instance.")
-    o.append(tech("rumus & sumber",[
+        if src:
+            found=True; historical.append(_formation_block(R,key,src))
+    if found:
+        o.append("<details><summary>Audit teknis: contoh formasi historis saat Smart rerank masih ON — bukan alasan basket aktif sekarang</summary><div class='body'>%s%s</div></details>"%(
+            "".join(historical),tech("rumus & sumber",[
         ("Rumus utility","<code>rawRank + 0,22×clamp(fastSupport,±2) − 0,20×max(0,clamp(ekstensi,−2,3)) + 0,08×clamp(fastSupport) bila sisi lawan sumbu</code>"),
         ("rawRank","(skor berarah − rata-rata kolam) ÷ simpangan baku kolam; runtime tidak menyimpannya, dihitung ulang di sini"),
         ("Verifikasi","uraian diuji terhadap utility tersimpan pada 1178 kandidat di kedua penyimpanan: cocok persis, selisih 0"),
         ("Penalti klaster","0,18 per nama tambahan sekluster, dikenakan pada KOMBINASI bukan pada kandidat, jadi tidak muncul di tabel per simbol"),
         ("Kolam kandidat","5 teratas per sisi, diperdalam bila batas klaster tidak terpenuhi"),
-        ("signalWeight",NA+" pada observasi bayangan — hanya basket tereksekusi yang menyimpannya")]))
+        ("signalWeight",NA+" pada observasi bayangan — hanya basket tereksekusi yang menyimpannya")])))
+    else:
+        o.append("<div class='note'>Belum ada contoh historis dengan rincian kandidat. Penjelasan basket aktif di atas tetap berasal dari data executor yang sebenarnya.</div>")
     return "".join(o)
 
 EXEC_UNCOVERED=[("Slippage terukur","executor tidak membukukan harga acuan vs fill sebagai biaya tersendiri"),
