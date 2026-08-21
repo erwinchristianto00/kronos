@@ -146,6 +146,8 @@ describe("CopyLeaderExecutor", () => {
     });
     expect(config.leverage).toBe(3);
     expect(config.pollMs).toBe(5_000);
+    expect(config.stalenessMs).toBe(300_000);
+    expect(config.sourceEntryMode).toBe("DELAYED_MIRROR");
     expect(parseCopyLeaderRuntimeConfig({
       COPY_LEADER_ENABLED: "1",
       LIVE_BINANCE_ENV: "testnet",
@@ -283,7 +285,7 @@ describe("CopyLeaderExecutor", () => {
     });
   });
 
-  it("records stale events and never submits them", async () => {
+  it("records events older than the configured delayed-mirror cap and never submits them", async () => {
     let now = START;
     const old = sourceOrder({ side: "SELL", at: START - 10_000 });
     const stale = sourceOrder({ side: "SELL", at: START + 1 });
@@ -299,7 +301,7 @@ describe("CopyLeaderExecutor", () => {
       client,
       store: new CopyLeaderStore(tempDir()),
       fetchImpl,
-      env: { COPY_LEADER_ENABLED: "1", LIVE_BINANCE_ENV: "testnet", COPY_LEADER_SOURCE_STALENESS_MS: "120000" },
+      env: { COPY_LEADER_ENABLED: "1", LIVE_BINANCE_ENV: "testnet", COPY_LEADER_SOURCE_STALENESS_MS: "300000" },
       leaders: [LEADER],
       nowMs: () => now,
       getKronosUniverse: () => new Set(),
@@ -307,7 +309,7 @@ describe("CopyLeaderExecutor", () => {
       exposure: { reserve: () => ({ ok: true, reservationId: "r" }), commitReservation: () => undefined, releaseReservation: () => undefined },
     });
     await executor.tick();
-    now = START + 130_000;
+    now = START + 310_000;
     await executor.tick();
     expect(submitted).toHaveLength(0);
     const status = executor.getStatus();
@@ -320,7 +322,7 @@ describe("CopyLeaderExecutor", () => {
     expect(staleRow).toMatchObject({
       sourceTimestampMs: START + 1,
       firstObservedAt: new Date(now).toISOString(),
-      sourceObservationLatencyMs: 129_999,
+      sourceObservationLatencyMs: 309_999,
     });
     const latency = (status.leaders as Array<{
       sourceLatency: {
@@ -336,7 +338,77 @@ describe("CopyLeaderExecutor", () => {
       measuredEventCount: 1,
       freshEventCount: 0,
       staleEventCount: 1,
-      latestObservationLatencyMs: 129_999,
+      latestObservationLatencyMs: 309_999,
+    });
+  });
+
+  it("mirrors a delayed source event inside the explicit five-minute cap", async () => {
+    let now = START;
+    const old = sourceOrder({ side: "SELL", at: START - 10_000 });
+    const delayedEntry = sourceOrder({ side: "SELL", at: START + 1 });
+    const { client, submitted } = makeClient(() => now);
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/detail")) return response({ code: "000000", data: { marginBalance: "1000" } });
+      const request = JSON.parse(String(init?.body ?? "{}")) as { startTime?: number };
+      const rows = (request.startTime ?? 0) <= START - 5 * 60_000 ? [old] : now === START ? [old] : [delayedEntry];
+      return response({ code: "000000", data: { list: rows, total: rows.length } });
+    }) as typeof fetch;
+    const executor = new CopyLeaderExecutor({
+      client,
+      store: new CopyLeaderStore(tempDir()),
+      fetchImpl,
+      env: { COPY_LEADER_ENABLED: "1", LIVE_BINANCE_ENV: "testnet", COPY_LEADER_SOURCE_STALENESS_MS: "300000" },
+      leaders: [LEADER],
+      nowMs: () => now,
+      getKronosUniverse: () => new Set(),
+      canOpenNewEntries: () => true,
+      exposure: { reserve: () => ({ ok: true, reservationId: "r" }), commitReservation: () => undefined, releaseReservation: () => undefined },
+    });
+
+    await executor.tick(); // durable cursor seed; no historical replay
+    now = START + 150_000;
+    await executor.tick();
+
+    expect(submitted).toHaveLength(1);
+    expect(submitted[0]).toMatchObject({ symbol: "ETHUSDT", side: "SELL" });
+    expect(submitted[0]!.reduceOnly).not.toBe(true);
+    expect(executor.getStatus()).toMatchObject({
+      stalenessMs: 300_000,
+      sourceEntryMode: "DELAYED_MIRROR",
+    });
+  });
+
+  it("surfaces a closed public leader portfolio instead of a generic margin error", async () => {
+    let now = START;
+    const old = sourceOrder({ side: "SELL", at: START - 10_000 });
+    const { client } = makeClient(() => now);
+    const fetchImpl = (async (input: string | URL | Request) => {
+      if (String(input).includes("/detail")) {
+        return response({ code: "11012028", message: "The current portfolio is closed." });
+      }
+      return response({ code: "000000", data: { list: [old], total: 1 } });
+    }) as typeof fetch;
+    const executor = new CopyLeaderExecutor({
+      client,
+      store: new CopyLeaderStore(tempDir()),
+      fetchImpl,
+      env: { COPY_LEADER_ENABLED: "1", LIVE_BINANCE_ENV: "testnet" },
+      leaders: [LEADER],
+      nowMs: () => now,
+      getKronosUniverse: () => new Set(),
+      canOpenNewEntries: () => true,
+      exposure: { reserve: () => ({ ok: true, reservationId: "r" }), commitReservation: () => undefined, releaseReservation: () => undefined },
+    });
+
+    await executor.tick(); // cursor seed
+    now += 1_000;
+    await executor.tick();
+
+    const [leader] = executor.getStatus().leaders as Array<{ state: string; stateReason: string | null }>;
+    expect(leader).toMatchObject({
+      state: "SOURCE_API_ERROR",
+      stateReason: "source portfolio detail unavailable (11012028): The current portfolio is closed.",
     });
   });
 

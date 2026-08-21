@@ -82,12 +82,22 @@ const COPY_SLEEVE_MARGIN_CAP_USD = 500;
 const COPY_TOTAL_GROSS_EQUITY_FRACTION = 0.3;
 const COPY_PER_SYMBOL_GROSS_EQUITY_FRACTION = 0.1;
 const MAX_COPY_LEADER_EXECUTION_LEVERAGE = 3;
+/** A Testnet delayed mirror may copy an event only inside this bounded window.
+ * Keep this distinct from the former exact-copy contract: a public history
+ * endpoint is not suddenly real-time merely because its event is eligible. */
+const DEFAULT_COPY_LEADER_SOURCE_AGE_CAP_MS = 5 * 60_000;
+const EXACT_COPY_SOURCE_AGE_CAP_MS = 120_000;
+
+export type CopyLeaderSourceEntryMode = "EXACT_COPY_120S" | "DELAYED_MIRROR";
 
 export interface CopyLeaderRuntimeConfig {
   enabled: boolean;
   destinationEndpoint: string;
   pollMs: number;
+  /** Legacy field name retained for API compatibility. It is the hard source
+   * event-age cap for entry and exit mirroring. */
   stalenessMs: number;
+  sourceEntryMode: CopyLeaderSourceEntryMode;
   sourceLookbackMs: number;
   leverage: number;
   configErrors: string[];
@@ -102,6 +112,12 @@ function positiveInteger(value: string | undefined, fallback: number, min: numbe
 export function parseCopyLeaderRuntimeConfig(env: NodeJS.ProcessEnv = process.env): CopyLeaderRuntimeConfig {
   const enabledIntent = env.COPY_LEADER_ENABLED === "1";
   const destinationEndpoint = env.COPY_LEADER_DESTINATION_ENDPOINT ?? COPY_LEADER_DESTINATION_ENDPOINT;
+  const stalenessMs = positiveInteger(
+    env.COPY_LEADER_SOURCE_STALENESS_MS,
+    DEFAULT_COPY_LEADER_SOURCE_AGE_CAP_MS,
+    1_000,
+    10 * 60_000,
+  );
   const configErrors: string[] = [];
   if (destinationEndpoint !== COPY_LEADER_DESTINATION_ENDPOINT) {
     configErrors.push(
@@ -115,7 +131,8 @@ export function parseCopyLeaderRuntimeConfig(env: NodeJS.ProcessEnv = process.en
     enabled: enabledIntent && configErrors.length === 0,
     destinationEndpoint,
     pollMs: positiveInteger(env.COPY_LEADER_SOURCE_POLL_MS, 15_000, 5_000, 60_000),
-    stalenessMs: positiveInteger(env.COPY_LEADER_SOURCE_STALENESS_MS, 120_000, 1_000, 10 * 60_000),
+    stalenessMs,
+    sourceEntryMode: stalenessMs > EXACT_COPY_SOURCE_AGE_CAP_MS ? "DELAYED_MIRROR" : "EXACT_COPY_120S",
     sourceLookbackMs: positiveInteger(env.COPY_LEADER_SOURCE_LOOKBACK_MS, SOURCE_CURSOR_LOOKBACK_MS, 120_000, 60 * 60_000),
     // This sleeve follows a leader's direction/entry/exit, not its nominal size
     // or leverage.  A deliberately small Testnet-only ceiling keeps the copy
@@ -214,8 +231,8 @@ export type CopyLeaderSourceLatencyClass = "NO_EVENTS" | "FRESH" | "DELAYED";
 
 /** Source-observation telemetry. This deliberately measures the whole path
  * from Binance's event clock to this process seeing it; it does not pretend a
- * public BAPI response was real-time. `DELAYED` is observational, not a new
- * trading gate: a future <= staleness event can still be copied. */
+ * public BAPI response was real-time. The legacy `fresh*` fields mean "within
+ * the effective source-age cap", which can be a delayed-mirror cap. */
 export interface CopyLeaderSourceLatency {
   classification: CopyLeaderSourceLatencyClass;
   measuredEventCount: number;
@@ -1089,6 +1106,7 @@ export class CopyLeaderExecutor {
       running: this.running,
       pollMs: this.config.pollMs,
       stalenessMs: this.config.stalenessMs,
+      sourceEntryMode: this.config.sourceEntryMode,
       executionLeverage: this.config.leverage,
       sizingMode: "AUTO_CAP_PROPORTIONAL",
       sleeve: state.sleeve,
@@ -1285,7 +1303,10 @@ export class CopyLeaderExecutor {
 
     const sourceMargin = await this.refreshSourceMarginBalance(leader.id);
     if (sourceMargin === null || sourceMargin <= 0) {
-      this.setLeaderState(leader.id, "SOURCE_API_ERROR", "leader margin balance unavailable");
+      const refreshed = this.leaderState(leader.id);
+      if (refreshed.state !== "SOURCE_API_ERROR" || !refreshed.stateReason) {
+        this.setLeaderState(leader.id, "SOURCE_API_ERROR", "leader margin balance unavailable");
+      }
       return;
     }
 
@@ -1443,14 +1464,36 @@ export class CopyLeaderExecutor {
       const response = await this.fetchImpl(url, {
         headers: { Accept: "application/json, text/plain, */*", clienttype: "web" },
       });
-      if (!response.ok) return null;
-      const decoded = await response.json() as { code?: unknown; data?: { marginBalance?: unknown } };
+      if (!response.ok) {
+        this.setLeaderState(leaderId, "SOURCE_API_ERROR", "source portfolio detail returned HTTP " + response.status);
+        return null;
+      }
+      const decoded = await response.json() as {
+        code?: unknown;
+        message?: unknown;
+        msg?: unknown;
+        data?: { marginBalance?: unknown };
+      };
       const margin = numberOrNull(decoded.data?.marginBalance);
-      if (String(decoded.code ?? "") !== "000000" || !finitePositive(margin)) return null;
+      if (String(decoded.code ?? "") !== "000000" || !finitePositive(margin)) {
+        const code = String(decoded.code ?? "unknown");
+        const message = typeof decoded.message === "string"
+          ? decoded.message
+          : typeof decoded.msg === "string"
+            ? decoded.msg
+            : "margin balance unavailable";
+        this.setLeaderState(
+          leaderId,
+          "SOURCE_API_ERROR",
+          "source portfolio detail unavailable (" + code + "): " + message.slice(0, 160),
+        );
+        return null;
+      }
       state.sourceMarginBalanceUsd = margin;
       state.sourceMarginBalanceCheckedAt = this.nowIso();
       return margin;
     } catch {
+      this.setLeaderState(leaderId, "SOURCE_API_ERROR", "source portfolio detail request failed");
       return null;
     }
   }

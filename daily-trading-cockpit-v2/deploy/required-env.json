@@ -138,15 +138,15 @@
         },
         "COPY_LEADER_SOURCE_POLL_MS": {
           "value": "5000",
-          "why": "Testnet Copy Sleeve source polling only. This removes up to 10 seconds of local observation delay versus the former 15s cadence, while retaining the separate 120s hard stale-event guard. It does not weaken entry eligibility or apply to mainnet."
+          "why": "Testnet Copy Sleeve source polling only. This removes up to 10 seconds of local observation delay versus the former 15s cadence. It does not weaken the independent bounded source-event age cap or apply to mainnet."
         },
         "COPY_LEADER_SOURCE_STALENESS_MS": {
-          "value": "120000",
-          "why": "Hard no-late-copy protection for the Testnet Copy Sleeve. A delayed source event is recorded and shown as latency evidence but is never chased into an entry."
+          "value": "300000",
+          "why": "Five-minute hard source-event age cap for the Testnet Copy Sleeve. This is deliberately a delayed-mirror policy, not a claim of exact copy: events older than five minutes are never chased into an entry or exit."
         },
         "COPY_LEADER_SOURCE_LOOKBACK_MS": {
           "value": "600000",
-          "why": "Ten-minute overlap window for source cursor recovery and durable event deduplication. It is not an eligibility window: the independent 120s freshness guard remains authoritative."
+          "why": "Ten-minute overlap window for source cursor recovery and durable event deduplication. It is not an eligibility window: the independent five-minute source-event age cap remains authoritative."
         }
       }
     },
