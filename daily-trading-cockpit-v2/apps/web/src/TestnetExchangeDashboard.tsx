@@ -351,6 +351,23 @@ interface CopyLeaderStatus {
       unavailableEventCount: number;
       coveragePct: number | null;
     } | null;
+    sourceLatency?: {
+      classification: 'NO_EVENTS' | 'FRESH' | 'DELAYED';
+      measuredEventCount: number;
+      freshEventCount: number;
+      staleEventCount: number;
+      freshRatePct: number | null;
+      latestObservationLatencyMs: number | null;
+      p50ObservationLatencyMs: number | null;
+      p95ObservationLatencyMs: number | null;
+      maxObservationLatencyMs: number | null;
+      latestFirstObservedAt: string | null;
+      latestSourceTimestamp: string | null;
+      lastSourceFetchAt: string | null;
+      lastSourceFetchDurationMs: number | null;
+      lastSourceFetchKind: 'COVERAGE' | 'CURSOR_SEED' | 'EVENT_POLL' | null;
+      lastSourceFetchOk: boolean | null;
+    };
   }>;
   ownerPositions?: Array<{
     symbol: string;
@@ -538,16 +555,36 @@ function copyEntryAdverseGapPct(
   return direction === 'LONG' ? raw : -raw;
 }
 
+function latencyLabel(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value) || value < 0) return '—';
+  if (value < 1_000) return `${Math.round(value)} ms`;
+  const seconds = value / 1_000;
+  return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} dtk`;
+}
+
 function tone(value: number | null | undefined): string {
   if (value == null || value === 0) return 'tone-measure';
   return value > 0 ? 'tone-healthy' : 'tone-critical';
 }
 
-function copyLeaderStatusCopy(state: string, reason: string | null | undefined): {
+function copyLeaderStatusCopy(
+  state: string,
+  reason: string | null | undefined,
+  sourceLatency?: NonNullable<CopyLeaderStatus['leaders']>[number]['sourceLatency'],
+): {
   label: string;
   detail: string;
   tone: 'ready' | 'waiting' | 'blocked';
 } {
+  if (state === 'ARMED_WAITING_SIGNAL' && sourceLatency?.classification === 'DELAYED') {
+    const observed = latencyLabel(sourceLatency.latestObservationLatencyMs);
+    const count = sourceLatency.measuredEventCount;
+    return {
+      label: 'Event source terakhir terlambat',
+      detail: `Event terakhir baru terlihat ${observed} setelah waktu source. ${sourceLatency.staleEventCount}/${count} event terukur melewati batas aman; sistem tidak mengejar harga lama.`,
+      tone: 'blocked',
+    };
+  }
   switch (state) {
     case 'ARMED_WAITING_SIGNAL':
       return {
@@ -2137,7 +2174,7 @@ export default function TestnetExchangeDashboard() {
     if (!autoRefresh || isLivePage) return undefined;
     const timer = window.setInterval(() => {
       void loadCopyLeaderStatus();
-    }, 15_000);
+    }, 5_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh, isLivePage, pageApiPrefix]);
 
@@ -2278,6 +2315,10 @@ export default function TestnetExchangeDashboard() {
     };
   });
   const copyLeaderClosedTrades = copyLeaderStatus?.closedTrades ?? [];
+  const copyDelayedSourceLeaders = (copyLeaderStatus?.leaders ?? []).filter(
+    (leader) => leader.state === 'ARMED_WAITING_SIGNAL' && leader.sourceLatency?.classification === 'DELAYED',
+  );
+  const copySourceLatencyDelayed = copyDelayedSourceLeaders.length > 0;
   const copyLeaderOpenCount = copyLeaderPositions.length;
   const copyLeaderClosedCount = copyLeaderStatus?.closedTradeCount ?? copyLeaderClosedTrades.length;
   const copyLeaderExecutionLeverage = copyLeaderStatus?.sleeve?.executionLeverage ?? copyLeaderStatus?.executionLeverage ?? 1;
@@ -2579,8 +2620,10 @@ export default function TestnetExchangeDashboard() {
               <span>Copy Trading · Testnet</span>
               <strong>Ikuti arah leader, ukuran tetap terkendali</strong>
             </div>
-            <div className={`copy-sleeve-status ${copyLeaderStatus?.armed ? 'is-ready' : 'is-waiting'}`}>
-              {copyLeaderStatus?.armed ? 'Aktif · menunggu sinyal' : copyLeaderStatus?.enabled ? 'Menunggu kondisi aman' : 'Tidak aktif'}
+            <div className={`copy-sleeve-status ${copyLeaderStatus?.armed && !copySourceLatencyDelayed ? 'is-ready' : 'is-waiting'}`}>
+              {copySourceLatencyDelayed
+                ? 'Sumber terlambat · event lama ditahan'
+                : copyLeaderStatus?.armed ? 'Aktif · menunggu sinyal' : copyLeaderStatus?.enabled ? 'Menunggu kondisi aman' : 'Tidak aktif'}
             </div>
           </header>
           {!copyLeaderStatus ? (
@@ -2590,7 +2633,7 @@ export default function TestnetExchangeDashboard() {
               <div className="copy-sleeve-overview">
                 <div className="copy-sleeve-primary-card">
                   <span>Status sekarang</span>
-                  <strong>{copyLeaderStatus.armed ? 'Mencari entry baru yang aman' : 'Tidak ada entry Copy yang sedang dibuka'}</strong>
+                  <strong>{copySourceLatencyDelayed ? 'Menunggu source event yang masih fresh' : copyLeaderStatus.armed ? 'Mencari entry baru yang aman' : 'Tidak ada entry Copy yang sedang dibuka'}</strong>
                   <p>
                     <a href="#open-positions">{copyLeaderOpenCount} posisi terbuka</a> ·{' '}
                     <a href="#copy-leader-closed">{copyLeaderClosedCount} trade selesai</a> · total hasil {signed(copyLeaderStatus.ownerPnl?.allTime)}.
@@ -2646,7 +2689,7 @@ export default function TestnetExchangeDashboard() {
                 </div>
                 <div className="copy-sleeve-leader-grid">
                   {copyLeaderStatus.leaders?.map((leader) => {
-                    const presentation = copyLeaderStatusCopy(leader.state, leader.stateReason);
+                    const presentation = copyLeaderStatusCopy(leader.state, leader.stateReason, leader.sourceLatency);
                     return (
                       <article key={leader.id} className={`copy-sleeve-leader-card is-${presentation.tone}`}>
                         <div className="copy-sleeve-leader-topline">
@@ -2661,6 +2704,7 @@ export default function TestnetExchangeDashboard() {
                           <small>modal {plain(leader.budgetMarginUsd, ' USDT')}</small>
                           <small>maks. posisi {plain(leader.budgetGrossCapUsd, ' USDT')}</small>
                           <small>simbol Testnet {leader.coverage?.coveragePct != null ? `${leader.coverage.coveragePct.toFixed(0)}% cocok` : 'sedang diperiksa'}</small>
+                          <small>event → kita {latencyLabel(leader.sourceLatency?.latestObservationLatencyMs)} · p95 {latencyLabel(leader.sourceLatency?.p95ObservationLatencyMs)}</small>
                         </div>
                       </article>
                     );
@@ -2669,6 +2713,11 @@ export default function TestnetExchangeDashboard() {
               </div>
 
               {copyLeaderStatus.reason && <p className="copy-sleeve-notice">{copyLeaderStatus.reason}</p>}
+              {copyDelayedSourceLeaders.map((leader) => (
+                <p key={`source-delay-${leader.id}`} className="copy-sleeve-notice tone-critical">
+                  Data leader terlambat: {leader.name} — event terakhir baru terlihat {latencyLabel(leader.sourceLatency?.latestObservationLatencyMs)} setelah waktu source; fresh {leader.sourceLatency?.freshEventCount ?? 0}/{leader.sourceLatency?.measuredEventCount ?? 0}. Event lama tidak disalin; batas aman tetap {copyLeaderStatus.stalenessMs != null ? `${Math.round(copyLeaderStatus.stalenessMs / 1000)} detik` : 'aktif'}.
+                </p>
+              ))}
               {copyLeaderStatus.configErrors?.map((message) => (
                 <p key={message} className="copy-sleeve-notice tone-critical">CONFIG INEFFECTIVE: {message}</p>
               ))}
@@ -2678,6 +2727,11 @@ export default function TestnetExchangeDashboard() {
                 <p>
                   Testnet only · sumber dicek setiap {copyLeaderStatus.pollMs != null ? `${Math.round(copyLeaderStatus.pollMs / 1000)} detik` : '—'} · signal lebih lama dari {copyLeaderStatus.stalenessMs != null ? `${Math.round(copyLeaderStatus.stalenessMs / 1000)} detik` : '—'} dilewati · saldo tersedia {plain(copyLeaderStatus.sleeve?.availableBalanceUsd, ' USDT')}.
                 </p>
+                {copyLeaderStatus.leaders?.map((leader) => leader.sourceLatency && (
+                  <p key={`source-latency-${leader.id}`}>
+                    {leader.name}: observasi terakhir {latencyLabel(leader.sourceLatency.latestObservationLatencyMs)} · p50 {latencyLabel(leader.sourceLatency.p50ObservationLatencyMs)} · p95 {latencyLabel(leader.sourceLatency.p95ObservationLatencyMs)} · fresh {leader.sourceLatency.freshEventCount}/{leader.sourceLatency.measuredEventCount} · fetch {leader.sourceLatency.lastSourceFetchOk === false ? 'gagal' : leader.sourceLatency.lastSourceFetchAt ? `${latencyLabel(leader.sourceLatency.lastSourceFetchDurationMs)} (${leader.sourceLatency.lastSourceFetchKind ?? 'source'})` : 'belum ada data'}.
+                  </p>
+                ))}
               </details>
             </>
           )}

@@ -142,8 +142,10 @@ describe("CopyLeaderExecutor", () => {
       COPY_LEADER_ENABLED: "1",
       LIVE_BINANCE_ENV: "testnet",
       COPY_LEADER_EXEC_LEVERAGE: "3",
+      COPY_LEADER_SOURCE_POLL_MS: "5000",
     });
     expect(config.leverage).toBe(3);
+    expect(config.pollMs).toBe(5_000);
     expect(parseCopyLeaderRuntimeConfig({
       COPY_LEADER_ENABLED: "1",
       LIVE_BINANCE_ENV: "testnet",
@@ -259,6 +261,26 @@ describe("CopyLeaderExecutor", () => {
       sourceEntry: { sourceReferencePrice: 100, testnetFillPrice: 100 },
       sourceExit: { sourceReferencePrice: 100, testnetFillPrice: 100 },
     });
+    const latency = (executor.getStatus().leaders as Array<{
+      sourceLatency: {
+        classification: string;
+        measuredEventCount: number;
+        freshEventCount: number;
+        staleEventCount: number;
+        latestObservationLatencyMs: number | null;
+        lastSourceFetchKind: string | null;
+        lastSourceFetchOk: boolean | null;
+      };
+    }>)[0]!.sourceLatency;
+    expect(latency).toMatchObject({
+      classification: "FRESH",
+      measuredEventCount: 2,
+      freshEventCount: 2,
+      staleEventCount: 0,
+      latestObservationLatencyMs: 500,
+      lastSourceFetchKind: "EVENT_POLL",
+      lastSourceFetchOk: true,
+    });
   });
 
   it("records stale events and never submits them", async () => {
@@ -288,7 +310,34 @@ describe("CopyLeaderExecutor", () => {
     now = START + 130_000;
     await executor.tick();
     expect(submitted).toHaveLength(0);
-    expect((executor.getStatus().eventLedger as Array<{ status: string }>).some((row) => row.status === "SKIPPED_STALE_SOURCE_EVENT")).toBe(true);
+    const status = executor.getStatus();
+    const staleRow = (status.eventLedger as Array<{
+      status: string;
+      sourceTimestampMs: number;
+      firstObservedAt: string | null;
+      sourceObservationLatencyMs: number | null;
+    }>).find((row) => row.status === "SKIPPED_STALE_SOURCE_EVENT");
+    expect(staleRow).toMatchObject({
+      sourceTimestampMs: START + 1,
+      firstObservedAt: new Date(now).toISOString(),
+      sourceObservationLatencyMs: 129_999,
+    });
+    const latency = (status.leaders as Array<{
+      sourceLatency: {
+        classification: string;
+        measuredEventCount: number;
+        freshEventCount: number;
+        staleEventCount: number;
+        latestObservationLatencyMs: number | null;
+      };
+    }>)[0]!.sourceLatency;
+    expect(latency).toMatchObject({
+      classification: "DELAYED",
+      measuredEventCount: 1,
+      freshEventCount: 0,
+      staleEventCount: 1,
+      latestObservationLatencyMs: 129_999,
+    });
   });
 
   it("blocks a leader below the 60% Testnet source-event coverage threshold", async () => {

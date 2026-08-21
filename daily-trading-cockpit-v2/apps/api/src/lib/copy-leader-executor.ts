@@ -136,6 +136,9 @@ export interface CopySourceOrder {
   orderTimeMs: number;
   orderUpdateTimeMs: number;
   sourceTimestampMs: number;
+  /** Local receipt time for this source response. It is attached by the
+   * measured fetch wrapper, never supplied by Binance. */
+  observedAtMs?: number;
   sourceEventId: string;
   sourceLogicalKey: string;
   raw: Record<string, unknown>;
@@ -156,8 +159,21 @@ export interface CopyEventLedgerRow {
   sourceEventId: string;
   sourceLogicalKey: string;
   leaderId: string;
+  /** Original source order creation time, retained separately from the
+   * update-time event clock used for freshness. */
+  sourceOrderTimestamp?: string | null;
+  sourceOrderTimestampMs?: number | null;
+  /** Binance's source event/update time. This remains the canonical freshness
+   * clock; changing it would silently weaken the no-late-copy protection. */
+  sourceUpdateTimestamp?: string | null;
+  sourceUpdateTimestampMs?: number | null;
   sourceTimestamp: string;
   sourceTimestampMs: number;
+  /** The first instant this process saw the source event, before any budget,
+   * exchange, or order-submission work. Legacy rows fall back to createdAt. */
+  firstObservedAt?: string | null;
+  firstObservedAtMs?: number | null;
+  sourceObservationLatencyMs?: number | null;
   /** Price/quantity observed on the public leader event.  Optional so the
    * pre-dashboard ledger remains readable without inventing legacy values. */
   sourceReferencePrice?: number | null;
@@ -192,6 +208,30 @@ export interface CopyEventLedgerRow {
   feeUsd: number | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export type CopyLeaderSourceLatencyClass = "NO_EVENTS" | "FRESH" | "DELAYED";
+
+/** Source-observation telemetry. This deliberately measures the whole path
+ * from Binance's event clock to this process seeing it; it does not pretend a
+ * public BAPI response was real-time. `DELAYED` is observational, not a new
+ * trading gate: a future <= staleness event can still be copied. */
+export interface CopyLeaderSourceLatency {
+  classification: CopyLeaderSourceLatencyClass;
+  measuredEventCount: number;
+  freshEventCount: number;
+  staleEventCount: number;
+  freshRatePct: number | null;
+  latestObservationLatencyMs: number | null;
+  p50ObservationLatencyMs: number | null;
+  p95ObservationLatencyMs: number | null;
+  maxObservationLatencyMs: number | null;
+  latestFirstObservedAt: string | null;
+  latestSourceTimestamp: string | null;
+  lastSourceFetchAt: string | null;
+  lastSourceFetchDurationMs: number | null;
+  lastSourceFetchKind: "COVERAGE" | "CURSOR_SEED" | "EVENT_POLL" | null;
+  lastSourceFetchOk: boolean | null;
 }
 
 interface CopyOwnedLot {
@@ -298,6 +338,11 @@ interface PersistedLeader {
   sourceMarginBalanceUsd: number | null;
   sourceMarginBalanceCheckedAt: string | null;
   lastPollAt: string | null;
+  /** Optional for backward-compatible reads of the pre-latency store. */
+  lastSourceFetchAt?: string | null;
+  lastSourceFetchDurationMs?: number | null;
+  lastSourceFetchKind?: "COVERAGE" | "CURSOR_SEED" | "EVENT_POLL" | null;
+  lastSourceFetchOk?: boolean | null;
 }
 
 export interface CopySleeveSnapshot {
@@ -594,16 +639,27 @@ function sourceEventRow(
   action: CopyEventLedgerRow["action"],
   direction: CopyDirection | null,
   status: CopyEventLedgerRow["status"],
-  nowIso: string,
+  firstObservedAt: string,
   reason: string | null = null,
 ): CopyEventLedgerRow {
+  const firstObservedAtMs = Date.parse(firstObservedAt);
+  const sourceObservationLatencyMs = Number.isFinite(firstObservedAtMs)
+    ? Math.max(0, firstObservedAtMs - order.sourceTimestampMs)
+    : null;
   return {
     strategy: COPY_LEADER_STRATEGY,
     sourceEventId: order.sourceEventId,
     sourceLogicalKey: order.sourceLogicalKey,
     leaderId,
+    sourceOrderTimestamp: iso(order.orderTimeMs),
+    sourceOrderTimestampMs: order.orderTimeMs,
+    sourceUpdateTimestamp: iso(order.orderUpdateTimeMs),
+    sourceUpdateTimestampMs: order.orderUpdateTimeMs,
     sourceTimestamp: iso(order.sourceTimestampMs),
     sourceTimestampMs: order.sourceTimestampMs,
+    firstObservedAt,
+    firstObservedAtMs: Number.isFinite(firstObservedAtMs) ? firstObservedAtMs : null,
+    sourceObservationLatencyMs,
     sourceReferencePrice: order.avgPrice,
     sourceExecutedQty: order.executedQty,
     symbol: order.symbol,
@@ -619,8 +675,8 @@ function sourceEventRow(
     fillPrice: null,
     fillPriceConfirmed: null,
     feeUsd: null,
-    createdAt: nowIso,
-    updatedAt: nowIso,
+    createdAt: firstObservedAt,
+    updatedAt: firstObservedAt,
   };
 }
 
@@ -677,6 +733,10 @@ export class CopyLeaderExecutor {
         sourceMarginBalanceUsd: null,
         sourceMarginBalanceCheckedAt: null,
         lastPollAt: null,
+        lastSourceFetchAt: null,
+        lastSourceFetchDurationMs: null,
+        lastSourceFetchKind: null,
+        lastSourceFetchOk: null,
       };
     }
     this.store.save(() => this.nowIso());
@@ -694,6 +754,87 @@ export class CopyLeaderExecutor {
     row.stateReason = reason;
   }
 
+  private sourceLatencyForLeader(leaderId: string): CopyLeaderSourceLatency {
+    const observations = this.store.getState().events
+      .filter((event) =>
+        event.leaderId === leaderId &&
+        (event.action === "ENTRY" || event.action === "EXIT"),
+      )
+      .map((event) => {
+        const firstObservedAt = event.firstObservedAt ?? event.createdAt;
+        const firstObservedAtMs = event.firstObservedAtMs ?? Date.parse(firstObservedAt);
+        if (!Number.isFinite(firstObservedAtMs) || !Number.isFinite(event.sourceTimestampMs)) return null;
+        const sourceObservationLatencyMs = event.sourceObservationLatencyMs
+          ?? Math.max(0, firstObservedAtMs - event.sourceTimestampMs);
+        return {
+          event,
+          firstObservedAt,
+          sourceObservationLatencyMs,
+        };
+      })
+      .filter((observation): observation is {
+        event: CopyEventLedgerRow;
+        firstObservedAt: string;
+        sourceObservationLatencyMs: number;
+      } => observation !== null)
+      .sort((left, right) =>
+        left.event.sourceTimestampMs - right.event.sourceTimestampMs || left.firstObservedAt.localeCompare(right.firstObservedAt),
+      );
+    const latencyValues = observations.map((observation) => observation.sourceObservationLatencyMs).sort((left, right) => left - right);
+    const percentile = (fraction: number): number | null => {
+      if (latencyValues.length === 0) return null;
+      const index = Math.max(0, Math.min(latencyValues.length - 1, Math.ceil(latencyValues.length * fraction) - 1));
+      return latencyValues[index] ?? null;
+    };
+    const latest = observations.at(-1) ?? null;
+    const freshEventCount = observations.filter((observation) => observation.sourceObservationLatencyMs <= this.config.stalenessMs).length;
+    const staleEventCount = observations.length - freshEventCount;
+    const persisted = this.leaderState(leaderId);
+    return {
+      classification: latest === null
+        ? "NO_EVENTS"
+        : latest.sourceObservationLatencyMs <= this.config.stalenessMs
+          ? "FRESH"
+          : "DELAYED",
+      measuredEventCount: observations.length,
+      freshEventCount,
+      staleEventCount,
+      freshRatePct: observations.length > 0 ? (freshEventCount / observations.length) * 100 : null,
+      latestObservationLatencyMs: latest?.sourceObservationLatencyMs ?? null,
+      p50ObservationLatencyMs: percentile(0.5),
+      p95ObservationLatencyMs: percentile(0.95),
+      maxObservationLatencyMs: latencyValues.at(-1) ?? null,
+      latestFirstObservedAt: latest?.firstObservedAt ?? null,
+      latestSourceTimestamp: latest?.event.sourceTimestamp ?? null,
+      lastSourceFetchAt: persisted.lastSourceFetchAt ?? null,
+      lastSourceFetchDurationMs: persisted.lastSourceFetchDurationMs ?? null,
+      lastSourceFetchKind: persisted.lastSourceFetchKind ?? null,
+      lastSourceFetchOk: persisted.lastSourceFetchOk ?? null,
+    };
+  }
+
+  private async fetchSourceOrdersMeasured(
+    leaderId: string,
+    kind: "COVERAGE" | "CURSOR_SEED" | "EVENT_POLL",
+    startTime: number,
+    endTime: number,
+  ): Promise<CopySourceOrder[] | null> {
+    const startedAtMs = this.nowMs();
+    const orders = await this.fetchSourceOrders(leaderId, startTime, endTime);
+    const completedAtMs = this.nowMs();
+    const state = this.leaderState(leaderId);
+    if (orders) {
+      // Capture source arrival before any downstream balance, sizing, or
+      // exchange work. This is the only defensible source-observation clock.
+      for (const order of orders) order.observedAtMs = completedAtMs;
+    }
+    state.lastSourceFetchAt = iso(completedAtMs);
+    state.lastSourceFetchDurationMs = Math.max(0, completedAtMs - startedAtMs);
+    state.lastSourceFetchKind = kind;
+    state.lastSourceFetchOk = orders !== null;
+    return orders;
+  }
+
   private eventById(sourceEventId: string): CopyEventLedgerRow | null {
     return this.store.getState().events.find((event) => event.sourceEventId === sourceEventId) ?? null;
   }
@@ -706,7 +847,22 @@ export class CopyLeaderExecutor {
     const state = this.store.getState();
     const existing = state.events.find((event) => event.sourceEventId === row.sourceEventId);
     if (existing) {
-      Object.assign(existing, row, { createdAt: existing.createdAt, updatedAt: this.nowIso() });
+      // Observation time is immutable provenance. A later fill/reconciliation
+      // update must never make the source look newer than when we first saw it.
+      const firstObservedAt = existing.firstObservedAt ?? row.firstObservedAt ?? existing.createdAt;
+      const firstObservedAtMs = existing.firstObservedAtMs
+        ?? row.firstObservedAtMs
+        ?? (Number.isFinite(Date.parse(firstObservedAt)) ? Date.parse(firstObservedAt) : null);
+      const sourceObservationLatencyMs = existing.sourceObservationLatencyMs
+        ?? row.sourceObservationLatencyMs
+        ?? (firstObservedAtMs === null ? null : Math.max(0, firstObservedAtMs - existing.sourceTimestampMs));
+      Object.assign(existing, row, {
+        createdAt: existing.createdAt,
+        firstObservedAt,
+        firstObservedAtMs,
+        sourceObservationLatencyMs,
+        updatedAt: this.nowIso(),
+      });
       return existing;
     }
     state.events.push(row);
@@ -808,7 +964,7 @@ export class CopyLeaderExecutor {
     return {
       sourceEventIds: sorted.map((event) => event.sourceEventId),
       sourceTimestamp: selected.sourceTimestamp,
-      firstObservedAt: sorted.map((event) => event.createdAt).sort()[0] ?? null,
+      firstObservedAt: sorted.map((event) => event.firstObservedAt ?? event.createdAt).sort()[0] ?? null,
       completedAt: sorted.map((event) => event.updatedAt).sort().at(-1) ?? null,
       sourceReferencePrice: weightedPrice((event) => event.sourceReferencePrice, (event) => event.sourceExecutedQty),
       sourceQty,
@@ -938,6 +1094,7 @@ export class CopyLeaderExecutor {
       sleeve: state.sleeve,
       leaders: this.leaders.map((leader) => ({
         ...state.leaders[leader.id],
+        sourceLatency: this.sourceLatencyForLeader(leader.id),
         budgetMarginUsd: state.sleeve?.sleeveMarginBudgetUsd === null || state.sleeve?.sleeveMarginBudgetUsd === undefined
           ? null
           : state.sleeve.sleeveMarginBudgetUsd * leader.sleeveShare,
@@ -1031,7 +1188,12 @@ export class CopyLeaderExecutor {
       !state.coverage ||
       now - Date.parse(state.coverage.checkedAt) > SOURCE_COVERAGE_REFRESH_MS
     ) {
-      const coverageOrders = await this.fetchSourceOrders(leader.id, now - SOURCE_COVERAGE_WINDOW_MS, now);
+      const coverageOrders = await this.fetchSourceOrdersMeasured(
+        leader.id,
+        "COVERAGE",
+        now - SOURCE_COVERAGE_WINDOW_MS,
+        now,
+      );
       if (coverageOrders === null) {
         this.setLeaderState(leader.id, "SOURCE_API_ERROR", "public Binance source unavailable");
         return;
@@ -1091,7 +1253,12 @@ export class CopyLeaderExecutor {
     }
 
     if (state.activationCursorAtMs === null) {
-      const seedOrders = await this.fetchSourceOrders(leader.id, now - this.config.sourceLookbackMs, now);
+      const seedOrders = await this.fetchSourceOrdersMeasured(
+        leader.id,
+        "CURSOR_SEED",
+        now - this.config.sourceLookbackMs,
+        now,
+      );
       if (seedOrders === null) {
         this.setLeaderState(leader.id, "SOURCE_API_ERROR", "could not initialise activation cursor");
         return;
@@ -1107,7 +1274,7 @@ export class CopyLeaderExecutor {
             "CURSOR_SEEDED",
             explicitSourceAction(order)?.direction ?? null,
             "CURSOR_SEEDED",
-            this.nowIso(),
+            iso(order.observedAtMs ?? this.nowMs()),
             "activation cursor; no historical replay",
           ));
         }
@@ -1123,7 +1290,7 @@ export class CopyLeaderExecutor {
     }
 
     const from = Math.max(state.activationCursorAtMs, now - this.config.sourceLookbackMs);
-    const orders = await this.fetchSourceOrders(leader.id, from, now);
+    const orders = await this.fetchSourceOrdersMeasured(leader.id, "EVENT_POLL", from, now);
     state.lastPollAt = this.nowIso();
     if (orders === null) {
       this.setLeaderState(leader.id, "SOURCE_API_ERROR", "public Binance source unavailable");
@@ -1343,6 +1510,9 @@ export class CopyLeaderExecutor {
       );
       return;
     }
+    // `observedAtMs` is set immediately when the source HTTP response is
+    // received. Do not overwrite it after local sizing or exchange calls.
+    const firstObservedAt = iso(order.observedAtMs ?? this.nowMs());
     const now = this.nowMs();
     if (now - order.sourceTimestampMs > this.config.stalenessMs) {
       this.upsertEvent(sourceEventRow(
@@ -1351,7 +1521,7 @@ export class CopyLeaderExecutor {
         action.action,
         action.direction,
         "SKIPPED_STALE_SOURCE_EVENT",
-        this.nowIso(),
+        firstObservedAt,
         "source event age exceeds " + this.config.stalenessMs + "ms",
       ));
       return;
@@ -1363,7 +1533,7 @@ export class CopyLeaderExecutor {
         action.action,
         action.direction,
         "SKIPPED_TESTNET_SYMBOL_UNAVAILABLE",
-        this.nowIso(),
+        firstObservedAt,
         "symbol absent from active USD-M Testnet exchange filters",
       ));
       return;
@@ -1375,7 +1545,7 @@ export class CopyLeaderExecutor {
         action.action,
         action.direction,
         "PAUSED_KRONOS_OVERLAP",
-        this.nowIso(),
+        firstObservedAt,
         "symbol entered current Kronos universe",
       ));
       this.setLeaderState(leader.id, "PAUSED_KRONOS_OVERLAP", order.symbol);
@@ -1390,14 +1560,21 @@ export class CopyLeaderExecutor {
           "ENTRY",
           action.direction,
           "SKIPPED_KRONOS_PRIORITY_GATE",
-          this.nowIso(),
+          firstObservedAt,
           "Kronos new-entry gate is closed",
         ));
         return;
       }
-      await this.copyEntry(leader, order, action.direction, filters.get(order.symbol)!, sourceMarginBalance);
+      await this.copyEntry(
+        leader,
+        order,
+        action.direction,
+        filters.get(order.symbol)!,
+        sourceMarginBalance,
+        firstObservedAt,
+      );
     } else {
-      await this.copyExit(leader, order, action.direction, filters.get(order.symbol)!);
+      await this.copyExit(leader, order, action.direction, filters.get(order.symbol)!, firstObservedAt);
     }
   }
 
@@ -1479,10 +1656,11 @@ export class CopyLeaderExecutor {
     direction: CopyDirection,
     filters: FuturesSymbolFilters,
     sourceMarginBalance: number,
+    firstObservedAt: string,
   ): Promise<void> {
     const budget = this.sleeveBudget(leader);
     if (!budget) {
-      this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "SKIPPED_BUDGET_CAP", "Testnet balance/equity unavailable");
+      this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "SKIPPED_BUDGET_CAP", "Testnet balance/equity unavailable", firstObservedAt);
       return;
     }
     const existingOwner = this.ownedPosition(leader.id, source.symbol, direction);
@@ -1491,12 +1669,12 @@ export class CopyLeaderExecutor {
     const ownership = this.ownerMatchesExchange(existingOwner, exchange);
     if (!ownership.ok) {
       this.setLeaderState(leader.id, "PAUSED_RECONCILIATION_REQUIRED", ownership.reason);
-      this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "ACCOUNTING_INCOMPLETE", ownership.reason);
+      this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "ACCOUNTING_INCOMPLETE", ownership.reason, firstObservedAt);
       return;
     }
     const mark = await this.client.getMarkPrice(source.symbol);
     if (!finitePositive(mark)) {
-      this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "SKIPPED_BUDGET_CAP", "Testnet mark price unavailable");
+      this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "SKIPPED_BUDGET_CAP", "Testnet mark price unavailable", firstObservedAt);
       return;
     }
     const sourceNotional = source.executedQty * source.avgPrice;
@@ -1510,7 +1688,7 @@ export class CopyLeaderExecutor {
       this.currentCopyGrossAtMark({ symbol: source.symbol }),
     ]);
     if (currentGross === null || currentLeaderGross === null || currentSymbolGross === null) {
-      this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "SKIPPED_BUDGET_CAP", "could not verify marked copy sleeve exposure");
+      this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "SKIPPED_BUDGET_CAP", "could not verify marked copy sleeve exposure", firstObservedAt);
       return;
     }
     const headroom = Math.min(
@@ -1533,11 +1711,12 @@ export class CopyLeaderExecutor {
         direction,
         desiredNotional <= 0 ? "SKIPPED_BUDGET_CAP" : "SKIPPED_MIN_NOTIONAL",
         desiredNotional <= 0 ? "copy sleeve/leader/symbol headroom exhausted" : "rounded quantity falls below Testnet filters",
+        firstObservedAt,
       );
       return;
     }
     if (!this.tryClaimEntrySymbol(source.symbol)) {
-      this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "SKIPPED_SYMBOL_IN_FLIGHT", "another executor owns an in-flight symbol claim");
+      this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "SKIPPED_SYMBOL_IN_FLIGHT", "another executor owns an in-flight symbol claim", firstObservedAt);
       return;
     }
     const clientOrderId = copyClientOrderId("E", source.sourceEventId);
@@ -1554,11 +1733,11 @@ export class CopyLeaderExecutor {
         clientOrderId,
       });
       if (!reserved.ok || !reserved.reservationId) {
-        this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "SKIPPED_BUDGET_CAP", reserved.reason ?? "central exposure reservation rejected");
+        this.recordSimpleSkip(source, leader.id, "ENTRY", direction, "SKIPPED_BUDGET_CAP", reserved.reason ?? "central exposure reservation rejected", firstObservedAt);
         return;
       }
       reservationId = reserved.reservationId;
-      const row = sourceEventRow(source, leader.id, "ENTRY", direction, "ORDER_SUBMISSION_PENDING", this.nowIso());
+      const row = sourceEventRow(source, leader.id, "ENTRY", direction, "ORDER_SUBMISSION_PENDING", firstObservedAt);
       row.clientOrderId = clientOrderId;
       row.requestedQty = requestedQty;
       this.upsertEvent(row);
@@ -1735,10 +1914,11 @@ export class CopyLeaderExecutor {
     source: CopySourceOrder,
     direction: CopyDirection,
     filters: FuturesSymbolFilters,
+    firstObservedAt: string,
   ): Promise<void> {
     const position = this.ownedPosition(leader.id, source.symbol, direction);
     if (!position || position.sourceTrackedQty <= EPS) {
-      this.recordSimpleSkip(source, leader.id, "EXIT", direction, "SKIPPED_UNTRACKED_SOURCE_EXIT", "no copy-owned source quantity");
+      this.recordSimpleSkip(source, leader.id, "EXIT", direction, "SKIPPED_UNTRACKED_SOURCE_EXIT", "no copy-owned source quantity", firstObservedAt);
       return;
     }
     const sourceCloseQty = Math.min(position.sourceTrackedQty, source.executedQty);
@@ -1746,10 +1926,10 @@ export class CopyLeaderExecutor {
     let closeQty = floorToStep(position.qty * proportion, filters.stepSize, filters.quantityPrecision);
     if (sourceCloseQty >= position.sourceTrackedQty - EPS) closeQty = position.qty;
     if (!finitePositive(closeQty) || closeQty + EPS < filters.minQty) {
-      this.recordSimpleSkip(source, leader.id, "EXIT", direction, "SKIPPED_MIN_NOTIONAL", "rounded source exit is below Testnet lot size");
+      this.recordSimpleSkip(source, leader.id, "EXIT", direction, "SKIPPED_MIN_NOTIONAL", "rounded source exit is below Testnet lot size", firstObservedAt);
       return;
     }
-    const closed = await this.closeOwnedPosition(position, closeQty, source, "EXIT", direction);
+    const closed = await this.closeOwnedPosition(position, closeQty, source, "EXIT", direction, null, firstObservedAt);
     // Never consume source-close provenance after a partial/ambiguous Testnet
     // exit.  That situation needs reconciliation, not an invisible residual.
     if (closed.completed) position.sourceTrackedQty = Math.max(0, position.sourceTrackedQty - sourceCloseQty);
@@ -1788,9 +1968,10 @@ export class CopyLeaderExecutor {
     action: "EXIT" | "CONTROL_CLOSE",
     direction: CopyDirection,
     controlReason: string | null = null,
+    firstObservedAt: string = this.nowIso(),
   ): Promise<{ completed: boolean; filledQty: number }> {
     if (!this.tryClaimEntrySymbol(position.symbol)) {
-      this.recordSimpleSkip(source, position.leaderId, action, direction, "SKIPPED_SYMBOL_IN_FLIGHT", "another executor owns an in-flight symbol claim");
+      this.recordSimpleSkip(source, position.leaderId, action, direction, "SKIPPED_SYMBOL_IN_FLIGHT", "another executor owns an in-flight symbol claim", firstObservedAt);
       return { completed: false, filledQty: 0 };
     }
     const clientOrderId = copyClientOrderId(action === "EXIT" ? "X" : "K", source.sourceEventId);
@@ -1800,10 +1981,10 @@ export class CopyLeaderExecutor {
       if (!ownership.ok) {
         position.status = "ACCOUNTING_INCOMPLETE";
         this.setLeaderState(position.leaderId, "PAUSED_RECONCILIATION_REQUIRED", ownership.reason);
-        this.recordSimpleSkip(source, position.leaderId, action, direction, "ACCOUNTING_INCOMPLETE", ownership.reason);
+        this.recordSimpleSkip(source, position.leaderId, action, direction, "ACCOUNTING_INCOMPLETE", ownership.reason, firstObservedAt);
         return { completed: false, filledQty: 0 };
       }
-      const row = sourceEventRow(source, position.leaderId, action, direction, "ORDER_SUBMISSION_PENDING", this.nowIso(), controlReason);
+      const row = sourceEventRow(source, position.leaderId, action, direction, "ORDER_SUBMISSION_PENDING", firstObservedAt, controlReason);
       row.clientOrderId = clientOrderId;
       row.requestedQty = requestedQty;
       this.upsertEvent(row);
@@ -1938,7 +2119,8 @@ export class CopyLeaderExecutor {
     direction: CopyDirection | null,
     status: Extract<CopyEventLedgerRow["status"], "SKIPPED_UNTRACKED_SOURCE_EXIT" | "SKIPPED_KRONOS_PRIORITY_GATE" | "SKIPPED_MIN_NOTIONAL" | "SKIPPED_SYMBOL_IN_FLIGHT" | "SKIPPED_BUDGET_CAP" | "ACCOUNTING_INCOMPLETE">,
     reason: string | null,
+    firstObservedAt: string = this.nowIso(),
   ): void {
-    this.upsertEvent(sourceEventRow(source, leaderId, action, direction, status, this.nowIso(), reason));
+    this.upsertEvent(sourceEventRow(source, leaderId, action, direction, status, firstObservedAt, reason));
   }
 }

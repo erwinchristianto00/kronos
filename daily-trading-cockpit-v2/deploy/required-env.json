@@ -135,6 +135,18 @@
         "CROSS_SECTIONAL_ENTRY_TRAFFIC_LIGHT": {
           "value": "0",
           "why": "Required for the bypass above to do anything. entryAdmissionForSignal says it outright: when the traffic light is enabled the global bypass is deliberately NOT consulted, and only the narrow YELLOW path may bridge an INCOMPLETE sample. Testnet's verdict is 'rolling edge negative', not incomplete, so YELLOW never applies and it sits RED forever \u2014 unable to produce the executed closes that would clear it. Off here, testnet uses the same legacy admission path live uses, so the two are comparable; live already runs this =0."
+        },
+        "COPY_LEADER_SOURCE_POLL_MS": {
+          "value": "5000",
+          "why": "Testnet Copy Sleeve source polling only. This removes up to 10 seconds of local observation delay versus the former 15s cadence, while retaining the separate 120s hard stale-event guard. It does not weaken entry eligibility or apply to mainnet."
+        },
+        "COPY_LEADER_SOURCE_STALENESS_MS": {
+          "value": "120000",
+          "why": "Hard no-late-copy protection for the Testnet Copy Sleeve. A delayed source event is recorded and shown as latency evidence but is never chased into an entry."
+        },
+        "COPY_LEADER_SOURCE_LOOKBACK_MS": {
+          "value": "600000",
+          "why": "Ten-minute overlap window for source cursor recovery and durable event deduplication. It is not an eligibility window: the independent 120s freshness guard remains authoritative."
         }
       }
     },
