@@ -270,4 +270,39 @@ describe("CopyLeaderExecutor", () => {
     expect(leaders[0]!.coverage?.coveragePct).toBe(10);
     expect(submitted).toHaveLength(0);
   });
+
+  it("follows Binance indexValue pagination and keeps a complete source coverage", async () => {
+    const first = sourceOrder({ side: "SELL", at: START - 60_000 });
+    const second = sourceOrder({ side: "BUY", at: START - 59_000 });
+    const { client, submitted } = makeClient(() => START);
+    const requests: Array<Record<string, unknown>> = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes("/detail")) return response({ code: "000000", data: { marginBalance: "1000" } });
+      const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      requests.push(payload);
+      if (payload.indexValue === undefined) {
+        return response({ code: "000000", data: { list: [first], total: 2, indexValue: "cursor-1" } });
+      }
+      expect(payload.indexValue).toBe("cursor-1");
+      return response({ code: "000000", data: { list: [second], total: 2, indexValue: null } });
+    }) as typeof fetch;
+    const executor = new CopyLeaderExecutor({
+      client,
+      store: new CopyLeaderStore(tempDir()),
+      fetchImpl,
+      env: { COPY_LEADER_ENABLED: "1", LIVE_BINANCE_ENV: "testnet" },
+      leaders: [LEADER],
+      nowMs: () => START,
+      getKronosUniverse: () => new Set(),
+      canOpenNewEntries: () => true,
+      exposure: { reserve: () => ({ ok: true, reservationId: "r" }), commitReservation: () => undefined, releaseReservation: () => undefined },
+    });
+
+    await executor.tick();
+    const leader = (executor.getStatus().leaders as Array<{ coverage: { sourceEventCount: number } | null; state: string }>)[0]!;
+    expect(requests).toHaveLength(4); // two coverage pages plus two cursor-seed pages
+    expect(leader.coverage?.sourceEventCount).toBe(2);
+    expect(leader.state).toBe("ARMED_WAITING_SIGNAL");
+    expect(submitted).toHaveLength(0);
+  });
 });

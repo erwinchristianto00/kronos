@@ -67,6 +67,11 @@ const EVENT_RETENTION = 20_000;
 const SOURCE_COVERAGE_WINDOW_MS = 30 * 24 * 60 * 60_000;
 const SOURCE_CURSOR_LOOKBACK_MS = 10 * 60_000;
 const SOURCE_COVERAGE_REFRESH_MS = 5 * 60_000;
+// Binance silently caps this public endpoint to 200 rows even if pageSize is
+// higher.  The next page is identified by data.indexValue, never pageNumber.
+// Keep a finite cap so partial history can never masquerade as coverage.
+const SOURCE_ORDER_MAX_PAGES = 32;
+const SOURCE_ORDER_RETRY_DELAYS_MS = [750, 1_500, 3_000] as const;
 const EPS = 1e-8;
 
 export interface CopyLeaderRuntimeConfig {
@@ -908,40 +913,89 @@ export class CopyLeaderExecutor {
   }
 
   private async fetchSourceOrders(leaderId: string, startTime: number, endTime: number): Promise<CopySourceOrder[] | null> {
-    const payload = {
+    const payload: Record<string, string | number> = {
       portfolioId: leaderId,
       startTime: Math.max(0, Math.floor(startTime)),
       endTime: Math.max(0, Math.floor(endTime)),
       pageSize: 1000,
     };
-    try {
-      const response = await this.fetchImpl(COPY_LEADER_SOURCE_ORDER_HISTORY_ENDPOINT, {
-        method: "POST",
-        headers: {
-          Accept: "application/json, text/plain, */*",
-          "Content-Type": "application/json",
-          clienttype: "web",
-        },
-        body: JSON.stringify(payload),
-      });
-      if (!response.ok) return null;
-      const decoded = await response.json() as {
-        code?: unknown;
-        data?: { list?: unknown; total?: unknown };
-      };
-      if (String(decoded.code ?? "") !== "000000" || !Array.isArray(decoded.data?.list)) return null;
-      const total = numberOrNull(decoded.data.total);
-      // A partial response would make both coverage and activation unsafe.  The
-      // public endpoint currently supports pageSize=1000; fail closed rather
-      // than silently act on an incomplete event set if that stops being enough.
-      if (total !== null && total > decoded.data.list.length) return null;
-      return decoded.data.list
-        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
-        .map((item) => normalizeCopySourceOrder(leaderId, item))
-        .filter((item): item is CopySourceOrder => item !== null);
-    } catch {
-      return null;
+    const rawRows: Record<string, unknown>[] = [];
+    const seenPageSignatures = new Set<string>();
+    const seenCursors = new Set<string>();
+    let reportedTotal: number | null = null;
+
+    for (let page = 0; page < SOURCE_ORDER_MAX_PAGES; page += 1) {
+      const decoded = await this.fetchSourceOrderPage(payload);
+      if (!decoded || !Array.isArray(decoded.data?.list)) return null;
+
+      const pageRows = decoded.data.list
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
+      const pageSignature = stableJson(pageRows);
+      if (pageRows.length > 0 && seenPageSignatures.has(pageSignature)) return null;
+      if (pageRows.length > 0) seenPageSignatures.add(pageSignature);
+
+      const pageTotal = numberOrNull(decoded.data.total);
+      if (reportedTotal === null) reportedTotal = pageTotal;
+      else if (pageTotal !== null && pageTotal !== reportedTotal) return null;
+      rawRows.push(...pageRows);
+
+      if (reportedTotal !== null) {
+        if (rawRows.length === reportedTotal) return this.normalizeSourceOrders(leaderId, rawRows);
+        if (rawRows.length > reportedTotal) return null;
+      }
+
+      const cursor = decoded.data.indexValue;
+      if (pageRows.length === 0 || cursor === null || cursor === undefined || cursor === "" || cursor === 0) {
+        // If Binance exposes a total, an exhausted cursor is complete only when
+        // every reported row was received.  Otherwise the response is partial.
+        if (reportedTotal !== null && rawRows.length !== reportedTotal) return null;
+        return this.normalizeSourceOrders(leaderId, rawRows);
+      }
+      const cursorText = String(cursor);
+      if (seenCursors.has(cursorText)) return null;
+      seenCursors.add(cursorText);
+      payload.indexValue = cursorText;
     }
+    return null;
+  }
+
+  private normalizeSourceOrders(leaderId: string, rows: readonly Record<string, unknown>[]): CopySourceOrder[] {
+    return rows
+      .map((item) => normalizeCopySourceOrder(leaderId, item))
+      .filter((item): item is CopySourceOrder => item !== null);
+  }
+
+  private async fetchSourceOrderPage(payload: Record<string, string | number>): Promise<{
+    code?: unknown;
+    data?: { list?: unknown; total?: unknown; indexValue?: unknown };
+  } | null> {
+    for (let attempt = 0; attempt <= SOURCE_ORDER_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        const response = await this.fetchImpl(COPY_LEADER_SOURCE_ORDER_HISTORY_ENDPOINT, {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; kronos-copy-leader-testnet/1.0)",
+            clienttype: "web",
+          },
+          body: JSON.stringify(payload),
+        });
+        const decoded = await response.json() as {
+          code?: unknown;
+          data?: { list?: unknown; total?: unknown; indexValue?: unknown };
+        };
+        if (response.ok && String(decoded.code ?? "") === "000000") return decoded;
+        // Binance uses this code for transient public-source pressure. Retry
+        // the exact cursor a bounded number of times; every other failure is
+        // intentionally a fail-closed source error.
+        if (String(decoded.code ?? "") !== "11012005" || attempt >= SOURCE_ORDER_RETRY_DELAYS_MS.length) return null;
+      } catch {
+        return null;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, SOURCE_ORDER_RETRY_DELAYS_MS[attempt]!));
+    }
+    return null;
   }
 
   private async refreshSourceMarginBalance(leaderId: string): Promise<number | null> {
