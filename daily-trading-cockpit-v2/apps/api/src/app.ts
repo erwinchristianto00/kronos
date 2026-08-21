@@ -42,8 +42,17 @@ import {
   crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
 import { crossSectionalExecTickMs } from "./lib/cross-sectional-policy.js";
-import { buildCrossSectionalReport, CROSS_SECTIONAL_FILTERED_SIGNAL, CROSS_SECTIONAL_UNIVERSE, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import {
+  buildCrossSectionalReport,
+  CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
+  CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
+  CROSS_SECTIONAL_FILTERED_SIGNAL,
+  CROSS_SECTIONAL_UNIVERSE,
+  getCrossSectionalReportSinceMs,
+  getCrossSectionalStore,
+} from "./lib/cross-sectional-edge.js";
 import { CrossSectionalSymbolReliabilityStore } from "./lib/cross-sectional-symbol-reliability.js";
+import { CopyLeaderExecutor, CopyLeaderStore } from "./lib/copy-leader-executor.js";
 import {
   SingleSymbolLaneExecutor,
   SingleSymbolLaneExecutorStore,
@@ -1075,6 +1084,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // construction below; stays null on instances that build no engine (e.g. 3101 research). READ-ONLY —
   // the four-brain path never mutates it.
   let liveExecutionStore: LiveExecutionStore | null = null;
+  // Testnet-only direct Copy Leader sleeve. Kept separate from strategy
+  // executors, but threaded into their shared account gateway below so it can
+  // never be mistaken for a manual/orphaned exchange position.
+  let copyLeaderExecutor: CopyLeaderExecutor | null = null;
   let crossSectionalExecutor: CrossSectionalExecutor | null = null;
   // Source-chain telemetry is process-local and read-only. It deliberately has
   // no path to an order, an eligibility override, or an execution setting.
@@ -1183,6 +1196,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     crossSectionalDirectionalShortExecutor,
     ...innovationSingleSymbolExecutors,
   ];
+  // These are the effective filtered cross-sectional pools loaded by the
+  // current runtime. Reading through this closure each Copy tick makes any
+  // future effective-pool change visible without the sleeve maintaining a
+  // second, drift-prone symbol list.
+  const currentKronosFilteredUniverse = (): ReadonlySet<string> => new Set([
+    ...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
+    ...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
+  ]);
   /** Notional already committed to `symbol` by every OTHER single-symbol executor (excludes
    *  `self` — an instance's own admission is already bounded by its own maxOpenPositions, and
    *  double-counting itself would make the cap tighter than intended).
@@ -1523,6 +1544,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // after that assignment has run (same forward-reference pattern as unifiedRegimeEntryGate and
       // every isAllowed gate below that reads `engineForGate`/`liveEngine`).
       getLegacyMirrorOpenIntents: () => liveEngine?.getStatus().openIntents ?? [],
+      getAdditionalManagedPositions: () => copyLeaderExecutor?.managedPositions() ?? [],
       // Restart/staleness reconciliation join key lookup (see binance-futures-private.ts's
       // queryOrderByClientId doc comment) — reuses the SAME signed client every executor below
       // shares, never a second HTTP path.
@@ -1675,8 +1697,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // single-instance fix addressed would otherwise recur for every one of the new instances' own
       // open legs. 2026-07-11: reuses the shared allCrossSectionalLaneExecutors()/
       // allSingleSymbolLaneExecutors() closures above instead of its own duplicated literal array.
-      externalManagedNetQty: () =>
-        computeExternalManagedNetQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
+      externalManagedNetQty: () => {
+        const managed = computeExternalManagedNetQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors());
+        for (const [symbol, qty] of copyLeaderExecutor?.managedNetQty() ?? []) {
+          managed.set(symbol, (managed.get(symbol) ?? 0) + qty);
+        }
+        return managed;
+      },
       // 2026-08-17 maker-entry disarm fix: resting post-only entry orders are not yet legs, so the
       // net claim above cannot see them — reconcile() needs them as a separate tolerance band.
       externalPendingEntryQty: () =>
@@ -1685,8 +1712,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // account-wide kill-switch (killSwitchTrip) can finally see real losses/gains from these lanes
       // instead of only its own mirror/directional-slot ledger — see live-executor-wiring.ts's
       // sumExternalRealizedPnlUsd doc comment.
-      getExternalRealizedPnlUsd: () =>
-        sumExternalRealizedPnlUsd(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
+      getExternalRealizedPnlUsd: () => {
+        const kronos = sumExternalRealizedPnlUsd(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors());
+        const copy = copyLeaderExecutor?.realisedPnl() ?? { today: 0, allTime: 0, feesUsd: null };
+        return { today: kronos.today + copy.today, allTime: kronos.allTime + copy.allTime };
+      },
       // 2026-07-12 kill-switch RESPONSE fix: when the account-wide breaker trips, close the OTHER
       // 11 executors' positions too — via each executor's OWN orderly close (reduce-only,
       // netting-aware), never a blanket symbol flatten (2026-07-07 netting-blind-closes rule).
@@ -1708,6 +1738,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           } catch (error) {
             console.error(`[app] kill-switch single-symbol close failed: ${(error as Error).message}`);
           }
+        }
+        try {
+          await copyLeaderExecutor?.closeAllPositionsOrderly(killReason);
+        } catch (error) {
+          console.error(`[app] kill-switch Copy Leader close failed: ${(error as Error).message}`);
         }
       },
       // 2026-07-20 real-money audit fix (BUG 1): laneId → fixed direction lookup for
@@ -3234,6 +3269,40 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         setInterval(pilotTick, 5 * 60_000);
       }
     }
+
+    // Direct outside-Kronos Copy Leader sleeve. This branch is structurally
+    // unreachable on mainnet: it is created only when the already-resolved
+    // private Binance client is Testnet. Source reads are public BAPI only;
+    // every destination order shares the one Testnet client and central
+    // exposure gateway used by Kronos.
+    if (!isTest && liveConfig.env === "testnet") {
+      copyLeaderExecutor = new CopyLeaderExecutor({
+        client: liveClient,
+        exposure: {
+          reserve: exposureCoordinator.reserve.bind(exposureCoordinator),
+          commitReservation: exposureCoordinator.commitReservation.bind(exposureCoordinator),
+          releaseReservation: exposureCoordinator.releaseReservation.bind(exposureCoordinator),
+          releaseCommittedReservation: exposureCoordinator.releaseCommittedReservation.bind(exposureCoordinator),
+        },
+        store: new CopyLeaderStore("data", "copy-leader-executor.json"),
+        fetchImpl: options.fetchImpl,
+        getKronosUniverse: currentKronosFilteredUniverse,
+        canOpenNewEntries: () => liveEngine?.canOpenNewEntries() ?? false,
+        tryClaimEntrySymbol: singleSymbolEntryClaims.tryClaimEntrySymbol,
+        releaseEntrySymbol: singleSymbolEntryClaims.releaseEntrySymbol,
+        updatePositionSnapshot: exposureCoordinator.updatePositionSnapshot.bind(exposureCoordinator),
+      });
+      if (copyLeaderExecutor.isEnabled()) {
+        const runCopyLeaderTick = (): void => {
+          void copyLeaderExecutor?.tick();
+        };
+        setTimeout(runCopyLeaderTick, 8_000);
+        setInterval(runCopyLeaderTick, copyLeaderExecutor.pollIntervalMs());
+        console.log(`[copy-leader-executor] scheduled TESTNET-only poll=${copyLeaderExecutor.pollIntervalMs()}ms`);
+      } else {
+        console.warn("[copy-leader-executor] not scheduled because effective Testnet configuration is disabled or invalid");
+      }
+    }
   }
 
   // 2026-08 canonical-market-regime scheduler wiring fix (HIGH deployment-scope gap) — the missing
@@ -4592,11 +4661,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       setTimeout(runDirectionEntryReconciliation, 120_000);
       setInterval(runDirectionEntryReconciliation, 15 * 60_000);
     }
+
   }
 
   await registerLiveRoutes(app, liveEngine, {
     configErrors: liveConfig.enabled ? liveConfig.configErrors : [],
     crossSectionalExecutor: () => crossSectionalExecutor,
+    copyLeaderExecutor: () => copyLeaderExecutor,
     symbolReliabilitySnapshotGetter: currentSymbolReliabilitySnapshot,
     crossSectionalTrendExecutor: () => crossSectionalTrendExecutor,
     crossSectionalMixedExecutor: () => crossSectionalMixedExecutor,

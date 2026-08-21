@@ -253,6 +253,51 @@ interface LiveStatus {
   reason?: string;
 }
 
+interface CopyLeaderStatus {
+  strategy: 'COPY_LEADER';
+  enabled: boolean;
+  armed: boolean;
+  running?: boolean;
+  reason?: string;
+  destinationEndpoint?: string;
+  sourceEndpoint?: string;
+  pollMs?: number;
+  stalenessMs?: number;
+  configErrors?: string[];
+  sleeve?: {
+    checkedAt: string;
+    availableBalanceUsd: number | null;
+    equityUsd: number | null;
+    sleeveMarginBudgetUsd: number | null;
+    totalGrossCapUsd: number | null;
+    perSymbolGrossCapUsd: number | null;
+  } | null;
+  leaders?: Array<{
+    id: string;
+    name: string;
+    tier: string;
+    sleeveShare: number;
+    state: string;
+    stateReason: string | null;
+    budgetMarginUsd: number | null;
+    coverage: {
+      sourceEventCount: number;
+      eligibleEventCount: number;
+      unavailableEventCount: number;
+      coveragePct: number | null;
+    } | null;
+  }>;
+  ownerPositions?: Array<{
+    symbol: string;
+    direction: 'LONG' | 'SHORT';
+    qty: number;
+    status: string;
+    leaderId: string;
+  }>;
+  ownerPnl?: { today: number; allTime: number; feesUsd: number | null };
+  lastError?: string | null;
+}
+
 interface LiveAccount {
   ok?: boolean;
   reason?: string;
@@ -1254,12 +1299,14 @@ export default function TestnetExchangeDashboard() {
   const allocationLabel = isLivePage ? 'LIVE lane allocation' : 'Testnet lane allocation';
   const [account, setAccount] = useState<LiveAccount | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
+  const [copyLeaderStatus, setCopyLeaderStatus] = useState<CopyLeaderStatus | null>(null);
   const [laneSeries, setLaneSeries] = useState<LanePerformanceSeries | null>(null);
   const [mfeRolloutSeries, setMfeRolloutSeries] = useState<LanePerformanceSeries | null>(null);
   // Guards against the view-filter effect and the 5s auto-refresh timer racing: only the result
   // of the MOST RECENTLY STARTED loadExchangeOnly() call is ever applied, so a slower older
   // request can't resolve after a newer one and overwrite fresher wallet/position/P&L state.
   const exchangeLoadSeqRef = useRef(0);
+  const copyLeaderLoadSeqRef = useRef(0);
   // Server-side cache/coalescing protects Binance too, but this client guard stops a cold-start
   // 418 from continually repainting the same error until the server's advertised cooldown ends.
   const liveRateLimitUntilRef = useRef(0);
@@ -1591,6 +1638,22 @@ export default function TestnetExchangeDashboard() {
     }
   }
 
+  async function loadCopyLeaderStatus() {
+    if (isLivePage) {
+      setCopyLeaderStatus(null);
+      return;
+    }
+    const seq = ++copyLeaderLoadSeqRef.current;
+    try {
+      const next = await fetchJson<CopyLeaderStatus>(`${pageApiPrefix}/live/copy-leader-executor`);
+      if (seq !== copyLeaderLoadSeqRef.current) return;
+      setCopyLeaderStatus(next);
+    } catch {
+      if (seq !== copyLeaderLoadSeqRef.current) return;
+      setCopyLeaderStatus(null);
+    }
+  }
+
   // Regime engine report — report-only, market-wide (lives on the TESTNET instance). Loaded
   // INDEPENDENTLY of the exchange fetches so a live-endpoint hiccup can never skip it — that
   // was why the panel could stay blank on /live. Shown identically on both /testnet and /live.
@@ -1913,6 +1976,15 @@ export default function TestnetExchangeDashboard() {
     }, exchangeRefreshMs);
     return () => window.clearInterval(timer);
   }, [autoRefresh, performanceView, performanceDay, performanceMonth, performanceYear, performanceRegime, exchangeRefreshMs]);
+
+  useEffect(() => {
+    void loadCopyLeaderStatus();
+    if (!autoRefresh || isLivePage) return undefined;
+    const timer = window.setInterval(() => {
+      void loadCopyLeaderStatus();
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, isLivePage, pageApiPrefix]);
 
   // Regime panel loads on its own cadence, independent of the exchange fetches (so it shows
   // on /live even if a live endpoint hiccups). Refreshes every 15s.
@@ -2310,6 +2382,48 @@ export default function TestnetExchangeDashboard() {
       <p className="tone-measure" style={{ margin: '0 14px 10px', fontSize: 12 }}>
         {pageScope} — reads only `{pageApiPrefix}/live/status` and `{pageApiPrefix}/live/account`; Binance positions are netted per symbol (one exchange position can carry multiple mirrored source entries).
       </p>
+
+      {!isLivePage && (
+        <section className="testnet-panel">
+          <header>
+            <span>Copy Leader Sleeve</span>
+            <strong className={copyLeaderStatus?.armed ? 'tone-healthy' : 'tone-warning'}>
+              {copyLeaderStatus?.armed ? 'ARMED / TESTNET' : copyLeaderStatus?.enabled ? 'BLOCKED / WAITING' : 'DISABLED'}
+            </strong>
+          </header>
+          {!copyLeaderStatus ? (
+            <p className="tone-warning" style={{ margin: '4px 0' }}>Effective Copy Leader state is unavailable.</p>
+          ) : (
+            <>
+              <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
+                Destination: {copyLeaderStatus.destinationEndpoint ?? 'not configured'} · poll {copyLeaderStatus.pollMs ?? '—'}ms · stale cutoff {copyLeaderStatus.stalenessMs ?? '—'}ms · owner positions {copyLeaderStatus.ownerPositions?.length ?? 0} · P&amp;L {signed(copyLeaderStatus.ownerPnl?.allTime)}.
+              </p>
+              {copyLeaderStatus.reason && <p className="tone-warning" style={{ margin: '4px 0' }}>{copyLeaderStatus.reason}</p>}
+              {copyLeaderStatus.configErrors?.map((message) => (
+                <p key={message} className="tone-critical" style={{ margin: '4px 0' }}>CONFIG INEFFECTIVE: {message}</p>
+              ))}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, margin: '6px 0' }}>
+                <small>available {copyLeaderStatus.sleeve?.availableBalanceUsd != null ? `${copyLeaderStatus.sleeve.availableBalanceUsd.toFixed(2)} USDT` : '—'}</small>
+                <small>sleeve cap {copyLeaderStatus.sleeve?.sleeveMarginBudgetUsd != null ? `${copyLeaderStatus.sleeve.sleeveMarginBudgetUsd.toFixed(2)} USDT` : '—'}</small>
+                <small>gross cap {copyLeaderStatus.sleeve?.totalGrossCapUsd != null ? `${copyLeaderStatus.sleeve.totalGrossCapUsd.toFixed(2)} USDT` : '—'}</small>
+                <small>per-symbol cap {copyLeaderStatus.sleeve?.perSymbolGrossCapUsd != null ? `${copyLeaderStatus.sleeve.perSymbolGrossCapUsd.toFixed(2)} USDT` : '—'}</small>
+              </div>
+              <div style={{ display: 'grid', gap: 4 }}>
+                {copyLeaderStatus.leaders?.map((leader) => (
+                  <div key={leader.id} style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'baseline' }}>
+                    <strong>{leader.name}</strong>
+                    <small>{leader.tier} · {Math.round(leader.sleeveShare * 100)}% · budget {leader.budgetMarginUsd != null ? `${leader.budgetMarginUsd.toFixed(2)} USDT` : '—'}</small>
+                    <span className={leader.state.startsWith('ARMED') || leader.state === 'EXECUTING' ? 'tone-healthy' : 'tone-warning'}>{leader.state}</span>
+                    <small>coverage {leader.coverage?.coveragePct != null ? `${leader.coverage.coveragePct.toFixed(2)}% (${leader.coverage.eligibleEventCount}/${leader.coverage.sourceEventCount})` : 'pending'}</small>
+                    {leader.stateReason && <small className="tone-warning">{leader.stateReason}</small>}
+                  </div>
+                ))}
+              </div>
+              {copyLeaderStatus.lastError && <p className="tone-critical" style={{ margin: '6px 0 0' }}>{copyLeaderStatus.lastError}</p>}
+            </>
+          )}
+        </section>
+      )}
 
       {showTestnetEngineControls && (
       <section className="testnet-panel">

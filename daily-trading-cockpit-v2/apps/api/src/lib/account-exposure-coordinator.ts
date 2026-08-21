@@ -179,6 +179,9 @@ export interface ExposureReservation {
   /** committedQty * the actual avgPrice Binance confirmed. */
   committedNotionalUsd?: number;
   committedAt?: string;
+  /** Quantity already closed by the owning executor.  Kept alongside the
+   * original committedQty so the reservation remains a truthful fill audit. */
+  releasedQty?: number;
   releasedAt?: string;
   /** e.g. "ENTRY_FAILED:<message>", "FRESH_POSITION_EXISTS", "RECONCILED_NOT_FILLED",
    *  "RECONCILED_NEVER_REACHED_EXCHANGE". */
@@ -368,6 +371,16 @@ export interface AccountExposureCoordinatorOptions {
    *  pre-existing asymmetry vs. computeClusterOpenSymbols) — wiring this only improves visibility,
    *  never removes it. */
   getLegacyMirrorOpenIntents?: () => ReadonlyArray<LegacyMirrorOpenIntent>;
+  /** A separately-owned execution sleeve (for example the Testnet-only Copy
+   * Leader sleeve) can report positions here.  They become an explicit managed
+   * source before S4, preventing the shared account snapshot from mistaking
+   * them for operator/manual exposure or double-counting them. */
+  getAdditionalManagedPositions?: () => ReadonlyArray<{
+    symbol: string;
+    direction: "LONG" | "SHORT";
+    qty: number;
+    entryPrice: number;
+  }>;
   nowIso?: () => string;
   maxGrossExposureUsd?: () => number;
   maxLongExposureUsd?: () => number;
@@ -391,6 +404,12 @@ export class AccountExposureCoordinator {
   private readonly getSingleSymbolExecutors: () => ReadonlyArray<SingleSymbolLaneExecutor | null>;
   private readonly getCrossSectionalExecutors: () => ReadonlyArray<CrossSectionalExecutor | null>;
   private readonly getLegacyMirrorOpenIntents: () => ReadonlyArray<LegacyMirrorOpenIntent>;
+  private readonly getAdditionalManagedPositions: () => ReadonlyArray<{
+    symbol: string;
+    direction: "LONG" | "SHORT";
+    qty: number;
+    entryPrice: number;
+  }>;
   private readonly nowIsoFn: () => string;
   private readonly maxGrossExposureUsdFn: () => number;
   private readonly maxLongExposureUsdFn: () => number;
@@ -417,6 +436,7 @@ export class AccountExposureCoordinator {
     this.getSingleSymbolExecutors = opts.getSingleSymbolExecutors;
     this.getCrossSectionalExecutors = opts.getCrossSectionalExecutors;
     this.getLegacyMirrorOpenIntents = opts.getLegacyMirrorOpenIntents ?? (() => []);
+    this.getAdditionalManagedPositions = opts.getAdditionalManagedPositions ?? (() => []);
     this.nowIsoFn = opts.nowIso ?? (() => new Date().toISOString());
     this.maxGrossExposureUsdFn = opts.maxGrossExposureUsd ?? maxGrossExposureUsd;
     this.maxLongExposureUsdFn = opts.maxLongExposureUsd ?? maxLongExposureUsd;
@@ -469,6 +489,7 @@ export class AccountExposureCoordinator {
     const singleSymbolExecutors = this.getSingleSymbolExecutors();
     const crossSectionalExecutors = this.getCrossSectionalExecutors();
     const legacyIntents = this.getLegacyMirrorOpenIntents();
+    const additionalManagedPositions = this.getAdditionalManagedPositions();
 
     // Base per-symbol map: S1+S2 (existing, proven helper — reused verbatim).
     const perSymbolUsd = computeNotionalPerSymbol(singleSymbolExecutors, crossSectionalExecutors);
@@ -551,6 +572,25 @@ export class AccountExposureCoordinator {
       addCluster(intent.symbol, intent.direction);
       concurrentCount += 1;
     }
+    // S3b — explicitly-owned external sleeves.  They are structurally the
+    // same account risk as S1/S2, but their ownership ledger is intentionally
+    // separate from Kronos strategy executors.  Count them here and subtract
+    // them from S4 below so the exchange snapshot cannot classify them as
+    // manual/external risk a second time.
+    for (const position of additionalManagedPositions) {
+      const symbol = position.symbol.toUpperCase();
+      if (!symbol || !Number.isFinite(position.qty) || !Number.isFinite(position.entryPrice)) continue;
+      const qty = Math.abs(position.qty);
+      const usd = qty * Math.abs(position.entryPrice);
+      if (qty <= 1e-9 || usd <= 0) continue;
+      claimedSymbols.add(symbol);
+      grossUsd += usd;
+      if (position.direction === "LONG") longUsd += usd;
+      else shortUsd += usd;
+      addPerSymbol(symbol, usd);
+      addCluster(symbol, position.direction);
+      concurrentCount += 1;
+    }
     // S4 — manual/external exposure: real positionAmt minus whatever S1+S2 already claim on that
     // symbol (computeExternalManagedNetQty, reused verbatim — the SAME subtraction
     // LiveExecutionEngine.reconcile() already performs at live-execution-engine.ts:3487). Bounded by
@@ -558,6 +598,12 @@ export class AccountExposureCoordinator {
     // ≤30s bound every other sharedGetPositions() consumer already tolerates, not a new staleness
     // class this file introduces.
     const claimedNetQty = computeExternalManagedNetQty(crossSectionalExecutors, singleSymbolExecutors);
+    for (const position of additionalManagedPositions) {
+      if (!Number.isFinite(position.qty) || Math.abs(position.qty) <= 1e-9) continue;
+      const symbol = position.symbol.toUpperCase();
+      const signed = position.direction === "LONG" ? Math.abs(position.qty) : -Math.abs(position.qty);
+      claimedNetQty.set(symbol, (claimedNetQty.get(symbol) ?? 0) + signed);
+    }
     for (const [symbol, pos] of this.positionSnapshot) {
       const claimed = claimedNetQty.get(symbol) ?? 0;
       const manualQty = pos.positionAmt - claimed;
@@ -887,6 +933,31 @@ export class AccountExposureCoordinator {
     record.status = "RELEASED";
     record.releasedAt = this.nowIsoFn();
     record.releaseReason = reason;
+    this.store.save();
+  }
+
+  /**
+   * Preserve the committed fill record while recording a later owned close.
+   * Capacity does not read COMMITTED rows (the live owner position is counted
+   * instead), so this is an audit/reconciliation transition rather than a new
+   * capacity path.  Partial closes stay COMMITTED with releasedQty; only a
+   * fully closed reservation transitions to RELEASED.
+   */
+  releaseCommittedReservation(reservationId: string, closedQty: number, reason: string): void {
+    if (!Number.isFinite(closedQty) || closedQty <= 1e-9) return;
+    const record = this.store.getState().reservations.find((r) => r.reservationId === reservationId);
+    if (!record || record.status !== "COMMITTED") return;
+    const committed = Math.max(0, record.committedQty ?? 0);
+    const alreadyReleased = Math.max(0, record.releasedQty ?? 0);
+    const remaining = Math.max(0, committed - alreadyReleased);
+    const applied = Math.min(remaining, closedQty);
+    if (applied <= 1e-9) return;
+    record.releasedQty = alreadyReleased + applied;
+    record.releaseReason = reason;
+    if (remaining - applied <= 1e-9) {
+      record.status = "RELEASED";
+      record.releasedAt = this.nowIsoFn();
+    }
     this.store.save();
   }
 

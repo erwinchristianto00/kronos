@@ -46,6 +46,7 @@ import {
 import type { InnovationCampaignDiagnostics } from "../lib/innovation-campaign.js";
 import type { SingleSymbolPriceTimelineService } from "../lib/single-symbol-price-timeline.js";
 import type { FuturesReferenceHealthSnapshot } from "../lib/futures-reference-health.js";
+import type { CopyLeaderExecutor } from "../lib/copy-leader-executor.js";
 import { REGIME_AUTOPILOT_PRESETS, type RegimeAutopilot } from "../lib/regime-autopilot.js";
 import { getShortFadeStore, buildShortFadeReport, SF_PAPER_LANE_ID } from "../lib/short-fade-edge.js";
 import { getIntradayMomentumStore, buildIntradayMomentumReport, IM_PAPER_LANE_ID } from "../lib/intraday-momentum-edge.js";
@@ -1139,6 +1140,9 @@ export async function registerLiveRoutes(
   opts: {
     configErrors?: string[];
     crossSectionalExecutor?: () => CrossSectionalExecutor | null;
+    /** Testnet-only direct Copy Leader sleeve.  Getter keeps this route a
+     * read-only effective-state view and avoids constructing any executor. */
+    copyLeaderExecutor?: () => CopyLeaderExecutor | null;
     /** API-owned V1 circuit-breaker state; presentation only, never recalculated by the dashboard. */
     symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
     // 2026-07-08: two more instances (TREND_BETA_VOL / MIXED_MEAN_REVERSION), wired alongside the
@@ -1242,6 +1246,19 @@ export async function registerLiveRoutes(
       unifiedOrchestrator: opts.unifiedOrchestrator?.()?.getStatus() ?? null,
       unifiedProposalSource: opts.unifiedProposalStore?.()?.getStatus() ?? null,
     };
+  });
+
+  app.get("/api/live/copy-leader-executor", async () => {
+    const executor = opts.copyLeaderExecutor?.() ?? null;
+    if (!executor) {
+      return {
+        strategy: "COPY_LEADER",
+        enabled: false,
+        armed: false,
+        reason: "Copy Leader sleeve is not configured on this runtime (it is structurally Testnet-only)",
+      };
+    }
+    return executor.getStatus();
   });
 
   app.get("/api/live/futures-reference-health", async (request, reply) => {
