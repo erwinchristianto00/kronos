@@ -391,6 +391,7 @@ import { spotSymbolForCandles, buildWinnersCounterfactualReport } from "../lib/c
 import { buildRegimeAxisTimeline } from "../lib/regime-axis-timeline.js";
 import { buildTpSweepReport } from "../lib/cross-sectional-tp-sweep.js";
 import { CrossSectionalExecutorStore } from "../lib/cross-sectional-executor.js";
+import type { SymbolReliabilityFormationDecision, SymbolReliabilitySnapshot } from "../lib/cross-sectional-symbol-reliability.js";
 import { buildNarrativeTiltReport } from "../lib/narrative-tags.js";
 import {
   isNewCoinRadarEnabled,
@@ -491,6 +492,10 @@ export async function registerShadowRoutes(
     liveEngineGetter?: () => { getStatus: () => unknown } | null;
     /** Testnet only: prevents a newly ranked FILTERED basket from reusing a live losing leg. */
     crossSectionalReentryBlocksGetter?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
+    /** Actual-fill Reliability V1 snapshot; this is the only path allowed to quarantine a symbol-side. */
+    symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
+    /** Returns true only after formation provenance is durable; false holds a new V1 basket. */
+    symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
     /** Lazy getter for the four-brain shadow tick's metrics aggregator (created after this
      *  registration, inside app.ts's `if (!isTest)` block, on instances that even construct it).
      *  null on any instance where four-brain shadow mode has never enabled (fail-open — see the
@@ -2935,6 +2940,8 @@ export async function registerShadowRoutes(
             regimeContext: crossSectionalRegimeContext,
             axisScore,
             filteredEntryBlocks: opts.crossSectionalReentryBlocksGetter,
+            symbolReliabilitySnapshotGetter: opts.symbolReliabilitySnapshotGetter,
+            symbolReliabilityDecisionRecorder: opts.symbolReliabilityDecisionRecorder,
             // spotSymbolForCandles: 1000x-multiplier futures contracts (1000PEPEUSDT, …) have no
             // spot pair under that name — fetch the bare spot symbol instead. Returns are price
             // RATIOS, so the 1000x scaling cancels; the rest of the pipeline (scoring, allowlist

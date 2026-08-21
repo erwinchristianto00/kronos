@@ -17,6 +17,15 @@ import { clusterOf, isMajorCluster } from "./correlation-clusters.js";
 import { recordRejectedBasket } from "./rejected-basket-recorder.js";
 import { evaluateMarketStandDown, standDownThresholdPct } from "./market-drawdown-standdown.js";
 import {
+  isCrossSectionalSymbolReliabilityEnabled,
+  reliabilityStatusFor,
+  type SymbolReliabilityFormationCandidate,
+  type SymbolReliabilityFormationDecision,
+  type SymbolReliabilityPersistence,
+  type SymbolReliabilitySide,
+  type SymbolReliabilitySnapshot,
+} from "./cross-sectional-symbol-reliability.js";
+import {
   isCrossSectionalSmartBasketLifecycleEnabled,
   isCrossSectionalSmartFormationRerankEnabled,
   type CrossSectionalFormationMode,
@@ -567,6 +576,8 @@ export interface CrossSectionalObservation {
   formationMode?: CrossSectionalFormationMode;
   /** Present only when Smart Formation utility reranking actually selected the basket. */
   smartFormation?: CrossSectionalSmartFormation | null;
+  /** Frozen Symbol Reliability V1 provenance. It is eligibility-only and never alters MOM36 scores. */
+  symbolReliability?: SymbolReliabilityFormationDecision | null;
   exitReason?: CrossSectionalExitReason | null;
   /** Return on deployed capital after market-beta cancels = the cross-sectional dispersion. */
   grossReturn: number | null;
@@ -1881,6 +1892,10 @@ export async function runCrossSectionalCycle(opts: {
   axisScore?: number | null;
   /** Execution-owned blocks for losing same-symbol/same-side open exposure. */
   filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
+  /** Actual-fill, independent-episode circuit-breaker state. Null/unavailable blocks new V1 formation. */
+  symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
+  /** Returns true only after a reliability decision is durable; otherwise a would-be basket is held. */
+  symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
 }): Promise<CrossSectionalCycleResult> {
   const result: CrossSectionalCycleResult = { opened: 0, resolved: 0, expired: 0 };
   const nowIso = new Date(opts.now).toISOString();
@@ -2014,7 +2029,60 @@ export async function runCrossSectionalCycle(opts: {
       result.standDownMarketReturn = standDown.marketReturn;
     }
     const rerankEnabled = isCrossSectionalSmartFormationRerankEnabled();
-    const basket = (liquidityStarved || standDown.standDown) ? null : buildFilteredCrossSectionalBasket(adaptiveRanked, {
+    const baseLongBlocks = new Set(dynamicBlocks.longBlocklist);
+    const baseShortBlocks = new Set([...adaptive.shortBlocklist, ...dynamicBlocks.shortBlocklist]);
+    let reliabilitySnapshot: SymbolReliabilitySnapshot | null = null;
+    let reliabilityReadError: string | null = null;
+    try {
+      reliabilitySnapshot = opts.symbolReliabilitySnapshotGetter?.() ?? null;
+    } catch (error) {
+      reliabilitySnapshot = null;
+      reliabilityReadError = error instanceof Error && error.message ? error.message : "snapshot getter threw";
+    }
+    const reliabilityEnabled = isCrossSectionalSymbolReliabilityEnabled();
+    const reliabilityPersistence: SymbolReliabilityPersistence = reliabilitySnapshot?.persistence ?? {
+      status: "UNAVAILABLE",
+      source: null,
+      reason: reliabilityReadError ?? "reliability snapshot was not supplied by the runtime",
+      recoveredAt: null,
+    };
+    // A missing/corrupt durability record is not equivalent to a lack of evidence.  The latter
+    // preserves baseline eligibility; the former must not release a previously quarantined side.
+    const reliabilityUnavailable = reliabilityEnabled && reliabilityPersistence.status === "UNAVAILABLE";
+    const quarantinedLong = new Set(
+      reliabilityEnabled
+        ? (reliabilitySnapshot?.quarantined ?? []).filter((row) => row.side === "LONG").map((row) => row.symbol)
+        : [],
+    );
+    const quarantinedShort = new Set(
+      reliabilityEnabled
+        ? (reliabilitySnapshot?.quarantined ?? []).filter((row) => row.side === "SHORT").map((row) => row.symbol)
+        : [],
+    );
+    const candidateList = (
+      side: SymbolReliabilitySide,
+      blocked: ReadonlySet<string>,
+    ): SymbolReliabilityFormationCandidate[] => {
+      const allowlist = side === "LONG" ? longAllow : shortAllow;
+      const sorted = adaptiveRanked
+        .filter((candidate) => allowed(candidate.symbol, allowlist, blocked))
+        .sort((a, b) => side === "LONG" ? b.score - a.score : a.score - b.score);
+      return sorted.map((candidate) => {
+        const status = reliabilityStatusFor(reliabilitySnapshot, candidate.symbol, side);
+        return {
+          symbol: candidate.symbol,
+          side,
+          score: candidate.score,
+          status: status?.status ?? "INSUFFICIENT_DATA",
+          diagnosticScore: status?.diagnosticScore ?? null,
+          eligible: !reliabilityUnavailable,
+          reason: reliabilityUnavailable
+            ? "reliability persistence unavailable: " + (reliabilityPersistence.reason ?? "unknown reason") + "; new formation held"
+            : status?.reason ?? "reliability snapshot unavailable; INSUFFICIENT_DATA, no intervention",
+        };
+      });
+    };
+    const buildOpts = {
       k: CROSS_SECTIONAL_K,
       longK: skew?.longK,
       shortK: skew?.shortK,
@@ -2023,17 +2091,116 @@ export async function runCrossSectionalCycle(opts: {
       horizonMs: CROSS_SECTIONAL_HORIZON_MS,
       regimeContext,
       longAllowlist: longAllow,
-      longBlocklist: new Set(dynamicBlocks.longBlocklist),
       shortAllowlist: shortAllow,
-      shortBlocklist: new Set([...adaptive.shortBlocklist, ...dynamicBlocks.shortBlocklist]),
       volBySymbol,
-      formationMode: rerankEnabled ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36",
+      formationMode: (rerankEnabled ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36") as CrossSectionalFormationMode,
       smartFormation: {
         enabled: rerankEnabled,
         axisScore: opts.axisScore ?? null,
       },
-      onGapReject: recordRejectedBasket,
+    };
+    const baselineGap = { value: null as CrossSectionalGapRejection | null };
+    const baseline = (liquidityStarved || standDown.standDown) ? null : buildFilteredCrossSectionalBasket(adaptiveRanked, {
+      ...buildOpts,
+      longBlocklist: baseLongBlocks,
+      shortBlocklist: baseShortBlocks,
+      onGapReject: (info) => { baselineGap.value = info; },
     });
+    const finalGap = { value: null as CrossSectionalGapRejection | null };
+    const finalLongBlocks = new Set([...baseLongBlocks, ...quarantinedLong]);
+    const finalShortBlocks = new Set([...baseShortBlocks, ...quarantinedShort]);
+    const candidateBasket = (liquidityStarved || standDown.standDown) ? null : buildFilteredCrossSectionalBasket(adaptiveRanked, {
+      ...buildOpts,
+      longBlocklist: finalLongBlocks,
+      shortBlocklist: finalShortBlocks,
+      onGapReject: (info) => {
+        finalGap.value = info;
+        recordRejectedBasket(info);
+      },
+    });
+    let basket = reliabilityUnavailable ? null : candidateBasket;
+    if (reliabilityEnabled) {
+      const selectedBefore = {
+        LONG: baseline?.longLeg.map((leg) => leg.symbol) ?? [],
+        SHORT: baseline?.shortLeg.map((leg) => leg.symbol) ?? [],
+      };
+      const selectedAfter = {
+        LONG: basket?.longLeg.map((leg) => leg.symbol) ?? [],
+        SHORT: basket?.shortLeg.map((leg) => leg.symbol) ?? [],
+      };
+      const replacements: SymbolReliabilityFormationDecision["replacements"] = [];
+      for (const side of ["LONG", "SHORT"] as const) {
+        const removed = selectedBefore[side].filter((symbol) => !selectedAfter[side].includes(symbol));
+        const added = selectedAfter[side].filter((symbol) => !selectedBefore[side].includes(symbol));
+        for (let index = 0; index < removed.length; index++) {
+          replacements.push({ side, removed: removed[index]!, replacement: added[index] ?? null });
+        }
+      }
+      const scoreGapAfter = candidateBasket?.scoreGap ?? finalGap.value?.scoreGap ?? null;
+      let decision: SymbolReliabilityFormationDecision = {
+        version: "SYMBOL_RELIABILITY_V1",
+        evaluatedAt: reliabilitySnapshot?.evaluatedAt ?? nowIso,
+        evaluationId: reliabilitySnapshot?.evaluationId ?? "sr-v1-unavailable",
+        persistence: { ...reliabilityPersistence },
+        sourceObservationId: `xsec:${CROSS_SECTIONAL_FILTERED_SIGNAL}:${opts.now}`,
+        decision: reliabilityUnavailable
+          ? "NO_TRADE_OTHER"
+          : basket
+          ? "PASS"
+          : finalGap.value
+            ? "NO_TRADE_SCORE_GAP"
+            : "NO_TRADE_INSUFFICIENT_ELIGIBLE",
+        candidateListBefore: {
+          LONG: candidateList("LONG", baseLongBlocks),
+          SHORT: candidateList("SHORT", baseShortBlocks),
+        },
+        candidateListAfter: {
+          LONG: candidateList("LONG", finalLongBlocks),
+          SHORT: candidateList("SHORT", finalShortBlocks),
+        },
+        quarantined: (reliabilitySnapshot?.quarantined ?? []).map((row) => ({ ...row })),
+        selectedBefore,
+        selectedAfter,
+        replacements,
+        scoreGapBefore: baseline?.scoreGap ?? baselineGap.value?.scoreGap ?? null,
+        scoreGapAfter,
+        scoreGapFloor: CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
+        diagnosticsBySymbolSide: (reliabilitySnapshot?.statuses ?? []).map((row) => ({
+          symbol: row.symbol,
+          side: row.side,
+          status: row.status,
+          diagnosticScore: row.diagnosticScore,
+          independentN: row.independentN,
+          meanContribution: row.meanContribution,
+          profitFactor: row.profitFactor,
+          cvar5: row.cvar5,
+          winnerToLoserDamageRate: row.winnerToLoserDamageRate,
+          reason: row.reason,
+        })),
+      };
+      let decisionPersisted = false;
+      try {
+        decisionPersisted = opts.symbolReliabilityDecisionRecorder?.(decision) === true;
+      } catch (error) {
+        console.error(
+          "[cross-sectional] RELIABILITY PERSISTENCE ERROR: formation decision could not be recorded; new basket held: " +
+          (error instanceof Error && error.message ? error.message : "unknown recorder failure"),
+        );
+      }
+      if (!decisionPersisted && basket) {
+        console.error(
+          "[cross-sectional] RELIABILITY PERSISTENCE UNAVAILABLE: formation decision is not durable; new basket held",
+        );
+        decision = {
+          ...decision,
+          decision: "NO_TRADE_OTHER",
+          selectedAfter: { LONG: [], SHORT: [] },
+          replacements: [],
+        };
+        basket = null;
+      }
+      if (basket) basket.symbolReliability = decision;
+    }
     if (basket) {
       opts.store.add(basket);
       result.opened += 1;
@@ -2091,6 +2258,8 @@ export async function runCrossSectionalCycleGuarded(opts: {
   regimeContext?: CrossSectionalRegimeContext | null;
   axisScore?: number | null;
   filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
+  symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
+  symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
 }): Promise<CrossSectionalCycleResult | null> {
   if (cycleRunning) return null;
   cycleRunning = true;

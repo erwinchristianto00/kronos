@@ -15,8 +15,9 @@ import {
   type CrossSectionalAdaptiveExitMode,
   type CrossSectionalFormationMode,
 } from "./cross-sectional-runtime-mode.js";
+import { symbolReliabilityPolicyFingerprint } from "./cross-sectional-symbol-reliability.js";
 
-export const CURRENT_POLICY_FINGERPRINT_SCHEMA = "CURRENT_POLICY_FORWARD_COHORT_V2" as const;
+export const CURRENT_POLICY_FINGERPRINT_SCHEMA = "CURRENT_POLICY_FORWARD_COHORT_V3" as const;
 
 type RuntimeConfigState = "EFFECTIVE" | "CONFIG_INEFFECTIVE";
 
@@ -63,6 +64,7 @@ export type CrossSectionalPolicyFingerprint = {
     entryRevalidationEnabled: boolean;
     entryHealthBypassed: boolean;
   };
+  reliability: ReturnType<typeof symbolReliabilityPolicyFingerprint>;
   execution: CrossSectionalExitPolicySnapshot;
 };
 
@@ -193,6 +195,7 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
       entryRevalidationEnabled: isCrossSectionalSmartBasketLifecycleEnabled(env),
       entryHealthBypassed: env.CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH === "1",
     },
+    reliability: symbolReliabilityPolicyFingerprint(env),
     execution: currentCrossSectionalExitPolicy(env),
   };
   const policyId = `xsec-${createHash("sha256").update(JSON.stringify(body)).digest("hex").slice(0, 16)}`;

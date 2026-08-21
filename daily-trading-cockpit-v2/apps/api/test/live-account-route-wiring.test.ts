@@ -6,6 +6,7 @@ import type { LiveExecutionEngine } from "../src/lib/live-execution-engine.js";
 import { BinanceFuturesPrivateError } from "../src/lib/binance-futures-private.js";
 import type { CrossSectionalExecutor, ExecutorBasket } from "../src/lib/cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor, SingleSymbolPosition } from "../src/lib/single-symbol-lane-executor.js";
+import type { SymbolReliabilitySnapshot } from "../src/lib/cross-sectional-symbol-reliability.js";
 
 /**
  * 2026-07-09 audit finding: routes/live.ts's registerLiveRoutes() builds allCrossSectionalExecutors()/
@@ -67,6 +68,7 @@ function fakeXsecExecutor(laneId: string, symbol: string): CrossSectionalExecuto
   };
   return {
     getStatus: () => ({ laneId, openBaskets: [basket] }),
+    getRegimeSkewCounterfactual: () => null,
     getClosedSummary: () => ({ closedCount: 0, wins: 0, losses: 0, realizedPnlUsd: 0, feesUsd: 0, symbols: [], lastClosedAt: null }),
     getClosedBaskets: () => [],
   } as unknown as CrossSectionalExecutor;
@@ -160,6 +162,42 @@ describe("registerLiveRoutes — /api/live/account wires ALL 5 executor instance
     expect(res.statusCode).toBe(200);
     const row = res.json().positions.find((p: { symbol: string }) => p.symbol === "AUSDT");
     expect(row.laneIds).toEqual(["CROSS_SECTIONAL_MARKET_NEUTRAL"]);
+  });
+});
+
+describe("registerLiveRoutes — Symbol Reliability V1 runtime contract", () => {
+  it("returns the API-owned snapshot beside the executor status rather than requiring dashboard inference", async () => {
+    const snapshot: SymbolReliabilitySnapshot = {
+      version: "SYMBOL_RELIABILITY_V1",
+      enabled: true,
+      persistence: { status: "HEALTHY", source: "PRIMARY", reason: null, recoveredAt: null },
+      evidenceContract: "ACTUAL_NO_TP_HOLD_36H_INDEPENDENT_EPISODES_V1",
+      evaluatedAt: "2026-08-21T00:00:00.000Z",
+      evaluationId: "sr-v1-route-test",
+      evaluationCycle: 1,
+      evidenceChanged: false,
+      independentEpisodes: 0,
+      eligibleBaskets: 0,
+      excludedBaskets: {},
+      minimumIndependentEpisodes: 8,
+      statuses: [],
+      quarantined: [],
+      lastFormationDecision: null,
+    };
+    const fakeEngine = {
+      getAccountSnapshot: async () => fakeAccountSnapshot(),
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+    } as unknown as LiveExecutionEngine;
+    app = Fastify();
+    await registerLiveRoutes(app, fakeEngine, {
+      crossSectionalExecutor: () => fakeXsecExecutor("CROSS_SECTIONAL_MARKET_NEUTRAL", "AUSDT"),
+      symbolReliabilitySnapshotGetter: () => snapshot,
+    });
+    await app.ready();
+
+    const response = await app.inject({ method: "GET", url: "/api/live/cross-sectional-executor" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().symbolReliability).toEqual(snapshot);
   });
 });
 

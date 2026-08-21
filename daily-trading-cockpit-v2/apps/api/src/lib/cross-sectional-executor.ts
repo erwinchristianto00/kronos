@@ -33,6 +33,7 @@ import {
   type CrossSectionalPolicyFingerprint,
 } from "./cross-sectional-policy.js";
 import type { CrossSectionalFormationMode } from "./cross-sectional-runtime-mode.js";
+import { isCrossSectionalSymbolReliabilityEnabled } from "./cross-sectional-symbol-reliability.js";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
@@ -1349,6 +1350,7 @@ export interface CrossSectionalEntryAdmissionEvent {
  */
 export type CrossSectionalEntryAttemptStage =
   | "ENTRY_ADMISSION"
+  | "RELIABILITY"
   | "FOUR_BRAIN_BRIDGE"
   | "LOSS_REENTRY_GUARD"
   | "OVERLAP_GUARD"
@@ -4352,6 +4354,24 @@ export class CrossSectionalExecutor {
       .sort((a: CrossSectionalObservation, b: CrossSectionalObservation) => b.openedAtMs - a.openedAtMs);
     const signal = candidates[0];
     if (!signal) return;
+
+    // Reliability belongs to formation, not a late per-leg mutation.  Once V1 is active, an
+    // unannotated FILTERED signal necessarily predates the deployment and must not slip through
+    // as a supposedly V3 basket. Existing positions are never touched; the next fresh formation
+    // carries a frozen reliability decision and a durable store state. Existing positions are
+    // never touched; an old or non-durable formation must not be promoted into a new V1 basket.
+    if (
+      targetVariant === "FILTERED" &&
+      isCrossSectionalSymbolReliabilityEnabled() &&
+      (
+        signal.symbolReliability?.version !== "SYMBOL_RELIABILITY_V1" ||
+        !signal.symbolReliability.persistence ||
+        signal.symbolReliability.persistence.status === "UNAVAILABLE"
+      )
+    ) {
+      this.skipSignal(signal, "RELIABILITY", "signal lacks a durable SYMBOL_RELIABILITY_V1 formation decision; waiting for a fresh annotated Plain MOM36 basket");
+      return;
+    }
 
     const entryAdmission = this.entryAdmissionForSignal(signal);
     if (!entryAdmission.allowed) {

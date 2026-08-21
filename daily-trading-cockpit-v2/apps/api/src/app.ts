@@ -42,7 +42,8 @@ import {
   crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
 import { crossSectionalExecTickMs } from "./lib/cross-sectional-policy.js";
-import { buildCrossSectionalReport, CROSS_SECTIONAL_FILTERED_SIGNAL, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import { buildCrossSectionalReport, CROSS_SECTIONAL_FILTERED_SIGNAL, CROSS_SECTIONAL_UNIVERSE, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import { CrossSectionalSymbolReliabilityStore } from "./lib/cross-sectional-symbol-reliability.js";
 import {
   SingleSymbolLaneExecutor,
   SingleSymbolLaneExecutorStore,
@@ -1081,6 +1082,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   let probeFuturesReferenceHealth:
     | ((symbols: string[]) => Promise<FuturesReferenceHealthSnapshot | null>)
     | null = null;
+  let crossSectionalExecutorStore: CrossSectionalExecutorStore | null = null;
+  const crossSectionalSymbolReliabilityStore = new CrossSectionalSymbolReliabilityStore();
+  const currentSymbolReliabilitySnapshot = () => crossSectionalSymbolReliabilityStore.evaluate({
+    baskets: crossSectionalExecutorStore?.getState().baskets ?? [],
+    universe: [...CROSS_SECTIONAL_UNIVERSE],
+    nowMs: Date.now(),
+  });
   // 2026-07-08: two more instances mirroring TREND_BETA_VOL / MIXED_MEAN_REVERSION, alongside the
   // FILTERED foundation instance above (see cross-sectional-executor.ts's targetVariant/laneId).
   let crossSectionalTrendExecutor: CrossSectionalExecutor | null = null;
@@ -1236,6 +1244,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         shortBlocklist: blocks.filter((block) => block.side === "SHORT").map((block) => block.symbol),
       };
     },
+    symbolReliabilitySnapshotGetter: currentSymbolReliabilitySnapshot,
+    symbolReliabilityDecisionRecorder: (decision) => crossSectionalSymbolReliabilityStore.recordFormationDecision(decision),
     kronosClient,
     fourBrainMetricsGetter: () => fourBrainMetricsRef?.summary() ?? null,
     fourBrainRecentDecisionsGetter: () => fourBrainRecentDecisionsRef?.getAll() ?? null,
@@ -1326,18 +1336,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           eligible ? undefined : "not an active USD-M USDT perpetual in exchangeInfo",
         );
         if (!eligible) continue;
-        // Do not consume or age the short-lived sizing cache from a dashboard
-        // GET. This direct, public USD-M probe is diagnostic only; cache hit/miss
-        // and stale counters remain an honest record of actual sizing activity.
-        const mark = await liveClient.getMarkPrice(symbol).catch(() => null);
-        const markUsable = typeof mark === "number" && Number.isFinite(mark) && mark > 0;
-        if (markUsable) {
-          futuresReferenceHealthTracker.recordReferenceObserved({
+        const reference = await futuresMarketReferenceCache.refresh(symbol);
+        if (!reference) {
+          futuresReferenceHealthTracker.recordReferenceUnavailable(
             symbol,
-            price: mark,
-            atMs: Date.now(),
-            source: "USD_M_MARK_PRICE",
-          });
+            "USD-M mark and two-sided book unavailable after exchangeInfo eligibility passed",
+          );
+          continue;
+        }
+        futuresReferenceHealthTracker.recordReferenceUsed(reference);
+        if (reference.source === "USD_M_MARK_PRICE") {
           const book = await liveClient.getBookTicker(symbol).catch(() => null);
           const bid = book?.bid ?? null;
           const ask = book?.ask ?? null;
@@ -1345,29 +1353,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
             typeof bid === "number" && Number.isFinite(bid) && bid > 0 &&
             typeof ask === "number" && Number.isFinite(ask) && ask >= bid
           ) {
-            futuresReferenceHealthTracker.recordMarkBookComparison(symbol, mark, (bid + ask) / 2);
+            futuresReferenceHealthTracker.recordMarkBookComparison(symbol, reference.price, (bid + ask) / 2);
           }
-          continue;
         }
-        const book = await liveClient.getBookTicker(symbol).catch(() => null);
-        const bid = book?.bid ?? null;
-        const ask = book?.ask ?? null;
-        if (
-          typeof bid === "number" && Number.isFinite(bid) && bid > 0 &&
-          typeof ask === "number" && Number.isFinite(ask) && ask >= bid
-        ) {
-          futuresReferenceHealthTracker.recordReferenceObserved({
-            symbol,
-            price: (bid + ask) / 2,
-            atMs: Date.now(),
-            source: "USD_M_BOOK_TICKER",
-          });
-          continue;
-        }
-        futuresReferenceHealthTracker.recordReferenceUnavailable(
-          symbol,
-          "USD-M mark and two-sided book unavailable after exchangeInfo eligibility passed",
-        );
       }
       return futuresReferenceHealthTracker.snapshot(symbols);
     };
@@ -2261,10 +2249,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // trade real money. Consumes the same store the measurement lane writes.
     if (isCrossSectionalExecEnabled()) {
       const engineForGate = liveEngine;
+      crossSectionalExecutorStore = new CrossSectionalExecutorStore();
       crossSectionalExecutor = new CrossSectionalExecutor({
         client: liveClient,
         signalStore: getCrossSectionalStore(),
-        store: new CrossSectionalExecutorStore(),
+        store: crossSectionalExecutorStore,
         // 2026-07-20 real-money audit fix (round 2): the first pass only swapped canOpenNewEntries()
         // for the manual-directional-blind variant, but every isAllowed() branch still ANDed
         // laneSelectionAllowsLane()/allowsCrossSectionalLane() — both of which ALSO route through
@@ -4608,6 +4597,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   await registerLiveRoutes(app, liveEngine, {
     configErrors: liveConfig.enabled ? liveConfig.configErrors : [],
     crossSectionalExecutor: () => crossSectionalExecutor,
+    symbolReliabilitySnapshotGetter: currentSymbolReliabilitySnapshot,
     crossSectionalTrendExecutor: () => crossSectionalTrendExecutor,
     crossSectionalMixedExecutor: () => crossSectionalMixedExecutor,
     directionalRegimeDecision: () => crossSectionalDirectionalDecisionRef(),

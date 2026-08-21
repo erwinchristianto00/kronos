@@ -30,6 +30,7 @@ import {
   isCrossSectionalBasketReportingExcluded,
   type CrossSectionalExecutor,
 } from "../lib/cross-sectional-executor.js";
+import type { SymbolReliabilitySnapshot } from "../lib/cross-sectional-symbol-reliability.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
 import {
   CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
@@ -1138,6 +1139,8 @@ export async function registerLiveRoutes(
   opts: {
     configErrors?: string[];
     crossSectionalExecutor?: () => CrossSectionalExecutor | null;
+    /** API-owned V1 circuit-breaker state; presentation only, never recalculated by the dashboard. */
+    symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
     // 2026-07-08: two more instances (TREND_BETA_VOL / MIXED_MEAN_REVERSION), wired alongside the
     // original FILTERED foundation instance above. Optional/independent — either can be absent
     // (e.g. disabled, or an older deploy) without affecting the other's routes.
@@ -1853,7 +1856,11 @@ export async function registerLiveRoutes(
     }
     // 2026-07-12 (profitability Stage 3): attach the report-only regime-skew counterfactual so the
     // operator can see whether CROSS_SECTIONAL_REGIME_SKEW's same-direction tilt is being rewarded.
-    return { ...executor.getStatus(), regimeSkewCounterfactual: executor.getRegimeSkewCounterfactual() };
+    return {
+      ...executor.getStatus(),
+      regimeSkewCounterfactual: executor.getRegimeSkewCounterfactual(),
+      symbolReliability: opts.symbolReliabilitySnapshotGetter?.() ?? null,
+    };
   });
 
   // Testnet-only emergency/operator close for the ORIGINAL market-neutral executor.
