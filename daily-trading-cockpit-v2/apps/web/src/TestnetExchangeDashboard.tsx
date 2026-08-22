@@ -1715,10 +1715,15 @@ export default function TestnetExchangeDashboard() {
     if (closeBusy) return;
     const busyKey = `xsec:${laneId}:${basket.basketId}`;
     const net = basket.lastNetReturn == null ? 'tidak tersedia' : `${basket.lastNetReturn >= 0 ? '+' : ''}${(basket.lastNetReturn * 100).toFixed(3)}% setelah estimasi biaya`;
+    const netAtMs = basket.lastNetAt == null ? Number.NaN : Date.parse(basket.lastNetAt);
+    const netStale = !Number.isFinite(netAtMs) || Date.now() - netAtMs > 15 * 60_000;
+    const netDisclosure = netStale
+      ? `Net basket terakhir: ${net} (STALE — cek P&L live sebelum klik).`
+      : `Net basket saat ini: ${net}.`;
     const liveLegs = basket.legs.filter((leg) => leg.exitOrderId == null).length;
     if (!window.confirm(
       `Close SELURUH basket ${label} (${basket.basketId}) sekarang?\n\n` +
-      `${liveLegs} leg yang masih tercatat akan ditutup dengan MARKET reduce-only. Net saat ini: ${net}.\n\n` +
+      `${liveLegs} leg yang masih tercatat akan ditutup dengan MARKET reduce-only. ${netDisclosure}\n\n` +
       'Ini tidak menutup basket lain atau posisi directional/single-symbol.',
     )) return;
     setCloseBusy(busyKey);
