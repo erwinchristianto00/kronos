@@ -547,7 +547,9 @@ function localMonthInput(date = new Date()): string {
 type XsecExitPolicy = {
   executionCapHours?: number | null;
   takeProfitEnabled?: boolean;
+  takeProfitNetReturn?: number | null;
   stopLossEnabled?: boolean;
+  stopLossNetReturn?: number | null;
   adaptiveExitsEnabled?: boolean;
 };
 
@@ -564,6 +566,11 @@ type XsecOpenBasket = {
   lastNetReturn?: number | null;
   lastNetAt?: string | null;
   legs: Array<{ symbol: string; side: string; exitOrderId: string | null }>;
+  operatorException?: {
+    kind: 'OPERATOR_ACCEPTED_MISSING_LEG';
+    reason: string;
+    missingLegs: Array<{ symbol: string; side: string }>;
+  } | null;
 };
 
 type XsecExecStatus = {
@@ -2518,11 +2525,23 @@ export default function TestnetExchangeDashboard() {
           {xsecInstances.some(({ status: xs }) => (xs?.openBaskets ?? []).length > 0) && (
             <div style={{ margin: '6px 0', fontSize: 12 }}>
               {xsecInstances.flatMap(({ label, status: xs }) => (xs?.openBaskets ?? []).map((b) => {
-                const tp = xs?.tpNetReturnPct ?? null;
+                // An open basket keeps the exit policy it was born with.  Do not let a
+                // later runtime policy change make an old NoTP basket look as though it
+                // has a new TP target (or vice versa).
+                const basketExitPolicy = b.policyFingerprint?.execution ?? xs?.legacyExitPolicy ?? null;
+                const basketTpEnabled = basketExitPolicy?.takeProfitEnabled ?? !xs?.tpDisabled;
+                const tp = basketTpEnabled
+                  ? (basketExitPolicy?.takeProfitNetReturn ?? (xs?.tpNetReturnPct == null ? null : xs.tpNetReturnPct / 100))
+                  : null;
                 const net = b.lastNetReturn != null ? b.lastNetReturn * 100 : null;
-                const gap = tp != null && net != null ? tp - net : null;
-                const sl = xs?.stopNetReturnPct ?? null;
-                const slGap = sl != null && net != null ? net + sl : null;
+                const tpPct = tp == null ? null : tp * 100;
+                const gap = tpPct != null && net != null ? tpPct - net : null;
+                const basketStopEnabled = basketExitPolicy?.stopLossEnabled ?? xs?.stopNetReturnPct != null;
+                const sl = basketStopEnabled
+                  ? (basketExitPolicy?.stopLossNetReturn ?? (xs?.stopNetReturnPct == null ? null : xs.stopNetReturnPct / 100))
+                  : null;
+                const slPct = sl == null ? null : sl * 100;
+                const slGap = slPct != null && net != null ? net + slPct : null;
                 // Keep the established compact row layout, but derive its countdown from the policy
                 // frozen for this basket. `closesAtMs` is the research measurement horizon, not always
                 // the executor's HORIZON cap; the complete source/time remains available on hover.
@@ -2531,6 +2550,9 @@ export default function TestnetExchangeDashboard() {
                 const openedAt = taipeiDateTime(b.openedAt);
                 const closesAt = taipeiDateTime(horizon.closeAtMs);
                 const closeLabel = horizon.earlyExitPossible ? 'batas close' : 'tutup';
+                const missing = b.operatorException?.missingLegs ?? [];
+                const actualLegs = b.legs.length;
+                const expectedLegs = actualLegs + missing.length;
                 // Stale = the 5-min TP tick hasn't stamped in >15m. A basket younger than
                 // 15m legitimately has no stamp yet — warning there is a false alarm.
                 const oldEnough = Date.now() - new Date(b.openedAt).getTime() > 15 * 60_000;
@@ -2538,9 +2560,12 @@ export default function TestnetExchangeDashboard() {
                 return (
                   <div key={b.basketId} style={{ display: 'flex', gap: 14, padding: '2px 0', flexWrap: 'wrap' }}>
                     <span className="tone-measure">[{label}] {b.basketId}</span>
+                    {missing.length > 0 && <span className="tone-warning" title={b.operatorException?.reason}>
+                      pengecualian operator · {actualLegs}/{expectedLegs} leg nyata · {missing.map((leg) => `${leg.symbol} ${leg.side}`).join(', ')} tidak dibuka
+                    </span>}
                     <span>net <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong></span>
-                    <span>ke TP <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{xs?.tpDisabled ? 'TP mati' : gap == null ? '—' : `${gap.toFixed(2)}pp (${tp?.toFixed(1)}%)`}</strong></span>
-                    <span>ke stop <strong className={slGap != null && slGap <= 0 ? 'tone-critical' : ''}>{sl == null ? 'stop mati' : slGap == null ? '—' : `${slGap.toFixed(2)}pp (-${sl.toFixed(1)}%)`}</strong></span>
+                    <span>ke TP <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{!basketTpEnabled ? 'TP mati' : gap == null ? '—' : `${gap.toFixed(2)}pp (${tpPct?.toFixed(1)}%)`}</strong></span>
+                    <span>ke stop <strong className={slGap != null && slGap <= 0 ? 'tone-critical' : ''}>{!basketStopEnabled ? 'stop mati' : slGap == null ? '—' : `${slGap.toFixed(2)}pp (-${slPct?.toFixed(1)}%)`}</strong></span>
                     <span className="tone-measure">buka {openedAt == null ? '—' : `${openedAt} Taipei`}</span>
                     <span
                       className="tone-measure"

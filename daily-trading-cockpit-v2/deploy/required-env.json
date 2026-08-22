@@ -28,8 +28,8 @@
       "why": "Retained only as an explicit dormant numeric value. TP is disabled by the separate boolean; deleting this key would silently revive the 0.60% default if that boolean ever drifted."
     },
     "CROSS_SECTIONAL_EXEC_TP_DISABLED": {
-      "value": "1",
-      "why": "Must be explicit. The numeric key alone never disables TP; new baskets use Hold to the 36h execution cap. Existing pre-cutover baskets keep their separately pinned legacy TP."
+      "value": "0",
+      "why": "Full 6% net take-profit is enabled for newly admitted baskets. The numeric target stays explicitly pinned below; baskets already open retain their frozen exit contract."
     },
     "CROSS_SECTIONAL_SMART_BASKET_V1": {
       "value": "1",
@@ -122,6 +122,14 @@
     "CROSS_SECTIONAL_EXEC_TICK_MS": {
       "value": "60000",
       "why": "Executor tick. Was a hardcoded 5 minutes, so a fresh signal waited ~150s on average before anything looked at it \u2014 measured end to end at 239.8s live / 229.9s testnet, almost all of it this interval. No gate is weakened by being asked sooner; the tick is idempotent and single-flighted. Bounded 15s-5m in code."
+    },
+    "CROSS_SECTIONAL_POLICY_VERSION": {
+      "value": "full-tp6-entry-integrity-v1",
+      "why": "Explicit policy identity for the full-TP 6% cutover plus maker-entry integrity repair. It prevents new forward evidence from being mixed with the prior NoTP policy."
+    },
+    "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
+      "value": "2026-08-22T02:23:39Z",
+      "why": "Forward-cohort boundary for the full-TP 6% / entry-integrity policy. Prior-policy rows remain in history but are not model-selection evidence for this policy."
     }
   },
   "instances": {

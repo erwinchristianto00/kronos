@@ -763,6 +763,30 @@ export interface PlannedLeg {
 }
 
 /**
+ * A one-off, explicitly approved reduced-geometry basket. This is deliberately
+ * not a normal execution state: the regular entry path must still either prove
+ * every planned fill or roll the basket back. It exists solely to preserve an
+ * already-open set of real exchange legs after an operator chooses to accept a
+ * verified historical missing leg rather than flatten the whole basket.
+ *
+ * The exception is immutable audit data. It is surfaced with the open basket
+ * and excluded from policy-selection evidence, while its actual realized P&L
+ * remains visible in account accounting once it closes.
+ */
+export type OperatorAcceptedPartialBasketException = {
+  kind: "OPERATOR_ACCEPTED_MISSING_LEG";
+  approvedAt: string;
+  reason: string;
+  missingLegs: Array<{
+    planIndex: number;
+    symbol: string;
+    side: "LONG" | "SHORT";
+    requestedQty: number;
+    entryClientOrderId: string;
+  }>;
+};
+
+/**
  * Per-token realized P&L for CLOSED baskets, plus when each basket opened and closed.
  *
  * Built for the operator question "which TOKEN actually made or lost the money in this basket" —
@@ -1054,6 +1078,8 @@ export interface ExecutorBasket {
    *  never retroactively assigned an invented tilt share. */
   cortexAppliedWeightPct?: number;
   cortexRawStaticWeightPct?: number;
+  /** See OperatorAcceptedPartialBasketException. Normal basket admission never writes this. */
+  operatorException?: OperatorAcceptedPartialBasketException | null;
   /**
    * A deliberate operator void for reporting/learning only.  The executed Binance orders and
    * every fill remain in their raw audit stores; ordinary P&L, timeline, edge, and promotion
@@ -1108,10 +1134,11 @@ export function currentPolicyForwardCohort(
 
   for (const basket of baskets) {
     if (basket.status !== "CLOSED" && basket.status !== "ABORTED") {
-      if (basket.policyFingerprint?.policyId === currentPolicy.policyId) currentOpenN += 1;
+      if (!basket.operatorException && basket.policyFingerprint?.policyId === currentPolicy.policyId) currentOpenN += 1;
       continue;
     }
     if (basket.status === "ABORTED") { exclude("ABORTED"); continue; }
+    if (basket.operatorException) { exclude("OPERATOR_ACCEPTED_REDUCED_GEOMETRY"); continue; }
     if (basket.accountingStatus === "ACCOUNTING_INCOMPLETE") { exclude("ACCOUNTING_INCOMPLETE"); continue; }
     if (isCrossSectionalBasketReportingExcluded(basket)) { exclude("REPORTING_EXCLUDED"); continue; }
     if (!basket.policyFingerprint) { exclude("LEGACY_NO_FINGERPRINT"); continue; }
@@ -2339,10 +2366,19 @@ export class CrossSectionalExecutor {
       makerQty: decision.filledQty, takerQty: decision.fallbackQty,
     };
 
-    if (decision.action !== "FALLBACK_TAKER") {
-      // DONE, or UNKNOWN_REQUERY — in which case no fallback may be sized. Returning the maker
-      // order's own numbers lets the caller's existing partial-fill handling book exactly what the
-      // exchange confirmed and orphan nothing it cannot see.
+    if (decision.action === "UNKNOWN_REQUERY") {
+      // Do NOT turn a non-terminal/unknown maker order into a planned fill.  In particular,
+      // `executedQty === 0` is not permission for the outer loop to substitute requestedQty:
+      // doing that fabricates a leg, marks a 5/6 basket COMPLETE, and leaves real directional
+      // exposure behind.  The outer loop already owns the one safe next step: reconcile by the
+      // durable client id, then either adopt a proven fill, wait, or roll the basket back.
+      this.store.save();
+      throw new Error(`${planned.symbol}: maker entry status is inconclusive (${decision.reason}); no fallback sent`);
+    }
+
+    if (decision.action === "DONE") {
+      // The maker order is terminal/full. Returning its actual values lets the caller book only
+      // what the exchange confirmed; this is never the UNKNOWN_REQUERY branch above.
       this.store.save();
       return { orderId: maker.orderId, entryOrderIds: [maker.orderId], avgPrice: latest.avgPrice, executedQty: latest.executedQty };
     }
@@ -2611,6 +2647,9 @@ export class CrossSectionalExecutor {
       b.accountingStatus !== "ACCOUNTING_INCOMPLETE" &&
       !isCrossSectionalBasketReportingExcluded(b),
     );
+    // A verified operator-approved reduced basket has known cash P&L, so it stays in the
+    // operational realized summary below. It is nevertheless not a clean 3L/3S observation.
+    const cleanClosed = closed.filter((basket) => !basket.operatorException);
     const openBaskets = st.baskets.filter((b) => this.isBasketLive(b));
     const targetVariant = this.targetVariant;
     const nowMs = new Date(this.nowIso()).getTime();
@@ -2678,8 +2717,8 @@ export class CrossSectionalExecutor {
       currentPolicyFingerprint,
       currentPolicyForwardCohort: currentPolicyForward,
       accountingCounts: {
-        cleanN: closed.length,
-        quarantinedN: st.baskets.filter((basket) => basket.status === "CLOSED" && (basket.accountingStatus === "ACCOUNTING_INCOMPLETE" || isCrossSectionalBasketReportingExcluded(basket))).length,
+        cleanN: cleanClosed.length,
+        quarantinedN: st.baskets.filter((basket) => basket.status === "CLOSED" && (basket.accountingStatus === "ACCOUNTING_INCOMPLETE" || isCrossSectionalBasketReportingExcluded(basket) || Boolean(basket.operatorException))).length,
         rejectedN: this.rejectedBasketCount(),
       },
       dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),

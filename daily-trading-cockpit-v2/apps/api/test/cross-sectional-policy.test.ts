@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCurrentCrossSectionalPolicyFingerprint,
+  currentCrossSectionalExitPolicy,
   effectiveCrossSectionalRuntime,
 } from "../src/lib/cross-sectional-policy.js";
 
@@ -78,5 +79,29 @@ describe("cross-sectional effective runtime policy", () => {
     expect(disabled.reliability.enabled).toBe(false);
     expect(enabled.reliability.enabled).toBe(true);
     expect(enabled.policyId).not.toBe(disabled.policyId);
+  });
+
+  it("enables the explicit full 6% TP only for policy snapshots created under that policy", () => {
+    const prior = currentCrossSectionalExitPolicy({
+      CROSS_SECTIONAL_EXEC_TP_DISABLED: "1",
+      CROSS_SECTIONAL_EXEC_TP_NET_RETURN: "0.06",
+      CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS: "36",
+    } as NodeJS.ProcessEnv);
+    const current = currentCrossSectionalExitPolicy({
+      CROSS_SECTIONAL_EXEC_TP_DISABLED: "0",
+      CROSS_SECTIONAL_EXEC_TP_NET_RETURN: "0.06",
+      CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS: "36",
+    } as NodeJS.ProcessEnv);
+
+    expect(prior).toMatchObject({
+      takeProfitEnabled: false,
+      takeProfitNetReturn: null,
+      executionCapHours: 36,
+    });
+    expect(current).toMatchObject({
+      takeProfitEnabled: true,
+      takeProfitNetReturn: 0.06,
+      executionCapHours: 36,
+    });
   });
 });

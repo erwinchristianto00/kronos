@@ -1025,6 +1025,67 @@ describe("[LIVE-TICK RECONCILIATION] an ambiguous entry-leg failure reconciles a
     expect(store.getState().baskets).toHaveLength(1); // never opened a second, duplicate basket
   });
 
+  it("[MAKER-UNKNOWN] a non-terminal post-only re-query never becomes a fake requested-quantity fill or a COMPLETE basket", async () => {
+    const prior = {
+      makerEntry: process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED,
+      makerWait: process.env.CROSS_SECTIONAL_MAKER_WAIT_MS,
+    };
+    process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = "1";
+    process.env.CROSS_SECTIONAL_MAKER_WAIT_MS = "1000";
+    try {
+      const client = new FakeExecClient() as FakeExecClient & {
+        cancelOrder: (symbol: string, orderId: string) => Promise<void>;
+      };
+      const placedById = new Map<string, { symbol: string; quantity: number }>();
+      let seq = 0;
+      const exchangeOrder = (symbol: string, orderId: string, quantity: number, status: string, executedQty: number, avgPrice: number): FuturesOrder => ({
+        symbol, orderId, clientOrderId: "", status, type: "LIMIT", side: "BUY", reduceOnly: false,
+        price: 0, stopPrice: 0, origQty: quantity, executedQty, avgPrice, updateTime: NOW_MS,
+      });
+      client.cancelOrder = async () => {};
+      client.placeOrder = async (params) => {
+        client.placed.push(params);
+        const orderId = `maker-${++seq}`;
+        placedById.set(orderId, { symbol: params.symbol, quantity: params.quantity });
+        const filled = params.symbol === "SOLUSDT";
+        return exchangeOrder(params.symbol, orderId, params.quantity, filled ? "FILLED" : "NEW", filled ? params.quantity : 0, filled ? 100 : 0);
+      };
+      client.queryOrder = async (symbol, orderId) => {
+        const placed = placedById.get(orderId)!;
+        const filled = symbol === "SOLUSDT";
+        return exchangeOrder(symbol, orderId, placed.quantity, filled ? "FILLED" : "NEW", filled ? placed.quantity : 0, filled ? 100 : 0);
+      };
+      client.queryOrderByClientId = async (symbol, clientOrderId) =>
+        exchangeOrder(symbol, `requery-${clientOrderId}`, symbol === "DOGEUSDT" ? 250 : 1, "NEW", 0, 0);
+
+      const { executor, store } = makeExecutor({
+        client,
+        signalMs: NOW_MS - 5 * 60_000,
+        readPublicQuote: (symbol) => symbol === "SOLUSDT"
+          ? { bid: 99.99, ask: 100.01, mid: 100, atMs: NOW_MS, venue: "TEST_BOOK" }
+          : { bid: 0.0999, ask: 0.1001, mid: 0.1, atMs: NOW_MS, venue: "TEST_BOOK" },
+      });
+
+      await executor.tick();
+
+      const basket = store.getState().baskets[0]!;
+      expect(basket.status).toBe("PARTIALLY_FILLED");
+      expect(basket.legs.map((leg) => leg.symbol)).toEqual(["SOLUSDT"]);
+      expect(basket.plan![1]).toMatchObject({
+        symbol: "DOGEUSDT",
+        status: "PLACING",
+        makerOutcome: { action: "UNKNOWN_REQUERY", makerQty: 0, takerQty: 0 },
+      });
+      expect(client.placed.filter((order) => order.symbol === "DOGEUSDT" && order.type === "MARKET")).toHaveLength(0);
+      expect(executor.getStatus().lastError).toMatch(/maker entry status is inconclusive/);
+    } finally {
+      if (prior.makerEntry === undefined) delete process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED;
+      else process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = prior.makerEntry;
+      if (prior.makerWait === undefined) delete process.env.CROSS_SECTIONAL_MAKER_WAIT_MS;
+      else process.env.CROSS_SECTIONAL_MAKER_WAIT_MS = prior.makerWait;
+    }
+  });
+
   it("[BLOCK RETRY] while an ambiguous leg's reservation stays outstanding (INCONCLUSIVE), the REAL AccountExposureCoordinator's single-flight-per-symbol gate rejects any fresh reservation attempt on the SAME symbol — from a brand-new basket, a sibling instance, or a SingleSymbolLaneExecutor — while leaving other symbols unaffected", async () => {
     const reservationStore = new AccountExposureReservationStore(tmpDir());
     const coordinator = new AccountExposureCoordinator({
