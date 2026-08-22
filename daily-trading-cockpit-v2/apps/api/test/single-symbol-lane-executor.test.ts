@@ -235,6 +235,9 @@ function makeExecutor(opts: {
   legUsd?: number;
   maxOpenPositions?: number;
   dailyMaxLossUsd?: number;
+  makerEntry?: boolean;
+  makerEntryWaitMs?: number;
+  readPublicQuote?: (symbol: string) => { bid: number | null; ask: number | null; mid: number; atMs: number; venue: string } | null;
   exitPolicy?: ReturnType<typeof makeFixedRewardExitPolicy>;
   portfolioExitPolicy?: SingleSymbolExitPolicy;
   existingNotionalForSymbol?: (symbol: string) => number;
@@ -278,6 +281,9 @@ function makeExecutor(opts: {
     dailyMaxLossUsd: () => opts.dailyMaxLossUsd ?? 0,
     nowIso: () => NOW,
     fillConfirmRetryDelayMs: 0,
+    ...(opts.makerEntry !== undefined ? { makerEntry: () => opts.makerEntry! } : {}),
+    ...(opts.makerEntryWaitMs !== undefined ? { makerEntryWaitMs: () => opts.makerEntryWaitMs! } : {}),
+    ...(opts.readPublicQuote ? { readPublicQuote: opts.readPublicQuote } : {}),
     existingNotionalForSymbol: opts.existingNotionalForSymbol ?? (() => 0),
     maxNotionalPerSymbolAcrossLanes: () => opts.maxNotionalPerSymbolAcrossLanes ?? 0,
     existingClusterOpenSymbols: opts.existingClusterOpenSymbols ?? (() => new Set<string>()),
@@ -1995,6 +2001,33 @@ describe("SingleSymbolLaneExecutor — own-lot P&L attribution", () => {
     expect(reported.pnlAttribution).toBe("OWN_LOT");
     expect(reported.pnlAttributionComplete).toBe(true);
     expect(executor.getStatus().totalNetPnlUsd).toBeCloseTo(-100.05, 9);
+  });
+});
+
+describe("[SS-MAKER-CANCEL-CONFIRM] bounded cancel confirmation never fabricates an open position", () => {
+  it("keeps the durable handle and books no position while Binance still reports NEW after cancel", async () => {
+    const client = new FakeClient() as FakeClient & {
+      cancelOrder: (symbol: string, orderId: string) => Promise<void>;
+    };
+    client.cancelOrder = async () => {};
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [signal()],
+      legUsd: 1_000,
+      makerEntry: true,
+      makerEntryWaitMs: 1_000,
+      currentPrice: 60_000,
+      readPublicQuote: () => ({ bid: 59_990, ask: 60_010, mid: 60_000, atMs: Date.now(), venue: "TEST_BOOK" }),
+    });
+
+    await executor.tick();
+
+    // The old caller converted executedQty=0 to requested qty and created an OPEN position here.
+    // The only honest state is an unresolved order handle, recoverable by client id next tick.
+    expect(store.getState().positions).toHaveLength(0);
+    expect(store.getState().pendingMakerEntries ?? []).toHaveLength(1);
+    expect(client.placed.filter((order) => order.timeInForce === "GTX")).toHaveLength(1);
+    expect(client.placed.filter((order) => order.type === "MARKET")).toHaveLength(0);
   });
 });
 

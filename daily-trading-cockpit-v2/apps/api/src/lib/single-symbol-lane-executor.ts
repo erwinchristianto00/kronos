@@ -43,6 +43,7 @@ import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder } from "./execution-fill-recorder.js";
 import { makerLimitPrice, resolveMakerLeg, signedMakerEntryQtyBySymbol } from "./maker-entry-plan.js";
+import { confirmMakerCancel, isTerminalMakerOrderStatus } from "./maker-cancel-confirmation.js";
 import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
 import type { FourBrainBridgeCandidate, FourBrainBridgeDecision } from "./four-brain-testnet-bridge.js";
 import type { PositionPathRecorder } from "./position-path-recorder.js";
@@ -1192,7 +1193,6 @@ export class SingleSymbolLaneExecutor {
     const maker = await this.client.placeOrder({
       symbol, side, type: "LIMIT", timeInForce: "GTX", price: limitPrice, quantity: qty, newClientOrderId: clientOrderId,
     });
-    const TERMINAL = ["FILLED", "CANCELED", "EXPIRED", "REJECTED"];
     const waitMs = this.makerEntryWaitMsFn();
     const deadline = this.nowMs() + waitMs;
     // Bounded by poll count as well as by the clock: nowMs() is injectable, and a frozen test clock
@@ -1200,24 +1200,32 @@ export class SingleSymbolLaneExecutor {
     const maxPolls = Math.max(1, Math.ceil(waitMs / 1_000));
     let latest = maker;
     for (let poll = 0; poll < maxPolls; poll++) {
-      if (TERMINAL.includes(String(latest.status).toUpperCase())) break;
+      if (isTerminalMakerOrderStatus(latest.status)) break;
       if (Number.isFinite(latest.executedQty) && latest.executedQty > 0) break; // live and unstopped
       if (this.nowMs() >= deadline) break;
       await new Promise((r) => setTimeout(r, 1_000));
       try { latest = await this.client.queryOrder(symbol, maker.orderId); } catch { break; }
     }
 
-    if (!TERMINAL.includes(String(latest.status).toUpperCase())) {
+    if (!isTerminalMakerOrderStatus(latest.status)) {
       try { await this.client.cancelOrder!(symbol, maker.orderId); } catch { /* already terminal */ }
     }
-    // Cancel, THEN read: the order can fill in the window between the two, and sizing a fallback
-    // from the pre-cancel figure is how that race doubles a position.
-    try { latest = await this.client.queryOrder(symbol, maker.orderId); } catch { /* keep last known */ }
+    // A cancel ACK is not a final order state.  Binance can still report NEW briefly after it
+    // accepts cancellation, so wait through one bounded confirmation window before deciding the
+    // fallback.  If the state remains ambiguous, throw and leave the durable pending handle for
+    // next-tick recovery; returning executedQty=0 here would make the caller fabricate a position.
+    latest = (await confirmMakerCancel(
+      latest,
+      () => this.client.queryOrder(symbol, maker.orderId),
+      { retryDelayMs: this.fillConfirmRetryDelayMs },
+    )).order;
 
     const decision = resolveMakerLeg(qty, latest.status, latest.executedQty);
-    if (decision.action !== "FALLBACK_TAKER") {
-      // DONE, or UNKNOWN_REQUERY — in which case no fallback may be sized at all and the caller
-      // books exactly what the exchange confirmed.
+    if (decision.action === "UNKNOWN_REQUERY") {
+      throw new Error(`${symbol}: maker entry status is inconclusive (${decision.reason}); no fallback sent`);
+    }
+    if (decision.action === "DONE") {
+      // A terminal, confirmed maker outcome is the only non-fallback result we may book.
       return {
         orderId: maker.orderId, avgPrice: latest.avgPrice, executedQty: latest.executedQty,
         liquidity: { makerQty: decision.filledQty, takerQty: 0, reason: decision.reason },

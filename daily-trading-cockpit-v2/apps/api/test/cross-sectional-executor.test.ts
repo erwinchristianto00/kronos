@@ -1043,6 +1043,7 @@ describe("[LIVE-TICK RECONCILIATION] an ambiguous entry-leg failure reconciles a
         price: 0, stopPrice: 0, origQty: quantity, executedQty, avgPrice, updateTime: NOW_MS,
       });
       client.cancelOrder = async () => {};
+      let dogeCancelEventuallyVisible = false;
       client.placeOrder = async (params) => {
         client.placed.push(params);
         const orderId = `maker-${++seq}`;
@@ -1053,10 +1054,25 @@ describe("[LIVE-TICK RECONCILIATION] an ambiguous entry-leg failure reconciles a
       client.queryOrder = async (symbol, orderId) => {
         const placed = placedById.get(orderId)!;
         const filled = symbol === "SOLUSDT";
-        return exchangeOrder(symbol, orderId, placed.quantity, filled ? "FILLED" : "NEW", filled ? placed.quantity : 0, filled ? 100 : 0);
+        const dogeTerminal = symbol === "DOGEUSDT" && dogeCancelEventuallyVisible;
+        return exchangeOrder(
+          symbol,
+          orderId,
+          placed.quantity,
+          filled ? "FILLED" : dogeTerminal ? "CANCELED" : "NEW",
+          filled ? placed.quantity : 0,
+          filled ? 100 : 0,
+        );
       };
       client.queryOrderByClientId = async (symbol, clientOrderId) =>
-        exchangeOrder(symbol, `requery-${clientOrderId}`, symbol === "DOGEUSDT" ? 250 : 1, "NEW", 0, 0);
+        exchangeOrder(
+          symbol,
+          `requery-${clientOrderId}`,
+          symbol === "DOGEUSDT" ? 250 : 1,
+          symbol === "DOGEUSDT" && dogeCancelEventuallyVisible ? "CANCELED" : "NEW",
+          0,
+          0,
+        );
 
       const { executor, store } = makeExecutor({
         client,
@@ -1078,6 +1094,153 @@ describe("[LIVE-TICK RECONCILIATION] an ambiguous entry-leg failure reconciles a
       });
       expect(client.placed.filter((order) => order.symbol === "DOGEUSDT" && order.type === "MARKET")).toHaveLength(0);
       expect(executor.getStatus().lastError).toMatch(/maker entry status is inconclusive/);
+
+      // The delayed cancel becomes visible on a later tick. Recovery must finish this SAME plan
+      // with one MARKET remainder, never a second GTX and never a permanent 1/2 basket.
+      dogeCancelEventuallyVisible = true;
+      await executor.tick();
+      expect(basket.status).toBe("COMPLETE");
+      expect(basket.legs.map((leg) => leg.symbol).sort()).toEqual(["DOGEUSDT", "SOLUSDT"]);
+      expect(client.placed.filter((order) => order.symbol === "DOGEUSDT" && order.timeInForce === "GTX")).toHaveLength(1);
+      expect(client.placed.filter((order) => order.symbol === "DOGEUSDT" && order.type === "MARKET")).toHaveLength(1);
+    } finally {
+      if (prior.makerEntry === undefined) delete process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED;
+      else process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = prior.makerEntry;
+      if (prior.makerWait === undefined) delete process.env.CROSS_SECTIONAL_MAKER_WAIT_MS;
+      else process.env.CROSS_SECTIONAL_MAKER_WAIT_MS = prior.makerWait;
+    }
+  });
+
+  it("[MAKER-DROPPED-ACK] adopts a pre-place order whose Binance response was lost instead of submitting a duplicate GTX", async () => {
+    const prior = {
+      makerEntry: process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED,
+      makerWait: process.env.CROSS_SECTIONAL_MAKER_WAIT_MS,
+    };
+    process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = "1";
+    process.env.CROSS_SECTIONAL_MAKER_WAIT_MS = "1000";
+    try {
+      const client = new FakeExecClient() as FakeExecClient & {
+        cancelOrder: (symbol: string, orderId: string) => Promise<void>;
+      };
+      let seq = 0;
+      const order = (symbol: string, orderId: string, quantity: number, status: string, executedQty: number, avgPrice: number): FuturesOrder => ({
+        symbol, orderId, clientOrderId: "", status, type: "LIMIT", side: "BUY", reduceOnly: false,
+        price: 0, stopPrice: 0, origQty: quantity, executedQty, avgPrice, updateTime: NOW_MS,
+      });
+      const baseQueryByClientId = client.queryOrderByClientId.bind(client);
+      client.cancelOrder = async () => {};
+      client.placeOrder = async (params) => {
+        client.placed.push(params);
+        const orderId = `${params.symbol}-${params.type}-${++seq}`;
+        // The DOGE GTX really reached Binance. Only its HTTP response is lost to the executor.
+        if (params.symbol === "DOGEUSDT" && params.type === "LIMIT") {
+          throw new Error("transport timeout after Binance accepted GTX");
+        }
+        const price = params.symbol === "SOLUSDT" ? 100 : 0.1;
+        return order(params.symbol, orderId, params.quantity, "FILLED", params.quantity, price);
+      };
+      client.queryOrderByClientId = async (symbol, clientOrderId) => {
+        if (symbol === "DOGEUSDT") {
+          return order(symbol, "doge-lost-ack", 250, "CANCELED", 0, 0);
+        }
+        return baseQueryByClientId(symbol, clientOrderId);
+      };
+      client.queryOrder = async (symbol, orderId) => {
+        if (symbol === "DOGEUSDT") return order(symbol, orderId, 250, "CANCELED", 0, 0);
+        return order(symbol, orderId, 1, "FILLED", 1, 100);
+      };
+
+      const { executor, store } = makeExecutor({
+        client,
+        signalMs: NOW_MS - 5 * 60_000,
+        readPublicQuote: (symbol) => symbol === "SOLUSDT"
+          ? { bid: 99.99, ask: 100.01, mid: 100, atMs: NOW_MS, venue: "TEST_BOOK" }
+          : { bid: 0.0999, ask: 0.1001, mid: 0.1, atMs: NOW_MS, venue: "TEST_BOOK" },
+      });
+
+      await executor.tick();
+
+      const basket = store.getState().baskets[0]!;
+      const dogePlan = basket.plan!.find((leg) => leg.symbol === "DOGEUSDT")!;
+      expect(basket.status).toBe("COMPLETE");
+      expect(basket.legs.map((leg) => leg.symbol).sort()).toEqual(["DOGEUSDT", "SOLUSDT"]);
+      expect(dogePlan.makerRestingOrderId).toBe("doge-lost-ack");
+      expect(dogePlan.makerPlacementAttemptedAt).toBeTruthy();
+      expect(client.placed.filter((placed) => placed.symbol === "DOGEUSDT" && placed.timeInForce === "GTX")).toHaveLength(1);
+      expect(client.placed.filter((placed) => placed.symbol === "DOGEUSDT" && placed.type === "MARKET")).toHaveLength(1);
+    } finally {
+      if (prior.makerEntry === undefined) delete process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED;
+      else process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = prior.makerEntry;
+      if (prior.makerWait === undefined) delete process.env.CROSS_SECTIONAL_MAKER_WAIT_MS;
+      else process.env.CROSS_SECTIONAL_MAKER_WAIT_MS = prior.makerWait;
+    }
+  });
+
+  it("[MAKER-CANCEL-CONFIRM] a transient NEW after cancel resolves to one confirmed fallback in the same basket", async () => {
+    const prior = {
+      makerEntry: process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED,
+      makerWait: process.env.CROSS_SECTIONAL_MAKER_WAIT_MS,
+    };
+    process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = "1";
+    process.env.CROSS_SECTIONAL_MAKER_WAIT_MS = "1000";
+    try {
+      const client = new FakeExecClient() as FakeExecClient & {
+        cancelOrder: (symbol: string, orderId: string) => Promise<void>;
+      };
+      const byOrderId = new Map<string, { symbol: string; quantity: number; type: string | undefined }>();
+      const cancelRequested = new Set<string>();
+      const postCancelReads = new Map<string, number>();
+      let seq = 0;
+      const order = (symbol: string, orderId: string, quantity: number, status: string, executedQty: number, avgPrice: number): FuturesOrder => ({
+        symbol, orderId, clientOrderId: "", status, type: "LIMIT", side: "BUY", reduceOnly: false,
+        price: 0, stopPrice: 0, origQty: quantity, executedQty, avgPrice, updateTime: NOW_MS,
+      });
+      client.placeOrder = async (params) => {
+        client.placed.push(params);
+        const orderId = `prop-${++seq}`;
+        byOrderId.set(orderId, { symbol: params.symbol, quantity: params.quantity, type: params.type });
+        const isMaker = params.type === "LIMIT";
+        const makerFilled = params.symbol === "SOLUSDT";
+        const price = params.symbol === "SOLUSDT" ? 100 : 0.1;
+        return order(
+          params.symbol,
+          orderId,
+          params.quantity,
+          isMaker && !makerFilled ? "NEW" : "FILLED",
+          isMaker && !makerFilled ? 0 : params.quantity,
+          isMaker && !makerFilled ? 0 : price,
+        );
+      };
+      client.cancelOrder = async (_symbol, orderId) => { cancelRequested.add(orderId); };
+      client.queryOrder = async (symbol, orderId) => {
+        const placed = byOrderId.get(orderId)!;
+        if (placed.type !== "LIMIT") {
+          return order(symbol, orderId, placed.quantity, "FILLED", placed.quantity, symbol === "SOLUSDT" ? 100 : 0.1);
+        }
+        if (symbol === "SOLUSDT") return order(symbol, orderId, placed.quantity, "FILLED", placed.quantity, 100);
+        if (!cancelRequested.has(orderId)) return order(symbol, orderId, placed.quantity, "NEW", 0, 0);
+        const reads = (postCancelReads.get(orderId) ?? 0) + 1;
+        postCancelReads.set(orderId, reads);
+        return order(symbol, orderId, placed.quantity, reads === 1 ? "NEW" : "CANCELED", 0, 0);
+      };
+
+      const { executor, store } = makeExecutor({
+        client,
+        signalMs: NOW_MS - 5 * 60_000,
+        readPublicQuote: (symbol) => symbol === "SOLUSDT"
+          ? { bid: 99.99, ask: 100.01, mid: 100, atMs: NOW_MS, venue: "TEST_BOOK" }
+          : { bid: 0.0999, ask: 0.1001, mid: 0.1, atMs: NOW_MS, venue: "TEST_BOOK" },
+      });
+
+      await executor.tick();
+
+      const basket = store.getState().baskets[0]!;
+      const dogePlan = basket.plan!.find((leg) => leg.symbol === "DOGEUSDT")!;
+      expect(basket.status).toBe("COMPLETE");
+      expect(dogePlan.makerOutcome).toMatchObject({ action: "FALLBACK_TAKER", makerQty: 0, takerQty: dogePlan.requestedQty });
+      expect(dogePlan.makerPostCancelConfirmAttempts).toBe(2);
+      expect(client.placed.filter((placed) => placed.symbol === "DOGEUSDT" && placed.timeInForce === "GTX")).toHaveLength(1);
+      expect(client.placed.filter((placed) => placed.symbol === "DOGEUSDT" && placed.type === "MARKET")).toHaveLength(1);
     } finally {
       if (prior.makerEntry === undefined) delete process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED;
       else process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = prior.makerEntry;

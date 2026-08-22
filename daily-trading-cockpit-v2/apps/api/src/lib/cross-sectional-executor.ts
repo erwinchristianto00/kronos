@@ -22,6 +22,7 @@ import {
   type SubmitRef,
 } from "./submit-reference-quote.js";
 import { makerLimitPrice, resolveMakerLeg } from "./maker-entry-plan.js";
+import { confirmMakerCancel, isTerminalMakerOrderStatus } from "./maker-cancel-confirmation.js";
 import {
   buildCurrentCrossSectionalPolicyFingerprint,
   crossSectionalMakerExitWaitMs,
@@ -743,14 +744,24 @@ export interface PlannedLeg {
    *  leave recovery querying the maker id, finding it CANCELED, and never discovering a fallback
    *  order that did reach the exchange — the exact "invisible naked position" this file's
    *  reconciliation was built to prevent. */
-  /** Set by the parallel pre-place pass: the post-only order for this leg is ALREADY resting on
-   *  the exchange. The sequential loop then skips straight to cancel/re-query/fallback instead of
-   *  placing a second one. Persisted because a crash between the pre-place and the loop must leave
-   *  recovery able to find the resting order — which it does via entryClientOrderId, unchanged. */
+  /** Written BEFORE any GTX submit.  If its response is lost, recovery first queries the exact
+   *  client id instead of submitting a second order for the same leg. */
+  makerPlacementAttemptedAt?: string;
+  /** Set by either the parallel pre-place pass or the sequential maker path once Binance returns
+   *  an order id.  The sequential loop then resolves this exact resting order rather than placing
+   *  a second one. Persisted immediately so recovery can continue a normal cancel propagation
+   *  delay instead of turning it into a missing basket leg. */
   makerRestingOrderId?: string;
   /** Limit price the resting order was posted at, kept so a fill whose avgPrice never confirms can
    *  still be booked at the price we actually rested at rather than a guess. */
   makerRestingPrice?: number;
+  /** Timing/audit only. These values show whether a maker order was submitted, when cancel was
+   *  requested, and how many bounded post-cancel reads were needed before its final state became
+   *  visible. They never alter sizing or selection. */
+  makerSubmittedAt?: string;
+  makerCancelRequestedAt?: string;
+  makerTerminalAt?: string;
+  makerPostCancelConfirmAttempts?: number;
   /** submitRef captured at PRE-PLACE time. Without this the loop would stamp it minutes later and
    *  `ageAtSubmitMs` would describe a quote the order never saw. */
   makerSubmitRef?: SubmitRef | null;
@@ -2227,10 +2238,87 @@ export class CrossSectionalExecutor {
    *
    * CRASH SAFETY. planned.status is set to PLACING and SAVED before any order is sent, exactly as
    * the sequential path does, so a crash mid-flight leaves every leg recoverable by
-   * entryClientOrderId. A resting order reconciles as INCONCLUSIVE, which keeps the leg PLACING and
-   * has recoverIncompleteBaskets revisit it — and because the client order id is unchanged, a retry
-   * that re-places is idempotent at the exchange rather than a second position.
+   * entryClientOrderId. A lost submit response is first recovered through that client id before any
+   * later code is allowed to submit again; relying on duplicate-id rejection is not reconciliation.
    */
+  private markMakerEntryPlacementAttempt(planned: PlannedLeg): void {
+    planned.makerPlacementAttemptedAt ??= this.nowIso();
+    this.store.save();
+  }
+
+  /** Persist the exchange identity as soon as the GTX acknowledgement is available.  This is not
+   * report-only: it is the recovery handle that stops a delayed cancel from becoming a second GTX
+   * or a permanently missing leg after a restart. */
+  private rememberMakerEntryOrder(planned: PlannedLeg, order: FuturesOrder, fallbackPrice: number): void {
+    planned.makerPlacementAttemptedAt ??= this.nowIso();
+    planned.makerRestingOrderId = order.orderId;
+    const exchangePrice = Number.isFinite(order.price) && order.price > 0 ? order.price : fallbackPrice;
+    if (Number.isFinite(exchangePrice) && exchangePrice > 0) planned.makerRestingPrice = exchangePrice;
+    planned.makerSubmittedAt ??= this.nowIso();
+    this.store.save();
+  }
+
+  /** Query an acknowledged GTX by order id, falling back to its durable client id only when the
+   * order-id read itself is unavailable.  The fallback is for response propagation, not a licence
+   * to treat a missing order as filled. */
+  private async queryKnownMakerEntry(planned: PlannedLeg, orderId: string): Promise<FuturesOrder> {
+    try {
+      return await this.client.queryOrder(planned.symbol, orderId);
+    } catch (error) {
+      if (!this.client.queryOrderByClientId) throw error;
+      return await this.client.queryOrderByClientId(planned.symbol, planned.entryClientOrderId);
+    }
+  }
+
+  /** If a pre-place request timed out after reaching Binance, adopt that exact order instead of
+   * retrying a GTX with the same client id and hoping the exchange deduplicates it. */
+  private async findExistingMakerEntry(planned: PlannedLeg): Promise<FuturesOrder | null> {
+    if (!this.client.queryOrderByClientId) {
+      throw new Error(
+        `${planned.symbol}: cannot reconcile prior maker entry ${planned.entryClientOrderId}; refusing a duplicate GTX`,
+      );
+    }
+    try {
+      return await this.client.queryOrderByClientId(planned.symbol, planned.entryClientOrderId);
+    } catch (error) {
+      if (this.isOrderNotFound(error)) return null;
+      throw new Error(
+        `${planned.symbol}: cannot verify prior maker entry ${planned.entryClientOrderId}; refusing a duplicate GTX`,
+      );
+    }
+  }
+
+  /** Cancel is asynchronous at the exchange.  After requesting it, wait only through a fixed
+   * confirmation budget for a terminal status; an answer that remains NEW/PARTIALLY_FILLED is
+   * deliberately left for the durable next-tick recovery path, never crossed blind. */
+  private async confirmMakerEntryAfterCancel(planned: PlannedLeg, initial: FuturesOrder): Promise<FuturesOrder> {
+    if (isTerminalMakerOrderStatus(initial.status)) {
+      planned.makerTerminalAt ??= this.nowIso();
+      this.store.save();
+      return initial;
+    }
+    const orderId = planned.makerRestingOrderId ?? initial.orderId;
+    if (!this.client.cancelOrder) {
+      throw new Error(`${planned.symbol}: maker entry cannot be safely cancelled (cancelOrder unavailable)`);
+    }
+    planned.makerCancelRequestedAt ??= this.nowIso();
+    this.store.save();
+    try {
+      await this.client.cancelOrder(planned.symbol, orderId);
+    } catch {
+      // A terminal race is normal. The post-cancel confirmation below, not this ACK, decides.
+    }
+    const confirmation = await confirmMakerCancel(
+      initial,
+      () => this.queryKnownMakerEntry(planned, orderId),
+      { retryDelayMs: this.fillConfirmRetryDelayMs },
+    );
+    planned.makerPostCancelConfirmAttempts = confirmation.attempts;
+    if (confirmation.terminal) planned.makerTerminalAt ??= this.nowIso();
+    this.store.save();
+    return confirmation.order;
+  }
+
   private async preplaceMakerLegs(plan: PlannedLeg[], quoteObserveStartMs: number): Promise<void> {
     const pending = plan.filter((p) => p.status === "PENDING" && !p.makerRestingOrderId);
     if (pending.length === 0) return;
@@ -2261,6 +2349,9 @@ export class CrossSectionalExecutor {
         // No usable book, or a client that cannot cancel: leave this leg entirely to the sequential
         // loop, which will cross for it. Never post what we cannot retract.
         if (limitPrice === null) return;
+        // Persist BEFORE the request. If its response times out after Binance accepted it, the
+        // sequential path must query this client id rather than submit a second post-only order.
+        this.markMakerEntryPlacementAttempt(planned);
         const order = await this.client.placeOrder({
           symbol: planned.symbol,
           side: planned.side === "LONG" ? "BUY" : "SELL",
@@ -2270,8 +2361,7 @@ export class CrossSectionalExecutor {
           quantity: planned.requestedQty,
           newClientOrderId: planned.entryClientOrderId,
         });
-        planned.makerRestingOrderId = order.orderId;
-        planned.makerRestingPrice = limitPrice;
+        this.rememberMakerEntryOrder(planned, order, limitPrice);
       } catch {
         // A rejected or failed pre-place is NOT an error here. The leg keeps status PLACING with no
         // resting id, so the sequential loop treats it exactly as it would have without this pass —
@@ -2288,7 +2378,6 @@ export class CrossSectionalExecutor {
     if (resting.length === 0) return;
     const waitMs = crossSectionalMakerWaitMs();
     const deadline = Date.parse(this.nowIso()) + waitMs;
-    const terminal = new Set(["FILLED", "CANCELED", "EXPIRED", "REJECTED"]);
     // Bounded by POLL COUNT as well as by the clock. nowIso() is injectable, and a frozen or
     // non-advancing clock would otherwise leave this spinning forever — which is exactly what the
     // first run of the parallel test did before this bound existed.
@@ -2296,10 +2385,10 @@ export class CrossSectionalExecutor {
     for (let poll = 0; poll < maxPolls && Date.parse(this.nowIso()) < deadline; poll++) {
       await new Promise((r) => setTimeout(r, 1_000));
       const states = await Promise.allSettled(
-        resting.map((p) => this.client.queryOrder(p.symbol, p.makerRestingOrderId as string)),
+        resting.map((p) => this.queryKnownMakerEntry(p, p.makerRestingOrderId as string)),
       );
       const stillResting = states.some(
-        (x) => x.status === "fulfilled" && !terminal.has(String(x.value.status).toUpperCase()),
+        (x) => x.status === "fulfilled" && !isTerminalMakerOrderStatus(x.value.status),
       );
       if (!stillResting) return;
     }
@@ -2311,14 +2400,16 @@ export class CrossSectionalExecutor {
     refBid: number | null,
     refAsk: number | null,
   ): Promise<{ orderId: string; entryOrderIds: string[]; avgPrice: number; executedQty: number }> {
-    // Pre-placed by preplaceMakerLegs? Then the order is already resting and the wait already
-    // happened — go straight to cancel/re-query/resolve. Placing a second one here would be a
-    // duplicate position, which is why this check comes before everything else.
-    const preplaced = planned.makerRestingOrderId
-      ? { orderId: planned.makerRestingOrderId, price: planned.makerRestingPrice ?? null }
+    // A pre-placed order already served the one parallel wait.  It must be resolved by its stored
+    // exchange id, never replaced by another GTX merely because the sequential loop reached it.
+    const preplaced = Boolean(planned.makerRestingOrderId);
+    const limitPrice = this.client.cancelOrder
+      ? (planned.makerRestingPrice ?? makerLimitPrice(planned.side, refBid, refAsk))
       : null;
-    const limitPrice = preplaced?.price ?? (this.client.cancelOrder ? makerLimitPrice(planned.side, refBid, refAsk) : null);
     if (limitPrice === null) {
+      if (planned.makerRestingOrderId) {
+        throw new Error(`${planned.symbol}: maker entry exists but cancel capability is unavailable; refusing a duplicate MARKET entry`);
+      }
       // No usable book: cross, exactly as before. A limit derived from a broken book would rest far
       // from the market and never fill, which is worse than paying the taker fee once.
       const order = await this.client.placeOrder({
@@ -2329,12 +2420,28 @@ export class CrossSectionalExecutor {
       return { orderId: order.orderId, entryOrderIds: [order.orderId], avgPrice: order.avgPrice, executedQty: order.executedQty };
     }
 
-    const maker = preplaced
-      ? await this.client.queryOrder(planned.symbol, preplaced.orderId)
-      : await this.client.placeOrder({
+    let maker: FuturesOrder;
+    if (planned.makerRestingOrderId) {
+      maker = await this.queryKnownMakerEntry(planned, planned.makerRestingOrderId);
+    } else {
+      // A previous pre-place can have reached Binance while its HTTP response was lost.  Query the
+      // durable client id before a new GTX; exchange-side duplicate-id rejection is not enough to
+      // establish whether a live order exists.
+      const existing = planned.makerPlacementAttemptedAt
+        ? await this.findExistingMakerEntry(planned)
+        : null;
+      if (existing) {
+        this.rememberMakerEntryOrder(planned, existing, limitPrice);
+        maker = existing;
+      } else {
+        this.markMakerEntryPlacementAttempt(planned);
+        maker = await this.client.placeOrder({
           symbol: planned.symbol, side, type: "LIMIT", timeInForce: "GTX",
           price: limitPrice, quantity: planned.requestedQty, newClientOrderId: planned.entryClientOrderId,
         });
+        this.rememberMakerEntryOrder(planned, maker, limitPrice);
+      }
+    }
 
     let latest = maker;
     // A pre-placed leg has ALREADY served its wait in preplaceMakerLegs — waiting again here would
@@ -2346,19 +2453,17 @@ export class CrossSectionalExecutor {
       // advancing to terminate a loop.
       const maxPolls = Math.max(1, Math.ceil(waitMs / 1_000));
       for (let poll = 0; poll < maxPolls; poll++) {
-        if (["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(latest.status).toUpperCase())) break;
+        if (isTerminalMakerOrderStatus(latest.status)) break;
         if (Date.parse(this.nowIso()) >= deadline) break;
         await new Promise((r) => setTimeout(r, 1_000));
-        try { latest = await this.client.queryOrder(planned.symbol, maker.orderId); } catch { break; }
+        try { latest = await this.queryKnownMakerEntry(planned, maker.orderId); } catch { break; }
       }
     }
 
-    // Cancel first, THEN read. Best-effort: a cancel that fails because the order already reached a
-    // terminal state is not an error, and the re-query below is what actually decides.
-    if (!["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(latest.status).toUpperCase())) {
-      try { await this.client.cancelOrder!(planned.symbol, maker.orderId); } catch { /* terminal already */ }
-    }
-    try { latest = await this.client.queryOrder(planned.symbol, maker.orderId); } catch { /* keep last known */ }
+    // Cancel is only a request. `confirmMakerEntryAfterCancel` retries the final read through a
+    // small fixed window; a late NEW response is retained for recovery, not silently declared a
+    // zero-fill and not fabricated into the requested quantity.
+    latest = await this.confirmMakerEntryAfterCancel(planned, latest);
 
     const decision = resolveMakerLeg(planned.requestedQty, latest.status, latest.executedQty);
     planned.makerOutcome = {
