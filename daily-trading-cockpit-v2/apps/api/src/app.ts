@@ -43,6 +43,7 @@ import {
 } from "./lib/cross-sectional-executor.js";
 import { crossSectionalExecTickMs } from "./lib/cross-sectional-policy.js";
 import { buildCrossSectionalReport, CROSS_SECTIONAL_FILTERED_SIGNAL, CROSS_SECTIONAL_UNIVERSE, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import { CrossSectionalAutoPool } from "./lib/cross-sectional-auto-pool.js";
 import { CrossSectionalSymbolReliabilityStore } from "./lib/cross-sectional-symbol-reliability.js";
 import {
   SingleSymbolLaneExecutor,
@@ -1084,6 +1085,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     | ((symbols: string[]) => Promise<FuturesReferenceHealthSnapshot | null>)
     | null = null;
   let crossSectionalExecutorStore: CrossSectionalExecutorStore | null = null;
+  // One durable, C1/C2-only eligibility pool shared by the signal producer and operator surfaces.
+  // It cannot close/rewrite an existing basket; it is consulted only while forming the next FILTERED
+  // observation. Testnet deliberately uses the same public mainnet USD-M liquidity source as live.
+  const crossSectionalAutoPool = new CrossSectionalAutoPool({ fetchImpl: options.fetchImpl });
   const crossSectionalSymbolReliabilityStore = new CrossSectionalSymbolReliabilityStore();
   const currentSymbolReliabilitySnapshot = () => crossSectionalSymbolReliabilityStore.evaluate({
     baskets: crossSectionalExecutorStore?.getState().baskets ?? [],
@@ -1248,6 +1253,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         shortBlocklist: blocks.filter((block) => block.side === "SHORT").map((block) => block.symbol),
       };
     },
+    crossSectionalAutoPool,
     symbolReliabilitySnapshotGetter: currentSymbolReliabilitySnapshot,
     symbolReliabilityDecisionRecorder: (decision) => crossSectionalSymbolReliabilityStore.recordFormationDecision(decision),
     kronosClient,
@@ -4632,6 +4638,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   await registerLiveRoutes(app, liveEngine, {
     configErrors: liveConfig.enabled ? liveConfig.configErrors : [],
     crossSectionalExecutor: () => crossSectionalExecutor,
+    crossSectionalAutoPool: () => crossSectionalAutoPool,
     symbolReliabilitySnapshotGetter: currentSymbolReliabilitySnapshot,
     crossSectionalTrendExecutor: () => crossSectionalTrendExecutor,
     crossSectionalMixedExecutor: () => crossSectionalMixedExecutor,

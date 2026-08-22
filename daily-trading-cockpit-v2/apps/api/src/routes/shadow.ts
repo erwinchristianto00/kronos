@@ -387,6 +387,7 @@ import {
   CROSS_SECTIONAL_TREND_SIGNAL,
   CROSS_SECTIONAL_MIXED_SIGNAL,
 } from "../lib/cross-sectional-edge.js";
+import type { CrossSectionalAutoPool } from "../lib/cross-sectional-auto-pool.js";
 import { spotSymbolForCandles, buildWinnersCounterfactualReport } from "../lib/cross-sectional-winners-counterfactual.js";
 import { buildRegimeAxisTimeline } from "../lib/regime-axis-timeline.js";
 import { buildTpSweepReport } from "../lib/cross-sectional-tp-sweep.js";
@@ -496,6 +497,8 @@ export async function registerShadowRoutes(
     symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
     /** Returns true only after formation provenance is durable; false holds a new V1 basket. */
     symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
+    /** Durable C1/C2 membership inside the fixed cross-sectional candidate universe. */
+    crossSectionalAutoPool?: CrossSectionalAutoPool;
     /** Lazy getter for the four-brain shadow tick's metrics aggregator (created after this
      *  registration, inside app.ts's `if (!isTest)` block, on instances that even construct it).
      *  null on any instance where four-brain shadow mode has never enabled (fail-open — see the
@@ -519,6 +522,32 @@ export async function registerShadowRoutes(
   } = {},
 ): Promise<void> {
   const overlayStore = new JsonExternalRotationOverlayStore(opts.externalOverlayDataDir ?? "data");
+  /**
+   * Automatic membership requires symmetric FILTERED long/short pools. That is the deployed
+   * contract on live and testnet. If a future operator deliberately makes the sides different,
+   * preserve the incumbent static policy rather than silently making it symmetric.
+   */
+  const autoPoolInput = () => {
+    const configured = getCrossSectionalFilteredConfig();
+    const long = configured.longAllowlist;
+    const short = configured.shortAllowlist;
+    if (long.length !== short.length || long.some((symbol) => !short.includes(symbol))) return null;
+    const baseLeg = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "");
+    const sizeMultiplier = Number.parseFloat(process.env.CROSS_SECTIONAL_TESTNET_LEARNING_LEG_MULTIPLIER ?? "");
+    return {
+      candidateUniverse: [...CROSS_SECTIONAL_UNIVERSE],
+      fallbackSymbols: long,
+      baseLegUsd: Number.isFinite(baseLeg) && baseLeg > 0 ? baseLeg : 25,
+      sizeMultiplier: Number.isFinite(sizeMultiplier) && sizeMultiplier > 0 ? sizeMultiplier : 1,
+    };
+  };
+  // Prime the durable snapshot at process start. This is public metadata only and cannot form or
+  // close a basket; it simply prevents the first post-deploy FILTERED cycle from waiting for the
+  // seven-minute scheduler before a newly eligible contract (such as ARKM) is usable.
+  const initialAutoPoolInput = autoPoolInput();
+  if (initialAutoPoolInput && opts.crossSectionalAutoPool) {
+    void opts.crossSectionalAutoPool.refreshIfDue(initialAutoPoolInput).catch(() => undefined);
+  }
   if (opts.notificationService) {
     opts.notificationService.setSnapshotProvider(() => {
       const scanStatus = opts.coreScanAutoRefreshController?.getStatus() ?? null;
@@ -1002,7 +1031,13 @@ export async function registerShadowRoutes(
       // necessarily the filter that this testnet executor is using today.
       filteredConfig: (() => {
         const configured = getCrossSectionalFilteredConfig();
-        const execution = getCrossSectionalFilteredExecutionFilters(store);
+        const autoInput = autoPoolInput();
+        const autoPool = autoInput ? opts.crossSectionalAutoPool?.getSnapshot(autoInput) ?? null : null;
+        const activePool = autoPool?.enabled && autoPool.activeSymbols.length > 0 ? autoPool.activeSymbols : null;
+        const execution = getCrossSectionalFilteredExecutionFilters(store, activePool ? {
+          baseLongAllowlist: activePool,
+          baseShortAllowlist: activePool,
+        } : {});
         const executionUniverse = new Set(CROSS_SECTIONAL_UNIVERSE);
         // The testnet deployment can narrow CROSS_SECTIONAL_UNIVERSE for an exchange constraint
         // (for example BTC's minimum notional). Reflect that same universe in the report so an
@@ -1017,6 +1052,7 @@ export async function registerShadowRoutes(
           executionShortAllowlist: executable(execution.shortAllowlist),
           executionShortBlocklist: execution.shortBlocklist,
           adaptiveDemotionActive: !execution.adaptiveDisabled,
+          autoPool,
         };
       })(),
       adaptiveConfig: getCrossSectionalAdaptiveConfig(),
@@ -2942,6 +2978,12 @@ export async function registerShadowRoutes(
             filteredEntryBlocks: opts.crossSectionalReentryBlocksGetter,
             symbolReliabilitySnapshotGetter: opts.symbolReliabilitySnapshotGetter,
             symbolReliabilityDecisionRecorder: opts.symbolReliabilityDecisionRecorder,
+            filteredExecutionPool: async () => {
+              const input = autoPoolInput();
+              return input && opts.crossSectionalAutoPool
+                ? opts.crossSectionalAutoPool.refreshIfDue(input)
+                : null;
+            },
             // spotSymbolForCandles: 1000x-multiplier futures contracts (1000PEPEUSDT, …) have no
             // spot pair under that name — fetch the bare spot symbol instead. Returns are price
             // RATIOS, so the 1000x scaling cancels; the rest of the pipeline (scoring, allowlist

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { Candle } from "@dtc/shared";
 import {
   deriveAdaptiveSymbolFilters,
+  getCrossSectionalFilteredExecutionFilters,
   crossSectionalMomentumScore,
   buildCrossSectionalBasket,
   buildFilteredCrossSectionalBasket,
@@ -30,6 +31,7 @@ import {
   crossSectionalLegScaleAnomaly,
   crossSectionalScaleAnomalies,
   isCrossSectionalMixedWideLongPoolEnabled,
+  shouldApplyCandleLiquidityFloor,
   getCrossSectionalAdaptiveConfig,
   regimeSkewedK,
   regimeSkewCounterfactual,
@@ -55,6 +57,26 @@ function scored(rows: Array<[string, number, number]>): ScoredSymbol[] {
 function freshStore(): CrossSectionalStore {
   return new CrossSectionalStore(mkdtempSync(join(tmpdir(), "xsec-")));
 }
+
+describe("venue-matched FILTERED liquidity", () => {
+  it("[AUTO-POOL-VENUE] uses durable USD-M C1 instead of reapplying a spot-candle floor", () => {
+    expect(shouldApplyCandleLiquidityFloor({ enabled: true, state: "ACTIVE" } as never)).toBe(false);
+    expect(shouldApplyCandleLiquidityFloor({ enabled: true, state: "STALE_FALLBACK" } as never)).toBe(true);
+    expect(shouldApplyCandleLiquidityFloor({ enabled: false, state: "DISABLED" } as never)).toBe(true);
+    expect(shouldApplyCandleLiquidityFloor(null)).toBe(true);
+  });
+
+  it("[AUTO-POOL-CEILING] treats the durable managed pool as the execution ceiling, not the stale env list", () => {
+    withEnv({ CROSS_SECTIONAL_ADAPTIVE_DISABLED: "1" }, () => {
+      const filters = getCrossSectionalFilteredExecutionFilters(freshStore(), {
+        baseLongAllowlist: ["ARKMUSDT", "SOLUSDT", "SUIUSDT"],
+        baseShortAllowlist: ["ARKMUSDT", "SOLUSDT", "SUIUSDT"],
+      });
+      expect(filters.longAllowlist.sort()).toEqual(["ARKMUSDT", "SOLUSDT", "SUIUSDT"]);
+      expect(filters.shortAllowlist.sort()).toEqual(["ARKMUSDT", "SOLUSDT", "SUIUSDT"]);
+    });
+  });
+});
 const T0 = "2099-01-02T00:00:00.000Z";
 const T0ms = new Date(T0).getTime();
 const DAY_MS = 24 * 60 * 60_000;
@@ -851,7 +873,7 @@ describe("[MIXED-POOL] CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL — widening the dea
     // Guards the whole block: if someone renarrows the FILTERED list to a subset of TREND's, the
     // tests below would pass vacuously instead of failing loudly.
     expect(CROSS_SECTIONAL_TREND_LONG_ALLOWLIST.size).toBe(4);
-    expect(WIDENING_ADDS.sort()).toEqual(["ADAUSDT", "BNBUSDT", "SUIUSDT"]);
+    expect(WIDENING_ADDS.sort()).toEqual(["ADAUSDT", "ARKMUSDT", "BNBUSDT", "SUIUSDT"]);
   });
 
   it("[RESOLVER] default resolves to TREND's narrow long pool; only an exact \"1\" widens it", () => {
