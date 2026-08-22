@@ -2501,6 +2501,8 @@ export class SingleSymbolLaneExecutor {
     const stillOpen = openedThisFormation.filter((position) => position.status === "OPEN");
     if (stillOpen.length === 0) return;
 
+    const protectedCount = stillOpen.filter((position) => position.stopAlgoOrderId !== null).length;
+
     const failedSymbols: string[] = [];
     for (const position of stillOpen) {
       try {
@@ -2512,14 +2514,14 @@ export class SingleSymbolLaneExecutor {
 
     if (failedSymbols.length > 0) {
       this.openHalted =
-        `CRITICAL: exact ${requiredOpenPositions}-position formation reached only ${openedThisFormation.length}; ` +
+        `CRITICAL: exact ${requiredOpenPositions}-position formation established only ${protectedCount}/${requiredOpenPositions} protected leg(s); ` +
         `emergency unwind failed for ${failedSymbols.join(", ")}. Remaining positions stay stopped and block every new route.`;
       this.lastEntrySkipReason = this.openHalted;
       return;
     }
 
     this.lastEntrySkipReason =
-      `exact ${requiredOpenPositions}-position formation reached only ${openedThisFormation.length}; ` +
+      `exact ${requiredOpenPositions}-position formation established only ${protectedCount}/${requiredOpenPositions} protected leg(s); ` +
       "all transient legs were immediately flattened";
   }
 
@@ -3056,7 +3058,15 @@ export class SingleSymbolLaneExecutor {
         this.releaseEntrySymbol(signal.symbol);
       }
     }
-    exactFormationComplete = requiredOpenPositions === 0 || openedThisFormation.length === requiredOpenPositions;
+    // A filled market order without an exchange-side stop is not a completed
+    // directional leg. ensureStopOrder deliberately records and retries a
+    // transient stop failure for ordinary independent lanes, but an exact-3
+    // formation must be all-or-flat: retaining three entries with even one
+    // naked leg would claim atomicity while leaving the new route exposed.
+    exactFormationComplete = requiredOpenPositions === 0 || (
+      openedThisFormation.length === requiredOpenPositions &&
+      openedThisFormation.every((position) => position.status === "OPEN" && position.stopAlgoOrderId !== null)
+    );
     } finally {
       if (!exactFormationComplete && openedThisFormation.length > 0) {
         await this.abortIncompleteExactFormation(openedThisFormation, requiredOpenPositions);

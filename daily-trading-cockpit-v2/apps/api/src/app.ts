@@ -1094,8 +1094,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // FILTERED foundation instance above (see cross-sectional-executor.ts's targetVariant/laneId).
   let crossSectionalTrendExecutor: CrossSectionalExecutor | null = null;
   let crossSectionalMixedExecutor: CrossSectionalExecutor | null = null;
-  // Testnet-only directional companions of the market-neutral cross-sectional lane. These use the
-  // core scan's existing score/quality evidence and are mutually exclusive with new 3x3 baskets.
+  // Directional companions of the market-neutral cross-sectional lane. These use the core scan's
+  // existing score/quality evidence and are mutually exclusive with new 3x3 baskets. Their owners
+  // are constructed even while NEW entries are hard-disabled, so a pre-existing position or resting
+  // maker entry can still be reconciled, stopped, and closed rather than becoming unmanaged after a
+  // kill-switch release.
   let crossSectionalDirectionalLongExecutor: SingleSymbolLaneExecutor | null = null;
   let crossSectionalDirectionalShortExecutor: SingleSymbolLaneExecutor | null = null;
   let crossSectionalDirectionalDecisionRef = () =>
@@ -2235,18 +2238,25 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       }),
     });
     const directionalRoutingEnabled = () => isCrossSectionalDirectionalRegimeExecEnabled();
-    const tryClaimMarketNeutralRoute = () =>
-      directionalRoutingEnabled()
+    const tryClaimMarketNeutralRoute = () => {
+      // Even with directional NEW entries disabled, a persisted directional
+      // position/pending maker entry still owns real account exposure and must
+      // block a new 3L/3S basket. Keep legacy market-neutral claim behavior
+      // unchanged when the directional router itself is off.
+      const admission = crossSectionalRouteCoordinator.admissionFor("MARKET_NEUTRAL");
+      if (!admission.allowed) return admission;
+      return directionalRoutingEnabled()
         ? crossSectionalRouteCoordinator.tryClaim("MARKET_NEUTRAL")
         : { allowed: true, reason: null };
+    };
     const releaseMarketNeutralRoute = () => crossSectionalRouteCoordinator.release("MARKET_NEUTRAL");
     // Directional conviction and a market-neutral hedge are distinct decisions.
     // A valid canonical MIXED regime may have an inconclusive directional scan;
     // in that case keep directional lanes flat but let the fully hedged 3x3
     // executor evaluate its own independent FILTERED signal and safeguards.
     const directionalRegimeAllowsBalancedBasket = () => {
-      if (!directionalRoutingEnabled()) return true;
       if (!crossSectionalRouteCoordinator.admissionFor("MARKET_NEUTRAL").allowed) return false;
+      if (!directionalRoutingEnabled()) return true;
       const decision = crossSectionalDirectionalDecision();
       return decision.mode === "BALANCED_3X3" ||
         (decision.mode === "NO_TRADE" && decision.canonicalAllowed === true && decision.canonicalRegimeFamily === "MIXED");
@@ -2501,14 +2511,25 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // A changed, stale, contradictory, or incomplete scan yields NO_TRADE and blocks new
     // directional entries while its exchange STOP_MARKET remains live. An open directional
     // position closes from this overlay only after two distinct scans confirm the opposite mode.
-    if (isCrossSectionalDirectionalRegimeExecEnabled()) {
+    // This is deliberately an unconditional owner block, not an entry flag.
+    // `tick()` always supervises persisted positions before it asks `isAllowed`
+    // for permission to create a new one. If MAX_OPEN_POSITIONS is changed to
+    // 0 after a directional formation, removing this owner would abandon its
+    // stops/horizon/reconciliation exactly when the operator intended only to
+    // halt fresh risk. `laneAllowed` below remains the sole new-entry gate.
+    {
       const engineForGate = liveEngine;
+      const directionalEntryEnabled = () => isCrossSectionalDirectionalRegimeExecEnabled();
       const laneAllowed = (laneId: string, mode: "BEAR_SHORT_3" | "BULL_LONG_3") =>
+        directionalEntryEnabled() &&
         isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, laneId) &&
         crossSectionalRouteCoordinator.admissionFor("DIRECTIONAL").allowed &&
         crossSectionalDirectionalDecision().mode === mode &&
         (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false);
       const laneReason = (mode: "BEAR_SHORT_3" | "BULL_LONG_3") => {
+        if (!directionalEntryEnabled()) {
+          return "directional cross-sectional new entries are hard-disabled (requires exact 3 slots and mainnet opt-in)";
+        }
         const route = crossSectionalRouteCoordinator.admissionFor("DIRECTIONAL");
         if (!route.allowed) return route.reason;
         const decision = crossSectionalDirectionalDecision();
@@ -2604,9 +2625,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         existingClusterOpenSymbols: (symbol, direction) =>
           clusterOpenSymbolsExcluding(crossSectionalDirectionalLongExecutor, symbol, direction),
       });
-      // Testnet is an execution environment too.  Previously these ticks only
-      // ran outside testnet, leaving the directional lane permanently unable
-      // to collect any sample even after a fresh scan became eligible.
+      // Testnet is an execution environment too. These ticks also remain live
+      // while the entry route is disabled: position supervision must outlive a
+      // kill switch, whereas laneAllowed above remains false for NEW entries.
       const directionalTickIntervalMs = isTest ? 30_000 : 5 * 60_000;
       const shortDirectionalInitialDelayMs = isTest ? 15_000 : 130_000;
       const longDirectionalInitialDelayMs = isTest ? 20_000 : 160_000;

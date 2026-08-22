@@ -1051,6 +1051,34 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     expect(executor.getStatus().lastEntrySkipReason).toMatch(/all transient legs were immediately flattened/i);
   });
 
+  it("[EXACT-FORMATION] immediately flattens all three legs when any initial protective stop fails", async () => {
+    const client = new FakeClient();
+    client.failAlgoOnce = true;
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [
+        signal({ observationId: "dir:BTC:1", symbol: "BTCUSDT", openedAtMs: NOW_MS - 60_000 }),
+        signal({ observationId: "dir:ETH:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090, openedAtMs: NOW_MS - 90_000 }),
+        signal({ observationId: "dir:SOL:1", symbol: "SOLUSDT", entryPrice: 150, stopPrice: 154.5, openedAtMs: NOW_MS - 120_000 }),
+      ],
+      legUsd: 10_000,
+      maxOpenPositions: 3,
+      requiredOpenPositions: 3,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions.filter((position) => position.status === "OPEN")).toHaveLength(0);
+    expect(store.getState().positions.map((position) => position.closeReason)).toEqual([
+      "INCOMPLETE_EXACT_FORMATION_ABORT",
+      "INCOMPLETE_EXACT_FORMATION_ABORT",
+      "INCOMPLETE_EXACT_FORMATION_ABORT",
+    ]);
+    expect(client.placed.filter((order) => order.reduceOnly).map((order) => order.symbol).sort())
+      .toEqual(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/only 2\/3 protected leg\(s\)/i);
+  });
+
   it("[EXACT-FORMATION] fails closed if a maker-entry configuration would leave a resting partial basket", async () => {
     const { executor, store, client } = makeExecutor({
       signals: [
