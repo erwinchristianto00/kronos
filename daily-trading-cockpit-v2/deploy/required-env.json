@@ -75,6 +75,26 @@
       "value": "CAPPED_SCORE_RANK",
       "why": "Current production weighting; the forward cohort labels every basket so it can be compared without mixing old policies."
     },
+    "CROSS_SECTIONAL_UNIVERSE": {
+      "value": "ETHUSDT,SOLUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,SUIUSDT,1000PEPEUSDT,ARBUSDT,OPUSDT,INJUSDT,WLDUSDT,APTUSDT,SEIUSDT,NEARUSDT,BNBUSDT,XRPUSDT,ADAUSDT,FETUSDT,RNDRUSDT,WIFUSDT,TAOUSDT,ARKMUSDT,UNIUSDT,AAVEUSDT,LDOUSDT",
+      "why": "Fixed, audited candidate universe for the Plain MOM36 cross-sectional lane. ARKMUSDT is explicitly included; automatic pool rotation may only add/drop membership inside this set, never promote arbitrary new Binance listings."
+    },
+    "CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST": {
+      "value": "SOLUSDT,DOGEUSDT,AVAXUSDT,SUIUSDT,1000PEPEUSDT,ARBUSDT,OPUSDT,INJUSDT,WLDUSDT,APTUSDT,NEARUSDT,BNBUSDT,XRPUSDT,ADAUSDT,FETUSDT,WIFUSDT,TAOUSDT,ARKMUSDT,UNIUSDT,LDOUSDT,SEIUSDT,AAVEUSDT",
+      "why": "Safe first-boot fallback for the symmetric FILTERED pool. ARKMUSDT is included immediately; after a valid C1/C2 refresh the durable runtime pool, not this frozen fallback, selects members."
+    },
+    "CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST": {
+      "value": "SOLUSDT,DOGEUSDT,AVAXUSDT,SUIUSDT,1000PEPEUSDT,ARBUSDT,OPUSDT,INJUSDT,WLDUSDT,APTUSDT,NEARUSDT,BNBUSDT,XRPUSDT,ADAUSDT,FETUSDT,WIFUSDT,TAOUSDT,ARKMUSDT,UNIUSDT,LDOUSDT,SEIUSDT,AAVEUSDT",
+      "why": "Matches the long fallback exactly so automatic pool membership remains market-neutral. The separate short blocklist still applies after this pool."
+    },
+    "CROSS_SECTIONAL_AUTO_POOL_ENABLED": {
+      "value": "1",
+      "why": "Enable durable, runtime C1/C2 membership rotation for FILTERED Plain MOM36 on both live and testnet. It refreshes public USD-M data only, applies 10% liquidity hysteresis, preserves the last valid pool on a read failure, and never changes an existing basket."
+    },
+    "CROSS_SECTIONAL_AUTO_POOL_REFRESH_MS": {
+      "value": "900000",
+      "why": "15-minute C1/C2 refresh cadence. Faster than the hourly formation bar while slow enough to avoid reacting to one transient quote-volume print; membership remains sticky inside the hysteresis band."
+    },
     "CROSS_SECTIONAL_EDGE_MAX_STORED_OBSERVATIONS": {
       "value": "15000",
       "why": "Depth of the IN-APP shadow reports only. History no longer depends on it: deploy/archive-observations.py harvests every resolved observation into an append-only JSONL (~15MB/yr/instance, never pruned) so the cap can no longer silently decide what survives. 15000 keeps the store ~24MB, an order of magnitude below the 234MB that once made testnet unresponsive; it is now a free knob rather than a load-bearing one."
@@ -122,6 +142,14 @@
     "CROSS_SECTIONAL_EXEC_TICK_MS": {
       "value": "60000",
       "why": "Executor tick. Was a hardcoded 5 minutes, so a fresh signal waited ~150s on average before anything looked at it \u2014 measured end to end at 239.8s live / 229.9s testnet, almost all of it this interval. No gate is weakened by being asked sooner; the tick is idempotent and single-flighted. Bounded 15s-5m in code."
+    },
+    "CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER": {
+      "value": "1",
+      "why": "After a confirmed exchange-side forced close, release the new-entry latch automatically only after the executor proves its own residual close is flat, no orphan remains, and authenticated position/open-order checks succeed. This is shared by Testnet and LIVE; =0 remains the explicit emergency manual-only override."
+    },
+    "CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER_COOLDOWN_MS": {
+      "value": "600000",
+      "why": "Ten-minute post-incident cooldown before the first automatic recovery verification. It is not a timer-based re-entry: a failed flat/order/exchange check keeps the latch closed, while a fresh post-incident signal and all normal gates remain mandatory after release."
     },
     "CROSS_SECTIONAL_POLICY_VERSION": {
       "value": "full-tp6-entry-integrity-v1",

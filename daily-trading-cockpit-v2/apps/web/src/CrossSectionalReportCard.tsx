@@ -163,6 +163,55 @@ type OpenBasketUnrealized = {
   unrealizedAfterEstimatedCloseCostUsd: number | null;
   unrealizedExtrema: UnrealizedExtrema | null;
 };
+type ExchangeIncident = {
+  kind: 'MARGIN_CALL' | 'UNEXPECTED_EXCHANGE_FLAT';
+  detectedAt: string;
+  exchangeEventAt: string | null;
+  evidence: 'AUTO_CLOSE_ORDER' | 'UNIQUE_POSITION_MISMATCH';
+  reason: string;
+  affectedLeg: {
+    symbol: string;
+    side: 'LONG' | 'SHORT';
+    expectedQty: number;
+    entryPrice: number;
+    lastMarkPrice: number | null;
+    lastMarkAt: string | null;
+    forcedExitOrderId: string | null;
+    forcedExitClientOrderId: string | null;
+    forcedExitQty: number | null;
+    forcedExitPrice: number | null;
+    forcedExitRealizedPnlUsd: number | null;
+    forcedExitCommissionUsd: number | null;
+    insuranceClearUsd: number | null;
+  };
+  residualClose: { state: 'PENDING' | 'FLAT' | 'UNRESOLVED'; requestedAt: string; completedAt: string | null; lastError: string | null };
+};
+type ExchangeIncidentBasket = {
+  lane: string;
+  laneId: string;
+  basketId: string;
+  signal: string;
+  variant: string;
+  openedAt: string;
+  closedAt: string | null;
+  status: string;
+  closeReason: string | null;
+  accountingStatus: string | null;
+  exchangeIncident: ExchangeIncident | null;
+  legs: Array<{
+    symbol: string;
+    side: 'LONG' | 'SHORT';
+    qty: number;
+    entryPrice: number;
+    entryOrderId: string;
+    lastMarkPrice: number | null;
+    lastMarkAt: string | null;
+    exitOrderId: string | null;
+    exitOrderIds: string[] | null;
+    exitPrice: number | null;
+    exitPriceConfirmed: boolean | null;
+  }>;
+};
 type CrossSectionalPnl = {
   openBasketCount: number;
   openLegCount: number;
@@ -183,6 +232,7 @@ type ClosedResponse = {
   reason: string | null;
   crossSectionalPnl?: CrossSectionalPnl;
   openBaskets?: OpenBasketUnrealized[];
+  exchangeIncidentBaskets?: ExchangeIncidentBasket[];
   lanes: ClosedLane[];
   auditHistory?: ClosedAuditHistory | null;
 };
@@ -406,6 +456,15 @@ type PoolReport = {
   /** The actionable verdict, hysteresis-aware. `mismatch` above is the RAW threshold comparison —
    *  true per symbol, but not a reason to change anything on its own. */
   reconciliation?: { changed: boolean; adds: string[]; drops: string[]; held: Array<{ symbol: string; action: string; reason: string }>; unmeasured: boolean };
+  automation: {
+    enabled: boolean;
+    state: 'DISABLED' | 'ACTIVE' | 'STALE_FALLBACK';
+    activeSymbols: string[];
+    updatedAt: string | null;
+    lastSuccessAt: string | null;
+    lastError: string | null;
+    refreshEveryMs: number;
+  } | null;
   blockedInPool: string[];
   btc: { oneLotUsd: number | null; legNeededUsd: number | null };
   unevaluatedCriteria: Array<{ code: string; why: string }>;
@@ -449,8 +508,8 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
   const activeShort = executionShort.filter((symbol) => !executionShortBlocked.includes(symbol));
   const poolsIdentical = executionLong.length === executionShort.length
     && executionLong.every((symbol) => executionShort.includes(symbol));
-  // The executor reads its allowlists from env; so does the criteria report. If the two disagree the
-  // panel is describing a pool the executor is not using, which must never pass silently.
+  // The actual formation pool is either the durable automatic state or the explicit static fallback.
+  // If the report and formation route disagree, surface it rather than claiming the panel is live.
   const countDrift = pool && (pool.counts.poolLong !== executionLong.length || pool.counts.poolShort !== executionShort.length);
 
   const label = (text: string, n: number, color: string) => <strong style={{ color }}>{text} ({n})</strong>;
@@ -468,6 +527,16 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
 
     {poolError && <Banner tone="warn">Kriteria tidak bisa dibaca (endpoint pool gagal). Daftar di bawah tetap yang dipakai executor, tapi belum diuji terhadap kriteria apa pun.</Banner>}
     {pool && !pool.measured && <Banner tone="warn">⚠ Kriteria tidak bisa diukur sekarang — pembacaan exchange gagal. Ini <b>bukan</b> berarti simbol-simbolnya gagal kriteria; belum ada yang diuji.</Banner>}
+    {pool?.automation?.enabled && pool.automation.state === 'ACTIVE' && <Banner tone="ok">
+      ● Pool otomatis aktif: evaluasi C1/C2 dari public Binance USD-M setiap {Math.round(pool.automation.refreshEveryMs / 60_000)} menit dengan pita histeresis ±10%. Perubahan hanya berlaku untuk basket baru; basket terbuka tetap memakai leg dan exit yang sudah dibekukan.
+    </Banner>}
+    {pool?.automation?.enabled && pool.automation.state === 'ACTIVE' && pool.automation.lastError && <Banner tone="warn">
+      ⚠ Refresh terakhir gagal, tetapi pool valid terakhir tetap dipertahankan tanpa mengubah basket terbuka: {pool.automation.lastError}
+    </Banner>}
+    {pool?.automation?.enabled && pool.automation.state === 'STALE_FALLBACK' && <Banner tone="warn">
+      ⚠ Pool otomatis belum punya pembacaan baru yang tersimpan. Sistem tetap memakai fallback aman yang sudah dikonfigurasi; tidak ada pool kosong atau perluasan ke semua simbol. {pool.automation.lastError ? `Alasan terakhir: ${pool.automation.lastError}.` : ''}
+    </Banner>}
+    {pool?.automation === null && <Banner tone="warn">Pool otomatis tidak diaktifkan karena konfigurasi long/short tidak simetris; daftar statis tetap dipakai agar tidak ada perubahan arah yang diam-diam.</Banner>}
     {/* Reads the RECONCILIATION, not the raw mismatch. This panel used to compute its own verdict
         from `mismatch` and cried wolf over WIF — $199,118 against a $200,000 floor, 0.44% under —
         while the API page's hysteresis said nothing needed changing. Two surfaces, two answers,
@@ -476,7 +545,7 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
       ⚠ Pool perlu diubah: {[
         ...pool.reconciliation.adds.map((s) => `tambah ${s.replace('USDT', '')}`),
         ...pool.reconciliation.drops.map((s) => `keluarkan ${s.replace('USDT', '')}`),
-      ].join(' · ')}. Penerapan manual — allowlist dibaca sekali saat proses start.
+      ].join(' · ')}. {pool.automation?.enabled ? 'Akan diterapkan otomatis pada refresh pool berikutnya; tidak perlu restart.' : 'Penerapan masih memakai fallback statis.'}
     </Banner>}
     {pool?.measured && pool.reconciliation && !pool.reconciliation.changed && pool.reconciliation.held.length > 0 && <Banner tone="ok">
       ● Tidak ada yang perlu diubah. {pool.reconciliation.held.map((d) => d.symbol.replace('USDT', '')).join(', ')} di bawah ambang mentah tetapi <strong style={{ color: C.text }}>di dalam pita histeresis ±10%</strong>, jadi keanggotaannya sengaja dipertahankan — tanpa pita, simbol di garis batas keluar-masuk tiap beberapa jam dan menulis ulang pool yang dibandingkan overlap guard.
@@ -722,6 +791,56 @@ function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized })
   </div>;
 }
 
+/** A forced exchange close is an audit record, never an open mark-to-market basket. */
+function ExchangeIncidentBlock({ basket }: { basket: ExchangeIncidentBasket }) {
+  const incident = basket.exchangeIncident;
+  if (!incident) return null;
+  const marginCall = incident.kind === 'MARGIN_CALL';
+  const affected = incident.affectedLeg;
+  return <div style={{ border: `1px solid ${C.bad}`, borderRadius: 6, marginTop: 10, overflow: 'hidden', background: '#321c24' }}>
+    <div style={{ padding: '9px 12px', background: '#4a2029', display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'baseline' }}>
+      <strong style={{ color: '#ffd6d6' }}>🛑 {marginCall ? 'MARGIN CALL — EXCHANGE FORCED CLOSE' : 'EXCHANGE-FLAT QUARANTINE'}</strong>
+      <strong style={{ color: C.text }}>{basket.basketId}</strong>
+      <span style={{ color: '#ffd6d6' }}>[{basket.lane}] {affected.symbol} {affected.side}</span>
+      <span style={{ color: C.dim }}>detected {formatDate(incident.detectedAt)} Taipei</span>
+    </div>
+    <div style={{ padding: '8px 12px', display: 'grid', gap: 5, color: C.dim, fontSize: 12, lineHeight: 1.45 }}>
+      <div><strong style={{ color: C.bad }}>Basket dikarantina:</strong> tidak lagi dihitung sebagai open P&amp;L atau closed performance; residual known legs {incident.residualClose.state === 'FLAT' ? 'sudah flat' : incident.residualClose.state.toLowerCase()}.</div>
+      <div>{incident.reason}</div>
+      <div>
+        forced exit {incident.exchangeEventAt ? `${formatDate(incident.exchangeEventAt)} Taipei` : 'waktu exchange tidak tersedia'}
+        {' · '}entry {price(affected.entryPrice)}
+        {' · '}exit {price(affected.forcedExitPrice)}
+        {' · '}realized {money(affected.forcedExitRealizedPnlUsd)}
+        {' · '}exit fee {money(affected.forcedExitCommissionUsd)}
+        {' · '}insurance {money(affected.insuranceClearUsd)}
+      </div>
+      {affected.forcedExitClientOrderId && <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#f5bdc4' }}>exchange order {affected.forcedExitClientOrderId} · {affected.forcedExitOrderId}</div>}
+      {incident.residualClose.lastError && <div style={{ color: C.bad }}>Residual close: {incident.residualClose.lastError}</div>}
+    </div>
+    <div style={{ overflowX: 'auto' }}>
+      <table style={{ width: '100%', minWidth: 920, borderCollapse: 'collapse', fontSize: 11 }}>
+        <thead><tr style={{ color: C.dim, textAlign: 'left' }}>
+          <th style={{ padding: 7 }}>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Last mark</th><th>Exchange exit</th><th>Exit order</th><th>State</th>
+        </tr></thead>
+        <tbody>{basket.legs.map((leg) => {
+          const isAffected = leg.symbol === affected.symbol && leg.side === affected.side;
+          return <tr key={`${basket.basketId}-${leg.symbol}-${leg.side}`} style={{ borderTop: `1px solid #5b2c35`, background: isAffected ? '#40202a' : undefined }}>
+            <td style={{ padding: 7, color: C.text, fontWeight: isAffected ? 700 : 500 }}>{leg.symbol}</td>
+            <td style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</td>
+            <td>{leg.qty}</td>
+            <td>{price(leg.entryPrice)}</td>
+            <td>{price(leg.lastMarkPrice)}</td>
+            <td>{price(leg.exitPrice)}</td>
+            <td style={{ fontFamily: 'monospace', color: isAffected ? '#ffd6d6' : C.dim }}>{leg.exitOrderId ?? 'pending'}</td>
+            <td style={{ color: leg.exitOrderId ? C.measure : C.bad }}>{leg.exitOrderId ? 'flat / recorded' : 'residual close pending'}</td>
+          </tr>;
+        })}</tbody>
+      </table>
+    </div>
+  </div>;
+}
+
 function directionalModeLabel(mode: DirectionalRegimeResponse['mode'], directionalPickCount = 3): string {
   if (mode === 'BEAR_SHORT_3') return `BEARISH KUAT → SHORT ${directionalPickCount}`;
   if (mode === 'BULL_LONG_3') return `BULLISH KUAT → LONG ${directionalPickCount}`;
@@ -923,8 +1042,9 @@ function OpenCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
   }
   useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 15_000); return () => window.clearInterval(timer); }, [apiPrefix]);
   const openBaskets = data?.openBaskets ?? [];
+  const exchangeIncidentBaskets = data?.exchangeIncidentBaskets ?? [];
   return <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-open-report">
-    <header><div><span>Open cross-basket · unrealized P&amp;L path</span><strong>{openBaskets.length} open basket{openBaskets.length === 1 ? '' : 's'}</strong></div><span className="tone-measure">grouped per basket · live marks</span></header>
+    <header><div><span>Open cross-basket · unrealized P&amp;L path</span><strong>{openBaskets.length} open basket{openBaskets.length === 1 ? '' : 's'}{exchangeIncidentBaskets.length ? ` · ${exchangeIncidentBaskets.length} quarantined` : ''}</strong></div><span className="tone-measure">grouped per basket · live marks</span></header>
     <NextSignalNote apiPrefix={apiPrefix} />
     {error ? <div style={{ padding: 12, color: C.bad }}>Open-basket report fetch failed.</div> : data?.crossSectionalPnl ? <>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(150px, 1fr))', borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
@@ -935,6 +1055,9 @@ function OpenCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
       {openBaskets.length ? <div style={{ padding: '0 12px 12px' }}>
         {openBaskets.map((basket) => <OpenBasketUnrealizedBlock key={basket.basketId} basket={basket} />)}
       </div> : <div style={{ padding: 12, color: C.dim }}>Tidak ada basket aktif.</div>}
+      {exchangeIncidentBaskets.length > 0 && <div style={{ padding: '0 12px 12px' }}>
+        {exchangeIncidentBaskets.map((basket) => <ExchangeIncidentBlock key={`${basket.laneId}-${basket.basketId}`} basket={basket} />)}
+      </div>}
     </> : <div style={{ padding: 12, color: C.dim }}>Loading open basket…</div>}
   </section>;
 }

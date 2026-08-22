@@ -115,7 +115,7 @@ export type CrossSectionalExecClient = Pick<
   /** Optional so every existing fake client keeps compiling. Maker entry REFUSES to run without
    *  it: a post-only order that cannot be cancelled has no safe way to stop resting, and leaving
    *  one on the book past its wait is worse than paying the taker fee. */
-  Partial<Pick<BinanceFuturesPrivateClient, "cancelOrder">
+  Partial<Pick<BinanceFuturesPrivateClient, "cancelOrder" | "getIncomeHistory" | "getOpenOrders">
 > & {
   /** Restart-recovery reconciliation only (see recoverIncompleteBaskets/reconcilePlannedLeg below) —
    *  deliberately OPTIONAL, not added to the Pick<...> list above, so every existing fake/test client
@@ -130,6 +130,22 @@ export type CrossSectionalExecClient = Pick<
 
 export function isCrossSectionalExecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.CROSS_SECTIONAL_EXEC_ENABLED === "1";
+}
+
+/**
+ * A forced Binance close is first quarantined, then may release itself only after the executor has
+ * re-proved that its own residual exposure is gone.  Enabled by default so TESTNET and LIVE follow
+ * the same safety policy; `=0` is the explicit emergency/manual-only override.
+ */
+export function isCrossSectionalExchangeIncidentAutoRecoveryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER !== "0";
+}
+
+/** Bounded cooldown before the first automatic post-incident recovery check. */
+export function crossSectionalExchangeIncidentAutoRecoveryCooldownMs(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = Number.parseInt(env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER_COOLDOWN_MS ?? "", 10);
+  if (!Number.isFinite(configured)) return 10 * 60_000;
+  return Math.min(60 * 60_000, Math.max(60_000, configured));
 }
 
 /** 2026-07-07 operator decision: cross-sectional is the FOUNDATION strategy and must run at full
@@ -549,6 +565,65 @@ export interface ExitExecutionRecord {
   feeEstimateUsd: number | null;
   reason: string;
   completedAt: string | null;
+}
+
+/**
+ * Durable evidence that Binance itself removed a leg outside the executor's normal close path.
+ *
+ * This is deliberately a separate axis from the basket lifecycle.  The basket becomes ABORTED
+ * once any remaining known legs are flattened, but the incident stays in the store so neither the
+ * Open Basket report nor Open Positions can quietly turn an exchange liquidation into a vanished
+ * row or a made-up mark-to-market result.
+ */
+export interface CrossSectionalExchangeIncident {
+  version: "EXCHANGE_INCIDENT_V1";
+  /** MARGIN_CALL is used only with a Binance `autoclose-*` order. Never infer it from a stale row. */
+  kind: "MARGIN_CALL" | "UNEXPECTED_EXCHANGE_FLAT";
+  detectedAt: string;
+  /** Binance trade/order time when it is available; null for a generic position mismatch. */
+  exchangeEventAt: string | null;
+  evidence: "AUTO_CLOSE_ORDER" | "UNIQUE_POSITION_MISMATCH";
+  reason: string;
+  affectedLeg: {
+    symbol: string;
+    side: "LONG" | "SHORT";
+    expectedQty: number;
+    entryPrice: number;
+    lastMarkPrice: number | null;
+    lastMarkAt: string | null;
+    forcedExitOrderId: string | null;
+    forcedExitClientOrderId: string | null;
+    forcedExitQty: number | null;
+    forcedExitPrice: number | null;
+    forcedExitRealizedPnlUsd: number | null;
+    forcedExitCommissionUsd: number | null;
+    insuranceClearUsd: number | null;
+  };
+  /** The executor immediately reduces every remaining known leg, then keeps this proof. */
+  residualClose: {
+    state: "PENDING" | "FLAT" | "UNRESOLVED";
+    requestedAt: string;
+    completedAt: string | null;
+    lastError: string | null;
+  };
+  /** How the new-entry halt was released. Kept on the terminal incident row for audit. */
+  entryHaltResolution?: {
+    mode: "AUTO_RECOVERY" | "OPERATOR_ACK";
+    at: string;
+    reason: string;
+  } | null;
+}
+
+/** Durable latch after an exchange-side incident. It is cleared only by verified auto-recovery or ACK. */
+export interface CrossSectionalExchangeIncidentEntryHalt {
+  setAt: string;
+  basketId: string;
+  kind: CrossSectionalExchangeIncident["kind"];
+  reason: string;
+  autoRecovery?: {
+    lastCheckedAt: string | null;
+    lastBlockedReason: string | null;
+  };
 }
 
 /** A post-only exit has to survive a process death just as an entry does. */
@@ -1117,13 +1192,15 @@ export interface ExecutorBasket {
     voidedAt: string;
     reason: string;
   } | null;
+  /** Exchange liquidation / unexpected-flat proof. Kept even after the basket becomes terminal. */
+  exchangeIncident?: CrossSectionalExchangeIncident | null;
 }
 
 /** True when a closed basket is retained for audit but must never influence normal reporting or learning. */
 export function isCrossSectionalBasketReportingExcluded(
-  basket: Pick<ExecutorBasket, "reportingExclusion">,
+  basket: Pick<ExecutorBasket, "reportingExclusion"> & Partial<Pick<ExecutorBasket, "exchangeIncident">>,
 ): boolean {
-  return basket.reportingExclusion?.kind === "OPERATOR_VOID";
+  return basket.reportingExclusion?.kind === "OPERATOR_VOID" || basket.exchangeIncident != null;
 }
 
 export type CurrentPolicyForwardCohort = {
@@ -1455,6 +1532,12 @@ interface ExecutorState {
   entryAdmissions?: CrossSectionalEntryAdmissionEvent[];
   /** Bounded, restart-durable explanation for post-admission skips and successful reservations. */
   entryAttempts?: CrossSectionalEntryAttemptEvent[];
+  /**
+   * Unlike an ordinary daily-loss pause, this survives restart: a forced exchange close means the
+   * book has lost its causal accounting. Existing close/reconciliation remains allowed; a fresh
+   * basket waits for verified automatic recovery or an explicit operator acknowledgement.
+   */
+  exchangeIncidentEntryHalt?: CrossSectionalExchangeIncidentEntryHalt | null;
 }
 
 export class CrossSectionalExecutorStore {
@@ -1510,6 +1593,9 @@ export class CrossSectionalExecutorStore {
           if (!Array.isArray((parsed as { entryAttempts?: unknown }).entryAttempts)) {
             (parsed as { entryAttempts: CrossSectionalEntryAttemptEvent[] }).entryAttempts = [];
           }
+          if ((parsed as { exchangeIncidentEntryHalt?: unknown }).exchangeIncidentEntryHalt === undefined) {
+            (parsed as { exchangeIncidentEntryHalt: CrossSectionalExchangeIncidentEntryHalt | null }).exchangeIncidentEntryHalt = null;
+          }
           // Legacy status migration: records persisted before this task's richer status enum
           // existed used status "OPEN" for BOTH "mid-placement" and "fully filled, healthy" —
           // there is no way to recover which one a bare "OPEN" meant after the fact, but every
@@ -1564,6 +1650,7 @@ export class CrossSectionalExecutorStore {
       orphanedLegs: [],
       entryAdmissions: [],
       entryAttempts: [],
+      exchangeIncidentEntryHalt: null,
     };
   }
 
@@ -2738,6 +2825,17 @@ export class CrossSectionalExecutor {
     };
     /** Non-null while the daily-loss breaker is holding NEW opens (open baskets unaffected). */
     openHalted: string | null;
+    /** Durable circuit breaker set after a confirmed exchange auto-close or unique unexplained flat. */
+    exchangeIncidentEntryHalt: CrossSectionalExchangeIncidentEntryHalt | null;
+    /** Effective automatic recovery policy and its last verified blocker, never an env-intention guess. */
+    exchangeIncidentAutoRecovery: {
+      enabled: boolean;
+      cooldownMs: number;
+      eligibleAt: string | null;
+      remainingMs: number | null;
+      lastCheckedAt: string | null;
+      lastBlockedReason: string | null;
+    } | null;
     openBasket: ExecutorBasket | null;
     /** ALL currently-open baskets, not just the first (openBasket, kept for compatibility, is
      *  just openBaskets[0]). MAX_OPEN_BASKETS can exceed 1 (e.g. testnet runs 4) — any consumer
@@ -2776,6 +2874,10 @@ export class CrossSectionalExecutor {
      *  label consumer must exclude these, never zero-fill them — surfaced here (same shape
      *  discipline as orphanedLegs above) so an operator can never mistake "excluded" for "handled". */
     accountingIncompleteBaskets: ExecutorBasket[];
+    /** Terminal audit records deliberately excluded from normal P&L and learning. */
+    exchangeIncidentBaskets: ExecutorBasket[];
+    /** Strict subset of exchangeIncidentBaskets: confirmed Binance `autoclose-*` events only. */
+    marginCallBaskets: ExecutorBasket[];
   } {
     const st = this.store.getState();
     const currentPolicyFingerprint = buildCurrentCrossSectionalPolicyFingerprint(this.nowIso());
@@ -2794,8 +2896,11 @@ export class CrossSectionalExecutor {
     // operational realized summary below. It is nevertheless not a clean 3L/3S observation.
     const cleanClosed = closed.filter((basket) => !basket.operatorException);
     const openBaskets = st.baskets.filter((b) => this.isBasketLive(b));
+    const exchangeIncidentBaskets = st.baskets.filter((basket) => basket.exchangeIncident != null);
+    const marginCallBaskets = exchangeIncidentBaskets.filter((basket) => basket.exchangeIncident?.kind === "MARGIN_CALL");
     const targetVariant = this.targetVariant;
     const nowMs = new Date(this.nowIso()).getTime();
+    const exchangeIncidentAutoRecovery = this.exchangeIncidentAutoRecoveryStatus(st.exchangeIncidentEntryHalt ?? null, nowMs);
     const matching = this.signalStore.all
       .filter((o) => (o.variant ?? "RAW") === targetVariant)
       .sort((a, b) => b.openedAtMs - a.openedAtMs);
@@ -2824,7 +2929,7 @@ export class CrossSectionalExecutor {
         : null;
     return {
       enabled: this.enabledFn(),
-      allowed: this.isAllowed() && entryAdmission.allowed,
+      allowed: this.isAllowed() && entryAdmission.allowed && !st.exchangeIncidentEntryHalt,
       entryHealthBypassed: !this.entryTrafficLightEnabledFn() && !this.rawEntryHealth().allowed && isCrossSectionalEntryHealthBypassed(),
       entryHealthVerdict: this.rawEntryHealth(),
       entryAdmission,
@@ -2861,13 +2966,20 @@ export class CrossSectionalExecutor {
       currentPolicyForwardCohort: currentPolicyForward,
       accountingCounts: {
         cleanN: cleanClosed.length,
-        quarantinedN: st.baskets.filter((basket) => basket.status === "CLOSED" && (basket.accountingStatus === "ACCOUNTING_INCOMPLETE" || isCrossSectionalBasketReportingExcluded(basket) || Boolean(basket.operatorException))).length,
+        quarantinedN: st.baskets.filter((basket) =>
+          (basket.status === "CLOSED" || basket.status === "ABORTED") &&
+          (basket.accountingStatus === "ACCOUNTING_INCOMPLETE" || isCrossSectionalBasketReportingExcluded(basket) || Boolean(basket.operatorException)),
+        ).length,
         rejectedN: this.rejectedBasketCount(),
       },
       dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),
       dailyMaxLossUsd: this.dailyMaxLossUsdFn(),
       maxOpenBaskets: this.maxOpenBasketsFn(),
-      openHalted: this.openHalted,
+      openHalted: st.exchangeIncidentEntryHalt
+        ? this.exchangeIncidentHaltMessage(st.exchangeIncidentEntryHalt, nowMs)
+        : this.openHalted,
+      exchangeIncidentEntryHalt: st.exchangeIncidentEntryHalt ?? null,
+      exchangeIncidentAutoRecovery,
       openBasket: openBaskets[0] ?? null,
       openBaskets,
       closedCount: closed.length,
@@ -2882,7 +2994,467 @@ export class CrossSectionalExecutor {
       formationEvaluation: evaluateCrossSectionalFormationCohort(closed, new Set(currentPolicyForward.validBasketIds)),
       orphanedLegs: st.orphanedLegs ?? [],
       accountingIncompleteBaskets: st.baskets.filter((b) => b.accountingStatus === "ACCOUNTING_INCOMPLETE"),
+      exchangeIncidentBaskets,
+      marginCallBaskets,
     };
+  }
+
+  private exchangeIncidentAutoRecoveryStatus(
+    halt: CrossSectionalExchangeIncidentEntryHalt | null,
+    nowMs: number,
+  ): {
+    enabled: boolean;
+    cooldownMs: number;
+    eligibleAt: string | null;
+    remainingMs: number | null;
+    lastCheckedAt: string | null;
+    lastBlockedReason: string | null;
+  } | null {
+    if (!halt) return null;
+    const cooldownMs = crossSectionalExchangeIncidentAutoRecoveryCooldownMs();
+    const setAtMs = Date.parse(halt.setAt);
+    const eligibleAtMs = Number.isFinite(setAtMs) ? setAtMs + cooldownMs : null;
+    return {
+      enabled: isCrossSectionalExchangeIncidentAutoRecoveryEnabled(),
+      cooldownMs,
+      eligibleAt: eligibleAtMs === null ? null : new Date(eligibleAtMs).toISOString(),
+      remainingMs: eligibleAtMs === null || !Number.isFinite(nowMs) ? null : Math.max(0, eligibleAtMs - nowMs),
+      lastCheckedAt: halt.autoRecovery?.lastCheckedAt ?? null,
+      lastBlockedReason: halt.autoRecovery?.lastBlockedReason ?? null,
+    };
+  }
+
+  private exchangeIncidentHaltMessage(halt: CrossSectionalExchangeIncidentEntryHalt, nowMs: number): string {
+    const recovery = this.exchangeIncidentAutoRecoveryStatus(halt, nowMs);
+    const base = `CRITICAL: exchange incident on ${halt.basketId}`;
+    if (!recovery?.enabled) {
+      return `${base} — automatic recovery disabled; new baskets require acknowledgement after residual close/reconciliation is flat.`;
+    }
+    if (recovery.remainingMs !== null && recovery.remainingMs > 0) {
+      return `${base} — automatic recovery rechecks after ${Math.ceil(recovery.remainingMs / 60_000)}m cooldown; manual acknowledgement remains available only after residual close/reconciliation is flat.`;
+    }
+    if (recovery.lastBlockedReason) {
+      return `${base} — automatic recovery is still blocked: ${recovery.lastBlockedReason}; manual acknowledgement remains available after residual close/reconciliation is flat.`;
+    }
+    return `${base} — automatic recovery verification is pending; existing close/reconciliation remains active.`;
+  }
+
+  /** Persist the last reason auto-recovery declined to release the entry latch. */
+  private noteExchangeIncidentAutoRecoveryBlocked(
+    halt: CrossSectionalExchangeIncidentEntryHalt,
+    reason: string,
+  ): void {
+    const now = this.nowIso();
+    halt.autoRecovery ??= { lastCheckedAt: null, lastBlockedReason: null };
+    halt.autoRecovery.lastCheckedAt = now;
+    halt.autoRecovery.lastBlockedReason = reason;
+    this.openHalted = this.exchangeIncidentHaltMessage(halt, Date.parse(now));
+    this.store.save();
+  }
+
+  /**
+   * Resolving a halt never reuses a signal that predates the incident. The normal fresh-signal
+   * gate remains responsible for all strategy/admission checks and may still refuse the next scan.
+   */
+  private clearExchangeIncidentEntryHalt(
+    halt: CrossSectionalExchangeIncidentEntryHalt,
+    resolution: "AUTO_RECOVERY" | "OPERATOR_ACK",
+    reason: string,
+  ): void {
+    const st = this.store.getState();
+    const incidentBasket = st.baskets.find((basket) => basket.basketId === halt.basketId);
+    if (incidentBasket?.exchangeIncident) {
+      incidentBasket.exchangeIncident.entryHaltResolution = { mode: resolution, at: this.nowIso(), reason };
+    }
+    const setAtMs = Date.parse(halt.setAt);
+    if (Number.isFinite(setAtMs)) {
+      st.lastSeenSignalMs = Math.max(st.lastSeenSignalMs ?? 0, setAtMs);
+    }
+    st.exchangeIncidentEntryHalt = null;
+    this.openHalted = null;
+    this.store.save();
+  }
+
+  /**
+   * Automatic recovery is deliberately narrower than an ordinary entry check. It never opens or
+   * closes a position; it merely releases the post-incident latch after proving that this executor
+   * has no live basket/orphan, the incident's own residual close is flat, and authenticated
+   * position/open-order reads are healthy with no order bearing this basket's client-id namespace.
+   * Other lanes may legitimately remain open on the shared netted account, so they are not treated
+   * as a false reason to strand this independent executor forever.
+   */
+  private async maybeAutoRecoverExchangeIncidentEntryHalt(): Promise<void> {
+    const st = this.store.getState();
+    const halt = st.exchangeIncidentEntryHalt;
+    if (!halt) return;
+    const nowMs = Date.parse(this.nowIso());
+    const recovery = this.exchangeIncidentAutoRecoveryStatus(halt, nowMs);
+    if (!recovery?.enabled) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, "automatic recovery is disabled by effective runtime policy");
+      return;
+    }
+    if (recovery.remainingMs === null) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, "incident timestamp is invalid; cannot establish a safe recovery cooldown");
+      return;
+    }
+    if (recovery.remainingMs > 0) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, `cooldown active for ${Math.ceil(recovery.remainingMs / 60_000)}m more`);
+      return;
+    }
+    if (st.baskets.some((basket) => this.isBasketLive(basket))) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, "a cross-sectional basket is still live");
+      return;
+    }
+    if ((st.orphanedLegs ?? []).length > 0) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, "orphaned exchange exposure remains");
+      return;
+    }
+    const incidentBasket = st.baskets.find((basket) => basket.basketId === halt.basketId);
+    const incident = incidentBasket?.exchangeIncident;
+    if (!incidentBasket || !incident) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, "incident audit record is unavailable");
+      return;
+    }
+    if (incident.residualClose.state !== "FLAT") {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, `incident residual close is ${incident.residualClose.state.toLowerCase()}`);
+      return;
+    }
+    if (incidentBasket.legs.some((leg) => leg.exitOrderId === null)) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, "a known incident-basket leg still lacks a confirmed exit");
+      return;
+    }
+    if (!this.client.getOpenOrders) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, "open-order verification is unavailable on this runtime client");
+      return;
+    }
+    let positions: Awaited<ReturnType<CrossSectionalExecClient["getPositions"]>>;
+    let openOrders: Awaited<ReturnType<NonNullable<CrossSectionalExecClient["getOpenOrders"]>>>;
+    try {
+      [positions, openOrders] = await Promise.all([this.client.getPositions(), this.client.getOpenOrders()]);
+    } catch {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, "authenticated exchange position/open-order check failed");
+      return;
+    }
+    if (!Array.isArray(positions) || positions.some((position) => !Number.isFinite(position.positionAmt))) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, "exchange position snapshot is malformed");
+      return;
+    }
+    if (!Array.isArray(openOrders)) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, "exchange open-order snapshot is malformed");
+      return;
+    }
+    const clientOrderPrefix = `xsec-${halt.basketId.slice(-12)}-`;
+    const residualOwnOrders = openOrders.filter((order) => order.clientOrderId.startsWith(clientOrderPrefix));
+    if (residualOwnOrders.length > 0) {
+      this.noteExchangeIncidentAutoRecoveryBlocked(halt, `exchange still has ${residualOwnOrders.length} open order(s) for the incident basket`);
+      return;
+    }
+    this.clearExchangeIncidentEntryHalt(
+      halt,
+      "AUTO_RECOVERY",
+      "cooldown elapsed; residual close flat; no orphan; exchange position and basket-order checks passed",
+    );
+  }
+
+  /**
+   * Exchange-side safety reconciliation.
+   *
+   * A normal executor close always has a durable, executor-originated order id.  Binance's forced
+   * liquidation route does not: it arrives as an `autoclose-*` order and can leave one persisted
+   * basket leg appearing open forever. We require that affirmative exchange evidence here. A bare
+   * zero position is insufficient on a netted account; the generic UNKNOWN-FLAT path instead
+   * originates only when Binance rejects this exact leg's reduce-only exit and the same request
+   * immediately reconciles the symbol flat/opposite.
+   *
+   * This method records/queues safety work only. `tick()` calls it before its normal close phase,
+   * so any residual legs are subsequently closed through the existing netting-aware reduce-only
+   * path, never through a blanket account flatten.
+   */
+  async reconcileExchangeIncidentsNow(): Promise<{
+    marginCallsDetected: number;
+    inspectedBaskets: number;
+  }> {
+    const st = this.store.getState();
+    let marginCallsDetected = 0;
+    const candidates = st.baskets.filter((basket) => {
+      if (basket.exchangeIncident) return false;
+      if (this.isBasketLive(basket)) return basket.legs.some((leg) => leg.exitOrderId === null);
+      return basket.accountingStatus === "ACCOUNTING_INCOMPLETE" &&
+        /RECONCILED_POSITION_ALREADY_FLAT/.test(basket.closeReason ?? "") &&
+        basket.legs.some((leg) => leg.exitOrderId === "POSITION_ALREADY_FLAT");
+    });
+
+    for (const basket of candidates) {
+      for (const leg of basket.legs) {
+        const eligible = leg.exitOrderId === null || leg.exitOrderId === "POSITION_ALREADY_FLAT";
+        if (!eligible) continue;
+        const evidence = await this.findAutoCloseEvidence(basket, leg);
+        if (!evidence) continue;
+        this.recordMarginCallIncident(basket, leg, evidence);
+        marginCallsDetected += 1;
+        break; // One forced exchange close quarantines the whole basket.
+      }
+    }
+
+    // A bare position snapshot is deliberately NOT enough to quarantine a running basket here.
+    // The account is netted across sibling lanes and a zero row cannot identify which internal
+    // leg disappeared. `autoclose-*` is affirmative proof. The generic UNKNOWN-FLAT quarantine is
+    // still covered in closeLegMarket's own -2022 + exact symbol reconciliation path, where the
+    // exchange has rejected the actual reduce-only exit for this exact leg.
+
+    return { marginCallsDetected, inspectedBaskets: candidates.length };
+  }
+
+  /**
+   * Operator override for the same durable post-incident latch. It intentionally refuses while
+   * any basket or orphan is still live; acknowledgement cannot bypass residual reconciliation.
+   */
+  acknowledgeExchangeIncidentEntryHalt(): { ok: boolean; reason: string | null; cleared: boolean } {
+    const st = this.store.getState();
+    const halt = st.exchangeIncidentEntryHalt;
+    if (!halt) return { ok: true, reason: null, cleared: false };
+    if (st.baskets.some((basket) => this.isBasketLive(basket))) {
+      return { ok: false, reason: "cannot acknowledge exchange incident while a basket is still live", cleared: false };
+    }
+    if ((st.orphanedLegs ?? []).length > 0) {
+      return { ok: false, reason: "cannot acknowledge exchange incident while orphaned exchange exposure remains", cleared: false };
+    }
+    this.clearExchangeIncidentEntryHalt(halt, "OPERATOR_ACK", "explicit dashboard/operator acknowledgement after flat/orphan checks");
+    return { ok: true, reason: null, cleared: true };
+  }
+
+  private async findAutoCloseEvidence(
+    basket: ExecutorBasket,
+    leg: ExecutorLeg,
+  ): Promise<{
+    eventAt: string;
+    orderId: string;
+    clientOrderId: string;
+    qty: number;
+    price: number;
+    realizedPnlUsd: number;
+    commissionUsd: number;
+    insuranceClearUsd: number | null;
+  } | null> {
+    const openedAtMs = Date.parse(basket.openedAt);
+    const startTime = Number.isFinite(openedAtMs) ? Math.max(0, openedAtMs - 60_000) : undefined;
+    let trades: Awaited<ReturnType<CrossSectionalExecClient["getUserTrades"]>>;
+    try {
+      trades = await this.client.getUserTrades(leg.symbol, { startTime, limit: 100 });
+    } catch {
+      // A failed audit read must never fabricate an exchange incident or interrupt the normal
+      // close/retry path. The next tick retries from the same durable basket state.
+      return null;
+    }
+    const entryOrderIds = new Set(entryOrderIdsForLeg(leg));
+    const recordedExitIds = new Set([
+      ...(leg.exitOrderIds ?? []),
+      ...(leg.exitFills ?? []).map((fill) => fill.orderId),
+      ...(leg.exitOrderId && leg.exitOrderId !== "POSITION_ALREADY_FLAT" ? [leg.exitOrderId] : []),
+    ]);
+    const candidateTimes = new Map<string, number>();
+    for (const trade of trades) {
+      if (!trade.orderId || entryOrderIds.has(trade.orderId) || recordedExitIds.has(trade.orderId)) continue;
+      candidateTimes.set(trade.orderId, Math.max(candidateTimes.get(trade.orderId) ?? 0, trade.time));
+    }
+    // A very active unrelated lane can trade the same symbol. Bound the forensic queries while
+    // preserving the most recent fills, where an exchange auto-close necessarily appears.
+    const candidateOrderIds = [...candidateTimes.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 24)
+      .map(([orderId]) => orderId);
+    for (const orderId of candidateOrderIds) {
+      let order: FuturesOrder;
+      try {
+        order = await this.client.queryOrder(leg.symbol, orderId);
+      } catch {
+        continue;
+      }
+      const expectedExitSide = leg.side === "LONG" ? "SELL" : "BUY";
+      if (!/^autoclose-/i.test(order.clientOrderId) || !order.reduceOnly || order.side !== expectedExitSide) continue;
+      const fills = trades.filter((trade) => trade.orderId === orderId);
+      const qty = fills.reduce((sum, trade) => sum + (Number.isFinite(trade.qty) ? Math.max(0, trade.qty) : 0), 0);
+      const fillQty = qty > 0 ? qty : Math.max(0, order.executedQty);
+      const price = qty > 0
+        ? fills.reduce((sum, trade) => sum + trade.qty * trade.price, 0) / qty
+        : order.avgPrice;
+      if (!(fillQty > 0) || !(price > 0)) continue;
+      // Binance nets positions by symbol across lanes. Do not attribute an account-level forced
+      // close to this basket merely because the symbol matches: only quarantine when the forced
+      // order's filled quantity exactly matches this leg's still-unexited lot (within a tiny
+      // exchange-rounding tolerance) and its close side is correct.
+      const expectedQty = this.incidentUnattributedExitQty(leg);
+      const qtyTolerance = Math.max(1e-8, expectedQty * 1e-6);
+      if (!(expectedQty > 0) || Math.abs(fillQty - expectedQty) > qtyTolerance) continue;
+      const eventAtMs = Math.max(order.updateTime || 0, ...fills.map((trade) => trade.time || 0));
+      let insuranceClearUsd: number | null = null;
+      if (this.client.getIncomeHistory) {
+        try {
+          const income = await this.client.getIncomeHistory({
+            startTime: Math.max(0, eventAtMs - 5 * 60_000),
+            endTime: eventAtMs + 5 * 60_000,
+            limit: 100,
+          });
+          const matching = income.filter((row) =>
+            row.symbol === leg.symbol &&
+            row.incomeType === "INSURANCE_CLEAR" &&
+            Math.abs(row.time - eventAtMs) <= 5 * 60_000,
+          );
+          if (matching.length) insuranceClearUsd = matching.reduce((sum, row) => sum + row.income, 0);
+        } catch {
+          // Insurance ledger corroborates the event but is not required: Binance's own
+          // `autoclose-*` order is already sufficient to classify a forced exchange close.
+        }
+      }
+      return {
+        eventAt: new Date(eventAtMs || Date.now()).toISOString(),
+        orderId,
+        clientOrderId: order.clientOrderId,
+        qty: fillQty,
+        price,
+        realizedPnlUsd: fills.reduce((sum, trade) => sum + (Number.isFinite(trade.realizedPnl) ? trade.realizedPnl : 0), 0),
+        commissionUsd: fills.reduce((sum, trade) => sum + (Number.isFinite(trade.commission) ? trade.commission : 0), 0),
+        insuranceClearUsd,
+      };
+    }
+    return null;
+  }
+
+  private armExchangeIncidentEntryHalt(basket: ExecutorBasket, incident: CrossSectionalExchangeIncident): void {
+    const st = this.store.getState();
+    // Preserve the first causal incident until an operator explicitly acknowledges it. Later
+    // incidents remain on their own basket rows, but must not overwrite the original alert.
+    st.exchangeIncidentEntryHalt ??= {
+      setAt: incident.detectedAt,
+      basketId: basket.basketId,
+      kind: incident.kind,
+      reason: incident.reason,
+      autoRecovery: { lastCheckedAt: null, lastBlockedReason: null },
+    };
+    this.openHalted = this.exchangeIncidentHaltMessage(st.exchangeIncidentEntryHalt, Date.parse(this.nowIso()));
+  }
+
+  private recordMarginCallIncident(
+    basket: ExecutorBasket,
+    leg: ExecutorLeg,
+    evidence: {
+      eventAt: string;
+      orderId: string;
+      clientOrderId: string;
+      qty: number;
+      price: number;
+      realizedPnlUsd: number;
+      commissionUsd: number;
+      insuranceClearUsd: number | null;
+    },
+  ): void {
+    const now = this.nowIso();
+    const remaining = this.incidentUnattributedExitQty(leg);
+    const attributableQty = Math.min(remaining, evidence.qty);
+    if (attributableQty > 0) {
+      this.recordExitFill(leg, {
+        orderId: evidence.orderId,
+        qty: attributableQty,
+        price: evidence.price,
+        priceConfirmed: true,
+        liquidity: "TAKER",
+      });
+    }
+    const incident: CrossSectionalExchangeIncident = {
+      version: "EXCHANGE_INCIDENT_V1",
+      kind: "MARGIN_CALL",
+      detectedAt: now,
+      exchangeEventAt: evidence.eventAt,
+      evidence: "AUTO_CLOSE_ORDER",
+      reason: `Binance forced close ${evidence.clientOrderId} on ${leg.symbol}`,
+      affectedLeg: {
+        symbol: leg.symbol,
+        side: leg.side,
+        expectedQty: leg.qty,
+        entryPrice: leg.entryPrice,
+        lastMarkPrice: leg.lastMarkPrice ?? null,
+        lastMarkAt: leg.lastMarkAt ?? null,
+        forcedExitOrderId: evidence.orderId,
+        forcedExitClientOrderId: evidence.clientOrderId,
+        forcedExitQty: evidence.qty,
+        forcedExitPrice: evidence.price,
+        forcedExitRealizedPnlUsd: evidence.realizedPnlUsd,
+        forcedExitCommissionUsd: evidence.commissionUsd,
+        insuranceClearUsd: evidence.insuranceClearUsd,
+      },
+      residualClose: {
+        state: this.isBasketLive(basket) ? "PENDING" : "FLAT",
+        requestedAt: now,
+        completedAt: this.isBasketLive(basket) ? null : now,
+        lastError: null,
+      },
+    };
+    basket.exchangeIncident = incident;
+    this.armExchangeIncidentEntryHalt(basket, incident);
+    if (this.isBasketLive(basket)) {
+      basket.operatorCloseRequest ??= {
+        reason: `EXCHANGE_MARGIN_CALL:${basket.basketId}:${leg.symbol}`,
+        requestedAt: now,
+        attempts: 0,
+        lastAttemptAt: null,
+        lastError: null,
+      };
+    } else {
+      basket.status = "ABORTED";
+      basket.closedAt ??= now;
+      basket.closeReason = `EXCHANGE_MARGIN_CALL:${leg.symbol}:${evidence.clientOrderId}`;
+      basket.accountingStatus = "ACCOUNTING_INCOMPLETE";
+      this.markFourBrainBasketUnmeasured(basket, "EXCHANGE_MARGIN_CALL");
+    }
+    this.store.save();
+  }
+
+  private recordUnexpectedExchangeFlatIncident(
+    basket: ExecutorBasket,
+    leg: ExecutorLeg,
+    exchangeNetQty: number,
+  ): void {
+    const now = this.nowIso();
+    // The exchange is provably flat/opposite for this uniquely owned leg, but no exchange order
+    // proves why. Do not fabricate a fill price or P&L; retain the old sentinel only as an exact
+    // accounting fact, then immediately reduce the remaining known legs.
+    leg.exitOrderId = "POSITION_ALREADY_FLAT";
+    leg.exitPrice = null;
+    leg.exitPriceConfirmed = false;
+    const incident: CrossSectionalExchangeIncident = {
+      version: "EXCHANGE_INCIDENT_V1",
+      kind: "UNEXPECTED_EXCHANGE_FLAT",
+      detectedAt: now,
+      exchangeEventAt: null,
+      evidence: "UNIQUE_POSITION_MISMATCH",
+      reason: `Binance position for unique ${leg.symbol} leg is ${exchangeNetQty}, expected ${leg.side === "LONG" ? leg.qty : -leg.qty}`,
+      affectedLeg: {
+        symbol: leg.symbol,
+        side: leg.side,
+        expectedQty: leg.qty,
+        entryPrice: leg.entryPrice,
+        lastMarkPrice: leg.lastMarkPrice ?? null,
+        lastMarkAt: leg.lastMarkAt ?? null,
+        forcedExitOrderId: null,
+        forcedExitClientOrderId: null,
+        forcedExitQty: null,
+        forcedExitPrice: null,
+        forcedExitRealizedPnlUsd: null,
+        forcedExitCommissionUsd: null,
+        insuranceClearUsd: null,
+      },
+      residualClose: { state: "PENDING", requestedAt: now, completedAt: null, lastError: null },
+    };
+    basket.exchangeIncident = incident;
+    basket.operatorCloseRequest ??= {
+      reason: `EXCHANGE_UNEXPECTED_FLAT:${basket.basketId}:${leg.symbol}`,
+      requestedAt: now,
+      attempts: 0,
+      lastAttemptAt: null,
+      lastError: null,
+    };
+    this.armExchangeIncidentEntryHalt(basket, incident);
+    this.store.save();
   }
 
   /** Realized results of every CLOSED basket, for account-level display: the engine's own
@@ -3284,6 +3856,10 @@ export class CrossSectionalExecutor {
       // comment. Runs FIRST, every tick, for as long as it stays unresolved; a transient failure
       // must self-heal, not leave real exposure silently open forever.
       await this.retryOrphanedLegFlattens();
+      // Binance can close one isolated leg outside this executor (for example `autoclose-*` after
+      // a liquidation). Reconcile that BEFORE normal TP/HORIZON logic: once detected, the basket
+      // is quarantined and every residual known leg is closed through the normal reduce-only path.
+      await this.reconcileExchangeIncidentsNow();
       // A whole-basket operator close is a risk-reducing instruction, not a one-shot HTTP
       // attempt.  Run it before every ordinary exit/new-entry decision so a partial fill or a
       // browser/network timeout cannot strand the remaining known leg until the distant horizon.
@@ -3291,6 +3867,10 @@ export class CrossSectionalExecutor {
       await this.closeBasketsHittingProfitTarget();
       await this.closeDueBaskets();
       await this.ensureOpenBasketLeverage();
+      // A prior exchange-side forced close may release NEW entries only after the close/reconcile
+      // phases above have made the incident basket terminal and the fresh authenticated checks
+      // below pass. This never alters a position; it only clears the durable entry latch.
+      await this.maybeAutoRecoverExchangeIncidentEntryHalt();
       // Restart-recovery (see recoverIncompleteBaskets' own doc comment): gated on isAllowed() —
       // the SAME master armed/testnet gate maybeOpenBasket itself requires — because resuming a
       // stuck placement means placing MORE real entry orders, exactly the same risk category as
@@ -3503,7 +4083,7 @@ export class CrossSectionalExecutor {
         this.store.save();
         return this.manualCloseResult(basket, "PENDING", message, false);
       }
-      if (hasStaleBookExit) {
+      if (hasStaleBookExit && !basket.exchangeIncident) {
         // Match closeBasket's existing stale-book accounting contract.  The exchange says the
         // relevant position was already flat, but there is no trustworthy per-leg exit fill from
         // which to claim a realised result.  Do not unlock it as a clean manual close.
@@ -3983,6 +4563,22 @@ export class CrossSectionalExecutor {
   }
 
   /**
+   * `POSITION_ALREADY_FLAT` is a bookkeeping sentinel, not a verified fill.  Ordinary close
+   * code quite reasonably treats a non-null exit order id as fully accounted for; forensic
+   * reconciliation must do the opposite for this one sentinel, otherwise a historical Binance
+   * `autoclose-*` can never be attributed because its expected residual would be read as zero.
+   * Preserve any explicitly recorded partial fills, then attribute only the unverified remainder.
+   */
+  private incidentUnattributedExitQty(leg: ExecutorLeg): number {
+    if (leg.exitOrderId !== "POSITION_ALREADY_FLAT") return this.exitRemainingQty(leg);
+    const confirmedPartial = (leg.exitFills ?? []).reduce(
+      (sum, fill) => sum + (Number.isFinite(fill.qty) && fill.qty > 0 ? fill.qty : 0),
+      0,
+    );
+    return Math.max(0, leg.qty - confirmedPartial);
+  }
+
+  /**
    * Stores a close portion before deciding whether a leg is fully flat.  If Binance partially fills
    * the fallback, the next tick knows the exact remaining quantity and cannot accidentally re-close
    * the already-filled maker lot.
@@ -4155,10 +4751,16 @@ export class CrossSectionalExecutor {
           const positionAmt = positions.find((position) => position.symbol === leg.symbol)?.positionAmt ?? 0;
           const expectedSign = leg.side === "LONG" ? 1 : -1;
           if (Math.abs(positionAmt) <= 1e-9 || Math.sign(positionAmt) !== expectedSign) {
-            leg.exitOrderId = "POSITION_ALREADY_FLAT";
-            leg.exitPrice = null;
-            leg.exitPriceConfirmed = false;
-            this.store.save();
+            // This is the only generic exchange-flat route: Binance rejected THIS exact
+            // reduce-only close and the immediate signed-position read confirms flat/opposite.
+            // It is therefore safe to quarantine the basket without guessing a mark or a fill.
+            if (!basket.exchangeIncident) this.recordUnexpectedExchangeFlatIncident(basket, leg, positionAmt);
+            else {
+              leg.exitOrderId = "POSITION_ALREADY_FLAT";
+              leg.exitPrice = null;
+              leg.exitPriceConfirmed = false;
+              this.store.save();
+            }
             return { staleBookReconciled: true };
           }
         } catch {
@@ -4475,6 +5077,35 @@ export class CrossSectionalExecutor {
     if (basket.legs.some((leg) => leg.exitOrderId === null)) {
       throw new Error(`basket ${basket.basketId} close incomplete: exchange filled only part of one or more legs; retrying remaining quantity without reversing`);
     }
+    if (basket.exchangeIncident) {
+      // The forced exchange close is retained as an incident record, not merged into the ordinary
+      // realised-basket cohort. Even when the remaining legs now reconcile cleanly, we do not have
+      // a causal whole-basket exit path anymore and must not turn it into a deceptively normal P&L.
+      if (!(await this.reconcileBasketExit(basket, true))) {
+        basket.exchangeIncident.residualClose.state = "UNRESOLVED";
+        basket.exchangeIncident.residualClose.lastError = "exchange net does not yet match the remaining sibling book";
+        this.store.save();
+        throw new Error(`basket ${basket.basketId} incident residual close is not yet exchange-reconciled`);
+      }
+      basket.status = "ABORTED";
+      basket.closedAt = this.nowIso();
+      // Keep the legacy generic stale-book close reason stable for existing audit consumers; the
+      // new exchangeIncident payload carries the richer quarantine explanation. A confirmed
+      // Binance auto-close gets its own explicit causal close reason.
+      basket.closeReason = basket.exchangeIncident.kind === "MARGIN_CALL"
+        ? `EXCHANGE_MARGIN_CALL:${basket.exchangeIncident.affectedLeg.symbol}:${reason}`
+        : `RECONCILED_POSITION_ALREADY_FLAT:${reason}`;
+      basket.grossPnlUsd = null;
+      basket.feeEstimateUsd = null;
+      basket.netPnlUsd = null;
+      basket.accountingStatus = "ACCOUNTING_INCOMPLETE";
+      basket.exchangeIncident.residualClose.state = "FLAT";
+      basket.exchangeIncident.residualClose.completedAt = basket.closedAt;
+      basket.exchangeIncident.residualClose.lastError = null;
+      this.markFourBrainBasketUnmeasured(basket, basket.exchangeIncident.kind);
+      this.store.save();
+      return;
+    }
     if (staleBookReconciled) {
       basket.status = "ABORTED";
       basket.closedAt = this.nowIso();
@@ -4726,6 +5357,11 @@ export class CrossSectionalExecutor {
   }
 
   private async maybeOpenBasket(): Promise<void> {
+    const incidentHalt = this.store.getState().exchangeIncidentEntryHalt;
+    if (incidentHalt) {
+      this.openHalted = this.exchangeIncidentHaltMessage(incidentHalt, Date.parse(this.nowIso()));
+      return;
+    }
     if (this.hasUnresolvedOrphanedExposure()) {
       this.openHalted =
         "CRITICAL: unresolved orphaned exchange exposure from a rollback/flatten failure — new baskets blocked until every orphaned leg clears (see getStatus().orphanedLegs); existing baskets keep closing normally.";

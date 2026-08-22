@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { rmSync } from "node:fs";
 import { resolve } from "node:path";
 import os from "node:os";
-import { BinanceFuturesPrivateError, type FuturesOrder, type FuturesPosition, type FuturesSymbolFilters } from "../src/lib/binance-futures-private.js";
+import { BinanceFuturesPrivateError, type FuturesIncomeEntry, type FuturesOrder, type FuturesPosition, type FuturesSymbolFilters } from "../src/lib/binance-futures-private.js";
 import {
   CrossSectionalStore,
   _resetCrossSectionalStoreForTests,
@@ -126,9 +126,12 @@ class FakeExecClient implements CrossSectionalExecClient {
   fillPriceBySymbol = new Map<string, number>();
   markPriceBySymbol = new Map<string, number>();
   positionAmtBySymbol = new Map<string, number>();
+  openOrders: FuturesOrder[] = [];
   /** What queryOrder reports for a symbol when polled — simulates the exchange confirming a fill
    *  that the initial placeOrder response returned as avgPrice=0. Unset ⇒ stays unconfirmed (NEW). */
   queryOrderAvgPriceBySymbol = new Map<string, number>();
+  /** Explicit order responses for exchange-originated events such as Binance `autoclose-*`. */
+  queryOrderResponses = new Map<string, FuturesOrder>();
   queryOrderCallCount = 0;
   private orderSeq = 100;
 
@@ -184,6 +187,9 @@ class FakeExecClient implements CrossSectionalExecClient {
       marginType: "ISOLATED",
     }));
   }
+  async getOpenOrders(): Promise<FuturesOrder[]> {
+    return this.openOrders.slice();
+  }
   /** Symbols where a reduceOnly order gets Binance's -2022 (netted account position has the
    *  opposite sign, e.g. a sibling basket holds a bigger opposite leg on the same symbol). */
   rejectReduceOnlyOn = new Set<string>();
@@ -196,6 +202,8 @@ class FakeExecClient implements CrossSectionalExecClient {
    *  `failOnSymbol` above, which throws a plain, ambiguous Error (simulating a network/timeout
    *  failure where whether the order reached the exchange is genuinely unknown). */
   failOnSymbolWithBinanceError: string | null = null;
+  /** Test-only exchange state mutation for reduce-only residual-close reconciliation. */
+  mutatePositionsOnReduceOnly = false;
   async placeOrder(params: {
     symbol: string;
     side: string;
@@ -223,10 +231,18 @@ class FakeExecClient implements CrossSectionalExecClient {
     this.placed.push(params);
     const orderId = String(this.orderSeq++);
     const avgPrice = this.fillPriceBySymbol.get(params.symbol) ?? 0;
+    if (params.reduceOnly && this.mutatePositionsOnReduceOnly) {
+      const current = this.positionAmtBySymbol.get(params.symbol) ?? 0;
+      const delta = params.side === "SELL" ? -params.quantity : params.quantity;
+      const next = current + delta;
+      this.positionAmtBySymbol.set(params.symbol, Math.abs(next) <= 1e-9 ? 0 : next);
+    }
     return this.buildOrder(params.symbol, params.side, params.quantity, params.reduceOnly, orderId, avgPrice);
   }
   async queryOrder(symbol: string, orderId: string) {
     this.queryOrderCallCount++;
+    const scripted = this.queryOrderResponses.get(`${symbol}|${orderId}`) ?? this.queryOrderResponses.get(orderId);
+    if (scripted) return scripted;
     const avgPrice = this.queryOrderAvgPriceBySymbol.get(symbol) ?? 0;
     return this.buildOrder(symbol, "BUY", 0, false, orderId, avgPrice);
   }
@@ -260,7 +276,11 @@ class FakeExecClient implements CrossSectionalExecClient {
     });
   }
 
+  userTradesBySymbol = new Map<string, Array<{ orderId: string; price: number; qty: number; realizedPnl: number; commission: number; commissionAsset: string; time: number }>>();
+  incomeHistory: FuturesIncomeEntry[] = [];
   async getUserTrades(symbol: string): Promise<Array<{ orderId: string; price: number; qty: number; realizedPnl: number; commission: number; commissionAsset: string; time: number }>> {
+    const scripted = this.userTradesBySymbol.get(symbol);
+    if (scripted) return scripted;
     const commission = this.commissionPerTradeBySymbol.get(symbol);
     if (commission === undefined) return [];
     return this.placed
@@ -275,6 +295,9 @@ class FakeExecClient implements CrossSectionalExecClient {
         commissionAsset: "USDT",
         time: 0,
       }));
+  }
+  async getIncomeHistory(): Promise<FuturesIncomeEntry[]> {
+    return this.incomeHistory;
   }
 }
 
@@ -6262,5 +6285,243 @@ describe("[EXEC HOLD CAP] CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS", () => {
   it("never EXTENDS a basket past its own horizon when the cap is larger", async () => {
     const b = await run("72", 50);   // horizon already passed at 48h; cap of 72h must not rescue it
     expect(b.status).toBe("CLOSED");
+  });
+});
+
+describe("[EXCHANGE INCIDENT QUARANTINE] forced Binance close", () => {
+  function terminalIncidentBasket(basketId: string): ExecutorBasket {
+    return {
+      basketId,
+      sourceObservationId: `manual:${basketId}`,
+      signal: "MOM36_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - 10 * 60_000).toISOString(),
+      closesAtMs: NOW_MS + 36 * 3_600_000,
+      legs: [
+        {
+          symbol: "DOGEUSDT", side: "SHORT", qty: 100, entryPrice: 0.1, entryOrderId: "entry-doge",
+          entryPriceConfirmed: true, exitPrice: 0.2, exitOrderId: "auto-doge", exitPriceConfirmed: true,
+        },
+      ],
+      status: "ABORTED",
+      closedAt: new Date(NOW_MS - 5 * 60_000).toISOString(),
+      closeReason: "EXCHANGE_MARGIN_CALL:DOGEUSDT:autoclose-test",
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+      accountingStatus: "ACCOUNTING_INCOMPLETE",
+      exchangeIncident: {
+        version: "EXCHANGE_INCIDENT_V1",
+        kind: "MARGIN_CALL",
+        detectedAt: new Date(NOW_MS - 2 * 60_000).toISOString(),
+        exchangeEventAt: new Date(NOW_MS - 3 * 60_000).toISOString(),
+        evidence: "AUTO_CLOSE_ORDER",
+        reason: "Binance forced close autoclose-test on DOGEUSDT",
+        affectedLeg: {
+          symbol: "DOGEUSDT", side: "SHORT", expectedQty: 100, entryPrice: 0.1,
+          lastMarkPrice: 0.2, lastMarkAt: new Date(NOW_MS - 2 * 60_000).toISOString(),
+          forcedExitOrderId: "auto-doge", forcedExitClientOrderId: "autoclose-test", forcedExitQty: 100,
+          forcedExitPrice: 0.2, forcedExitRealizedPnlUsd: -10, forcedExitCommissionUsd: -0.008, insuranceClearUsd: null,
+        },
+        residualClose: { state: "FLAT", requestedAt: new Date(NOW_MS - 3 * 60_000).toISOString(), completedAt: new Date(NOW_MS - 2 * 60_000).toISOString(), lastError: null },
+      },
+    } as ExecutorBasket;
+  }
+
+  function armAutoRecoveryHalt(store: CrossSectionalExecutorStore, basketId: string, setAtMs: number): void {
+    store.getState().exchangeIncidentEntryHalt = {
+      setAt: new Date(setAtMs).toISOString(),
+      basketId,
+      kind: "MARGIN_CALL",
+      reason: "Binance forced close autoclose-test on DOGEUSDT",
+      autoRecovery: { lastCheckedAt: null, lastBlockedReason: null },
+    };
+  }
+
+  it("auto-recovers only after cooldown plus flat/orphan/order verification, and advances the signal watermark", async () => {
+    const previousEnabled = process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER;
+    const previousCooldown = process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER_COOLDOWN_MS;
+    process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER = "1";
+    process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER_COOLDOWN_MS = "60000";
+    try {
+      const { executor, store } = makeExecutor();
+      const basketId = "xb-auto-recover";
+      store.getState().baskets.push(terminalIncidentBasket(basketId));
+      armAutoRecoveryHalt(store, basketId, NOW_MS - 2 * 60_000);
+      store.save();
+
+      await executor.tick();
+
+      const basket = store.getState().baskets.find((row) => row.basketId === basketId)!;
+      expect(executor.getStatus().exchangeIncidentEntryHalt).toBeNull();
+      expect(basket.exchangeIncident?.entryHaltResolution).toMatchObject({ mode: "AUTO_RECOVERY" });
+      expect(store.getState().lastSeenSignalMs).toBe(NOW_MS - 2 * 60_000);
+    } finally {
+      if (previousEnabled === undefined) delete process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER;
+      else process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER = previousEnabled;
+      if (previousCooldown === undefined) delete process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER_COOLDOWN_MS;
+      else process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER_COOLDOWN_MS = previousCooldown;
+    }
+  });
+
+  it("keeps the halt when an incident-basket order is still resting on the exchange", async () => {
+    const previousEnabled = process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER;
+    const previousCooldown = process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER_COOLDOWN_MS;
+    process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER = "1";
+    process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER_COOLDOWN_MS = "60000";
+    try {
+      const client = new FakeExecClient();
+      const { executor, store } = makeExecutor({ client });
+      const basketId = "xb-auto-pending";
+      client.openOrders = [{
+        symbol: "DOGEUSDT", orderId: "resting-order", clientOrderId: `xsec-${basketId.slice(-12)}-e0`, status: "NEW",
+        type: "LIMIT", side: "BUY", reduceOnly: false, price: 0.1, stopPrice: 0, origQty: 100, executedQty: 0, avgPrice: 0, updateTime: NOW_MS,
+      }];
+      store.getState().baskets.push(terminalIncidentBasket(basketId));
+      armAutoRecoveryHalt(store, basketId, NOW_MS - 2 * 60_000);
+      store.save();
+
+      await executor.tick();
+
+      expect(executor.getStatus().exchangeIncidentEntryHalt?.basketId).toBe(basketId);
+      expect(executor.getStatus().exchangeIncidentAutoRecovery?.lastBlockedReason).toContain("open order");
+      expect(store.getState().baskets.find((row) => row.basketId === basketId)?.exchangeIncident?.entryHaltResolution).toBeUndefined();
+    } finally {
+      if (previousEnabled === undefined) delete process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER;
+      else process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER = previousEnabled;
+      if (previousCooldown === undefined) delete process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER_COOLDOWN_MS;
+      else process.env.CROSS_SECTIONAL_EXCHANGE_INCIDENT_AUTO_RECOVER_COOLDOWN_MS = previousCooldown;
+    }
+  });
+
+  it("records a confirmed autoclose, closes only residual legs reduce-only, and blocks a fresh basket", async () => {
+    const client = new FakeExecClient();
+    client.mutatePositionsOnReduceOnly = true;
+    client.positionAmtBySymbol.set("SOLUSDT", 1);
+    client.positionAmtBySymbol.set("DOGEUSDT", 0); // Binance already force-closed this short leg.
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.userTradesBySymbol.set("DOGEUSDT", [
+      { orderId: "entry-doge", price: 0.1, qty: 100, realizedPnl: 0, commission: 0.004, commissionAsset: "USDT", time: NOW_MS - 60_000 },
+      { orderId: "auto-doge", price: 0.2, qty: 100, realizedPnl: -10, commission: 0.008, commissionAsset: "USDT", time: NOW_MS - 30_000 },
+    ]);
+    client.queryOrderResponses.set("DOGEUSDT|auto-doge", {
+      symbol: "DOGEUSDT",
+      orderId: "auto-doge",
+      clientOrderId: "autoclose-verified-test",
+      status: "FILLED",
+      type: "LIMIT",
+      side: "BUY",
+      reduceOnly: true,
+      price: 0.2,
+      stopPrice: 0,
+      origQty: 100,
+      executedQty: 100,
+      avgPrice: 0.2,
+      updateTime: NOW_MS - 30_000,
+    });
+    client.incomeHistory = [{
+      symbol: "DOGEUSDT",
+      incomeType: "INSURANCE_CLEAR",
+      income: -0.5,
+      asset: "USDT",
+      time: NOW_MS - 30_000,
+      tranId: "insurance-1",
+      info: "",
+    }];
+    const { executor, store } = makeExecutor({ client });
+    store.getState().baskets.push({
+      basketId: "xb-autoclose",
+      sourceObservationId: "manual:xb-autoclose",
+      signal: "MOM36_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - 60_000).toISOString(),
+      closesAtMs: NOW_MS + 36 * 3_600_000,
+      legs: [
+        { symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100, entryOrderId: "entry-sol", entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null },
+        { symbol: "DOGEUSDT", side: "SHORT", qty: 100, entryPrice: 0.1, entryOrderId: "entry-doge", entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null },
+      ],
+      status: "COMPLETE",
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    } as ExecutorBasket);
+    store.save();
+
+    await executor.tick();
+
+    const basket = store.getState().baskets.find((row) => row.basketId === "xb-autoclose")!;
+    expect(basket.status).toBe("ABORTED");
+    expect(basket.exchangeIncident?.kind).toBe("MARGIN_CALL");
+    expect(basket.exchangeIncident?.affectedLeg.forcedExitClientOrderId).toBe("autoclose-verified-test");
+    expect(basket.exchangeIncident?.affectedLeg.forcedExitPrice).toBe(0.2);
+    expect(basket.exchangeIncident?.affectedLeg.insuranceClearUsd).toBe(-0.5);
+    expect(basket.exchangeIncident?.residualClose.state).toBe("FLAT");
+    expect(basket.legs.find((leg) => leg.symbol === "DOGEUSDT")?.exitOrderId).toBe("auto-doge");
+    expect(client.placed).toEqual(expect.arrayContaining([
+      expect.objectContaining({ symbol: "SOLUSDT", side: "SELL", reduceOnly: true }),
+    ]));
+    expect(client.placed.some((order) => !order.reduceOnly)).toBe(false);
+    expect(executor.getStatus().openBaskets).toHaveLength(0);
+    expect(executor.getStatus().exchangeIncidentEntryHalt?.basketId).toBe("xb-autoclose");
+    expect(executor.getClosedBaskets()).toHaveLength(0);
+
+    expect(executor.acknowledgeExchangeIncidentEntryHalt()).toEqual({ ok: true, reason: null, cleared: true });
+  });
+
+  it("backfills an historical POSITION_ALREADY_FLAT sentinel from exact autoclose evidence", async () => {
+    const client = new FakeExecClient();
+    client.userTradesBySymbol.set("DOGEUSDT", [
+      { orderId: "entry-doge", price: 0.1, qty: 100, realizedPnl: 0, commission: 0.004, commissionAsset: "USDT", time: NOW_MS - 120_000 },
+      { orderId: "auto-doge", price: 0.2, qty: 100, realizedPnl: -10, commission: 0, commissionAsset: "USDT", time: NOW_MS - 60_000 },
+    ]);
+    client.queryOrderResponses.set("DOGEUSDT|auto-doge", {
+      symbol: "DOGEUSDT",
+      orderId: "auto-doge",
+      clientOrderId: "autoclose-historical-test",
+      status: "FILLED",
+      type: "LIMIT",
+      side: "BUY",
+      reduceOnly: true,
+      price: 0.2,
+      stopPrice: 0,
+      origQty: 100,
+      executedQty: 100,
+      avgPrice: 0.2,
+      updateTime: NOW_MS - 60_000,
+    });
+    const { executor, store } = makeExecutor({ client });
+    store.getState().baskets.push({
+      basketId: "xb-historical-autoclose",
+      sourceObservationId: "manual:xb-historical-autoclose",
+      signal: "MOM36_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - 120_000).toISOString(),
+      closesAtMs: NOW_MS - 60_000,
+      legs: [
+        {
+          symbol: "DOGEUSDT", side: "SHORT", qty: 100, entryPrice: 0.1, entryOrderId: "entry-doge",
+          entryPriceConfirmed: true, exitPrice: null, exitOrderId: "POSITION_ALREADY_FLAT", exitPriceConfirmed: false,
+        },
+      ],
+      status: "ABORTED",
+      closedAt: new Date(NOW_MS - 30_000).toISOString(),
+      closeReason: "RECONCILED_POSITION_ALREADY_FLAT:OPERATOR_MANUAL_CLOSE",
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+      accountingStatus: "ACCOUNTING_INCOMPLETE",
+    } as ExecutorBasket);
+    store.save();
+
+    await expect(executor.reconcileExchangeIncidentsNow()).resolves.toEqual({ marginCallsDetected: 1, inspectedBaskets: 1 });
+
+    const basket = store.getState().baskets.find((row) => row.basketId === "xb-historical-autoclose")!;
+    expect(basket.exchangeIncident?.kind).toBe("MARGIN_CALL");
+    expect(basket.legs[0]?.exitOrderId).toBe("auto-doge");
+    expect(basket.legs[0]?.exitPrice).toBe(0.2);
+    expect(basket.closeReason).toBe("EXCHANGE_MARGIN_CALL:DOGEUSDT:autoclose-historical-test");
+    expect(executor.getStatus().exchangeIncidentEntryHalt?.basketId).toBe("xb-historical-autoclose");
   });
 });

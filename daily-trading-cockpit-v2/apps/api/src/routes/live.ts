@@ -31,6 +31,7 @@ import {
   type CrossSectionalExecutor,
 } from "../lib/cross-sectional-executor.js";
 import type { SymbolReliabilitySnapshot } from "../lib/cross-sectional-symbol-reliability.js";
+import type { CrossSectionalAutoPool, CrossSectionalAutoPoolSnapshot } from "../lib/cross-sectional-auto-pool.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
 import {
   CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
@@ -1142,6 +1143,9 @@ interface PoolReport {
     held: Array<{ symbol: string; action: string; reason: string }>;
     unmeasured: boolean;
   };
+  /** Null if the configured long/short pools are deliberately asymmetric, in which case automatic
+   * membership is fail-closed and the legacy static policy remains in force. */
+  automation: CrossSectionalAutoPoolSnapshot | null;
   unevaluatedCriteria: Array<{ code: string; why: string }>;
 }
 let poolReportCache: { atMs: number; report: PoolReport } | null = null;
@@ -1152,6 +1156,8 @@ export async function registerLiveRoutes(
   opts: {
     configErrors?: string[];
     crossSectionalExecutor?: () => CrossSectionalExecutor | null;
+    /** Shared runtime C1/C2 pool used by the FILTERED formation path. */
+    crossSectionalAutoPool?: () => CrossSectionalAutoPool;
     /** API-owned V1 circuit-breaker state; presentation only, never recalculated by the dashboard. */
     symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
     // 2026-07-08: two more instances (TREND_BETA_VOL / MIXED_MEAN_REVERSION), wired alongside the
@@ -1876,6 +1882,67 @@ export async function registerLiveRoutes(
     };
   });
 
+  // Forensic/safety reconciliation for a Binance-side forced close. This is intentionally
+  // loopback-only and confirmation-gated: it may persist a quarantine record and queue residual
+  // reduce-only exits, but it can never open a basket or flatten a whole account.
+  app.post("/api/live/cross-sectional-reconcile-exchange-incidents", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    if (!isLoopbackAddress(request.ip)) {
+      reply.code(403);
+      return { ok: false, reason: "loopback caller required" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string; laneId?: string };
+    if (body.confirm !== "RECONCILE_XSEC_EXCHANGE_INCIDENTS" || !body.laneId) {
+      reply.code(400);
+      return { ok: false, reason: 'reconcile requires body {"confirm":"RECONCILE_XSEC_EXCHANGE_INCIDENTS","laneId":"..."}' };
+    }
+    const executor = [
+      { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", executor: opts.crossSectionalExecutor?.() ?? null },
+      { laneId: "CROSS_SECTIONAL_TREND", executor: opts.crossSectionalTrendExecutor?.() ?? null },
+      { laneId: "CROSS_SECTIONAL_MIXED", executor: opts.crossSectionalMixedExecutor?.() ?? null },
+    ].find((candidate) => candidate.laneId === body.laneId)?.executor ?? null;
+    if (!executor) {
+      reply.code(404);
+      return { ok: false, reason: `no cross-sectional executor for lane ${body.laneId}` };
+    }
+    const result = await executor.reconcileExchangeIncidentsNow();
+    return { ok: true, laneId: body.laneId, result, status: executor.getStatus() };
+  });
+
+  // An exchange incident blocks new baskets durably even across restart. The executor can release
+  // it only through its verified automatic recovery checks; this endpoint is the separate explicit
+  // operator override and still refuses while any basket/orphan is live.
+  app.post("/api/live/cross-sectional-acknowledge-exchange-incident", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    if (!isLoopbackAddress(request.ip)) {
+      reply.code(403);
+      return { ok: false, reason: "loopback caller required" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string; laneId?: string };
+    if (body.confirm !== "ACKNOWLEDGE_XSEC_EXCHANGE_INCIDENT" || !body.laneId) {
+      reply.code(400);
+      return { ok: false, reason: 'acknowledgement requires body {"confirm":"ACKNOWLEDGE_XSEC_EXCHANGE_INCIDENT","laneId":"..."}' };
+    }
+    const executor = [
+      { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", executor: opts.crossSectionalExecutor?.() ?? null },
+      { laneId: "CROSS_SECTIONAL_TREND", executor: opts.crossSectionalTrendExecutor?.() ?? null },
+      { laneId: "CROSS_SECTIONAL_MIXED", executor: opts.crossSectionalMixedExecutor?.() ?? null },
+    ].find((candidate) => candidate.laneId === body.laneId)?.executor ?? null;
+    if (!executor) {
+      reply.code(404);
+      return { ok: false, reason: `no cross-sectional executor for lane ${body.laneId}` };
+    }
+    const result = executor.acknowledgeExchangeIncidentEntryHalt();
+    if (!result.ok) reply.code(409);
+    return { ...result, laneId: body.laneId, status: executor.getStatus() };
+  });
+
   // Operator close for ONE market-neutral cross-sectional basket. This is deliberately narrower
   // than an account flatten: it requires a loopback caller plus an exact lane + basket id before
   // it invokes the executor's netting-aware reduce-only close path. It never widens to a sibling
@@ -2054,11 +2121,26 @@ export async function registerLiveRoutes(
     if (poolReportCache && now - poolReportCache.atMs < 15 * 60_000) return poolReportCache.report;
     const list = (k: string): string[] => (process.env[k] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
     const universe = list("CROSS_SECTIONAL_UNIVERSE");
-    const longAllow = new Set(list("CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST"));
-    const shortAllow = new Set(list("CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST"));
-    const shortBlock = new Set(list("CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST"));
+    const configuredLong = list("CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST");
+    const configuredShort = list("CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST");
+    const symmetricConfiguredPool = configuredLong.length === configuredShort.length
+      && configuredLong.every((symbol) => configuredShort.includes(symbol));
     const baseLeg = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "") || 25;
     const mult = Number.parseFloat(process.env.CROSS_SECTIONAL_TESTNET_LEARNING_LEG_MULTIPLIER ?? "") || 1;
+    const automation = symmetricConfiguredPool
+      ? opts.crossSectionalAutoPool?.().getSnapshot({
+          candidateUniverse: universe,
+          fallbackSymbols: configuredLong,
+          baseLegUsd: baseLeg,
+          sizeMultiplier: mult,
+        }) ?? null
+      : null;
+    // The report must show the pool the signal producer actually uses. When automation is off or
+    // unavailable, it deliberately falls back to the same env lists instead of inventing a pool.
+    const managedPool = automation?.enabled && automation.activeSymbols.length > 0 ? automation.activeSymbols : null;
+    const longAllow = new Set(managedPool ?? configuredLong);
+    const shortAllow = new Set(managedPool ?? configuredShort);
+    const shortBlock = new Set(list("CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST"));
     const leg = effectiveLegUsd(baseLeg, mult);
 
     const filters = new Map<string, { minNotional: number | null; stepSize: number | null; minQty: number | null }>();
@@ -2178,6 +2260,7 @@ export async function registerLiveRoutes(
           unmeasured: pl.unmeasured,
         };
       })(),
+      automation,
       unevaluatedCriteria: [
         { code: "C3_LISTING_AGE", why: "butuh satu panggilan riwayat per simbol" },
         { code: "C4_FUNDING_CARRY", why: "butuh riwayat funding per simbol" },
@@ -2305,6 +2388,11 @@ th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;le
     // Computed once inside buildPoolReport and shared with the dashboard panel via JSON, so the
     // two surfaces cannot drift into disagreeing about the same symbol again.
     const plan = report.reconciliation;
+    const automationSummary = report.automation?.enabled
+      ? report.automation.state === "ACTIVE"
+        ? `Pool runtime otomatis aktif; C1/C2 direfresh tiap ${Math.round(report.automation.refreshEveryMs / 60_000)} menit. Perubahan hanya memengaruhi basket baru, bukan basket terbuka.`
+        : `Pool runtime otomatis memakai fallback aman sambil menunggu pembacaan valid berikutnya${report.automation.lastError ? ` (${esc(report.automation.lastError)})` : ""}.`
+      : "Pool otomatis tidak aktif; konfigurasi statis tetap dipakai.";
     const actionFor = new Map(plan.held.map((d) => [d.symbol, d]));
     const needsAction = new Set([...plan.adds, ...plan.drops]);
     const rows = report.rows.map((r) => `<tr class="${r.passesEvaluated ? "" : "out"}">
@@ -2355,6 +2443,8 @@ ${!measured
       ? `<div class="note">&#9679; <b>Tidak ada yang perlu diubah.</b> ${plan.held.map((d) => esc(d.symbol.replace("USDT", ""))).join(", ")} berada di bawah ambang mentah tetapi <b>di dalam pita histeresis</b>, jadi keanggotaannya sengaja dipertahankan &mdash; tanpa pita, simbol di garis batas akan keluar-masuk tiap beberapa jam. Kolom status di bawah tetap menampilkan vonis kriteria mentahnya, karena itu memang fakta.</div>`
       : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; Pool aktif sama persis dengan hasil kriteria.</div>`}
 
+<p class="muted">${automationSummary}</p>
+
 <h2>Per simbol</h2>
 <div class="wrapx"><table><thead><tr>
 <th>simbol</th><th class="num">likuiditas/jam</th><th class="num">satu lot</th><th>C1 &amp; C2</th><th>status</th><th>catatan</th>
@@ -2364,7 +2454,7 @@ ${(() => {
   const act = [...plan.adds.map((x) => ({ symbol: x, action: "ADD", reason: "melewati batas masuk" })), ...plan.drops.map((x) => ({ symbol: x, action: "DROP", reason: "di bawah batas keluar" })), ...plan.held];
   if (plan.unmeasured) return `<h2>Rekonsiliasi pool</h2><div class="note">Tidak ada simbol yang terukur — tidak ada keputusan yang bisa dipercaya, dan rencana ini TIDAK boleh diterapkan.</div>`;
   return `<h2>Rekonsiliasi pool</h2>
-<p class="muted">Pita histeresis <b>&plusmn;10%</b>: masuk perlu &ge; $${Math.round(report.thresholds.minLiquidityUsdPerHour * 1.1).toLocaleString("en-US")}/jam, keluar baru di bawah $${Math.round(report.thresholds.minLiquidityUsdPerHour * 0.9).toLocaleString("en-US")}/jam. Simbol di antara keduanya <b>mempertahankan keanggotaannya</b>. Penerapan masih MANUAL &mdash; allowlist adalah const yang dibaca sekali saat proses start, jadi perubahan butuh edit <code>.env</code> lalu restart.</p>
+<p class="muted">Pita histeresis <b>&plusmn;10%</b>: masuk perlu &ge; $${Math.round(report.thresholds.minLiquidityUsdPerHour * 1.1).toLocaleString("en-US")}/jam, keluar baru di bawah $${Math.round(report.thresholds.minLiquidityUsdPerHour * 0.9).toLocaleString("en-US")}/jam. Simbol di antara keduanya <b>mempertahankan keanggotaannya</b>. ${report.automation?.enabled ? "Penerapan otomatis tersimpan di runtime; restart tidak diperlukan untuk perubahan anggota berikutnya." : "Penerapan memakai konfigurasi statis."}</p>
 ${act.length ? `<div class="wrapx"><table><thead><tr><th>simbol</th><th>tindakan</th><th>alasan</th></tr></thead><tbody>${act.map((d) => `<tr><td class="sym">${esc(d.symbol.replace("USDT", ""))}</td><td class="mono">${esc(d.action)}</td><td class="muted">${esc(d.reason)}</td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">Tidak ada simbol yang butuh perhatian.</p>`}
 `;
 })()}
@@ -2760,7 +2850,44 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
     ];
     const filteredExecutor = opts.crossSectionalExecutor?.() ?? null;
     const filteredStatus = filteredExecutor?.getStatus() ?? null;
-    const filteredOpenBaskets = filteredStatus?.openBaskets.filter((basket) => inReportEra(basket.openedAt)) ?? [];
+    // An exchange-side incident is deliberately shown in its own red quarantine surface below.
+    // It must never be valued from a public mark fallback as though the forced-flat leg were still
+    // open, and it must never contribute to ordinary open-basket P&L/counts.
+    const filteredOpenBaskets = filteredStatus?.openBaskets.filter((basket) =>
+      inReportEra(basket.openedAt) && !basket.exchangeIncident,
+    ) ?? [];
+    const exchangeIncidentBaskets = instances
+      .filter((row): row is { label: string; executor: CrossSectionalExecutor } => row.executor !== null)
+      .flatMap(({ label, executor }) => {
+        const status = executor.getStatus();
+        return status.exchangeIncidentBaskets.map((basket) => ({
+          lane: label,
+          laneId: status.laneId,
+          basketId: basket.basketId,
+          signal: basket.signal,
+          variant: basket.variant,
+          openedAt: basket.openedAt,
+          closedAt: basket.closedAt,
+          status: basket.status,
+          closeReason: basket.closeReason,
+          accountingStatus: basket.accountingStatus ?? null,
+          exchangeIncident: basket.exchangeIncident,
+          legs: basket.legs.map((leg) => ({
+            symbol: leg.symbol,
+            side: leg.side,
+            qty: leg.qty,
+            entryPrice: leg.entryPrice,
+            entryOrderId: leg.entryOrderId,
+            lastMarkPrice: leg.lastMarkPrice ?? null,
+            lastMarkAt: leg.lastMarkAt ?? null,
+            exitOrderId: leg.exitOrderId,
+            exitOrderIds: leg.exitOrderIds ?? null,
+            exitPrice: leg.exitPrice,
+            exitPriceConfirmed: leg.exitPriceConfirmed,
+          })),
+        }));
+      })
+      .sort((left, right) => Date.parse(right.exchangeIncident?.detectedAt ?? right.openedAt) - Date.parse(left.exchangeIncident?.detectedAt ?? left.openedAt));
     const filteredClosedBaskets = filteredExecutor
       ? closedBasketRealizedBreakdown(filteredExecutor.getClosedBaskets()).filter((basket) => inReportEra(basket.openedAt))
       : [];
@@ -3060,6 +3187,9 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
         slippageCaveat: "Slippage fill aktual tidak disimpan terpisah; unrealized after slippage memakai estimasi biaya close LIVE_ESTIMATED_CLOSE_COST_PCT.",
       },
       openBaskets: responseOpenBaskets,
+      // Kept separate from openBaskets and closed performance: these are terminal audit records
+      // for an exchange-side incident, not live mark-to-market exposure and not normal basket P&L.
+      exchangeIncidentBaskets,
       lanes,
       auditHistory: auditHistoryLanes.length > 0
         ? {

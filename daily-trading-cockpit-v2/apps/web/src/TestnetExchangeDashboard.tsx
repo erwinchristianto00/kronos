@@ -587,6 +587,46 @@ type XsecOpenBasket = {
   } | null;
 };
 
+type XsecExchangeIncident = {
+  kind: 'MARGIN_CALL' | 'UNEXPECTED_EXCHANGE_FLAT';
+  detectedAt: string;
+  exchangeEventAt: string | null;
+  reason: string;
+  affectedLeg: {
+    symbol: string;
+    side: 'LONG' | 'SHORT';
+    expectedQty: number;
+    entryPrice: number;
+    forcedExitOrderId: string | null;
+    forcedExitClientOrderId: string | null;
+    forcedExitQty: number | null;
+    forcedExitPrice: number | null;
+    forcedExitRealizedPnlUsd: number | null;
+    forcedExitCommissionUsd: number | null;
+    insuranceClearUsd: number | null;
+  };
+  residualClose: { state: 'PENDING' | 'FLAT' | 'UNRESOLVED'; completedAt: string | null; lastError: string | null };
+  entryHaltResolution?: { mode: 'AUTO_RECOVERY' | 'OPERATOR_ACK'; at: string; reason: string } | null;
+};
+
+type XsecExchangeIncidentBasket = {
+  basketId: string;
+  openedAt: string;
+  closedAt: string | null;
+  closeReason: string | null;
+  status: string;
+  exchangeIncident: XsecExchangeIncident | null;
+  legs: Array<{
+    symbol: string;
+    side: 'LONG' | 'SHORT';
+    qty: number;
+    entryPrice: number;
+    lastMarkPrice?: number | null;
+    exitOrderId: string | null;
+    exitPrice: number | null;
+  }>;
+};
+
 type XsecExecStatus = {
   enabled: boolean;
   tpNetReturnPct?: number | null;
@@ -623,6 +663,22 @@ type XsecExecStatus = {
     metrics: Array<{ model: string; samples: number; meanNetReturnPct: number | null; winRatePct: number | null; worstNetReturnPct: number | null }>;
   };
   openBaskets?: XsecOpenBasket[];
+  exchangeIncidentEntryHalt?: {
+    setAt: string;
+    basketId: string;
+    kind: 'MARGIN_CALL' | 'UNEXPECTED_EXCHANGE_FLAT';
+    reason: string;
+    autoRecovery?: { lastCheckedAt: string | null; lastBlockedReason: string | null };
+  } | null;
+  exchangeIncidentAutoRecovery?: {
+    enabled: boolean;
+    cooldownMs: number;
+    eligibleAt: string | null;
+    remainingMs: number | null;
+    lastCheckedAt: string | null;
+    lastBlockedReason: string | null;
+  } | null;
+  exchangeIncidentBaskets?: XsecExchangeIncidentBasket[];
 };
 
 function positiveFinite(value: number | null | undefined): number | null {
@@ -1341,6 +1397,8 @@ export default function TestnetExchangeDashboard() {
   const [singleSymbolTimeline, setSingleSymbolTimeline] = useState<SingleSymbolPriceTimelineData | null>(null);
   const [closeBusy, setCloseBusy] = useState<string | null>(null);
   const [closeResult, setCloseResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [incidentAckBusy, setIncidentAckBusy] = useState<string | null>(null);
+  const [incidentAckResult, setIncidentAckResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [xsecExec, setXsecExec] = useState<XsecExecStatus | null>(null);
   // 2026-07-11: TREND/MIXED are separate CrossSectionalExecutor instances with their own halted/
   // error/openBaskets state (see cross-sectional-executor-{trend,mixed} routes) — before this fix
@@ -1762,6 +1820,51 @@ export default function TestnetExchangeDashboard() {
     }
   }
 
+  // This is deliberately an ENTRY-latch acknowledgement, not a close action: the API rejects it
+  // while any basket/orphan remains live. It is rendered directly in both /testnet and /live Open
+  // Positions so the operator does not have to discover a hidden /control page after an incident.
+  async function acknowledgeCrossSectionalExchangeIncident(
+    laneId: string,
+    label: string,
+    halt: NonNullable<XsecExecStatus['exchangeIncidentEntryHalt']>,
+  ) {
+    if (incidentAckBusy) return;
+    const environment = isLivePage ? 'LIVE mainnet' : 'TESTNET';
+    if (!window.confirm(
+      `Acknowledge exchange incident for ${label} (${halt.basketId}) on ${environment}?\n\n` +
+      'This does NOT close, rebuild, or change any existing position. It only releases the new-entry latch if the server confirms no live basket or orphan remains. New entries still need a fresh GREEN signal and every normal admission gate.',
+    )) return;
+    const busyKey = `${laneId}:${halt.basketId}`;
+    setIncidentAckBusy(busyKey);
+    setIncidentAckResult(null);
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/cross-sectional-acknowledge-exchange-incident`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm: 'ACKNOWLEDGE_XSEC_EXCHANGE_INCIDENT', laneId }),
+      });
+      const body = await readJsonResponse<{ ok?: boolean; reason?: string; cleared?: boolean }>(res);
+      if (!res.ok || body?.ok === false) {
+        setIncidentAckResult({ ok: false, message: `ACK ${label} gagal: ${body?.reason ?? res.status}` });
+      } else {
+        setIncidentAckResult({
+          ok: true,
+          message: body?.cleared
+            ? `ACK ${label} diterima. Entry kembali otomatis hanya saat sinyal baru masih fresh dan semua gate lolos.`
+            : `Tidak ada incident latch aktif pada ${label}.`,
+        });
+      }
+    } catch (err) {
+      setIncidentAckResult({ ok: false, message: err instanceof Error ? err.message : 'incident acknowledgement request failed' });
+    } finally {
+      setIncidentAckBusy(null);
+      void loadExchangeOnly();
+      void loadXsecExec();
+      void loadXsecExecTrend();
+      void loadXsecExecMixed();
+    }
+  }
+
   // Flat per-lane-position list backing the "Single-symbol executor" panel (2026-07-10) — one row
   // per lane's OWN position on a symbol, not summed across lanes, so each can be inspected/closed
   // independently.
@@ -2130,6 +2233,15 @@ export default function TestnetExchangeDashboard() {
     { label: 'TREND', laneId: 'CROSS_SECTIONAL_TREND', status: xsecExecTrend, staleSince: xsecExecTrendStaleSince },
     { label: 'MIXED', laneId: 'CROSS_SECTIONAL_MIXED', status: xsecExecMixed, staleSince: xsecExecMixedStaleSince },
   ];
+  // Terminal exchange incidents are deliberately not included in `openPositionsCount`: Binance is
+  // already flat. They remain visible as red audit rows below so a forced close cannot disappear
+  // merely because the exchange position list no longer contains the symbol.
+  const xsecIncidentRows = xsecInstances.flatMap(({ label, laneId, status: xs }) =>
+    (xs?.exchangeIncidentBaskets ?? [])
+      .filter((basket): basket is XsecExchangeIncidentBasket & { exchangeIncident: XsecExchangeIncident } => basket.exchangeIncident != null)
+      .map((basket) => ({ label, laneId, basket })),
+  );
+  const marginCallRecordCount = xsecIncidentRows.filter((row) => row.basket.exchangeIncident.kind === 'MARGIN_CALL').length;
   // The exchange account is netted by symbol, while executor state owns the real basket clock.
   // Match on lane + symbol + side only; if the account is not provably tied to a current executor
   // leg, render no time rather than assigning another basket's deadline.
@@ -2533,21 +2645,57 @@ export default function TestnetExchangeDashboard() {
            keep NO per-leg close action — closing one leg would leave the rest a naked directional
            bet. The live-only control below closes one explicitly selected WHOLE basket instead. */}
         <section id="open-positions" className="testnet-panel testnet-wide-panel">
-          <header><span>Open Positions</span><strong>{openPositionsCount} pos</strong></header>
+          <header><span>Open Positions</span><strong>{openPositionsCount} pos{marginCallRecordCount ? ` · ${marginCallRecordCount} margin-call record` : xsecIncidentRows.length ? ` · ${xsecIncidentRows.length} quarantine record` : ''}</strong></header>
           <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
             Directional (operator-controlled, engine mirror) + Basket (cross-sectional hedge; live can close the
             entire selected basket only) + Single-symbol (stop-protected, own exchange-side stop) in one table. Not
             every column applies to every book — blank cells are expected, not missing data.
           </p>
           {closeResult && <p className={closeResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{closeResult.message}</p>}
+          {incidentAckResult && <p className={incidentAckResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{incidentAckResult.message}</p>}
           {copyResult && (
             <p className={copyResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>
               {copyResult.ok ? '✓' : '✗'} {copyResult.message}
             </p>
           )}
-          {xsecInstances.map(({ label, status: xs }) => xs?.openHalted && (
-            <p key={`halt-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>⛔ [{label}] {xs.openHalted}</p>
-          ))}
+          {xsecInstances.map(({ label, laneId, status: xs }) => {
+            if (!xs?.openHalted) return null;
+            const halt = xs.exchangeIncidentEntryHalt ?? null;
+            const recovery = xs.exchangeIncidentAutoRecovery ?? null;
+            const busyKey = halt ? `${laneId}:${halt.basketId}` : null;
+            const autoRecoveryText = !recovery
+              ? null
+              : !recovery.enabled
+                ? 'Auto-recovery OFF — ACK manual diperlukan setelah semua exposure selesai direkonsiliasi.'
+                : recovery.remainingMs != null && recovery.remainingMs > 0
+                  ? `Auto-recovery cek lagi sekitar ${Math.ceil(recovery.remainingMs / 60_000)} menit.`
+                  : recovery.lastBlockedReason
+                    ? `Auto-recovery masih menunggu: ${recovery.lastBlockedReason}.`
+                    : 'Auto-recovery sedang memverifikasi kondisi exchange.';
+            return <div key={`halt-${label}`} className={halt ? 'tone-critical' : 'tone-warning'} style={{ margin: '6px 0', padding: halt ? '7px 9px' : 0, border: halt ? '1px solid #d85d6c' : undefined, background: halt ? '#4a2029' : undefined, fontSize: 12 }}>
+              <span>⛔ [{label}] {xs.openHalted}</span>
+              {autoRecoveryText && <small style={{ display: 'block', marginTop: 3, color: '#ffd6d6' }}>{autoRecoveryText}</small>}
+              {halt && <button
+                type="button"
+                disabled={incidentAckBusy !== null}
+                onClick={() => void acknowledgeCrossSectionalExchangeIncident(laneId, label, halt)}
+                style={{ marginTop: 6 }}
+              >
+                {incidentAckBusy === busyKey ? 'ACK sedang dikirim…' : `ACK incident ${isLivePage ? 'LIVE' : 'TESTNET'}`}
+              </button>}
+            </div>;
+          })}
+          {xsecIncidentRows.map(({ label, basket }) => {
+            const incident = basket.exchangeIncident;
+            return <p key={`incident-${label}-${basket.basketId}`} className="tone-critical" style={{ margin: '6px 0', padding: '7px 9px', border: '1px solid #d85d6c', background: '#4a2029', fontSize: 12 }}>
+              🛑 [{label}] {incident.kind === 'MARGIN_CALL' ? 'MARGIN CALL' : 'EXCHANGE-FLAT'} · basket {basket.basketId} dikarantina · {incident.affectedLeg.symbol} {incident.affectedLeg.side}
+              {' · '}detected {taipeiDateTime(incident.detectedAt) ?? '—'} Taipei
+              {incident.affectedLeg.forcedExitPrice != null ? ` · forced exit ${price(incident.affectedLeg.forcedExitPrice)}` : ''}
+              {incident.affectedLeg.forcedExitRealizedPnlUsd != null ? ` · realized ${signed(incident.affectedLeg.forcedExitRealizedPnlUsd)}` : ''}
+              {incident.residualClose.state === 'FLAT' ? ' · residual legs flat' : ` · residual ${incident.residualClose.state.toLowerCase()}`}
+              {incident.entryHaltResolution ? ` · entry gate ${incident.entryHaltResolution.mode === 'AUTO_RECOVERY' ? 'auto-recovered' : 'ACK operator'} ${taipeiDateTime(incident.entryHaltResolution.at) ?? ''}` : ''}
+            </p>;
+          })}
           {xsecInstances.map(({ label, status: xs }) => {
             const latest = xs?.entryAttemptAudit?.latest ?? null;
             const legacy = xs?.entryAttemptAudit?.unattributedConsumedSignal ?? null;
@@ -2718,7 +2866,7 @@ export default function TestnetExchangeDashboard() {
                 </tr>
               </thead>
               <tbody>
-                {directionalPositions.length === 0 && foundationPositions.length === 0 && singleSymbolLanePositions.length === 0 ? (
+                {directionalPositions.length === 0 && foundationPositions.length === 0 && singleSymbolLanePositions.length === 0 && xsecIncidentRows.length === 0 ? (
                   <tr><td colSpan={20}>No open positions across any book.</td></tr>
                 ) : (
                   <>
@@ -2848,6 +2996,41 @@ export default function TestnetExchangeDashboard() {
                           </td>
                           <td>—</td>
                           <td className="tone-measure" title="Menutup satu leg basket akan membuat sisa basket jadi taruhan directional telanjang — tidak ada Close now di sini, sama seperti sebelumnya.">auto-exit only</td>
+                        </tr>
+                      );
+                    })}
+                    {xsecIncidentRows.map(({ label, laneId, basket }) => {
+                      const incident = basket.exchangeIncident;
+                      const affected = incident.affectedLeg;
+                      const affectedLeg = basket.legs.find((leg) => leg.symbol === affected.symbol && leg.side === affected.side) ?? null;
+                      const openedAt = taipeiDateTime(basket.openedAt);
+                      const forcedOrder = affected.forcedExitClientOrderId ?? affected.forcedExitOrderId ?? 'no forced-order proof';
+                      const incidentLabel = incident.kind === 'MARGIN_CALL' ? 'MARGIN CALL' : 'EXCHANGE-FLAT';
+                      return (
+                        <tr key={`xsec-incident-${laneId}-${basket.basketId}`} style={{ background: '#4a2029', borderTop: '1px solid #d85d6c' }}>
+                          <td style={{ color: '#ffd6d6', fontWeight: 700 }}>Basket · {incidentLabel}</td>
+                          <td style={{ color: '#ffd6d6', fontWeight: 700 }}>{affected.symbol}</td>
+                          <td className={affected.side === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{affected.side}</td>
+                          <td>{affected.expectedQty}</td>
+                          <td>{price(affected.entryPrice)}</td>
+                          <td>{affectedLeg?.lastMarkPrice == null ? 'exchange-flat' : price(affectedLeg.lastMarkPrice)}</td>
+                          <td>—</td>
+                          <td>—</td>
+                          <td className="tone-critical" title={incident.reason}>{incidentLabel}</td>
+                          <td>—</td>
+                          <td>—</td>
+                          <td className="tone-critical">QUARANTINED · {incident.residualClose.state}</td>
+                          <td className={tone(affected.forcedExitRealizedPnlUsd)}>{affected.forcedExitRealizedPnlUsd == null ? '—' : signed(affected.forcedExitRealizedPnlUsd)}</td>
+                          <td className="tone-critical" title={`exit commission ${signed(affected.forcedExitCommissionUsd)} · insurance ${signed(affected.insuranceClearUsd)}`}>
+                            fee {affected.forcedExitCommissionUsd == null ? '—' : signed(affected.forcedExitCommissionUsd)}
+                            {affected.insuranceClearUsd == null ? '' : ` · insurance ${signed(affected.insuranceClearUsd)}`}
+                          </td>
+                          <td>—</td>
+                          <td style={{ fontFamily: 'monospace', fontSize: 10 }} title={forcedOrder}>{forcedOrder}</td>
+                          <td>{compactLane(laneId)} · {label}</td>
+                          <td>{openedAt == null ? '—' : `${openedAt} Taipei`}</td>
+                          <td className="tone-critical">exchange-flat</td>
+                          <td className="tone-critical">quarantined</td>
                         </tr>
                       );
                     })}
