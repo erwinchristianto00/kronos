@@ -4804,6 +4804,222 @@ describe("[CONCURRENT CLOSE RACE] closeAllBasketsOrderly vs. an in-flight placeR
   });
 });
 
+describe("[OPERATOR WHOLE-BASKET CLOSE] durable manual close, reconciliation, and re-entry safety", () => {
+  it("uses immediate reduce-only closes for every leg, confirms the exchange ledger, and leaves the next fresh basket eligible", async () => {
+    const { executor, client, signalStore, store } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000 });
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    await executor.tick();
+    const first = store.getState().baskets[0]!;
+    expect(first.status).toBe("COMPLETE");
+
+    const result = await executor.manualCloseBasket(first.basketId, `OPERATOR_MANUAL_CLOSE:${first.basketId}`);
+
+    expect(result).toMatchObject({ ok: true, state: "CLOSED", basketId: first.basketId });
+    expect(result.exitReconciliation?.state).toBe("CONFIRMED");
+    expect(result.unresolvedOrphanedLegs).toHaveLength(0);
+    expect(first.status).toBe("CLOSED");
+    expect(first.operatorCloseRequest).toBeUndefined();
+    expect(first.legs.every((leg) => leg.exitOrderId !== null)).toBe(true);
+    expect(client.placed.filter((order) => order.reduceOnly && order.type === "MARKET")).toHaveLength(first.legs.length);
+
+    // A close must release the executor's basket slot. A genuinely fresh signal can form a new
+    // full hedge; the old observation itself remains consumed and is not reopened.
+    signalStore.add(signalObs(NOW_MS - 60_000));
+    await executor.tick();
+    const later = store.getState().baskets.filter((basket) => basket.status === "COMPLETE");
+    expect(later).toHaveLength(1);
+    expect(later[0]!.basketId).not.toBe(first.basketId);
+    expect(store.getState().orphanedLegs).toHaveLength(0);
+  });
+
+  it("never reports a partial MARKET fill as closed; it persists the exact remainder and retries only that remainder", async () => {
+    const { executor, client, store } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000 });
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    await executor.tick();
+    const target = store.getState().baskets[0]!;
+    const solLeg = target.legs.find((leg) => leg.symbol === "SOLUSDT")!;
+    const partialQty = solLeg.qty * 0.4;
+    client.partialFillQtyBySymbol.set("SOLUSDT", partialQty);
+
+    const firstAttempt = await executor.manualCloseBasket(target.basketId, `OPERATOR_MANUAL_CLOSE:${target.basketId}`);
+
+    expect(firstAttempt).toMatchObject({ ok: false, state: "PENDING", basketId: target.basketId });
+    expect(target.status).toBe("COMPLETE");
+    expect(target.operatorCloseRequest?.attempts).toBe(1);
+    expect(target.legs.find((leg) => leg.symbol === "SOLUSDT")!.exitOrderId).toBeNull();
+    expect(store.getState().orphanedLegs).toHaveLength(0); // known residual stays attached to its basket
+
+    client.partialFillQtyBySymbol.delete("SOLUSDT");
+    await executor.tick(); // retryPendingOperatorCloses runs before normal exit/new-entry work
+
+    expect(target.status).toBe("CLOSED");
+    expect(target.exitReconciliation?.state).toBe("CONFIRMED");
+    expect(target.operatorCloseRequest).toBeUndefined();
+    expect(store.getState().orphanedLegs).toHaveLength(0);
+    const solCloses = client.placed.filter((order) => order.reduceOnly && order.symbol === "SOLUSDT");
+    expect(solCloses).toHaveLength(2);
+    expect(solCloses[1]!.quantity).toBeCloseTo(solLeg.qty - partialQty, 9);
+  });
+
+  it("forces exchange reconciliation even for a legacy basket, so a store-only close cannot unlock a new basket", async () => {
+    const { executor, client, store } = makeExecutor();
+    const legacy: ExecutorBasket = {
+      basketId: "xb-legacy-manual-close",
+      sourceObservationId: "manual:legacy-manual-close",
+      signal: "MOM36_FILTERED",
+      variant: "FILTERED",
+      openedAt: NOW,
+      closesAtMs: NOW_MS + 24 * 3_600_000,
+      legs: [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100, entryOrderId: "legacy-entry", entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null }],
+      status: "COMPLETE",
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    };
+    store.getState().baskets.push(legacy);
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    // The fake exchange deliberately still reports a long after the close order. A legacy basket
+    // used to bypass reconciliation, which could have falsely freed its slot at this point.
+    client.positionAmtBySymbol.set("SOLUSDT", 1);
+
+    const firstAttempt = await executor.manualCloseBasket(legacy.basketId, `OPERATOR_MANUAL_CLOSE:${legacy.basketId}`);
+
+    expect(firstAttempt).toMatchObject({ ok: false, state: "PENDING" });
+    expect(legacy.status).toBe("COMPLETE");
+    expect(legacy.exitReconciliation).toMatchObject({ state: "PENDING" });
+    expect(legacy.operatorCloseRequest).toBeTruthy();
+
+    client.positionAmtBySymbol.set("SOLUSDT", 0);
+    await executor.tick();
+
+    expect(legacy.status).toBe("CLOSED");
+    expect(legacy.exitReconciliation?.state).toBe("CONFIRMED");
+    expect(legacy.operatorCloseRequest).toBeUndefined();
+    expect(store.getState().orphanedLegs).toHaveLength(0);
+  });
+
+  it("never resumes an unfinished plan after Close now is pending, even when the first reduce-only attempts fail", async () => {
+    const { executor, client, store } = makeExecutor();
+    const incomplete: ExecutorBasket = {
+      basketId: "xb-operator-close-no-resume",
+      sourceObservationId: "manual:operator-close-no-resume",
+      signal: "MOM36_FILTERED",
+      variant: "FILTERED",
+      openedAt: NOW,
+      closesAtMs: NOW_MS + 24 * 3_600_000,
+      legs: [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100, entryOrderId: "sol-entry", entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null, planIndex: 0 }],
+      status: "PARTIALLY_FILLED",
+      plan: [
+        { planIndex: 0, symbol: "SOLUSDT", side: "LONG", requestedQty: 1, refPrice: 100, reservationId: null, entryClientOrderId: "operator-close-no-resume-e0", status: "FILLED", failureReason: null },
+        { planIndex: 1, symbol: "DOGEUSDT", side: "SHORT", requestedQty: 100, refPrice: 0.1, reservationId: null, entryClientOrderId: "operator-close-no-resume-e1", status: "PENDING", failureReason: null },
+      ],
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    };
+    store.getState().baskets.push(incomplete);
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.failNextReduceOnlyOrders = 2;
+
+    const initial = await executor.manualCloseBasket(incomplete.basketId, `OPERATOR_MANUAL_CLOSE:${incomplete.basketId}`);
+    expect(initial).toMatchObject({ ok: false, state: "PENDING" });
+    expect(incomplete.operatorCloseRequest).toBeTruthy();
+
+    await executor.tick(); // second flatten attempt fails; recovery MUST NOT place the DOGE plan leg
+
+    expect(incomplete.status).toBe("PARTIALLY_FILLED");
+    expect(incomplete.operatorCloseRequest).toBeTruthy();
+    expect(client.placed.filter((order) => !order.reduceOnly && order.symbol === "DOGEUSDT")).toHaveLength(0);
+
+    await executor.tick(); // the durable close retry succeeds and finalises; still no DOGE entry
+
+    expect(incomplete.status).toBe("CLOSED");
+    expect(incomplete.operatorCloseRequest).toBeUndefined();
+    expect(client.placed.filter((order) => !order.reduceOnly && order.symbol === "DOGEUSDT")).toHaveLength(0);
+    expect(store.getState().orphanedLegs).toHaveLength(0);
+  });
+
+  it("reduces known legs but keeps an ambiguous entry live for reconciliation instead of silently dropping or resuming it", async () => {
+    const { executor, client, store } = makeExecutor();
+    const incomplete: ExecutorBasket = {
+      basketId: "xb-operator-close-ambiguous-entry",
+      sourceObservationId: "manual:operator-close-ambiguous-entry",
+      signal: "MOM36_FILTERED",
+      variant: "FILTERED",
+      openedAt: NOW,
+      closesAtMs: NOW_MS + 24 * 3_600_000,
+      legs: [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100, entryOrderId: "sol-entry", entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null, planIndex: 0 }],
+      status: "PARTIALLY_FILLED",
+      plan: [
+        { planIndex: 0, symbol: "SOLUSDT", side: "LONG", requestedQty: 1, refPrice: 100, reservationId: null, entryClientOrderId: "operator-close-ambiguous-e0", status: "FILLED", failureReason: null },
+        { planIndex: 1, symbol: "DOGEUSDT", side: "SHORT", requestedQty: 100, refPrice: 0.1, reservationId: null, entryClientOrderId: "operator-close-ambiguous-e1", status: "PLACING", failureReason: null },
+      ],
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    };
+    store.getState().baskets.push(incomplete);
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.queryOrderByClientIdNetworkError = true;
+
+    const initial = await executor.manualCloseBasket(incomplete.basketId, `OPERATOR_MANUAL_CLOSE:${incomplete.basketId}`);
+
+    expect(initial).toMatchObject({ ok: false, state: "PENDING" });
+    expect(incomplete.status).toBe("PARTIALLY_FILLED");
+    expect(incomplete.plan![1]).toMatchObject({ status: "PLACING" });
+    expect(incomplete.legs[0]!.exitOrderId).not.toBeNull(); // known SOL is risk-reduced immediately
+    expect(incomplete.operatorCloseRequest).toBeTruthy();
+    expect(store.getState().orphanedLegs).toHaveLength(0);
+
+    await executor.tick(); // reconciliation remains unavailable; recovery must not submit DOGE
+
+    expect(incomplete.status).toBe("PARTIALLY_FILLED");
+    expect(incomplete.operatorCloseRequest).toBeTruthy();
+    expect(client.placed.filter((order) => !order.reduceOnly && order.symbol === "DOGEUSDT")).toHaveLength(0);
+    expect(store.getState().orphanedLegs).toHaveLength(0);
+  });
+
+  it("hands Close now from an in-flight entry loop into the reconciled close state machine without opening the next leg", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    const originalPlaceOrder = client.placeOrder.bind(client);
+    let initialResult: Awaited<ReturnType<CrossSectionalExecutor["manualCloseBasket"]>> | null = null;
+    let requested = false;
+    client.placeOrder = async (params) => {
+      const result = await originalPlaceOrder(params);
+      if (params.symbol === "SOLUSDT" && !params.reduceOnly && !requested) {
+        requested = true;
+        const basket = store.getState().baskets[0]!;
+        initialResult = await executor.manualCloseBasket(basket.basketId, `OPERATOR_MANUAL_CLOSE:${basket.basketId}`);
+      }
+      return result;
+    };
+
+    await executor.tick();
+
+    const basket = store.getState().baskets[0]!;
+    expect(initialResult).toMatchObject({ ok: false, state: "PENDING", basketId: basket.basketId });
+    expect(basket.status).toBe("CLOSED");
+    expect(basket.exitReconciliation?.state).toBe("CONFIRMED");
+    expect(basket.operatorCloseRequest).toBeUndefined();
+    expect(basket.legs).toHaveLength(1); // DOGE was never opened after the operator action
+    expect(basket.legs[0]!.exitOrderId).not.toBeNull();
+    expect(client.placed.filter((order) => !order.reduceOnly && order.symbol === "DOGEUSDT")).toHaveLength(0);
+    expect(store.getState().orphanedLegs).toHaveLength(0);
+  });
+});
+
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 // [2026-08-04 supplemental] closing the remaining required-scenario gaps for the durable basket
 // lifecycle that the sections above don't yet exercise directly: a genuinely PARTIAL fill adopted

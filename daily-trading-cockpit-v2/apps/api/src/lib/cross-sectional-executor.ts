@@ -1032,6 +1032,18 @@ export interface ExecutorBasket {
    * once a basket reaches a terminal status.
    */
   pendingKillReason?: string;
+  /**
+   * Durable operator-requested close.  Unlike a normal HORIZON/TP close, this must keep retrying
+   * until the exact basket is demonstrably flat.  A browser timeout or a partial MARKET fill must
+   * therefore never turn a real close request into a forgotten, still-open residual.
+   */
+  operatorCloseRequest?: {
+    reason: string;
+    requestedAt: string;
+    attempts: number;
+    lastAttemptAt: string | null;
+    lastError: string | null;
+  };
   closedAt: string | null;
   closeReason: string | null;
   grossPnlUsd: number | null;
@@ -1359,6 +1371,19 @@ export interface OrphanedLeg {
   lastError: string;
   attempts: number;
 }
+
+/** Exact outcome of an operator-requested whole-basket close.  `ok` is deliberately true only
+ * after every recorded leg is closed AND the exchange's net position reconciles to the remaining
+ * sibling-book exposure.  A partial fill/network failure stays PENDING and is retried on ticks. */
+export type ManualCrossSectionalBasketCloseResult = {
+  ok: boolean;
+  state: "CLOSED" | "PENDING" | "ACCOUNTING_INCOMPLETE" | "NOT_FOUND";
+  basketId: string;
+  reason: string | null;
+  closeReason: string | null;
+  exitReconciliation: ExecutorBasket["exitReconciliation"];
+  unresolvedOrphanedLegs: OrphanedLeg[];
+};
 
 /** Durable, compact audit trail for the traffic-light decision. `ADMITTED` means the full basket
  * plan was successfully reserved; exchange fills remain visible separately on the basket itself.
@@ -3259,6 +3284,10 @@ export class CrossSectionalExecutor {
       // comment. Runs FIRST, every tick, for as long as it stays unresolved; a transient failure
       // must self-heal, not leave real exposure silently open forever.
       await this.retryOrphanedLegFlattens();
+      // A whole-basket operator close is a risk-reducing instruction, not a one-shot HTTP
+      // attempt.  Run it before every ordinary exit/new-entry decision so a partial fill or a
+      // browser/network timeout cannot strand the remaining known leg until the distant horizon.
+      await this.retryPendingOperatorCloses();
       await this.closeBasketsHittingProfitTarget();
       await this.closeDueBaskets();
       await this.ensureOpenBasketLeverage();
@@ -3346,6 +3375,226 @@ export class CrossSectionalExecutor {
       }
     }
     return { closed, failed };
+  }
+
+  /**
+   * Operator control surface for ONE explicitly identified basket.  It shares the executor's
+   * netting-aware, reduce-only close mechanics, but is stricter than scheduled exits: success is
+   * reported only after exchange-side reconciliation confirms that this basket's symbols now hold
+   * exactly the remaining sibling-book quantity.  Incomplete closes stay durable and retry on
+   * every executor tick; they never masquerade as a completed manual exit.
+   */
+  async manualCloseBasket(
+    basketId: string,
+    reason: string,
+  ): Promise<ManualCrossSectionalBasketCloseResult> {
+    const target = this.store.getState().baskets.find((basket) => basket.basketId === basketId);
+    if (!target || !this.isBasketLive(target)) {
+      return {
+        ok: false,
+        state: "NOT_FOUND",
+        basketId,
+        reason: "target basket is not live in this executor",
+        closeReason: target?.closeReason ?? null,
+        exitReconciliation: target?.exitReconciliation ?? null,
+        unresolvedOrphanedLegs: (this.store.getState().orphanedLegs ?? []).filter((leg) => leg.basketId === basketId),
+      };
+    }
+
+    target.operatorCloseRequest ??= {
+      reason,
+      requestedAt: this.nowIso(),
+      attempts: 0,
+      lastAttemptAt: null,
+      lastError: null,
+    };
+    // A placement/recovery loop may already own this exact basket.  It sees pendingKillReason
+    // between legs and turns the request into a safe rollback instead of racing a new close over
+    // an in-flight entry.  The durable operator request remains for any known residual afterward.
+    if (!this.claimBasket(target.basketId)) {
+      target.pendingKillReason ??= target.operatorCloseRequest.reason;
+      this.store.save();
+      return this.manualCloseResult(
+        target,
+        "PENDING",
+        "close queued behind an in-flight basket operation; it will continue automatically",
+      );
+    }
+    try {
+      return await this.attemptPendingOperatorClose(target);
+    } finally {
+      this.releaseBasket(target.basketId);
+    }
+  }
+
+  /** Retries only durable, known operator close requests.  This is deliberately not gated on
+   * `isAllowed()`/entry health: it can only reduce exposure and must still work while new entries
+   * are halted. */
+  private async retryPendingOperatorCloses(): Promise<void> {
+    const pending = this.store.getState().baskets.filter(
+      (basket) => this.isBasketLive(basket) && basket.operatorCloseRequest !== undefined,
+    );
+    for (const basket of pending) {
+      if (!this.claimBasket(basket.basketId)) {
+        basket.pendingKillReason ??= basket.operatorCloseRequest!.reason;
+        this.store.save();
+        continue;
+      }
+      try {
+        await this.attemptPendingOperatorClose(basket);
+      } finally {
+        this.releaseBasket(basket.basketId);
+      }
+    }
+  }
+
+  private manualCloseResult(
+    basket: ExecutorBasket,
+    state: ManualCrossSectionalBasketCloseResult["state"],
+    reason: string | null,
+    ok = state === "CLOSED",
+  ): ManualCrossSectionalBasketCloseResult {
+    const unresolvedOrphanedLegs = (this.store.getState().orphanedLegs ?? []).filter(
+      (leg) => leg.basketId === basket.basketId,
+    );
+    return {
+      // A terminal basket row is not enough to tell the operator it is safe: a maker-cancel or
+      // rollback race can surface a separately tracked orphan after the row becomes terminal.
+      // Never let this lower-level result claim a clean manual close while that residual exists.
+      ok: ok && unresolvedOrphanedLegs.length === 0,
+      state,
+      basketId: basket.basketId,
+      reason,
+      closeReason: basket.closeReason,
+      exitReconciliation: basket.exitReconciliation ?? null,
+      unresolvedOrphanedLegs,
+    };
+  }
+
+  /** Assumes this basket is already claimed by the caller. */
+  private async attemptPendingOperatorClose(
+    basket: ExecutorBasket,
+  ): Promise<ManualCrossSectionalBasketCloseResult> {
+    const request = basket.operatorCloseRequest;
+    if (!request) {
+      return this.manualCloseResult(basket, "PENDING", "operator close request is missing", false);
+    }
+    request.attempts += 1;
+    request.lastAttemptAt = this.nowIso();
+    request.lastError = null;
+    this.store.save();
+    try {
+      // A close can land during a restart-recovered PLACING basket.  Adopt an exchange-confirmed
+      // fill (or release only an exchange-confirmed non-fill) before deciding what to flatten.
+      await this.reconcileAmbiguousLegBeforeClose(basket);
+      const hasInconclusivePlacingOrder = Array.isArray(basket.plan) && basket.plan.some((entry) => entry.status === "PLACING");
+      const hasStaleBookExit = basket.legs.some((leg) => leg.exitOrderId === "POSITION_ALREADY_FLAT");
+      if (hasInconclusivePlacingOrder) {
+        // The ambiguous entry may still be a real exchange fill.  Stop it from ever being resumed
+        // as a new entry (recoverIncompleteBaskets skips operator-owned requests), but still cross
+        // every *known* leg immediately.  Keeping the basket live here is intentional: a later
+        // reconciliation can adopt and close the unknown leg instead of turning it into an orphan.
+        const staleBookReconciled = hasStaleBookExit || await this.closeKnownLegsForPendingOperatorClose(basket, request.reason);
+        const message = staleBookReconciled
+          ? `basket ${basket.basketId} has an already-flat recorded leg while entry reconciliation remains inconclusive; close accounting is pending audit`
+          : `basket ${basket.basketId} entry reconciliation remains inconclusive; known legs were reduced and the exact close will retry`;
+        request.lastError = message;
+        this.lastError = message;
+        this.store.save();
+        return this.manualCloseResult(basket, "PENDING", message, false);
+      }
+      if (hasStaleBookExit) {
+        // Match closeBasket's existing stale-book accounting contract.  The exchange says the
+        // relevant position was already flat, but there is no trustworthy per-leg exit fill from
+        // which to claim a realised result.  Do not unlock it as a clean manual close.
+        basket.status = "ABORTED";
+        basket.closedAt = this.nowIso();
+        basket.closeReason = `RECONCILED_POSITION_ALREADY_FLAT:${request.reason}`;
+        basket.grossPnlUsd = null;
+        basket.feeEstimateUsd = null;
+        basket.netPnlUsd = null;
+        basket.accountingStatus = "ACCOUNTING_INCOMPLETE";
+        this.markFourBrainBasketUnmeasured(basket, "ACCOUNTING_INCOMPLETE_POSITION_ALREADY_FLAT");
+        basket.operatorCloseRequest = undefined;
+        this.store.save();
+        return this.manualCloseResult(
+          basket,
+          "ACCOUNTING_INCOMPLETE",
+          "exchange position was already flat; close accounting is incomplete and requires audit",
+          false,
+        );
+      }
+      if (basket.legs.length === 0) {
+        // No exchange fill was ever recorded.  There is nothing to market-close; mark the
+        // reservation-only formation terminal without inventing P&L or an orphan.
+        basket.status = "ABORTED";
+        basket.closedAt = this.nowIso();
+        basket.closeReason = `${request.reason}:NO_FILLED_LEGS`;
+        basket.exitReconciliation = { state: "CONFIRMED", checkedAt: this.nowIso(), residualBySymbol: [] };
+        basket.operatorCloseRequest = undefined;
+        this.store.save();
+        return this.manualCloseResult(basket, "CLOSED", null);
+      }
+
+      await this.closeBasket(basket, request.reason, true);
+      if (basket.status === "CLOSED" && basket.exitReconciliation?.state === "CONFIRMED") {
+        basket.operatorCloseRequest = undefined;
+        basket.pendingKillReason = undefined;
+        this.store.save();
+        return this.manualCloseResult(basket, "CLOSED", null);
+      }
+      if (basket.status === "ABORTED" || basket.accountingStatus === "ACCOUNTING_INCOMPLETE") {
+        // The exchange is already flat, but this executor did not observe a trustworthy exit fill.
+        // Do not present that as a successful operator close or fold it into P&L.
+        basket.operatorCloseRequest = undefined;
+        this.store.save();
+        return this.manualCloseResult(
+          basket,
+          "ACCOUNTING_INCOMPLETE",
+          "exchange position was already flat; close accounting is incomplete and requires audit",
+          false,
+        );
+      }
+      throw new Error(`basket ${basket.basketId} did not reach a reconciled terminal close state`);
+    } catch (error) {
+      const message = (error as Error).message ?? "operator basket close failed";
+      // Keep the request alive.  `closeBasket()` records exact partial quantities first, so a
+      // retry crosses only the remaining known lot and can never reverse a prior partial fill.
+      request.lastError = message;
+      this.lastError = message;
+      this.store.save();
+      return this.manualCloseResult(basket, "PENDING", message, false);
+    }
+  }
+
+  /**
+   * Crosses only the known legs of an operator-owned basket without finalising its lifecycle.
+   * This is used only while a separate PLACING entry cannot yet be reconciled.  It deliberately
+   * shares closeLegMarket's durable partial-fill ledger, so a retry sends only an exact residual
+   * and can never reverse a prior partial close.
+   */
+  private async closeKnownLegsForPendingOperatorClose(
+    basket: ExecutorBasket,
+    reason: string,
+  ): Promise<boolean> {
+    const failures: string[] = [];
+    let staleBookReconciled = false;
+    for (const leg of basket.legs) {
+      if (leg.exitOrderId !== null) continue;
+      try {
+        const result = await this.closeLegMarket(basket, leg, reason);
+        staleBookReconciled ||= result.staleBookReconciled;
+      } catch (error) {
+        failures.push(`${leg.symbol}: ${(error as Error).message}`);
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(`basket ${basket.basketId} close incomplete, ${failures.length} leg(s) failed: ${failures[0]}`);
+    }
+    if (basket.legs.some((leg) => leg.exitOrderId === null)) {
+      throw new Error(`basket ${basket.basketId} close incomplete: exchange filled only part of one or more legs; retrying remaining quantity without reversing`);
+    }
+    return staleBookReconciled;
   }
 
   /**
@@ -3474,7 +3723,9 @@ export class CrossSectionalExecutor {
     // RESERVED/PLACING/PARTIALLY_FILLED basket is mid-open, not a settled hedge to score; letting
     // recoverIncompleteBaskets() finish (or abort) it first is the correct path, not a live TP read
     // against an incomplete position.
-    const openBaskets = st.baskets.filter((b) => b.status === "COMPLETE");
+    // An operator-requested close owns its own retry lifecycle.  Do not issue a second,
+    // differently-labelled exit in this same tick after a partial/manual attempt.
+    const openBaskets = st.baskets.filter((b) => b.status === "COMPLETE" && b.operatorCloseRequest === undefined);
     if (openBaskets.length === 0) return;
 
     const positions = await this.sharedGetPositions();
@@ -3674,7 +3925,7 @@ export class CrossSectionalExecutor {
       // exactly the CORE GAP this task closes. recoverIncompleteBaskets() gets first chance to
       // finish or abort it; if it's genuinely stuck (e.g. persistently INCONCLUSIVE reconciliation),
       // it now stays visibly incomplete past its horizon instead of being silently mis-closed.
-      if (basket.status !== "COMPLETE") continue;
+      if (basket.status !== "COMPLETE" || basket.operatorCloseRequest !== undefined) continue;
       // The cap is frozen per admission.  A policy deployment must never retrospectively shorten
       // (or lengthen) a basket that was already on the exchange.
       const holdCapHours = this.basketExecutionPolicy(basket).executionCapHours;
@@ -4161,10 +4412,13 @@ export class CrossSectionalExecutor {
     if (fallbackFailure?.status === "rejected") throw fallbackFailure.reason;
   }
 
-  private async reconcileBasketExit(basket: ExecutorBasket): Promise<boolean> {
+  private async reconcileBasketExit(basket: ExecutorBasket, requireExchangeReconciliation = false): Promise<boolean> {
     // Legacy baskets retain their pre-cutover settle contract. New policy baskets must prove that
     // the exchange's net position equals the remaining sibling-book position before they become CLOSED.
-    if (!basket.policyFingerprint) return true;
+    // A manual whole-basket close intentionally opts into this stricter proof even for a legacy
+    // basket: the dashboard must never claim "closed" just because old bookkeeping had no policy
+    // fingerprint to activate the normal reconciliation gate.
+    if (!requireExchangeReconciliation && !basket.policyFingerprint) return true;
     const relevantSymbols = new Set(basket.legs.map((leg) => leg.symbol));
     const positions = await this.sharedGetPositions();
     const exchangeBySymbol = new Map(positions.map((position) => [position.symbol, position.positionAmt]));
@@ -4189,7 +4443,11 @@ export class CrossSectionalExecutor {
     return confirmed;
   }
 
-  private async closeBasket(basket: ExecutorBasket, reason: string): Promise<void> {
+  private async closeBasket(
+    basket: ExecutorBasket,
+    reason: string,
+    requireExchangeReconciliation = false,
+  ): Promise<void> {
     const failures: string[] = [];
     let staleBookReconciled = false;
     if (this.shouldUseMakerExit(basket, reason)) {
@@ -4234,7 +4492,7 @@ export class CrossSectionalExecutor {
       this.store.save();
       return;
     }
-    if (!(await this.reconcileBasketExit(basket))) {
+    if (!(await this.reconcileBasketExit(basket, requireExchangeReconciliation))) {
       throw new Error(`basket ${basket.basketId} exit reconciliation pending: exchange net does not yet match sibling ledger`);
     }
     // Finalize P&L from the STORED per-leg prices, not a loop-local accumulator: on a retry after
@@ -5219,6 +5477,21 @@ export class CrossSectionalExecutor {
         const reason = basket.pendingKillReason ?? "REGIME_CLOSED_BEFORE_ANY_FILL";
         basket.pendingKillReason = undefined;
         await this.markRemainingNeverAttempted(basket, i, `KILL_OR_DRAIN_BASKET_INTERRUPTED:${reason}`);
+        if (basket.operatorCloseRequest) {
+          // Close now arrived while this placement loop owned the basket.  Do not take the old
+          // generic ABORT/flatten path: it does not perform the manual route's required exchange
+          // reconciliation and would leave the durable request stranded on a terminal row.  Stop
+          // every future entry first, then hand the already-known legs straight to the exact
+          // operator-close state machine while we still hold the same mutual-exclusion claim.
+          basket.status = basket.legs.length === plan.length
+            ? "COMPLETE"
+            : basket.legs.length === 0
+              ? "RESERVED"
+              : "PARTIALLY_FILLED";
+          this.store.save();
+          await this.attemptPendingOperatorClose(basket);
+          return;
+        }
         basket.status = "ABORTED";
         basket.closedAt = this.nowIso();
         basket.closeReason = reason;
@@ -5484,7 +5757,13 @@ export class CrossSectionalExecutor {
   private async recoverIncompleteBaskets(): Promise<void> {
     const st = this.store.getState();
     const incomplete = st.baskets.filter(
-      (b) => (b.status === "RESERVED" || b.status === "PLACING" || b.status === "PARTIALLY_FILLED") && Array.isArray(b.plan),
+      (b) =>
+        (b.status === "RESERVED" || b.status === "PLACING" || b.status === "PARTIALLY_FILLED") &&
+        Array.isArray(b.plan) &&
+        // A human pressed Close now.  Retrying its reduction/reconciliation is allowed, but
+        // resuming a missing entry would directly reverse that instruction and can recreate the
+        // very incomplete basket the operator is trying to eliminate.
+        b.operatorCloseRequest === undefined,
     );
     for (const basket of incomplete) {
       if (!this.claimBasket(basket.basketId)) continue; // owned by a concurrent close — retry next tick

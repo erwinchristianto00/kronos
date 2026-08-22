@@ -571,6 +571,20 @@ type XsecOpenBasket = {
     reason: string;
     missingLegs: Array<{ symbol: string; side: string }>;
   } | null;
+  /** A real operator close is never fire-and-forget. While present, the API is retrying only
+   * the known remaining basket legs and the dashboard must not present the basket as settled. */
+  operatorCloseRequest?: {
+    reason: string;
+    requestedAt: string;
+    attempts: number;
+    lastAttemptAt: string | null;
+    lastError: string | null;
+  };
+  exitReconciliation?: {
+    state: 'CONFIRMED' | 'PENDING';
+    checkedAt: string;
+    residualBySymbol: Array<{ symbol: string; expectedNetQty: number; exchangeNetQty: number }>;
+  } | null;
 };
 
 type XsecExecStatus = {
@@ -1689,6 +1703,60 @@ export default function TestnetExchangeDashboard() {
     }
   }
 
+  // Whole-basket manual close for the live page.  It deliberately sits above the per-symbol
+  // table because clicking one leg would leave the remaining basket as an unintended directional
+  // position.  The server accepts success only after every tracked leg and the exchange netting
+  // reconciliation are clean; an incomplete result remains visible and retries automatically.
+  async function closeCrossSectionalBasketNow(
+    laneId: string,
+    label: string,
+    basket: XsecOpenBasket,
+  ) {
+    if (closeBusy) return;
+    const busyKey = `xsec:${laneId}:${basket.basketId}`;
+    const net = basket.lastNetReturn == null ? 'tidak tersedia' : `${basket.lastNetReturn >= 0 ? '+' : ''}${(basket.lastNetReturn * 100).toFixed(3)}% setelah estimasi biaya`;
+    const liveLegs = basket.legs.filter((leg) => leg.exitOrderId == null).length;
+    if (!window.confirm(
+      `Close SELURUH basket ${label} (${basket.basketId}) sekarang?\n\n` +
+      `${liveLegs} leg yang masih tercatat akan ditutup dengan MARKET reduce-only. Net saat ini: ${net}.\n\n` +
+      'Ini tidak menutup basket lain atau posisi directional/single-symbol.',
+    )) return;
+    setCloseBusy(busyKey);
+    setCloseResult(null);
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/cross-sectional-close`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          confirm: 'CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET',
+          laneId,
+          basketId: basket.basketId,
+        }),
+      });
+      const body = await readJsonResponse<{
+        ok?: boolean;
+        reason?: string;
+        state?: string;
+        result?: { exitReconciliation?: { state?: string } | null; unresolvedOrphanedLegs?: unknown[] };
+        orphanedLegs?: unknown[];
+      }>(res);
+      if (!res.ok || body?.ok === false) {
+        const state = body?.state ? ` (${body.state})` : '';
+        setCloseResult({ ok: false, message: `Basket ${label} belum dinyatakan flat${state}: ${body?.reason ?? res.status}. Retry aman tetap berjalan; jangan anggap close selesai.` });
+      } else {
+        setCloseResult({ ok: true, message: `Basket ${label} ${basket.basketId} closed — exchange reconciliation CONFIRMED, tanpa orphan leg.` });
+      }
+      void loadExchangeOnly();
+      void loadXsecExec();
+      void loadXsecExecTrend();
+      void loadXsecExecMixed();
+    } catch (err) {
+      setCloseResult({ ok: false, message: err instanceof Error ? err.message : 'basket close request failed' });
+    } finally {
+      setCloseBusy(null);
+    }
+  }
+
   // Flat per-lane-position list backing the "Single-symbol executor" panel (2026-07-10) — one row
   // per lane's OWN position on a symbol, not summed across lanes, so each can be inspected/closed
   // independently.
@@ -2456,15 +2524,15 @@ export default function TestnetExchangeDashboard() {
            ONE wider table. Halt/error/stale banners (previously above the foundation table only)
            now sit above the WHOLE merged table. Mirror-intents is folded into the directional
            rows on testnet (Intent state column + Copy-to-LIVE action) and cut entirely on /live
-           (Copy-to-LIVE was already isLivePage-gated). Basket/foundation rows deliberately keep
-           NO close action — closing one leg would leave the rest a naked directional bet, the
-           same real-money safety reason the old foundation table never had a close button. */}
+           (Copy-to-LIVE was already isLivePage-gated). Basket/foundation table rows deliberately
+           keep NO per-leg close action — closing one leg would leave the rest a naked directional
+           bet. The live-only control below closes one explicitly selected WHOLE basket instead. */}
         <section id="open-positions" className="testnet-panel testnet-wide-panel">
           <header><span>Open Positions</span><strong>{openPositionsCount} pos</strong></header>
           <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
-            Directional (operator-controlled, engine mirror) + Basket (cross-sectional hedge, automatic exit only) +
-            Single-symbol (stop-protected, own exchange-side stop) in one table. Not every column applies to every
-            book — blank cells are expected, not missing data.
+            Directional (operator-controlled, engine mirror) + Basket (cross-sectional hedge; live can close the
+            entire selected basket only) + Single-symbol (stop-protected, own exchange-side stop) in one table. Not
+            every column applies to every book — blank cells are expected, not missing data.
           </p>
           {closeResult && <p className={closeResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{closeResult.message}</p>}
           {copyResult && (
@@ -2525,7 +2593,7 @@ export default function TestnetExchangeDashboard() {
           )}
           {xsecInstances.some(({ status: xs }) => (xs?.openBaskets ?? []).length > 0) && (
             <div style={{ margin: '6px 0', fontSize: 12 }}>
-              {xsecInstances.flatMap(({ label, status: xs }) => (xs?.openBaskets ?? []).map((b) => {
+              {xsecInstances.flatMap(({ label, laneId, status: xs }) => (xs?.openBaskets ?? []).map((b) => {
                 // An open basket keeps the exit policy it was born with.  Do not let a
                 // later runtime policy change make an old NoTP basket look as though it
                 // has a new TP target (or vice versa).
@@ -2576,6 +2644,23 @@ export default function TestnetExchangeDashboard() {
                       {hoursLeft == null ? '' : ` · ${hoursLeft.toFixed(1)}h lagi`}{horizon.capHours != null ? ` (cap ${horizon.capHours}h)` : ''}
                     </span>
                     {stale && <span className="tone-warning">stamp basi &gt;15m — cek executor</span>}
+                    {b.operatorCloseRequest && <span className="tone-warning" title={b.operatorCloseRequest.lastError ?? undefined}>
+                      close pending · percobaan {b.operatorCloseRequest.attempts}{b.operatorCloseRequest.lastError ? ` · ${b.operatorCloseRequest.lastError}` : ''}
+                    </span>}
+                    {isLivePage && (
+                      <button
+                        type="button"
+                        disabled={closeBusy !== null || Boolean(b.operatorCloseRequest)}
+                        onClick={() => void closeCrossSectionalBasketNow(laneId, label, b)}
+                        title="Menutup seluruh basket ini saja dengan MARKET reduce-only. Sukses hanya jika exchange reconciliation confirmed dan tidak ada orphan leg."
+                      >
+                        {closeBusy === `xsec:${laneId}:${b.basketId}`
+                          ? 'closing…'
+                          : b.operatorCloseRequest
+                            ? 'close pending'
+                            : 'Close basket now'}
+                      </button>
+                    )}
                   </div>
                 );
               }))}

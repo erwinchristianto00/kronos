@@ -291,7 +291,7 @@ describe("registerLiveRoutes — dashboard account snapshot pressure guard", () 
   });
 });
 
-describe("[operator close] /api/live/cross-sectional-close stays scoped to one market-neutral basket", () => {
+describe("[operator close] /api/live/cross-sectional-close stays scoped to one named basket", () => {
   const basket = (basketId: string): ExecutorBasket => ({
     basketId, sourceObservationId: "o1", signal: "MOM24", variant: "FILTERED",
     openedAt: "2026-07-08T00:00:00.000Z", closesAtMs: 0,
@@ -299,7 +299,7 @@ describe("[operator close] /api/live/cross-sectional-close stays scoped to one m
     status: "COMPLETE", closedAt: null, closeReason: null, grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
   });
 
-  it("uses only the market-neutral executor, and only when its exact target is the sole open basket", async () => {
+  it("uses only the selected market-neutral executor, and only when its exact target is the sole open basket", async () => {
     const previousEnv = process.env.LIVE_BINANCE_ENV;
     process.env.LIVE_BINANCE_ENV = "testnet";
     try {
@@ -309,17 +309,25 @@ describe("[operator close] /api/live/cross-sectional-close stays scoped to one m
       let closeReason = "";
       let directionalGetterCalls = 0;
       const coreExecutor = {
-        getStatus: () => ({ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", openBaskets: targetOpen ? [target] : [] }),
-        closeAllBasketsOrderly: async (reason: string) => {
+        getStatus: () => ({ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", openBaskets: targetOpen ? [target] : [], orphanedLegs: [] }),
+        manualCloseBasket: async (basketId: string, reason: string) => {
           closeCalls += 1;
           closeReason = reason;
           targetOpen = false;
-          return { closed: 1, failed: 0 };
+          return {
+            ok: true,
+            state: "CLOSED" as const,
+            basketId,
+            reason: null,
+            closeReason: reason,
+            exitReconciliation: { state: "CONFIRMED" as const, checkedAt: "2026-07-08T00:01:00.000Z", residualBySymbol: [] },
+            unresolvedOrphanedLegs: [],
+          };
         },
       } as unknown as CrossSectionalExecutor;
 
       app = Fastify();
-      await registerLiveRoutes(app, null, {
+      await registerLiveRoutes(app, {} as LiveExecutionEngine, {
         crossSectionalExecutor: () => coreExecutor,
         crossSectionalDirectionalShortExecutor: () => {
           directionalGetterCalls += 1;
@@ -331,12 +339,12 @@ describe("[operator close] /api/live/cross-sectional-close stays scoped to one m
         method: "POST",
         url: "/api/live/cross-sectional-close",
         remoteAddress: "127.0.0.1",
-        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", basketId: target.basketId },
+        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", basketId: target.basketId },
       });
       expect(res.statusCode).toBe(200);
       expect(res.json()).toMatchObject({ ok: true, basketId: target.basketId, openBasketIds: [] });
       expect(closeCalls).toBe(1);
-      expect(closeReason).toBe(`OPERATOR_SCOPED_CLOSE:${target.basketId}`);
+      expect(closeReason).toBe(`OPERATOR_MANUAL_CLOSE:CROSS_SECTIONAL_MARKET_NEUTRAL:${target.basketId}`);
       expect(directionalGetterCalls).toBe(0);
     } finally {
       if (previousEnv === undefined) delete process.env.LIVE_BINANCE_ENV;
@@ -344,31 +352,164 @@ describe("[operator close] /api/live/cross-sectional-close stays scoped to one m
     }
   });
 
-  it("refuses to turn a one-basket request into a bulk cross-sectional close", async () => {
+  it("closes only the exact target when a sibling basket remains open in the same executor", async () => {
     const previousEnv = process.env.LIVE_BINANCE_ENV;
     process.env.LIVE_BINANCE_ENV = "testnet";
     try {
       const target = basket("target-basket");
+      const sibling = basket("another-basket");
       let closeCalls = 0;
+      let open = [target, sibling];
       const coreExecutor = {
-        getStatus: () => ({ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", openBaskets: [target, basket("another-basket")] }),
-        closeAllBasketsOrderly: async () => {
+        getStatus: () => ({ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", openBaskets: open, orphanedLegs: [] }),
+        manualCloseBasket: async (basketId: string, reason: string) => {
           closeCalls += 1;
-          return { closed: 2, failed: 0 };
+          open = open.filter((current) => current.basketId !== basketId);
+          return {
+            ok: true,
+            state: "CLOSED" as const,
+            basketId,
+            reason: null,
+            closeReason: reason,
+            exitReconciliation: { state: "CONFIRMED" as const, checkedAt: "2026-07-08T00:01:00.000Z", residualBySymbol: [] },
+            unresolvedOrphanedLegs: [],
+          };
         },
       } as unknown as CrossSectionalExecutor;
 
       app = Fastify();
-      await registerLiveRoutes(app, null, { crossSectionalExecutor: () => coreExecutor });
+      await registerLiveRoutes(app, {} as LiveExecutionEngine, { crossSectionalExecutor: () => coreExecutor });
       await app.ready();
       const res = await app.inject({
         method: "POST",
         url: "/api/live/cross-sectional-close",
         remoteAddress: "127.0.0.1",
-        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", basketId: target.basketId },
+        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", basketId: target.basketId },
       });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({ ok: true, basketId: target.basketId, openBasketIds: [sibling.basketId] });
+      expect(closeCalls).toBe(1);
+    } finally {
+      if (previousEnv === undefined) delete process.env.LIVE_BINANCE_ENV;
+      else process.env.LIVE_BINANCE_ENV = previousEnv;
+    }
+  });
+
+  it("never acknowledges a close as clean while the target has an orphaned residual", async () => {
+    const previousEnv = process.env.LIVE_BINANCE_ENV;
+    process.env.LIVE_BINANCE_ENV = "mainnet";
+    try {
+      const target = basket("orphaned-target-basket");
+      let afterClose = false;
+      const coreExecutor = {
+        getStatus: () => ({
+          laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL",
+          openBaskets: afterClose ? [] : [target],
+          orphanedLegs: afterClose ? [{ basketId: target.basketId, symbol: "AUSDT", side: "LONG", qty: 1, attempts: 1 }] : [],
+        }),
+        manualCloseBasket: async (basketId: string, reason: string) => {
+          afterClose = true;
+          return {
+            ok: true,
+            state: "CLOSED" as const,
+            basketId,
+            reason: null,
+            closeReason: reason,
+            exitReconciliation: { state: "CONFIRMED" as const, checkedAt: "2026-07-08T00:01:00.000Z", residualBySymbol: [] },
+            unresolvedOrphanedLegs: [{ basketId, symbol: "AUSDT", side: "LONG", qty: 1, attempts: 1 }],
+          };
+        },
+      } as unknown as CrossSectionalExecutor;
+      app = Fastify();
+      await registerLiveRoutes(app, {} as LiveExecutionEngine, { crossSectionalExecutor: () => coreExecutor });
+      await app.ready();
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/live/cross-sectional-close",
+        remoteAddress: "127.0.0.1",
+        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", basketId: target.basketId },
+      });
+
       expect(res.statusCode).toBe(409);
-      expect(res.json()).toMatchObject({ ok: false, basketId: target.basketId, openBasketIds: [target.basketId, "another-basket"] });
+      expect(res.json()).toMatchObject({ ok: false, state: "CLOSED", basketId: target.basketId });
+      expect(res.json().orphanedLegs).toHaveLength(1);
+    } finally {
+      if (previousEnv === undefined) delete process.env.LIVE_BINANCE_ENV;
+      else process.env.LIVE_BINANCE_ENV = previousEnv;
+    }
+  });
+
+  it("allows the explicit TREND basket path on mainnet without touching the foundation executor", async () => {
+    const previousEnv = process.env.LIVE_BINANCE_ENV;
+    process.env.LIVE_BINANCE_ENV = "mainnet";
+    try {
+      const target = basket("only-trend-basket");
+      let trendOpen = true;
+      let coreCalls = 0;
+      let trendCalls = 0;
+      const coreExecutor = {
+        getStatus: () => ({ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", openBaskets: [], orphanedLegs: [] }),
+        manualCloseBasket: async () => { coreCalls += 1; throw new Error("must not close foundation"); },
+      } as unknown as CrossSectionalExecutor;
+      const trendExecutor = {
+        getStatus: () => ({ laneId: "CROSS_SECTIONAL_TREND", openBaskets: trendOpen ? [target] : [], orphanedLegs: [] }),
+        manualCloseBasket: async (basketId: string, reason: string) => {
+          trendCalls += 1;
+          trendOpen = false;
+          return {
+            ok: true,
+            state: "CLOSED" as const,
+            basketId,
+            reason: null,
+            closeReason: reason,
+            exitReconciliation: { state: "CONFIRMED" as const, checkedAt: "2026-07-08T00:01:00.000Z", residualBySymbol: [] },
+            unresolvedOrphanedLegs: [],
+          };
+        },
+      } as unknown as CrossSectionalExecutor;
+      app = Fastify();
+      await registerLiveRoutes(app, {} as LiveExecutionEngine, {
+        crossSectionalExecutor: () => coreExecutor,
+        crossSectionalTrendExecutor: () => trendExecutor,
+      });
+      await app.ready();
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/live/cross-sectional-close",
+        remoteAddress: "127.0.0.1",
+        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", laneId: "CROSS_SECTIONAL_TREND", basketId: target.basketId },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({ ok: true, laneId: "CROSS_SECTIONAL_TREND", basketId: target.basketId });
+      expect(trendCalls).toBe(1);
+      expect(coreCalls).toBe(0);
+    } finally {
+      if (previousEnv === undefined) delete process.env.LIVE_BINANCE_ENV;
+      else process.env.LIVE_BINANCE_ENV = previousEnv;
+    }
+  });
+
+  it("rejects a non-loopback caller before it can reach any executor", async () => {
+    const previousEnv = process.env.LIVE_BINANCE_ENV;
+    process.env.LIVE_BINANCE_ENV = "mainnet";
+    try {
+      const target = basket("private-basket");
+      let closeCalls = 0;
+      const coreExecutor = {
+        getStatus: () => ({ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", openBaskets: [target], orphanedLegs: [] }),
+        manualCloseBasket: async () => { closeCalls += 1; throw new Error("must not run"); },
+      } as unknown as CrossSectionalExecutor;
+      app = Fastify();
+      await registerLiveRoutes(app, {} as LiveExecutionEngine, { crossSectionalExecutor: () => coreExecutor });
+      await app.ready();
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/live/cross-sectional-close",
+        remoteAddress: "203.0.113.7",
+        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", basketId: target.basketId },
+      });
+      expect(res.statusCode).toBe(403);
       expect(closeCalls).toBe(0);
     } finally {
       if (previousEnv === undefined) delete process.env.LIVE_BINANCE_ENV;

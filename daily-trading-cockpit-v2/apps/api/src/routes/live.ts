@@ -1876,32 +1876,43 @@ export async function registerLiveRoutes(
     };
   });
 
-  // Testnet-only emergency/operator close for the ORIGINAL market-neutral executor.
-  // This is deliberately narrower than an account flatten: it requires a loopback caller,
-  // an exact basket id, and exactly one live basket in THIS executor before it invokes the
-  // executor's netting-aware reduce-only close path. Trend, mixed, innovation, and all
-  // single-symbol/directional executors are unreachable from here.
+  // Operator close for ONE market-neutral cross-sectional basket. This is deliberately narrower
+  // than an account flatten: it requires a loopback caller plus an exact lane + basket id before
+  // it invokes the executor's netting-aware reduce-only close path. It never widens to a sibling
+  // basket in the same executor. Directional, innovation, and every single-symbol executor are
+  // unreachable here.
+  // Mainnet is reachable only through the local dashboard proxy and still requires the explicit
+  // browser confirmation plus the exact API confirmation phrase below.
   app.post("/api/live/cross-sectional-close", async (request, reply) => {
-    if (process.env.LIVE_BINANCE_ENV !== "testnet") {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const environment = process.env.LIVE_BINANCE_ENV;
+    if (environment !== "testnet" && environment !== "mainnet") {
       reply.code(403);
-      return { ok: false, reason: "testnet only" };
+      return { ok: false, reason: "cross-sectional operator close unavailable for this environment" };
     }
     if (!isLoopbackAddress(request.ip)) {
       reply.code(403);
       return { ok: false, reason: "loopback caller required" };
     }
-    const body = (request.body ?? {}) as { confirm?: string; basketId?: string };
-    if (body.confirm !== "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET" || !body.basketId) {
+    const body = (request.body ?? {}) as { confirm?: string; basketId?: string; laneId?: string };
+    if (body.confirm !== "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET" || !body.basketId || !body.laneId) {
       reply.code(400);
       return {
         ok: false,
-        reason: 'close requires body {"confirm":"CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET","basketId":"..."}',
+        reason: 'close requires body {"confirm":"CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET","laneId":"...","basketId":"..."}',
       };
     }
-    const executor = opts.crossSectionalExecutor?.() ?? null;
+    const executor = [
+      { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", executor: opts.crossSectionalExecutor?.() ?? null },
+      { laneId: "CROSS_SECTIONAL_TREND", executor: opts.crossSectionalTrendExecutor?.() ?? null },
+      { laneId: "CROSS_SECTIONAL_MIXED", executor: opts.crossSectionalMixedExecutor?.() ?? null },
+    ].find((candidate) => candidate.laneId === body.laneId)?.executor ?? null;
     if (!executor) {
-      reply.code(503);
-      return { ok: false, reason: "cross-sectional executor disabled" };
+      reply.code(404);
+      return { ok: false, reason: `no operator-closeable cross-sectional executor for lane ${body.laneId}` };
     }
 
     const before = executor.getStatus();
@@ -1909,40 +1920,41 @@ export async function registerLiveRoutes(
     const target = liveBaskets.find((basket) => basket.basketId === body.basketId);
     if (!target) {
       reply.code(404);
-      return { ok: false, reason: "target basket is not open in the market-neutral executor", basketId: body.basketId };
+      return { ok: false, reason: "target basket is not open in the selected cross-sectional executor", laneId: body.laneId, basketId: body.basketId };
     }
-    // closeAllBasketsOrderly is intentionally the executor's established safe close path, but
-    // it closes every live basket owned by that executor. Refuse rather than accidentally widen
-    // a request for one basket into a bulk close.
-    if (liveBaskets.length !== 1) {
-      reply.code(409);
-      return {
-        ok: false,
-        reason: "refused: more than one market-neutral basket is open; no basket was closed",
-        basketId: body.basketId,
-        openBasketIds: liveBaskets.map((basket) => basket.basketId),
-      };
-    }
-
-    const result = await executor.closeAllBasketsOrderly(`OPERATOR_SCOPED_CLOSE:${body.basketId}`);
+    const result = await executor.manualCloseBasket(
+      body.basketId,
+      `OPERATOR_MANUAL_CLOSE:${body.laneId}:${body.basketId}`,
+    );
     const after = executor.getStatus();
     const stillOpen = after.openBaskets.some((basket) => basket.basketId === body.basketId);
-    if (result.closed !== 1 || result.failed !== 0 || stillOpen) {
+    const targetOrphans = after.orphanedLegs.filter((leg) => leg.basketId === body.basketId);
+    const fullyVerified =
+      result.ok &&
+      result.state === "CLOSED" &&
+      !stillOpen &&
+      result.exitReconciliation?.state === "CONFIRMED" &&
+      targetOrphans.length === 0;
+    if (!fullyVerified) {
       reply.code(409);
       return {
         ok: false,
-        reason: "close did not complete cleanly; inspect executor status before retrying",
+        reason: result.reason ?? "close is not yet fully reconciled; automatic retry remains active",
+        state: result.state,
+        laneId: body.laneId,
         basketId: body.basketId,
         result,
         openBasketIds: after.openBaskets.map((basket) => basket.basketId),
+        orphanedLegs: targetOrphans,
       };
     }
     return {
       ok: true,
-      laneId: before.laneId,
+      laneId: body.laneId,
       basketId: body.basketId,
       result,
       openBasketIds: after.openBaskets.map((basket) => basket.basketId),
+      orphanedLegs: targetOrphans,
     };
   });
 
