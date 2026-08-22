@@ -62,6 +62,11 @@ class FakeClient implements SingleSymbolExecClient {
    *  cross-sectional-executor.test.ts's FakeExecClient field of the same name. */
   failOnSymbolWithBinanceError: string | null = null;
   failAlgoOnce = false;
+  /** Fail this many reduce-only close attempts after all entries have been placed. Test-only hook
+   *  for exact-formation emergency-unwind recovery. */
+  failReduceOnlyAttempts = 0;
+  /** When the next configured reduce-only failure fires, make the following stop re-arm fail too. */
+  failNextStopAfterReduceOnlyFailure = false;
   /** Reject the NEXT reduceOnly placeOrder call with the given Binance error code (e.g. -2022),
    *  then clear itself. Non-reduceOnly retries are NOT rejected. */
   rejectNextReduceOnlyWithCode: number | null = null;
@@ -137,6 +142,14 @@ class FakeClient implements SingleSymbolExecClient {
     }
     if (this.failOnSymbol === params.symbol) throw new Error(`exchange rejected ${params.symbol}`);
     if (this.failAllPlaceOrders) throw new Error("exchange rejected (persistent, non-recoverable)");
+    if (params.reduceOnly && this.failReduceOnlyAttempts > 0) {
+      this.failReduceOnlyAttempts -= 1;
+      if (this.failNextStopAfterReduceOnlyFailure) {
+        this.failNextStopAfterReduceOnlyFailure = false;
+        this.failAlgoOnce = true;
+      }
+      throw new Error("exchange rejected (configured reduce-only close failure)");
+    }
     if (params.reduceOnly && this.rejectNextReduceOnlyWithCode !== null) {
       const code = this.rejectNextReduceOnlyWithCode;
       this.rejectNextReduceOnlyWithCode = null;
@@ -1077,6 +1090,35 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     expect(client.placed.filter((order) => order.reduceOnly).map((order) => order.symbol).sort())
       .toEqual(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
     expect(executor.getStatus().lastEntrySkipReason).toMatch(/only 2\/3 protected leg\(s\)/i);
+  });
+
+  it("[EXACT-FORMATION] immediately retries protection and truthfully exposes a leg when its emergency unwind also fails", async () => {
+    const client = new FakeClient();
+    client.failAlgoOnce = true;
+    client.failReduceOnlyAttempts = 1;
+    client.failNextStopAfterReduceOnlyFailure = true;
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [
+        signal({ observationId: "dir:BTC:1", symbol: "BTCUSDT", openedAtMs: NOW_MS - 60_000 }),
+        signal({ observationId: "dir:ETH:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090, openedAtMs: NOW_MS - 90_000 }),
+        signal({ observationId: "dir:SOL:1", symbol: "SOLUSDT", entryPrice: 150, stopPrice: 154.5, openedAtMs: NOW_MS - 120_000 }),
+      ],
+      legUsd: 10_000,
+      maxOpenPositions: 3,
+      requiredOpenPositions: 3,
+    });
+
+    await executor.tick();
+
+    const open = store.getState().positions.filter((position) => position.status === "OPEN");
+    expect(open).toHaveLength(1);
+    expect(open[0]!.symbol).toBe("BTCUSDT");
+    expect(open[0]!.stopAlgoOrderId).toBeNull();
+    expect(open[0]!.stopFailureCount).toBe(2);
+    expect(executor.getStatus().unprotectedPositions.map((position) => position.symbol)).toEqual(["BTCUSDT"]);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/UNPROTECTED after immediate re-arm: BTCUSDT/i);
+    expect(executor.getStatus().lastEntrySkipReason).not.toMatch(/remain(?:ing)? positions stay stopped/i);
   });
 
   it("[EXACT-FORMATION] fails closed if a maker-entry configuration would leave a resting partial basket", async () => {

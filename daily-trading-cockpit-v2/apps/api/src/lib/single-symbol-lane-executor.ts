@@ -2503,19 +2503,39 @@ export class SingleSymbolLaneExecutor {
 
     const protectedCount = stillOpen.filter((position) => position.stopAlgoOrderId !== null).length;
 
-    const failedSymbols: string[] = [];
+    const failedPositions: SingleSymbolPosition[] = [];
     for (const position of stillOpen) {
       try {
         await this.closePosition(position, "INCOMPLETE_EXACT_FORMATION_ABORT");
       } catch {
-        failedSymbols.push(position.symbol);
+        // closePosition() clears the stop id whenever its market exit fails,
+        // because the earlier cancel may already have removed that exchange
+        // order. Do not defer protection until the next scheduled tick: an
+        // exact formation which failed its own unwind has to re-arm its stop
+        // in this same error path. ensureStopOrder records an honest
+        // UNPROTECTED status if the re-arm itself also fails.
+      }
+      if (position.status === "OPEN") {
+        await this.ensureStopOrder(position);
+        failedPositions.push(position);
       }
     }
 
-    if (failedSymbols.length > 0) {
+    if (failedPositions.length > 0) {
+      const reprotectedSymbols = failedPositions
+        .filter((position) => position.stopAlgoOrderId !== null)
+        .map((position) => position.symbol);
+      const unprotectedSymbols = failedPositions
+        .filter((position) => position.stopAlgoOrderId === null)
+        .map((position) => position.symbol);
+      const protectionStatus = unprotectedSymbols.length > 0
+        ? `UNPROTECTED after immediate re-arm: ${unprotectedSymbols.join(", ")}. ` +
+          "Both the emergency market exit and its replacement stop failed; retries continue every tick."
+        : `replacement exchange stop confirmed for ${reprotectedSymbols.join(", ")}.`;
       this.openHalted =
         `CRITICAL: exact ${requiredOpenPositions}-position formation established only ${protectedCount}/${requiredOpenPositions} protected leg(s); ` +
-        `emergency unwind failed for ${failedSymbols.join(", ")}. Remaining positions stay stopped and block every new route.`;
+        `emergency unwind failed for ${failedPositions.map((position) => position.symbol).join(", ")}. ` +
+        `${protectionStatus} Every new route remains blocked.`;
       this.lastEntrySkipReason = this.openHalted;
       return;
     }
