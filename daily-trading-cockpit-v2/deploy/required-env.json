@@ -139,6 +139,34 @@
       "value": "0",
       "why": "Hard-disabled state for the directional cross-sectional route. Only exactly 3 enables it; 1 or 2 are rejected rather than becoming an accidental partial directional basket."
     },
+    "CROSS_SECTIONAL_DIRECTIONAL_MAX_HOLD_HOURS": {
+      "value": "24",
+      "why": "Directional is a short-lived conviction sleeve, not the 36h market-neutral Hold36 baseline. A release must not silently lengthen a directional runner past its approved 24h cap."
+    },
+    "CROSS_SECTIONAL_DIRECTIONAL_MFE_ARM_R": {
+      "value": "0.75",
+      "why": "The sole directional profit-protection mechanism arms only after a runner reaches 0.75R. It preserves room for a genuine trend rather than banking the first small gain."
+    },
+    "CROSS_SECTIONAL_DIRECTIONAL_MFE_GIVEBACK_FRACTION": {
+      "value": "0.3",
+      "why": "After the 0.75R arm, exit only after a 30% giveback from the runner's MFE. This is intentionally one trailing mechanism, not a stack of TP and locks."
+    },
+    "CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_NET_RETURN": {
+      "value": "0",
+      "why": "Disables the old price-percent profit lock. Zero is explicit because deleting the key could restore a code default in a future release."
+    },
+    "CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_R": {
+      "value": "0",
+      "why": "Disables the old R-denominated early profit lock so it cannot compete with the approved MFE giveback trail."
+    },
+    "CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_R": {
+      "value": "0",
+      "why": "Disables fixed directional take-profit. A directional runner must not be capped at 1.5R while the MFE giveback policy is the approved exit."
+    },
+    "CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_MAX_NET_RETURN": {
+      "value": "0",
+      "why": "Keeps the report/counterfactual static-TP ceiling explicitly off alongside STATIC_TP_R, so the dashboard cannot imply an inactive fixed target."
+    },
     "CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY": {
       "value": "0",
       "why": "Exact three-symbol directional formations use immediate market entries. A resting maker entry can survive a restart and later create a one-leg basket, so this route fails closed if maker entry is enabled."
