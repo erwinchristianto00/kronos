@@ -136,8 +136,8 @@
       "why": "Keeps the directional-router code path explicitly configured on both environments, but it cannot create exposure while the exact-three slot control below is 0. Testnet promotion changes only the bounded slot control after review."
     },
     "CROSS_SECTIONAL_DIRECTIONAL_MAX_OPEN_POSITIONS": {
-      "value": "0",
-      "why": "Hard-disabled state for the directional cross-sectional route. Only exactly 3 enables it; 1 or 2 are rejected rather than becoming an accidental partial directional basket."
+      "value": "3",
+      "why": "Directional pilot is armed on both environments. Only exactly 3 enables it; 1 or 2 remain rejected rather than becoming an accidental partial directional basket. The route coordinator still blocks this formation while any market-neutral basket is open."
     },
     "CROSS_SECTIONAL_DIRECTIONAL_MAX_HOLD_HOURS": {
       "value": "24",
@@ -190,8 +190,8 @@
       "role": "mainnet",
       "extra": {
         "CROSS_SECTIONAL_DIRECTIONAL_REGIME_MAINNET_ENABLED": {
-          "value": "0",
-          "why": "A separate mainnet opt-in is required even if the shared directional feature flag is present. Release copy or a testnet setting must never create live directional exposure by itself."
+          "value": "1",
+          "why": "Explicit operator-approved mainnet opt-in for the exact-three directional route. The separate flag remains required so future release copies cannot enable mainnet exposure without this deliberate policy value."
         }
       }
     }
