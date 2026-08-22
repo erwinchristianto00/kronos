@@ -78,15 +78,15 @@ export function DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS(env: NodeJS.ProcessEnv = p
 }
 export const DIRECTIONAL_REGIME_MAX_SIGNAL_AGE_MS = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MAX_SIGNAL_AGE_MS", 15 * 60_000);
 export const DIRECTIONAL_REGIME_DAILY_MAX_LOSS_USD = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_DAILY_MAX_LOSS_USD", 15);
-export const DIRECTIONAL_REGIME_MFE_ARM_R = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_ARM_R", 1);
-export const DIRECTIONAL_REGIME_MFE_GIVEBACK_FRACTION = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_GIVEBACK_FRACTION", 0.5);
-/** Profit is locked only after a runner has first earned this estimated-net return; it is not a full TP. */
-export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_NET_RETURN", 0.005);
-/** Profit-lock in R. Default 0 = unset, so the price-denominated lock above stays in force until an
- *  operator opts in. Set it and the lock becomes scale-free: 0.5R means 0.5R on every symbol,
- *  instead of 1.15R on ETH and 0.25R on SOL as the price-% form measurably did. Keep it BELOW
- *  DIRECTIONAL_REGIME_MFE_ARM_R so the two mechanisms tile rather than shadow each other — the lock
- *  catches peaks between itself and the arm, the giveback trails everything above the arm. */
+export const DIRECTIONAL_REGIME_MFE_ARM_R = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_ARM_R", 0.75);
+export const DIRECTIONAL_REGIME_MFE_GIVEBACK_FRACTION = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_GIVEBACK_FRACTION", 0.3);
+/** Optional profit floor after a runner has first earned it. Zero disables it; the directional default
+ * deliberately relies on the MFE giveback trail instead of banking a small fixed winner. */
+export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_NET_RETURN", 0);
+/** Optional profit-lock in R. Zero leaves the runner governed only by the MFE giveback trail.
+ *  If an operator explicitly enables it, the lock becomes scale-free: 0.5R means 0.5R on every
+ *  symbol, instead of a price-% lock whose R value changes with stop width. Keep it BELOW
+ *  DIRECTIONAL_REGIME_MFE_ARM_R so the two mechanisms tile rather than shadow each other. */
 export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_R = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_R", 0);
 /** Floor on how far the stop sits from entry, as a PERCENT of entry. 0 = off (scanner stop used
  *  verbatim, the behaviour every deployment had before 2026-08-16).
@@ -144,8 +144,8 @@ export function effectiveDirectionalStop(
     ? Math.min(scannerStop, entryPrice - floor)
     : Math.max(scannerStop, entryPrice + floor);
 }
-/** Ceiling for any future static default TP. The active directional policy remains MFE-managed. */
-export const DIRECTIONAL_REGIME_STATIC_TP_MAX_NET_RETURN = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_MAX_NET_RETURN", 0.0065);
+/** Informational ceiling for a static TP. Zero means no static cap is active. */
+export const DIRECTIONAL_REGIME_STATIC_TP_MAX_NET_RETURN = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_MAX_NET_RETURN", 0);
 export const DIRECTIONAL_REGIME_MAX_HOLD_HOURS = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MAX_HOLD_HOURS", 24);
 
 export const DIRECTIONAL_REVERSAL_CONFIRMATIONS_REQUIRED = 2;
@@ -190,7 +190,11 @@ export function evaluateDirectionalReversal(
   nowMs: number,
 ): DirectionalReversalEvaluation {
   const next = { ...(previous ?? freshDirectionalReversalState()) };
-  if (decision.mode === activeMode) {
+  const oppositeMode = activeMode === "BEAR_SHORT_3" ? "BULL_LONG_3" : "BEAR_SHORT_3";
+  if (decision.mode !== oppositeMode) {
+    // NO_TRADE and BALANCED_3X3 freeze new directional entries; they do not reverse a
+    // still-valid directional thesis. They also break an in-progress opposite confirmation,
+    // so an exit requires two distinct, consecutive opposite confirmations.
     next.activeMode = activeMode;
     next.lastInvalidatingScanBatchId = null;
     next.invalidatingScanCount = 0;
@@ -396,13 +400,10 @@ function emptyDecision(reason: string): CrossSectionalDirectionalDecision {
  * longs.  This makes a conflicting evidence set fail closed rather than flip
  * its direction simply because one scalar happened to be higher.
  */
-/* 2026-08-18 merge: diambil dari research/phase3a-residual-generator.
- * Dua yang pertama lebih KETAT (fail-closed saat pick kurang dari tiga, dan saat canonical
- * regime tidak setuju). evaluateDirectionalReversal diambil karena satu-satunya yang punya
- * bukti lapangan: reason DIRECTIONAL_REVERSAL_CONFIRMED:NO_TRADE muncul 9 kali di close nyata
- * testnet, dan string itu hanya bisa dihasilkan varian ini. Varian saya (hanya mode BERLAWANAN
- * yang menghitung; NO_TRADE mereset) belum pernah dijalankan. Konsekuensi yang diterima:
- * regime NO_TRADE yang bertahan menutup posisi - 9 dari 17 close yang terukur. */
+/* 2026-08-22 policy: a missing/balanced directional signal blocks fresh risk but is not a
+ * reversal. The prior implementation counted NO_TRADE as a reversal and dominated the small
+ * testnet sample with short-lived churn; only two fresh, canonical-confirmed opposite modes may
+ * invalidate an open directional thesis. */
 /* 2026-08-18 merge: badan fungsi ini milik saya (ia mengecualikan simbol yang sudah dipegang
  * basket - fitur yang tidak ada di sisi seberang), TAPI ambangnya diambil dari
  * research/phase3a-residual-generator: `=== 3`, bukan `>= 1`. Mode ini bernama BEAR_SHORT_3 /

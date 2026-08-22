@@ -36,6 +36,8 @@ import {
   CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
   CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID,
   DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN,
+  DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_R,
+  DIRECTIONAL_REGIME_STATIC_TP_R,
   DIRECTIONAL_REGIME_STATIC_TP_MAX_NET_RETURN,
   type CrossSectionalDirectionalDecision,
 } from "../lib/cross-sectional-directional-regime.js";
@@ -697,6 +699,7 @@ export type SingleSymbolLanePositionRow = {
   mfeProfitLockPrice: number | null;
   mfeProfitLockGapPct: number | null;
   mfeProfitLockNetReturn: number | null;
+  mfeProfitLockR: number | null;
   /** Informational maximum for future static defaults; it is never a live TP by itself. */
   staticTpMaxNetReturn: number | null;
   markPrice: number | null;
@@ -765,18 +768,25 @@ export function flattenSingleSymbolPositions(
         ? ((targetPrice - markPrice) / markPrice) * dir * 100
         : null;
     const directionalMfe = laneId === CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID || laneId === CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID;
-    const mfeProfitLockNetReturn = directionalMfe && targetPrice === null
-      ? DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN()
+    const configuredMfeProfitLockR = DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_R();
+    const mfeProfitLockR = directionalMfe && targetPrice === null && configuredMfeProfitLockR > 0
+      ? configuredMfeProfitLockR
+      : null;
+    const configuredMfeProfitLockNetReturn = DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN();
+    const mfeProfitLockNetReturn = directionalMfe && targetPrice === null && mfeProfitLockR === null && configuredMfeProfitLockNetReturn > 0
+      ? configuredMfeProfitLockNetReturn
       : null;
     const estimatedCloseCostPctRaw = Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT);
     const estimatedCloseCostPct = Number.isFinite(estimatedCloseCostPctRaw) && estimatedCloseCostPctRaw >= 0
       ? estimatedCloseCostPctRaw
       : 0.0022;
-    const mfeProfitLockPrice = mfeProfitLockNetReturn !== null && p.entryPrice > 0
-      ? p.entryPrice * (dir === 1
+    const mfeProfitLockPrice = mfeProfitLockR !== null && p.entryPrice > 0 && Math.abs(p.entryPrice - p.stopPrice) > 0
+      ? p.entryPrice + dir * Math.abs(p.entryPrice - p.stopPrice) * mfeProfitLockR
+      : mfeProfitLockNetReturn !== null && p.entryPrice > 0
+        ? p.entryPrice * (dir === 1
         ? 1 + mfeProfitLockNetReturn + estimatedCloseCostPct
         : 1 - mfeProfitLockNetReturn - estimatedCloseCostPct)
-      : null;
+        : null;
     const mfeProfitLockGapPct =
       mfeProfitLockPrice !== null && markPrice !== null && markPrice > 0
         ? ((mfeProfitLockPrice - markPrice) / markPrice) * dir * 100
@@ -795,7 +805,10 @@ export function flattenSingleSymbolPositions(
       mfeProfitLockPrice,
       mfeProfitLockGapPct,
       mfeProfitLockNetReturn,
-      staticTpMaxNetReturn: directionalMfe ? DIRECTIONAL_REGIME_STATIC_TP_MAX_NET_RETURN() : null,
+      mfeProfitLockR,
+      staticTpMaxNetReturn: directionalMfe && DIRECTIONAL_REGIME_STATIC_TP_R() > 0
+        ? DIRECTIONAL_REGIME_STATIC_TP_MAX_NET_RETURN()
+        : null,
       markPrice,
       unrealizedPnl,
       leverage: safelyBound && Number.isFinite(exchange?.leverage) ? exchange!.leverage : null,

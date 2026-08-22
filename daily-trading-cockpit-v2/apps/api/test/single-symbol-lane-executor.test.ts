@@ -749,6 +749,29 @@ describe("makeMfeGivebackExitPolicy (INTRADAY_MOMENTUM_BREAKOUT geometry)", () =
   });
 });
 
+describe("makeMfeGivebackExitPolicy — directional runner policy", () => {
+  const g = { entryPrice: 100, stopPrice: 98 };
+  const atR = (r: number) => g.entryPrice + r * (g.entryPrice - g.stopPrice);
+  const policy = makeMfeGivebackExitPolicy({
+    armR: 0.75,
+    givebackFrac: 0.3,
+    maxHoldMs: 24 * 3_600_000,
+    profitLockNetReturn: 0,
+    profitLockR: 0,
+    staticTpR: 0,
+  });
+
+  it("uses only the 0.75R / 30% MFE trail: no early lock and no fixed TP", () => {
+    expect(policy({ direction: "LONG", ...g, currentPrice: atR(0.5), peakFavorableR: 0.5, msHeld: 0 }).shouldExit).toBe(false);
+    expect(policy({ direction: "LONG", ...g, currentPrice: atR(1.5), peakFavorableR: 1.5, msHeld: 0 }).shouldExit).toBe(false);
+
+    // A 1.5R peak arms the 30% giveback line at 1.05R. Only after that retrace does it exit.
+    const retraced = policy({ direction: "LONG", ...g, currentPrice: atR(1), peakFavorableR: 1.5, msHeld: 60_000 });
+    expect(retraced.shouldExit).toBe(true);
+    expect(retraced.reason).toBe("MFE_GIVEBACK");
+  });
+});
+
 describe("SingleSymbolLaneExecutor — entry", () => {
   it("[TIMELINE-GATE] keeps a fresh signal retryable while the BTC/ETH/SOL timeline says WAIT", async () => {
     const sig = signal();

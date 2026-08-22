@@ -691,6 +691,7 @@ type SingleSymbolLanePosition = {
   mfeProfitLockPrice: number | null;
   mfeProfitLockGapPct: number | null;
   mfeProfitLockNetReturn: number | null;
+  mfeProfitLockR: number | null;
   staticTpMaxNetReturn: number | null;
   markPrice: number | null;
   unrealizedPnl: number | null;
@@ -2776,8 +2777,8 @@ export default function TestnetExchangeDashboard() {
                           <td>{price(p.entryPrice)}</td>
                           <td>{price(p.markPrice)}</td>
                           <td>{hasFixedTarget ? price(p.targetPrice) : hasMfeProfitLock ? <>
-                            <strong>MFE lock {percent((p.mfeProfitLockNetReturn ?? 0) * 100)}</strong>
-                            <small style={{ display: 'block' }}>guide {price(p.mfeProfitLockPrice)} · static cap {percent((p.staticTpMaxNetReturn ?? 0) * 100)}</small>
+                            <strong>MFE lock {p.mfeProfitLockR != null ? `${p.mfeProfitLockR.toFixed(2)}R` : percent((p.mfeProfitLockNetReturn ?? 0) * 100)}</strong>
+                            <small style={{ display: 'block' }}>guide {price(p.mfeProfitLockPrice)}{p.staticTpMaxNetReturn != null ? ` · static cap ${percent(p.staticTpMaxNetReturn * 100)}` : ''}</small>
                           </> : 'dynamic exit'}</td>
                           <td className={tone(hasFixedTarget ? p.targetTpGapPct : p.mfeProfitLockGapPct)}>{hasFixedTarget
                             ? percent(p.targetTpGapPct)

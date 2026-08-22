@@ -49,26 +49,30 @@ export interface OwnExitParams {
 }
 
 export const DEFAULT_OWN_EXIT: OwnExitParams = {
-  armR: 0.2,
+  armR: 0.75,
   givebackFraction: 0.3,
-  profitLockNetReturn: 0.005,
+  profitLockNetReturn: 0,
   profitLockR: 0,
-  staticTpMaxNetReturn: 0.0065,
+  staticTpMaxNetReturn: 0,
   maxHoldHours: 24,
 };
 
 export function ownExitParamsFromEnv(env: NodeJS.ProcessEnv = process.env): OwnExitParams {
-  const num = (raw: string | undefined, fallback: number): number => {
+  const positive = (raw: string | undefined, fallback: number): number => {
     const n = Number.parseFloat(raw ?? "");
     return Number.isFinite(n) && n > 0 ? n : fallback;
   };
+  const nonNegative = (raw: string | undefined, fallback: number): number => {
+    const n = Number.parseFloat(raw ?? "");
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+  };
   return {
-    armR: num(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_ARM_R, DEFAULT_OWN_EXIT.armR),
-    givebackFraction: num(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_GIVEBACK_FRACTION, DEFAULT_OWN_EXIT.givebackFraction),
-    profitLockNetReturn: num(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_NET_RETURN, DEFAULT_OWN_EXIT.profitLockNetReturn),
-    profitLockR: num(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_R, DEFAULT_OWN_EXIT.profitLockR ?? 0),
-    staticTpMaxNetReturn: num(env.CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_MAX_NET_RETURN, DEFAULT_OWN_EXIT.staticTpMaxNetReturn),
-    maxHoldHours: num(env.CROSS_SECTIONAL_DIRECTIONAL_MAX_HOLD_HOURS, DEFAULT_OWN_EXIT.maxHoldHours),
+    armR: positive(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_ARM_R, DEFAULT_OWN_EXIT.armR),
+    givebackFraction: positive(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_GIVEBACK_FRACTION, DEFAULT_OWN_EXIT.givebackFraction),
+    profitLockNetReturn: nonNegative(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_NET_RETURN, DEFAULT_OWN_EXIT.profitLockNetReturn),
+    profitLockR: nonNegative(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_R, DEFAULT_OWN_EXIT.profitLockR ?? 0),
+    staticTpMaxNetReturn: nonNegative(env.CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_MAX_NET_RETURN, DEFAULT_OWN_EXIT.staticTpMaxNetReturn),
+    maxHoldHours: positive(env.CROSS_SECTIONAL_DIRECTIONAL_MAX_HOLD_HOURS, DEFAULT_OWN_EXIT.maxHoldHours),
   };
 }
 
@@ -167,8 +171,8 @@ export function replayOwnExit(bars: readonly Bar[], p: Pick<DirectionalClosedPos
       }
     } else {
       const closeRet = retOf(bar.close);
-      if (closeRet >= params.staticTpMaxNetReturn) return done(bar.close, "STATIC_TP", bar.openTimeMs);
-      if (closeRet >= params.profitLockNetReturn) return done(bar.close, "PROFIT_LOCK", bar.openTimeMs);
+      if (params.staticTpMaxNetReturn > 0 && closeRet >= params.staticTpMaxNetReturn) return done(bar.close, "STATIC_TP", bar.openTimeMs);
+      if (params.profitLockNetReturn > 0 && closeRet >= params.profitLockNetReturn) return done(bar.close, "PROFIT_LOCK", bar.openTimeMs);
     }
     const barPeak = Math.max(peakR, barR);
     if (barPeak >= params.armR && barR <= barPeak * (1 - params.givebackFraction)) {

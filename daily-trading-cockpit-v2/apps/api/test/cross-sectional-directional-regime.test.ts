@@ -238,7 +238,7 @@ describe("cross-sectional directional regime selector", () => {
 describe("directional reversal confirmation", () => {
   const nowMs = Date.parse("2026-08-14T04:00:00.000Z");
 
-  it("closes a short after two distinct scans stop confirming it, NO_TRADE included", () => {
+  it("keeps a short open across repeated NO_TRADE scans and resets any pending reversal", () => {
     const first = evaluateDirectionalReversal(null, "BEAR_SHORT_3", {
       mode: "NO_TRADE",
       scanBatchId: "scan-no-trade-1",
@@ -249,18 +249,18 @@ describe("directional reversal confirmation", () => {
     }, nowMs + 60_000);
 
     expect(first.shouldExit).toBe(false);
-    expect(second.shouldExit).toBe(true);
-    expect(second.next.invalidatingScanCount).toBe(2);
+    expect(second.shouldExit).toBe(false);
+    expect(second.next.invalidatingScanCount).toBe(0);
   });
 
-  it("counts a balanced 3x3 decision as one invalidating scan", () => {
+  it("keeps a long open across a balanced 3x3 decision", () => {
     const result = evaluateDirectionalReversal(null, "BULL_LONG_3", {
       mode: "BALANCED_3X3",
       scanBatchId: "scan-balanced",
     }, nowMs);
 
     expect(result.shouldExit).toBe(false);
-    expect(result.next.invalidatingScanCount).toBe(1);
+    expect(result.next.invalidatingScanCount).toBe(0);
   });
 
   it("requires two distinct consecutive opposite-direction scans before closing", () => {
@@ -281,5 +281,25 @@ describe("directional reversal confirmation", () => {
     expect(repeat.shouldExit).toBe(false);
     expect(confirmed.shouldExit).toBe(true);
     expect(confirmed.reason).toBe("DIRECTIONAL_REVERSAL_CONFIRMED:BULL_LONG_3");
+  });
+
+  it("requires two consecutive opposite scans: NO_TRADE breaks an unfinished opposite confirmation", () => {
+    const firstOpposite = evaluateDirectionalReversal(null, "BULL_LONG_3", {
+      mode: "BEAR_SHORT_3",
+      scanBatchId: "scan-bear-1",
+    }, nowMs);
+    const pause = evaluateDirectionalReversal(firstOpposite.next, "BULL_LONG_3", {
+      mode: "NO_TRADE",
+      scanBatchId: "scan-no-trade",
+    }, nowMs + 60_000);
+    const secondOpposite = evaluateDirectionalReversal(pause.next, "BULL_LONG_3", {
+      mode: "BEAR_SHORT_3",
+      scanBatchId: "scan-bear-2",
+    }, nowMs + 120_000);
+
+    expect(firstOpposite.shouldExit).toBe(false);
+    expect(pause.shouldExit).toBe(false);
+    expect(secondOpposite.shouldExit).toBe(false);
+    expect(secondOpposite.next.invalidatingScanCount).toBe(1);
   });
 });

@@ -150,6 +150,17 @@ describe("ownExitParamsFromEnv", () => {
     expect(p.armR).toBe(0.2); expect(p.maxHoldHours).toBe(24);
   });
   it("nilai tak sah jatuh ke default, bukan NaN", () => {
-    expect(ownExitParamsFromEnv({ CROSS_SECTIONAL_DIRECTIONAL_MFE_ARM_R: "abc" } as NodeJS.ProcessEnv).armR).toBe(0.2);
+    expect(ownExitParamsFromEnv({ CROSS_SECTIONAL_DIRECTIONAL_MFE_ARM_R: "abc" } as NodeJS.ProcessEnv).armR).toBe(0.75);
+  });
+
+  it("zero secara eksplisit mematikan fixed TP dan kedua profit lock", () => {
+    const p = ownExitParamsFromEnv({
+      CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_NET_RETURN: "0",
+      CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_R: "0",
+      CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_MAX_NET_RETURN: "0",
+    } as NodeJS.ProcessEnv);
+    expect(p.profitLockNetReturn).toBe(0);
+    expect(p.profitLockR).toBe(0);
+    expect(p.staticTpMaxNetReturn).toBe(0);
   });
 });
