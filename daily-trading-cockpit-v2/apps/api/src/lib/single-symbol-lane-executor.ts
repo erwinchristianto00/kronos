@@ -643,6 +643,14 @@ export interface SingleSymbolLaneExecutorOptions {
   timelineExitGate?: SingleSymbolTimelineExitGate;
   /** Master permission gate. Testnet: () => true. Mainnet: () => engine.isArmed(). */
   isAllowed: () => boolean;
+  /**
+   * Optional account-level route claim for a whole formation pass. Unlike the
+   * per-symbol claim below, this lets a three-symbol directional basket reserve
+   * the cross-sectional route before its first order is persisted.
+   */
+  tryClaimEntryScope?: () => { allowed: boolean; reason?: string | null };
+  /** Releases the matching optional route claim after the formation pass. */
+  releaseEntryScope?: () => void;
   /** 2026-07-12: optional human-readable reason surfaced in getStatus() when a NON-obvious gate
    *  (e.g. the regime×direction edge-memory veto) is the thing holding this lane back — isAllowed()
    *  is a bare boolean, so a false with no reason is indistinguishable from disarmed/unallocated.
@@ -695,6 +703,21 @@ export interface SingleSymbolLaneExecutorOptions {
   /** How long a post-only entry may rest before it is cancelled and crossed. */
   makerEntryWaitMs?: () => number;
   maxOpenPositions?: () => number;
+  /**
+   * Optional exact formation size. `0` (the default) preserves the normal
+   * independent-single-symbol behavior. A positive value makes this executor
+   * an all-or-flat formation: it will only start with exactly that many fresh,
+   * distinct signals and will immediately unwind every position opened by the
+   * attempt if any selected leg cannot be established.
+   *
+   * This cannot make exchange market orders literally simultaneous. It does
+   * make a partial sequence transient and actively risk-reducing rather than
+   * leaving a durable one- or two-leg directional bet after a later failure.
+   * Exact formations deliberately reject maker entry: a resting order can
+   * outlive a process restart and turn a partially formed basket into a live
+   * exposure after this method has returned.
+   */
+  requiredOpenPositions?: () => number;
   /** Only execute signals younger than this (a stale signal's edge has drifted). */
   maxSignalAgeMs?: () => number;
   dailyMaxLossUsd?: () => number;
@@ -905,6 +928,8 @@ export class SingleSymbolLaneExecutor {
   private readonly timelineEntryGate: SingleSymbolTimelineEntryGate | null;
   private readonly timelineExitGate: SingleSymbolTimelineExitGate | null;
   private readonly isAllowed: () => boolean;
+  private readonly tryClaimEntryScope: () => { allowed: boolean; reason?: string | null };
+  private readonly releaseEntryScope: () => void;
   private readonly isAllowedReasonFn: () => string | null;
   private readonly laneWeightPctFn: () => number;
   private readonly rawLaneWeightPctFn: (() => number) | null;
@@ -919,6 +944,7 @@ export class SingleSymbolLaneExecutor {
   private readonly legUsdFn: () => number;
   private readonly leverageFn: () => number;
   private readonly maxOpenPositionsFn: () => number;
+  private readonly requiredOpenPositionsFn: () => number;
   private readonly maxSignalAgeMsFn: () => number;
   private readonly dailyMaxLossUsdFn: () => number;
   private readonly nowIso: () => string;
@@ -969,6 +995,8 @@ export class SingleSymbolLaneExecutor {
     this.timelineEntryGate = opts.timelineEntryGate ?? null;
     this.timelineExitGate = opts.timelineExitGate ?? null;
     this.isAllowed = opts.isAllowed;
+    this.tryClaimEntryScope = opts.tryClaimEntryScope ?? (() => ({ allowed: true, reason: null }));
+    this.releaseEntryScope = opts.releaseEntryScope ?? (() => {});
     this.isAllowedReasonFn = opts.isAllowedReason ?? (() => null);
     this.laneWeightPctFn = opts.laneWeightPct ?? (() => 100);
     this.rawLaneWeightPctFn = opts.rawLaneWeightPct ?? null;
@@ -983,6 +1011,7 @@ export class SingleSymbolLaneExecutor {
     this.legUsdFn = opts.legUsd;
     this.leverageFn = opts.leverage;
     this.maxOpenPositionsFn = opts.maxOpenPositions ?? (() => 1);
+    this.requiredOpenPositionsFn = opts.requiredOpenPositions ?? (() => 0);
     this.maxSignalAgeMsFn = opts.maxSignalAgeMs ?? (() => 50 * 60_000);
     this.dailyMaxLossUsdFn = opts.dailyMaxLossUsd ?? (() => 0);
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
@@ -1646,9 +1675,13 @@ export class SingleSymbolLaneExecutor {
    *  tick by default on testnet. Mirrors getOpenUnexitedLegs()'s identical rationale in
    *  cross-sectional-executor.ts. Use this, never getStatus(), anywhere that only needs raw open
    *  exposure and must not risk depending on isAllowed(). */
-  getExposureSnapshot(): { laneId: string; openPositions: SingleSymbolPosition[] } {
-    const open = this.store.getState().positions.filter((p) => p.status === "OPEN");
-    return { laneId: this.laneId, openPositions: open };
+  getExposureSnapshot(): { laneId: string; openPositions: SingleSymbolPosition[]; pendingMakerEntryCount: number } {
+    const state = this.store.getState();
+    const open = state.positions.filter((p) => p.status === "OPEN");
+    // A persisted maker entry can still fill after a process restart. It is
+    // exposure-in-formation, not an empty slot another route may safely take.
+    const pendingMakerEntryCount = state.pendingMakerEntries?.length ?? 0;
+    return { laneId: this.laneId, openPositions: open, pendingMakerEntryCount };
   }
 
   /**
@@ -2455,6 +2488,41 @@ export class SingleSymbolLaneExecutor {
     }
   }
 
+  /**
+   * A required-size formation may still encounter a real exchange failure after
+   * one or more market orders have filled. Binance has no atomic multi-symbol
+   * order, so the only safe interpretation of "exactly N" is to flatten the
+   * transient legs immediately and leave the route closed if a flatten fails.
+   */
+  private async abortIncompleteExactFormation(
+    openedThisFormation: SingleSymbolPosition[],
+    requiredOpenPositions: number,
+  ): Promise<void> {
+    const stillOpen = openedThisFormation.filter((position) => position.status === "OPEN");
+    if (stillOpen.length === 0) return;
+
+    const failedSymbols: string[] = [];
+    for (const position of stillOpen) {
+      try {
+        await this.closePosition(position, "INCOMPLETE_EXACT_FORMATION_ABORT");
+      } catch {
+        failedSymbols.push(position.symbol);
+      }
+    }
+
+    if (failedSymbols.length > 0) {
+      this.openHalted =
+        `CRITICAL: exact ${requiredOpenPositions}-position formation reached only ${openedThisFormation.length}; ` +
+        `emergency unwind failed for ${failedSymbols.join(", ")}. Remaining positions stay stopped and block every new route.`;
+      this.lastEntrySkipReason = this.openHalted;
+      return;
+    }
+
+    this.lastEntrySkipReason =
+      `exact ${requiredOpenPositions}-position formation reached only ${openedThisFormation.length}; ` +
+      "all transient legs were immediately flattened";
+  }
+
   private async maybeOpenPosition(): Promise<void> {
     const st = this.store.getState();
     const lossLimit = this.dailyMaxLossUsdFn();
@@ -2473,6 +2541,64 @@ export class SingleSymbolLaneExecutor {
       .filter((s) => !attempted.has(s.observationId) && nowMs - s.openedAtMs <= this.maxSignalAgeMsFn())
       .sort((a, b) => b.openedAtMs - a.openedAtMs);
     this.lastEntrySkipReason = null;
+    if (candidates.length === 0) return;
+    const maxOpenPositions = Math.max(0, Math.floor(this.maxOpenPositionsFn()));
+    const requiredOpenPositions = Math.max(0, Math.floor(this.requiredOpenPositionsFn()));
+    const alreadyOpen = st.positions.filter((p) => p.status === "OPEN").length;
+    if (requiredOpenPositions > maxOpenPositions) {
+      this.openHalted =
+        `invalid exact-formation configuration: required ${requiredOpenPositions} positions exceeds max ${maxOpenPositions}`;
+      this.lastEntrySkipReason = this.openHalted;
+      return;
+    }
+    if (requiredOpenPositions > 0) {
+      if (alreadyOpen > 0) {
+        this.lastEntrySkipReason =
+          `exact ${requiredOpenPositions}-position formation already has ${alreadyOpen} open position(s); no incremental entries`;
+        return;
+      }
+      if ((st.pendingMakerEntries?.length ?? 0) > 0) {
+        this.openHalted =
+          `exact ${requiredOpenPositions}-position formation has pending maker entry state; refusing a new formation until reconciled`;
+        this.lastEntrySkipReason = this.openHalted;
+        return;
+      }
+      if (candidates.length !== requiredOpenPositions) {
+        this.lastEntrySkipReason =
+          `exact ${requiredOpenPositions}-position formation requires exactly ${requiredOpenPositions} fresh candidates; found ${candidates.length}`;
+        return;
+      }
+      if (new Set(candidates.map((candidate) => candidate.symbol.toUpperCase())).size !== requiredOpenPositions) {
+        this.lastEntrySkipReason =
+          `exact ${requiredOpenPositions}-position formation requires ${requiredOpenPositions} distinct symbols`;
+        return;
+      }
+      // A rest-on-book entry can fill after a crash/restart, when only a subset
+      // of the intended symbols has ever been sent. Exact formations therefore
+      // fail closed instead of accepting a future maker configuration drift.
+      if (this.makerEntryFn()) {
+        this.openHalted =
+          `exact ${requiredOpenPositions}-position formation rejects maker entry; use immediate market entries or disable the lane`;
+        this.lastEntrySkipReason = this.openHalted;
+        return;
+      }
+    }
+    if (alreadyOpen >= maxOpenPositions) {
+      this.lastEntrySkipReason = `max open positions (${maxOpenPositions}) reached for this lane instance`;
+      return;
+    }
+
+    // Claim once for the whole formation pass, not once per symbol: a valid
+    // directional route must either establish its selected three-symbol basket
+    // or leave the route free for a later, fresh decision.
+    const entryScope = this.tryClaimEntryScope();
+    if (!entryScope.allowed) {
+      this.lastEntrySkipReason = entryScope.reason ?? "cross-sectional route is owned by another formation";
+      return;
+    }
+    const openedThisFormation: SingleSymbolPosition[] = [];
+    let exactFormationComplete = requiredOpenPositions === 0;
+    try {
 
     // Binance USD-M one-way mode nets positions by symbol. Never let an independently-managed
     // lane reverse or reduce an existing exchange position simply because it sees an opposite
@@ -2491,8 +2617,8 @@ export class SingleSymbolLaneExecutor {
     // tick. See the state interface's doc comment for the incident this (plus per-observationId
     // dedup) fixes.
     for (const signal of candidates) {
-      if (st.positions.filter((p) => p.status === "OPEN").length >= this.maxOpenPositionsFn()) {
-        this.lastEntrySkipReason = `max open positions (${this.maxOpenPositionsFn()}) reached for this lane instance`;
+      if (st.positions.filter((p) => p.status === "OPEN").length >= maxOpenPositions) {
+        this.lastEntrySkipReason = `max open positions (${maxOpenPositions}) reached for this lane instance`;
         break;
       }
 
@@ -2841,14 +2967,17 @@ export class SingleSymbolLaneExecutor {
         // requested qty only when the exchange never reports a usable executedQty, same convention
         // as cross-sectional-executor.ts's own filledQty). Idempotent no-op when reservationId is
         // null (reserveExposure not wired — the safe default).
-        const committedQty = Number.isFinite(order.executedQty) && order.executedQty > 0 ? order.executedQty : qty;
-        if (reservationId) this.commitExposureReservationFn(reservationId, { qty: committedQty, avgPrice: resolvedEntry.price });
+        const filledQty = Number.isFinite(order.executedQty) && order.executedQty > 0 ? order.executedQty : qty;
+        if (reservationId) this.commitExposureReservationFn(reservationId, { qty: filledQty, avgPrice: resolvedEntry.price });
         const position: SingleSymbolPosition = {
           positionId,
           sourceObservationId: signal.observationId,
           symbol: signal.symbol,
           direction: this.direction,
-          qty,
+          // Stops and eventual reduce-only exits must use the quantity Binance
+          // actually filled. Recording the requested quantity here can turn a
+          // thin-book partial market fill into an oversized protective order.
+          qty: filledQty,
           entryPrice: resolvedEntry.price,
           entryOrderId: order.orderId,
           entryPriceConfirmed: resolvedEntry.confirmed,
@@ -2882,6 +3011,7 @@ export class SingleSymbolLaneExecutor {
         };
         st.positions.push(position);
         this.store.save();
+        if (requiredOpenPositions > 0) openedThisFormation.push(position);
         // Outcome is booked as a real position — the handle is no longer needed.
         this.store.clearPendingMakerEntry(entryClientOrderId);
         this.bindFourBrainActualFill(position);
@@ -2925,6 +3055,13 @@ export class SingleSymbolLaneExecutor {
       } finally {
         this.releaseEntrySymbol(signal.symbol);
       }
+    }
+    exactFormationComplete = requiredOpenPositions === 0 || openedThisFormation.length === requiredOpenPositions;
+    } finally {
+      if (!exactFormationComplete && openedThisFormation.length > 0) {
+        await this.abortIncompleteExactFormation(openedThisFormation, requiredOpenPositions);
+      }
+      this.releaseEntryScope();
     }
   }
 }

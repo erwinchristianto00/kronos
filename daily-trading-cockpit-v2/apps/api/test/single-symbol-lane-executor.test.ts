@@ -69,6 +69,8 @@ class FakeClient implements SingleSymbolExecClient {
    *  persistent, non-recoverable-via-fallback close failure. */
   failAllPlaceOrders = false;
   fillPriceBySymbol = new Map<string, number>();
+  /** Optional actual execution quantity for a partial MARKET-fill regression. */
+  executedQtyBySymbol = new Map<string, number>();
   markPriceBySymbol = new Map<string, number>();
   queryOrderAvgPriceBySymbol = new Map<string, number>();
   /** algoId -> actualOrderId (null = still resting/not triggered). */
@@ -143,7 +145,9 @@ class FakeClient implements SingleSymbolExecClient {
     this.placed.push(params);
     const orderId = String(this.orderSeq++);
     const avgPrice = this.fillPriceBySymbol.get(params.symbol) ?? 0;
-    return this.buildOrder(params.symbol, params.side, params.quantity, params.reduceOnly, orderId, avgPrice);
+    const order = this.buildOrder(params.symbol, params.side, params.quantity, params.reduceOnly, orderId, avgPrice);
+    order.executedQty = this.executedQtyBySymbol.get(params.symbol) ?? params.quantity;
+    return order;
   }
   /** 2026-08-18: drives reconcilePendingMakerEntries. Default THROWS -2013 ("order does not
    *  exist"), which is the honest default for an order that was never placed in a test. */
@@ -234,6 +238,10 @@ function makeExecutor(opts: {
   laneWeightPct?: number;
   legUsd?: number;
   maxOpenPositions?: number;
+  requiredOpenPositions?: number;
+  makerEntry?: boolean;
+  tryClaimEntryScope?: () => { allowed: boolean; reason?: string | null };
+  releaseEntryScope?: () => void;
   dailyMaxLossUsd?: number;
   makerEntry?: boolean;
   makerEntryWaitMs?: number;
@@ -278,6 +286,10 @@ function makeExecutor(opts: {
     legUsd: () => opts.legUsd ?? 25,
     leverage: () => 3,
     maxOpenPositions: () => opts.maxOpenPositions ?? 1,
+    ...(opts.requiredOpenPositions !== undefined ? { requiredOpenPositions: () => opts.requiredOpenPositions! } : {}),
+    ...(opts.makerEntry !== undefined ? { makerEntry: () => opts.makerEntry! } : {}),
+    ...(opts.tryClaimEntryScope ? { tryClaimEntryScope: opts.tryClaimEntryScope } : {}),
+    ...(opts.releaseEntryScope ? { releaseEntryScope: opts.releaseEntryScope } : {}),
     dailyMaxLossUsd: () => opts.dailyMaxLossUsd ?? 0,
     nowIso: () => NOW,
     fillConfirmRetryDelayMs: 0,
@@ -943,6 +955,131 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     await executor.tick();
     const ids = store.getState().positions.map((p) => p.positionId);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("[EXACT-FORMATION] opens a directional route only when all three distinct selected symbols are available", async () => {
+    const signals = [
+      signal({ observationId: "dir:BTC:1", symbol: "BTCUSDT", openedAtMs: NOW_MS - 60_000 }),
+      signal({ observationId: "dir:ETH:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090, openedAtMs: NOW_MS - 90_000 }),
+      signal({ observationId: "dir:SOL:1", symbol: "SOLUSDT", entryPrice: 150, stopPrice: 154.5, openedAtMs: NOW_MS - 120_000 }),
+    ];
+    let claims = 0;
+    let releases = 0;
+    const { executor, store, client } = makeExecutor({
+      signals,
+      legUsd: 10_000,
+      maxOpenPositions: 3,
+      requiredOpenPositions: 3,
+      tryClaimEntryScope: () => {
+        claims += 1;
+        return { allowed: true, reason: null };
+      },
+      releaseEntryScope: () => { releases += 1; },
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions.filter((position) => position.status === "OPEN").map((position) => position.symbol).sort())
+      .toEqual(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+    expect(client.placed.filter((order) => order.reduceOnly)).toHaveLength(0);
+    expect(claims).toBe(1);
+    expect(releases).toBe(1);
+  });
+
+  it("[EXACT-FORMATION] refuses a one- or two-symbol fallback before submitting any order", async () => {
+    const { executor, store, client } = makeExecutor({
+      signals: [
+        signal({ observationId: "dir:BTC:1", symbol: "BTCUSDT" }),
+        signal({ observationId: "dir:ETH:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090 }),
+      ],
+      legUsd: 10_000,
+      maxOpenPositions: 3,
+      requiredOpenPositions: 3,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(0);
+    expect(client.placed).toHaveLength(0);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/requires exactly 3 fresh candidates; found 2/i);
+  });
+
+  it("[ROUTE-CLAIM] does not submit any directional leg when the market-neutral route is still forming", async () => {
+    const { executor, store, client } = makeExecutor({
+      signals: [
+        signal({ observationId: "dir:BTC:1", symbol: "BTCUSDT" }),
+        signal({ observationId: "dir:ETH:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090 }),
+        signal({ observationId: "dir:SOL:1", symbol: "SOLUSDT", entryPrice: 150, stopPrice: 154.5 }),
+      ],
+      legUsd: 10_000,
+      maxOpenPositions: 3,
+      requiredOpenPositions: 3,
+      tryClaimEntryScope: () => ({ allowed: false, reason: "market-neutral cross-sectional entry is already being formed" }),
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(0);
+    expect(client.placed).toHaveLength(0);
+    expect(executor.getStatus().lastEntrySkipReason).toBe("market-neutral cross-sectional entry is already being formed");
+  });
+
+  it("[EXACT-FORMATION] immediately flattens every transient leg if a later selected leg fails", async () => {
+    const client = new FakeClient();
+    client.failOnSymbol = "ETHUSDT";
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [
+        signal({ observationId: "dir:BTC:1", symbol: "BTCUSDT", openedAtMs: NOW_MS - 60_000 }),
+        signal({ observationId: "dir:ETH:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090, openedAtMs: NOW_MS - 90_000 }),
+        signal({ observationId: "dir:SOL:1", symbol: "SOLUSDT", entryPrice: 150, stopPrice: 154.5, openedAtMs: NOW_MS - 120_000 }),
+      ],
+      legUsd: 10_000,
+      maxOpenPositions: 3,
+      requiredOpenPositions: 3,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions.filter((position) => position.status === "OPEN")).toHaveLength(0);
+    expect(store.getState().positions.map((position) => position.closeReason)).toEqual([
+      "INCOMPLETE_EXACT_FORMATION_ABORT",
+      "INCOMPLETE_EXACT_FORMATION_ABORT",
+    ]);
+    expect(client.placed.filter((order) => order.reduceOnly).map((order) => order.symbol).sort())
+      .toEqual(["BTCUSDT", "SOLUSDT"]);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/all transient legs were immediately flattened/i);
+  });
+
+  it("[EXACT-FORMATION] fails closed if a maker-entry configuration would leave a resting partial basket", async () => {
+    const { executor, store, client } = makeExecutor({
+      signals: [
+        signal({ observationId: "dir:BTC:1", symbol: "BTCUSDT" }),
+        signal({ observationId: "dir:ETH:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090 }),
+        signal({ observationId: "dir:SOL:1", symbol: "SOLUSDT", entryPrice: 150, stopPrice: 154.5 }),
+      ],
+      legUsd: 10_000,
+      maxOpenPositions: 3,
+      requiredOpenPositions: 3,
+      makerEntry: true,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(0);
+    expect(client.placed).toHaveLength(0);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/rejects maker entry/i);
+  });
+
+  it("uses the actual market-filled quantity for the stored position and protective stop", async () => {
+    const client = new FakeClient();
+    client.executedQtyBySymbol.set("BTCUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+
+    await executor.tick();
+
+    expect(store.getState().positions[0]!.qty).toBe(0.1);
+    expect(client.algosPlaced[0]!.quantity).toBe(0.1);
   });
 
   it("does not open when isAllowed() is false", async () => {

@@ -1620,6 +1620,15 @@ export interface CrossSectionalExecutorOptions {
   store: CrossSectionalExecutorStore;
   /** Master permission gate. Testnet: () => true. Mainnet: () => engine.isArmed(). */
   isAllowed: () => boolean;
+  /**
+   * Optional account-level route claim. It is acquired only for a real basket
+   * formation attempt, never from getStatus()/isAllowed(), so UI polling cannot
+   * accidentally reserve execution. The app wires it only to the legacy
+   * market-neutral route when the directional companion is enabled.
+   */
+  tryClaimEntryScope?: () => { allowed: boolean; reason?: string | null };
+  /** Releases the matching optional route claim after every formation outcome. */
+  releaseEntryScope?: () => void;
   /** Operator lane allocation weight. 100 = normal leg size; 0 = blocked. */
   laneWeightPct?: () => number;
   nowIso?: () => string;
@@ -1787,6 +1796,8 @@ export class CrossSectionalExecutor {
   private readonly signalStore: Pick<CrossSectionalStore, "all">;
   private readonly store: CrossSectionalExecutorStore;
   private readonly isAllowed: () => boolean;
+  private readonly tryClaimEntryScope: () => { allowed: boolean; reason?: string | null };
+  private readonly releaseEntryScope: () => void;
   private readonly fillConfirmRetryDelayMs: number;
   private readonly laneWeightPct: () => number;
   private readonly nowIso: () => string;
@@ -1849,6 +1860,8 @@ export class CrossSectionalExecutor {
     this.signalStore = opts.signalStore;
     this.store = opts.store;
     this.isAllowed = opts.isAllowed;
+    this.tryClaimEntryScope = opts.tryClaimEntryScope ?? (() => ({ allowed: true, reason: null }));
+    this.releaseEntryScope = opts.releaseEntryScope ?? (() => {});
     this.laneWeightPct = opts.laneWeightPct ?? (() => 100);
     this.targetVariant = opts.targetVariant ?? EXEC_VARIANT();
     this.laneId = opts.laneId ?? CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID;
@@ -4499,6 +4512,16 @@ export class CrossSectionalExecutor {
     const signal = candidates[0];
     if (!signal) return;
 
+    // Claim only after a fresh target signal exists. This closes the gap where
+    // a directional executor and this legacy basket both observe a flat
+    // account before either one persists its first order.
+    const entryScope = this.tryClaimEntryScope();
+    if (!entryScope.allowed) {
+      this.openHalted = entryScope.reason ?? "cross-sectional route is owned by another formation";
+      return;
+    }
+    try {
+
     // Reliability belongs to formation, not a late per-leg mutation.  Once V1 is active, an
     // unannotated FILTERED signal necessarily predates the deployment and must not slip through
     // as a supposedly V3 basket. Existing positions are never touched; the next fresh formation
@@ -4954,6 +4977,9 @@ export class CrossSectionalExecutor {
     // basket.legs.length landed there. Sharing one implementation is the point: a fresh open and a
     // resumed one must behave identically for every leg they both place, or the two paths drift.
     await this.placeRemainingLegs(basket, 0);
+    } finally {
+      this.releaseEntryScope();
+    }
   }
 
   /** Marks every plan entry from `fromIndex` onward NEVER_ATTEMPTED (idempotent — skips one

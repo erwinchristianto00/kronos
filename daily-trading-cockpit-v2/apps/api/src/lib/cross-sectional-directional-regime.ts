@@ -3,8 +3,9 @@
  *
  * This is deliberately a selector, not a second scanner: it only converts a
  * fresh, already-scored core scan into one of four mutually-exclusive modes.
- * Ambiguous or incomplete evidence is NO_TRADE.  It is testnet-only even when
- * the feature flag is accidentally copied to another environment.
+ * Ambiguous or incomplete evidence is NO_TRADE. Testnet can opt in with the
+ * normal feature flag; mainnet additionally needs an explicit, separate
+ * mainnet opt-in so copying a testnet flag can never create live exposure.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -51,8 +52,8 @@ export interface CanonicalDirectionalConfirmation {
   reason: string | null;
 }
 
-function envNumber(name: string, fallback: number): number {
-  const value = Number(process.env[name] ?? fallback);
+function envNumber(name: string, fallback: number, env: NodeJS.ProcessEnv = process.env): number {
+  const value = Number(env[name] ?? fallback);
   return Number.isFinite(value) ? value : fallback;
 }
 
@@ -62,7 +63,19 @@ export const DIRECTIONAL_REGIME_MIN_RELATIVE_EDGE = (): number => envNumber("CRO
 export const DIRECTIONAL_REGIME_DOMINANCE_GAP = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_DOMINANCE_GAP", 5);
 export const DIRECTIONAL_REGIME_LEG_USD = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_LEG_USD", 25);
 export const DIRECTIONAL_REGIME_LEVERAGE = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_LEVERAGE", 3);
-export const DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS = (): number => Math.max(1, Math.floor(envNumber("CROSS_SECTIONAL_DIRECTIONAL_MAX_OPEN_POSITIONS", 3)));
+/**
+ * This lane is a three-symbol directional basket, not a single-name fallback.
+ *
+ * `0`, `1`, and `2` therefore all mean disabled.  The previous minimum-one
+ * clamp silently converted an operator's explicit `0` into one live position,
+ * which is the exact opposite of a fail-closed execution control. Values over
+ * three are capped: a later scan must never pyramid a fourth symbol into a
+ * basket whose route decision was explicitly `*_3`.
+ */
+export function DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS(env: NodeJS.ProcessEnv = process.env): number {
+  const requested = Math.floor(envNumber("CROSS_SECTIONAL_DIRECTIONAL_MAX_OPEN_POSITIONS", 0, env));
+  return requested >= 3 ? 3 : 0;
+}
 export const DIRECTIONAL_REGIME_MAX_SIGNAL_AGE_MS = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MAX_SIGNAL_AGE_MS", 15 * 60_000);
 export const DIRECTIONAL_REGIME_DAILY_MAX_LOSS_USD = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_DAILY_MAX_LOSS_USD", 15);
 export const DIRECTIONAL_REGIME_MFE_ARM_R = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_ARM_R", 1);
@@ -266,7 +279,10 @@ export class DirectionalReversalStateStore {
 }
 
 export function isCrossSectionalDirectionalRegimeExecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.LIVE_BINANCE_ENV === "testnet" && env.CROSS_SECTIONAL_DIRECTIONAL_REGIME_EXEC_ENABLED === "1";
+  if (env.CROSS_SECTIONAL_DIRECTIONAL_REGIME_EXEC_ENABLED !== "1") return false;
+  if (DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS(env) !== 3) return false;
+  if (env.LIVE_BINANCE_ENV === "testnet") return true;
+  return env.LIVE_BINANCE_ENV === "mainnet" && env.CROSS_SECTIONAL_DIRECTIONAL_REGIME_MAINNET_ENABLED === "1";
 }
 
 const strongStatuses = new Set(["READY", "TRADE_NOW"]);

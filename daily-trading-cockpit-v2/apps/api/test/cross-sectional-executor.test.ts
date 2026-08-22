@@ -279,6 +279,8 @@ class FakeExecClient implements CrossSectionalExecClient {
 }
 
 function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; rawLaneWeightPct?: number; cortexRealAttribution?: CortexRealAttributionStore; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; maxOpenBaskets?: number; entryHealthAllowed?: boolean; entryHealthReason?: string | null; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number; respectSignalRiskGeometry?: boolean;
+  tryClaimEntryScope?: () => { allowed: boolean; reason?: string | null };
+  releaseEntryScope?: () => void;
   smartBasketEnabled?: boolean; smartMaxAdverseEntryDriftVol?: number; smartMinAdverseEntryDriftPct?: number; smartInvalidationScans?: number; smartMfeArmNetReturn?: number; smartMfeGivebackFraction?: number;
   reserveExposure?: (req: { executorId: string; symbol: string; direction: "LONG" | "SHORT"; requestedNotionalUsd: number; clientOrderId: string; basketId?: string }) => { ok: boolean; reservationId: string | null; reason?: string };
   commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
@@ -302,6 +304,8 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     signalStore,
     store,
     isAllowed: () => opts.allowed ?? true,
+    ...(opts.tryClaimEntryScope ? { tryClaimEntryScope: opts.tryClaimEntryScope } : {}),
+    ...(opts.releaseEntryScope ? { releaseEntryScope: opts.releaseEntryScope } : {}),
     laneWeightPct: () => opts.laneWeightPct ?? 100,
     ...(opts.rawLaneWeightPct !== undefined ? { rawLaneWeightPct: () => opts.rawLaneWeightPct! } : {}),
     ...(opts.cortexRealAttribution !== undefined ? { cortexRealAttribution: opts.cortexRealAttribution } : {}),
@@ -1407,6 +1411,38 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
       { symbol: "SOLUSDT", leverage: 3 },
       { symbol: "DOGEUSDT", leverage: 3 },
     ]);
+  });
+
+  it("[ROUTE-CLAIM] fails closed before the first leg when another cross-sectional route owns formation", async () => {
+    const { executor, client, store } = makeExecutor({
+      signalMs: NOW_MS - 5 * 60_000,
+      tryClaimEntryScope: () => ({ allowed: false, reason: "directional cross-sectional entry is already being formed" }),
+    });
+
+    await executor.tick();
+
+    expect(store.getState().baskets).toHaveLength(0);
+    expect(client.placed).toHaveLength(0);
+    expect(executor.getStatus().openHalted).toBe("directional cross-sectional entry is already being formed");
+  });
+
+  it("[ROUTE-CLAIM] releases the route claim after a completed basket formation", async () => {
+    let claims = 0;
+    let releases = 0;
+    const { executor, store } = makeExecutor({
+      signalMs: NOW_MS - 5 * 60_000,
+      tryClaimEntryScope: () => {
+        claims += 1;
+        return { allowed: true, reason: null };
+      },
+      releaseEntryScope: () => { releases += 1; },
+    });
+
+    await executor.tick();
+
+    expect(store.getState().baskets[0]!.status).toBe("COMPLETE");
+    expect(claims).toBe(1);
+    expect(releases).toBe(1);
   });
 
   it("honors an innovation basket's own stop without changing the default executor geometry", async () => {

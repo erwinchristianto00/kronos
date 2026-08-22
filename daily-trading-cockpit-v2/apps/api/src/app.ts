@@ -168,6 +168,7 @@ import {
   crossSectionalDirectionalOpenSignals,
   isCrossSectionalDirectionalRegimeExecEnabled,
 } from "./lib/cross-sectional-directional-regime.js";
+import { CrossSectionalRouteCoordinator } from "./lib/cross-sectional-route-coordinator.js";
 import {
   AccountExposureCoordinator,
   AccountExposureReservationStore,
@@ -2197,11 +2198,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         snapshot: getCanonicalMarketRegimeSnapshot(),
         nowMs: Date.now(),
       });
-      const basketOwnedLegs = [
-        ...(crossSectionalExecutor?.getOpenUnexitedLegs() ?? []),
-        ...(crossSectionalTrendExecutor?.getOpenUnexitedLegs() ?? []),
-        ...(crossSectionalMixedExecutor?.getOpenUnexitedLegs() ?? []),
-      ];
+      const basketOwnedLegs = allCrossSectionalLaneExecutors()
+        .flatMap((executor) => executor?.getOpenUnexitedLegs() ?? []);
       return confirmCrossSectionalDirectionalRegime(
         buildCrossSectionalDirectionalRegimeDecision(getLatestScanCandidates(), {
           // Opposite basket side is never rankable. Same side reaches the
@@ -2218,12 +2216,37 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       );
     };
     const crossSectionalDirectionalDecision = () => crossSectionalDirectionalDecisionRef();
+    // One account may have several cross-sectional executors, but all of their
+    // baskets consume the same portfolio slot as a directional 3-long/3-short
+    // formation. This is deliberately broader than the Plain MOM36 instance:
+    // a TREND/MIXED/innovation basket must not quietly coexist with the new
+    // directional route just because it uses a different executor store.
+    const crossSectionalRouteCoordinator = new CrossSectionalRouteCoordinator({
+      hasMarketNeutralExposure: () => allCrossSectionalLaneExecutors().some((executor) => {
+        const snapshot = executor?.getExposureSnapshot();
+        return (snapshot?.openBaskets.length ?? 0) > 0 || (snapshot?.orphanedLegs.length ?? 0) > 0;
+      }),
+      hasDirectionalExposure: () => [
+        crossSectionalDirectionalLongExecutor,
+        crossSectionalDirectionalShortExecutor,
+      ].some((executor) => {
+        const snapshot = executor?.getExposureSnapshot();
+        return (snapshot?.openPositions.length ?? 0) > 0 || (snapshot?.pendingMakerEntryCount ?? 0) > 0;
+      }),
+    });
+    const directionalRoutingEnabled = () => isCrossSectionalDirectionalRegimeExecEnabled();
+    const tryClaimMarketNeutralRoute = () =>
+      directionalRoutingEnabled()
+        ? crossSectionalRouteCoordinator.tryClaim("MARKET_NEUTRAL")
+        : { allowed: true, reason: null };
+    const releaseMarketNeutralRoute = () => crossSectionalRouteCoordinator.release("MARKET_NEUTRAL");
     // Directional conviction and a market-neutral hedge are distinct decisions.
     // A valid canonical MIXED regime may have an inconclusive directional scan;
     // in that case keep directional lanes flat but let the fully hedged 3x3
     // executor evaluate its own independent FILTERED signal and safeguards.
     const directionalRegimeAllowsBalancedBasket = () => {
-      if (!isCrossSectionalDirectionalRegimeExecEnabled()) return true;
+      if (!directionalRoutingEnabled()) return true;
+      if (!crossSectionalRouteCoordinator.admissionFor("MARKET_NEUTRAL").allowed) return false;
       const decision = crossSectionalDirectionalDecision();
       return decision.mode === "BALANCED_3X3" ||
         (decision.mode === "NO_TRADE" && decision.canonicalAllowed === true && decision.canonicalRegimeFamily === "MIXED");
@@ -2254,6 +2277,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         client: liveClient,
         signalStore: getCrossSectionalStore(),
         store: crossSectionalExecutorStore,
+        tryClaimEntryScope: tryClaimMarketNeutralRoute,
+        releaseEntryScope: releaseMarketNeutralRoute,
         // 2026-07-20 real-money audit fix (round 2): the first pass only swapped canOpenNewEntries()
         // for the manual-directional-blind variant, but every isAllowed() branch still ANDed
         // laneSelectionAllowsLane()/allowsCrossSectionalLane() — both of which ALSO route through
@@ -2375,6 +2400,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         store: new CrossSectionalExecutorStore(undefined, "cross-sectional-executor-trend.json"),
         targetVariant: "TREND_BETA_VOL",
         laneId: CROSS_SECTIONAL_TREND_LANE_ID,
+        tryClaimEntryScope: tryClaimMarketNeutralRoute,
+        releaseEntryScope: releaseMarketNeutralRoute,
         // 2026-07-08 audit fix: isNewExecutorLaneAllowed requires EXPLICIT allocation inclusion,
         // not just laneSelectionAllowsLane (which defaults to true when NO allocation is set at
         // all — the "reorder, never reject" ALL_LANES convention every established lane relies
@@ -2388,13 +2415,15 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // canOpenNewEntriesIgnoringManualDirectional) — see
         // isCrossSectionalTrendMixedAdmissionIndependent's doc comment for why. Off by default;
         // the rest of this ternary is untouched, so disabling the flag is a byte-for-byte revert.
-        isAllowed: () => !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_TREND_LANE_ID)
-          ? false
-          : isCrossSectionalTrendMixedAdmissionIndependent()
-            ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
-          : unifiedOrchestrator?.isEnabled()
-            ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_TREND_LANE_ID)
-            : isNewExecutorLaneAllowed(CROSS_SECTIONAL_TREND_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+        isAllowed: () => directionalRegimeAllowsBalancedBasket() && (
+          !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_TREND_LANE_ID)
+            ? false
+            : isCrossSectionalTrendMixedAdmissionIndependent()
+              ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
+              : unifiedOrchestrator?.isEnabled()
+                ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_TREND_LANE_ID)
+                : isNewExecutorLaneAllowed(CROSS_SECTIONAL_TREND_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false })
+        ),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
         // 2026-07-22 bug-hunt fix: see the FILTERED instance above.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
@@ -2423,15 +2452,19 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         store: new CrossSectionalExecutorStore(undefined, "cross-sectional-executor-mixed.json"),
         targetVariant: "MIXED_MEAN_REVERSION",
         laneId: CROSS_SECTIONAL_MIXED_LANE_ID,
+        tryClaimEntryScope: tryClaimMarketNeutralRoute,
+        releaseEntryScope: releaseMarketNeutralRoute,
         // Same 2026-07-08 fix as CROSS_SECTIONAL_TREND above, plus the same 2026-07-22
         // admission-independence bypass (see CROSS_SECTIONAL_TREND's isAllowed above).
-        isAllowed: () => !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_MIXED_LANE_ID)
-          ? false
-          : isCrossSectionalTrendMixedAdmissionIndependent()
-            ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
-          : unifiedOrchestrator?.isEnabled()
-            ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_MIXED_LANE_ID)
-            : isNewExecutorLaneAllowed(CROSS_SECTIONAL_MIXED_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+        isAllowed: () => directionalRegimeAllowsBalancedBasket() && (
+          !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_MIXED_LANE_ID)
+            ? false
+            : isCrossSectionalTrendMixedAdmissionIndependent()
+              ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
+              : unifiedOrchestrator?.isEnabled()
+                ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_MIXED_LANE_ID)
+                : isNewExecutorLaneAllowed(CROSS_SECTIONAL_MIXED_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false })
+        ),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
         // 2026-07-22 bug-hunt fix: see the FILTERED instance above.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
@@ -2460,7 +2493,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       scheduleCrossSectionalTick(150_000, () => void crossSectionalMixedExecutor?.tick());
     }
 
-    // Directional cross-sectional sublanes (testnet only). The selector is mutually exclusive:
+    // Directional cross-sectional sublanes. Testnet may opt in through the
+    // normal flag; mainnet additionally requires an explicit mainnet flag.
+    // The selector is mutually exclusive:
     // BEAR_SHORT_3 opens the three highest-quality relative-model weak shorts; BULL_LONG_3 is
     // symmetric; BALANCED_3X3 leaves this pair flat and permits the existing complete hedge.
     // A changed, stale, contradictory, or incomplete scan yields NO_TRADE and blocks new
@@ -2470,9 +2505,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       const engineForGate = liveEngine;
       const laneAllowed = (laneId: string, mode: "BEAR_SHORT_3" | "BULL_LONG_3") =>
         isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, laneId) &&
+        crossSectionalRouteCoordinator.admissionFor("DIRECTIONAL").allowed &&
         crossSectionalDirectionalDecision().mode === mode &&
         (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false);
       const laneReason = (mode: "BEAR_SHORT_3" | "BULL_LONG_3") => {
+        const route = crossSectionalRouteCoordinator.admissionFor("DIRECTIONAL");
+        if (!route.allowed) return route.reason;
         const decision = crossSectionalDirectionalDecision();
         return decision.mode === mode ? null : decision.reason;
       };
@@ -2509,6 +2547,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         legUsd: DIRECTIONAL_REGIME_LEG_USD,
         leverage: DIRECTIONAL_REGIME_LEVERAGE,
         maxOpenPositions: DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS,
+        requiredOpenPositions: DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS,
         maxSignalAgeMs: DIRECTIONAL_REGIME_MAX_SIGNAL_AGE_MS,
         dailyMaxLossUsd: DIRECTIONAL_REGIME_DAILY_MAX_LOSS_USD,
         maxNotionalPerSymbolAcrossLanes,
@@ -2519,40 +2558,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // The selector may revisit the same symbol on later scans, but SHORT/LONG 3
         // means three distinct symbols, never three independent copies of BNB/XRP.
         preventSameSymbolPyramiding: true,
-        // Binance reports realized P&L on the account-netted symbol. Directional
-        // results must use the lot's own entry/exit economics when a basket shares it,
-        // otherwise dashboard/CORTEX/Four-Brain can learn a basket's P&L as theirs.
+        // The cross-sectional route coordinator rejects an existing 3L/3S
+        // basket before this executor reaches an order. Keep own-lot attribution
+        // for any non-basket account netting that remains visible in reporting.
         useOwnLotPnlAttribution: true,
-        allowSameDirectionExistingPosition: async (symbol: string, direction: "LONG" | "SHORT") => {
-          const basketLegs = [
-            ...(crossSectionalExecutor?.getOpenUnexitedLegsWithEntry() ?? []),
-            ...(crossSectionalTrendExecutor?.getOpenUnexitedLegsWithEntry() ?? []),
-            ...(crossSectionalMixedExecutor?.getOpenUnexitedLegsWithEntry() ?? []),
-          ].filter((leg) => leg.symbol === symbol);
-          if (basketLegs.length === 0) {
-            return { allowed: false, reason: `${symbol}: existing position is not owned by a live basket` };
-          }
-          if (basketLegs.some((leg) => leg.side !== direction)) {
-            return { allowed: false, reason: `${symbol}: basket has opposite-side leg; directional entry would net/reverse it` };
-          }
-          const mark = await currentPublicPrice(symbol).catch(() => null);
-          if (!(typeof mark === "number" && Number.isFinite(mark) && mark > 0)) {
-            return { allowed: false, reason: `${symbol}: harga live tidak tersedia untuk verifikasi P&L basket` };
-          }
-          const configuredCost = Number.parseFloat(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT ?? "");
-          const estimatedCloseCostPct = Number.isFinite(configuredCost) && configuredCost >= 0 ? configuredCost : 0.0022;
-          const netAfterCloseCost = basketLegs.reduce((sum, leg) => {
-            const gross = (direction === "LONG" ? mark - leg.entryPrice : leg.entryPrice - mark) * leg.qty;
-            return sum + gross - mark * leg.qty * estimatedCloseCostPct;
-          }, 0);
-          if (!(netAfterCloseCost > 0)) {
-            return {
-              allowed: false,
-              reason: `${symbol}: basket ${direction} masih ${netAfterCloseCost.toFixed(4)} USDT setelah estimasi biaya; directional tidak boleh menambah posisi kalah`,
-            };
-          }
-          return { allowed: true };
-        },
+        tryClaimEntryScope: () => crossSectionalRouteCoordinator.tryClaim("DIRECTIONAL"),
+        releaseEntryScope: () => crossSectionalRouteCoordinator.release("DIRECTIONAL"),
         onPositionClosed: (netUsd: number) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         onPositionClosedDetail: ({ symbol, reason }: { symbol: string; reason: string }) => {
           if (reason.startsWith("DIRECTIONAL_REVERSAL_CONFIRMED:")) {
@@ -3045,6 +3056,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // admits (enabled, within window, named in allowedLaneIds, under every cap) can ever reach
       // that engine check at all.
       const innovationAllowed = (laneId: string): boolean =>
+        directionalRegimeAllowsBalancedBasket() &&
         isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, laneId) &&
         innovationCampaignAdmissionForLane(laneId).allowed &&
         innovationTestnetAdmissionAllowed(
@@ -3113,6 +3125,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           laneId: descriptor.laneId,
           idNamespace: descriptor.laneId,
           enabled: () => true,
+          tryClaimEntryScope: tryClaimMarketNeutralRoute,
+          releaseEntryScope: releaseMarketNeutralRoute,
           isAllowed: () => innovationAllowed(descriptor.laneId),
           laneWeightPct: () => innovationWeight(descriptor.laneId),
           rawLaneWeightPct: () => innovationWeight(descriptor.laneId),

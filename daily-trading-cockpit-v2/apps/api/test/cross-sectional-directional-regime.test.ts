@@ -1,10 +1,12 @@
 import type { Candidate } from "@dtc/shared";
 import { describe, expect, it } from "vitest";
 import {
+  DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS,
   buildCrossSectionalDirectionalRegimeDecision,
   confirmCrossSectionalDirectionalRegime,
   crossSectionalDirectionalOpenSignals,
   evaluateDirectionalReversal,
+  isCrossSectionalDirectionalRegimeExecEnabled,
 } from "../src/lib/cross-sectional-directional-regime.js";
 import { isTestnetCrossSectionalHorizonLaneAllowed } from "../src/lib/live-executor-wiring.js";
 
@@ -71,6 +73,29 @@ function snapshot(marketRegime: string, candidates: Candidate[]) {
 // cross-sectional-directional-regime.ts and flip these five back.
 // ─────────────────────────────────────────────────────────────────────────────
 describe("cross-sectional directional regime selector", () => {
+  it("treats 0, 1, and 2 directional slots as a hard-disabled state", () => {
+    expect(DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS({} as NodeJS.ProcessEnv)).toBe(0);
+    expect(DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS({ CROSS_SECTIONAL_DIRECTIONAL_MAX_OPEN_POSITIONS: "0" } as NodeJS.ProcessEnv)).toBe(0);
+    expect(DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS({ CROSS_SECTIONAL_DIRECTIONAL_MAX_OPEN_POSITIONS: "1" } as NodeJS.ProcessEnv)).toBe(0);
+    expect(DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS({ CROSS_SECTIONAL_DIRECTIONAL_MAX_OPEN_POSITIONS: "2" } as NodeJS.ProcessEnv)).toBe(0);
+    expect(DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS({ CROSS_SECTIONAL_DIRECTIONAL_MAX_OPEN_POSITIONS: "3" } as NodeJS.ProcessEnv)).toBe(3);
+    expect(DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS({ CROSS_SECTIONAL_DIRECTIONAL_MAX_OPEN_POSITIONS: "9" } as NodeJS.ProcessEnv)).toBe(3);
+  });
+
+  it("requires an explicit mainnet opt-in after the exact-three gate passes", () => {
+    const shared = {
+      CROSS_SECTIONAL_DIRECTIONAL_REGIME_EXEC_ENABLED: "1",
+      CROSS_SECTIONAL_DIRECTIONAL_MAX_OPEN_POSITIONS: "3",
+    } as NodeJS.ProcessEnv;
+    expect(isCrossSectionalDirectionalRegimeExecEnabled({ ...shared, LIVE_BINANCE_ENV: "testnet" })).toBe(true);
+    expect(isCrossSectionalDirectionalRegimeExecEnabled({ ...shared, LIVE_BINANCE_ENV: "mainnet" })).toBe(false);
+    expect(isCrossSectionalDirectionalRegimeExecEnabled({
+      ...shared,
+      LIVE_BINANCE_ENV: "mainnet",
+      CROSS_SECTIONAL_DIRECTIONAL_REGIME_MAINNET_ENABLED: "1",
+    })).toBe(true);
+  });
+
   it("keeps every non-cross-sectional lane locked on testnet", () => {
     const env = {
       TESTNET_ONLY_CROSS_SECTIONAL_HORIZON: "1",

@@ -952,7 +952,7 @@ describe("computeInnovationExposure", () => {
     expect(executor!.getStatus().laneId).toBe(LANE_1);
     // The narrow accessor itself must also terminate and return the right shape.
     expect(() => executor!.getExposureSnapshot()).not.toThrow();
-    expect(executor!.getExposureSnapshot()).toEqual({ laneId: LANE_1, openPositions: [] });
+    expect(executor!.getExposureSnapshot()).toEqual({ laneId: LANE_1, openPositions: [], pendingMakerEntryCount: 0 });
   });
 });
 
