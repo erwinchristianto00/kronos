@@ -560,6 +560,7 @@ export interface DynamicMom36FormationSnapshot {
   decisionInformationCutoff: string;
   activeUniverse: Array<{
     symbol: string;
+    cluster: string;
     mom36: number;
     price: number;
     longEligible: boolean;
@@ -574,6 +575,10 @@ export interface DynamicMom36FormationSnapshot {
   shockRawOutput: Record<string, unknown>;
   shockState: DynamicMom36ShockState;
   shockReason: string | null;
+  /** Base-only legs are retained even when the bounded shock overlay changes the final rung. */
+  baseSelectedLongs: string[];
+  baseSelectedShorts: string[];
+  baseSelectionInsufficientReason: string | null;
   finalAllocation: DynamicMom36Allocation;
   selectedLongs: string[];
   selectedShorts: string[];
@@ -1106,6 +1111,7 @@ export function buildDynamicMom36ShockBasket(input: {
       decisionInformationCutoff: new Date(input.decisionInformationCutoffMs).toISOString(),
       activeUniverse: formation.activeUniverse.map((row) => ({
         symbol: row.symbol,
+        cluster: clusterOf(row.symbol),
         mom36: row.mom36,
         price: row.price,
         longEligible: row.longEligible,
@@ -1120,6 +1126,9 @@ export function buildDynamicMom36ShockBasket(input: {
       shockRawOutput: formation.shock.rawOutput,
       shockState: formation.shock.state,
       shockReason: formation.shock.reason,
+      baseSelectedLongs: formation.baseSelection.selectedLongs.map((row) => row.symbol),
+      baseSelectedShorts: formation.baseSelection.selectedShorts.map((row) => row.symbol),
+      baseSelectionInsufficientReason: formation.baseSelection.insufficientReason,
       finalAllocation: formation.finalAllocation,
       selectedLongs: formation.selection.selectedLongs.map((row) => row.symbol),
       selectedShorts: formation.selection.selectedShorts.map((row) => row.symbol),
@@ -2569,6 +2578,9 @@ export async function runCrossSectionalCycle(opts: {
         shockState: snapshot?.shockState ?? "NO_EDGE",
         shockConfidence: snapshot?.shockRawOutput.probabilities ?? null,
         shockReason: snapshot?.shockReason ?? null,
+        baseSelectedLongs: snapshot?.baseSelectedLongs ?? [],
+        baseSelectedShorts: snapshot?.baseSelectedShorts ?? [],
+        baseSelectionInsufficientReason: snapshot?.baseSelectionInsufficientReason ?? null,
         finalAllocation: snapshot?.finalAllocation ?? null,
         selectedLongs: snapshot?.selectedLongs ?? [],
         selectedShorts: snapshot?.selectedShorts ?? [],

@@ -154,6 +154,12 @@ export type DynamicMom36Formation = {
   negativeCount: number;
   zeroCount: number;
   baseAllocation: DynamicMom36Allocation;
+  /**
+   * The exact unmodified Dynamic MOM36 selection. This is immutable audit evidence only: it
+   * lets later forward research compare a bounded shock action against the base portfolio without
+   * recomputing ranks from changed code, pool membership, or market data.
+   */
+  baseSelection: DynamicMom36Selection;
   shock: FrozenShockOverlay;
   finalAllocation: DynamicMom36Allocation;
   vetoed: boolean;
@@ -312,6 +318,7 @@ export function buildDynamicMom36Formation(input: {
     .filter((row) => Number.isFinite(row.mom36) && Number.isFinite(row.price) && row.price > 0)
     .sort((a, b) => b.mom36 - a.mom36 || a.symbol.localeCompare(b.symbol));
   const breadth = baseDynamicMom36Allocation(activeUniverse);
+  const baseSelection = selectDynamicMom36Legs(activeUniverse, breadth.allocation, input.maxPerCluster);
   const shock = input.shock ?? resolveFrozenRuntimeShockOverlay();
   const overlay = applyBoundedShockOverlay(breadth.allocation, shock);
   const selection = overlay.vetoed
@@ -323,6 +330,7 @@ export function buildDynamicMom36Formation(input: {
     negativeCount: breadth.negativeCount,
     zeroCount: breadth.zeroCount,
     baseAllocation: breadth.allocation,
+    baseSelection,
     shock,
     finalAllocation: overlay.allocation,
     vetoed: overlay.vetoed,

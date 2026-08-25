@@ -77,9 +77,12 @@ describe("Dynamic MOM36 formation timestamp and frozen snapshot", () => {
         negativeCount: 2,
         zeroCount: 0,
         baseAllocation: { label: "4L2S" },
+        baseSelectedLongs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"],
+        baseSelectedShorts: ["LINKUSDT", "AVAXUSDT"],
         finalAllocation: { label: "4L2S" },
       },
     });
+    expect(observation.dynamicMom36?.activeUniverse.every((row) => typeof row.cluster === "string" && row.cluster.length > 0)).toBe(true);
     expect([...observation.longLeg, ...observation.shortLeg].every((leg) => leg.weight === 1 / 6)).toBe(true);
     expect(observation.dynamicMom36?.activeUniverse).toHaveLength(6);
     expect(buildDynamicMom36ShockBasket({

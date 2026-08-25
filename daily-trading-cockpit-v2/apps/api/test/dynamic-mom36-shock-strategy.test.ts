@@ -115,6 +115,24 @@ describe("dynamic-mom36-shock-36h-v1 — deterministic breadth and frozen overla
     expect(applyBoundedShockOverlay(from(2), shock("CONFLICT_LONG")).allocation.label).toBe("2L4S");
   });
 
+  it("preserves the exact base-only legs beside a shock-adjusted final selection", () => {
+    const formation = buildDynamicMom36Formation({
+      activeUniverse: signedRows(4, 2),
+      maxPerCluster: 0,
+      shock: shock("CONFIRM_LONG"),
+    });
+
+    expect(formation.baseAllocation.label).toBe("4L2S");
+    expect(formation.baseSelection.selectedLongs).toHaveLength(4);
+    expect(formation.baseSelection.selectedShorts).toHaveLength(2);
+    expect(formation.finalAllocation.label).toBe("5L1S");
+    expect(formation.selection.selectedLongs).toHaveLength(5);
+    expect(formation.selection.selectedShorts).toHaveLength(1);
+    expect(formation.baseSelection.selectedLongs.map((leg) => leg.symbol)).not.toEqual(
+      formation.selection.selectedLongs.map((leg) => leg.symbol),
+    );
+  });
+
   it("falls back to NO_EDGE for every optional shock failure and keeps base MOM36 intact", () => {
     const failures: unknown[] = [
       null,
