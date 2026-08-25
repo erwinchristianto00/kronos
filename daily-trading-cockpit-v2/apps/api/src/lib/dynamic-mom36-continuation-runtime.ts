@@ -206,7 +206,9 @@ export function evaluateDynamicMom36Continuation(input: {
   const env = input.env ?? process.env;
   const artifact = readPinnedArtifact(env);
   const base = {
-    artifactId: DYNAMIC_MOM36_CONTINUATION_ARTIFACT_VERSION,
+    // Keep the formation snapshot self-identifying: version alone is not a pinned artifact.
+    // The full immutable identity couples the exact V4 version to its verified bytes.
+    artifactId: DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID,
     artifactSha256: artifact.sha256,
     schemaVersion: artifact.schemaVersion,
     featureVersion: DYNAMIC_MOM36_CONTINUATION_FEATURE_VERSION,
