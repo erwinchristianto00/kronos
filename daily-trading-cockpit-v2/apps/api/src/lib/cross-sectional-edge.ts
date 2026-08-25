@@ -32,7 +32,6 @@ import {
   type CrossSectionalFormationMode,
 } from "./cross-sectional-runtime-mode.js";
 import {
-  DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3,
   DYNAMIC_MOM36_SHOCK_36H_V1,
   DYNAMIC_MOM36_HORIZON_MS,
   DYNAMIC_MOM36_LOOKBACK_BARS,
@@ -40,9 +39,14 @@ import {
   DYNAMIC_MOM36_SHOCK_VARIANT,
   buildDynamicMom36Formation,
   crossSectionalStrategyVersion,
+  isDynamicMom36ContinuationStrategy,
+  isDynamicMom36ContinuationVersion,
   isDynamicMom36ShockStrategy,
-  isDynamicMom36V3Strategy,
+  isDynamicMom36SlowFastStrategy,
+  isDynamicMom36SlowFastVersion,
   type DynamicMom36StrategyVersion,
+  type DynamicMom36CandidateSelectionAudit,
+  type DynamicMom36SlowFastPolicy,
   type FrozenContinuationOverlay,
   resolveFrozenRuntimeShockOverlay,
   type DynamicMom36Allocation,
@@ -54,6 +58,7 @@ import {
   evaluateDynamicMom36Continuation,
   type DynamicMom36ContinuationRuntimeResult,
 } from "./dynamic-mom36-continuation-runtime.js";
+import { DYNAMIC_MOM36_SLOW_FAST_FAST_BARS } from "./dynamic-mom36-slowfast.js";
 
 function envNumPos(key: string, fallback: number): number {
   const v = Number(process.env[key]);
@@ -576,6 +581,14 @@ export interface DynamicMom36FormationSnapshot {
     cluster: string;
     mom36: number;
     price: number;
+    fastReturn?: number | null;
+    slowSourceTimestampMs?: number | null;
+    slowStartTimestampMs?: number | null;
+    fastSourceTimestampMs?: number | null;
+    fastStartTimestampMs?: number | null;
+    slowFastDataValid?: boolean | null;
+    longExecutionBlockReason?: string | null;
+    shortExecutionBlockReason?: string | null;
     longEligible: boolean;
     shortEligible: boolean;
     shortBlocked: boolean;
@@ -593,14 +606,38 @@ export interface DynamicMom36FormationSnapshot {
    * V4 reads persist a NO_EDGE object rather than blocking the canonical MOM36 basket.
    */
   continuation: FrozenContinuationOverlay | null;
+  /** Null/disabled on retained v1/v3 observations; v4 freezes the exact recovered legacy policy. */
+  slowFast?: DynamicMom36SlowFastPolicy;
   /** Base-only legs are retained even when the bounded shock overlay changes the final rung. */
   baseSelectedLongs: string[];
   baseSelectedShorts: string[];
   baseSelectionInsufficientReason: string | null;
+  /** Current v3 counterfactual after the V4 allocation but before per-leg SLOW_AND_FAST gating. */
+  rawV3SelectedLongs?: string[];
+  rawV3SelectedShorts?: string[];
+  rawV3SelectionInsufficientReason?: string | null;
+  rawV3CandidateAudit?: {
+    long: DynamicMom36CandidateSelectionAudit[];
+    short: DynamicMom36CandidateSelectionAudit[];
+  };
   finalAllocation: DynamicMom36Allocation;
   selectedLongs: string[];
   selectedShorts: string[];
   blockedShortsSkipped: string[];
+  /** Full v4 (or raw for older versions) selection trail, including SLOW_FAST_* skip reasons. */
+  selectionCandidateAudit?: {
+    long: DynamicMom36CandidateSelectionAudit[];
+    short: DynamicMom36CandidateSelectionAudit[];
+  };
+  selectionInsufficientReason?: string | null;
+  requiredLongs?: number;
+  requiredShorts?: number;
+  availableAlignedLongs?: number;
+  availableAlignedShorts?: number;
+  availableExecutionEligibleAlignedLongs?: number;
+  availableExecutionEligibleAlignedShorts?: number;
+  /** Why this candidate was not made executable; emitted even when no observation/basket exists. */
+  noEntryReason?: string | null;
   /** Existing score-gap/cluster admission values, kept separate from allocation. */
   admission: {
     scoreGap: number | null;
@@ -1056,11 +1093,8 @@ export function completedCandlesForDynamicMom36(
   return { candles: complete, featureTimestampMs };
 }
 
-/**
- * Constructs a dynamic observation after current admission has already passed.  The helper is
- * intentionally free of env reads: its inputs are the frozen pool/guard outputs of this cycle.
- */
-export function buildDynamicMom36ShockBasket(input: {
+/** Frozen inputs for one Dynamic MOM36 formation attempt. */
+export type DynamicMom36FormationInput = {
   activeUniverse: DynamicMom36RankedSymbol[];
   now: string;
   openedAtMs: number;
@@ -1073,20 +1107,150 @@ export function buildDynamicMom36ShockBasket(input: {
   admissionPassed: boolean;
   strategyVersion?: DynamicMom36StrategyVersion;
   continuationRuntime?: DynamicMom36ContinuationRuntimeResult | null;
-}): CrossSectionalObservation | null {
-  if (!input.admissionPassed) return null;
-  if (!(input.featureTimestampMs <= input.decisionInformationCutoffMs)) return null;
+};
+
+/**
+ * One attempt is evaluated once, then the exact same frozen result is used for both observation
+ * construction and no-entry audit persistence.  This avoids a second selection walk with subtly
+ * different guards, pool membership, or continuation output.
+ */
+export type DynamicMom36FormationEvaluation = {
+  formation: ReturnType<typeof buildDynamicMom36Formation> | null;
+  snapshot: DynamicMom36FormationSnapshot | null;
+  basket: CrossSectionalObservation | null;
+  noEntryReason: string | null;
+};
+
+function noEntryReasonForDynamicFormation(input: DynamicMom36FormationInput, formation: ReturnType<typeof buildDynamicMom36Formation>): string | null {
+  if (!input.admissionPassed) return "ADMISSION_NOT_PASSED";
+  if (formation.vetoed) return "FROZEN_SHOCK_MAPPING_VETOED";
+  if (formation.selection.insufficientReason) return formation.selection.insufficientReason;
+  if (formation.selection.selectedLongs.length + formation.selection.selectedShorts.length !== 6) {
+    return "DYNAMIC_MOM36_EXACT_SIX_LEG_INVARIANT_FAILED";
+  }
+  return null;
+}
+
+function dynamicMom36Snapshot(
+  input: DynamicMom36FormationInput,
+  strategyVersion: DynamicMom36StrategyVersion,
+  formation: ReturnType<typeof buildDynamicMom36Formation>,
+  noEntryReason: string | null,
+): DynamicMom36FormationSnapshot {
+  return {
+    strategyVersion,
+    formationTimestamp: input.now,
+    featureTimestamp: new Date(input.featureTimestampMs).toISOString(),
+    decisionInformationCutoff: new Date(input.decisionInformationCutoffMs).toISOString(),
+    activeUniverse: formation.activeUniverse.map((row) => ({
+      symbol: row.symbol,
+      cluster: clusterOf(row.symbol),
+      mom36: row.mom36,
+      price: row.price,
+      fastReturn: row.fastReturn,
+      slowSourceTimestampMs: row.slowSourceTimestampMs ?? null,
+      slowStartTimestampMs: row.slowStartTimestampMs ?? null,
+      fastSourceTimestampMs: row.fastSourceTimestampMs ?? null,
+      fastStartTimestampMs: row.fastStartTimestampMs ?? null,
+      slowFastDataValid: row.slowFastDataValid ?? null,
+      longExecutionBlockReason: row.longExecutionBlockReason ?? null,
+      shortExecutionBlockReason: row.shortExecutionBlockReason ?? null,
+      longEligible: row.longEligible,
+      shortEligible: row.shortEligible,
+      shortBlocked: row.shortBlocked,
+    })),
+    positiveCount: formation.positiveCount,
+    negativeCount: formation.negativeCount,
+    zeroCount: formation.zeroCount,
+    baseAllocation: formation.baseAllocation,
+    shockModelArtifact: formation.shock.modelArtifactId,
+    shockRawOutput: formation.shock.rawOutput,
+    shockState: formation.shock.state,
+    shockReason: formation.shock.reason,
+    continuation: formation.continuation,
+    slowFast: formation.slowFast,
+    baseSelectedLongs: formation.baseSelection.selectedLongs.map((row) => row.symbol),
+    baseSelectedShorts: formation.baseSelection.selectedShorts.map((row) => row.symbol),
+    baseSelectionInsufficientReason: formation.baseSelection.insufficientReason,
+    rawV3SelectedLongs: formation.rawV3Selection.selectedLongs.map((row) => row.symbol),
+    rawV3SelectedShorts: formation.rawV3Selection.selectedShorts.map((row) => row.symbol),
+    rawV3SelectionInsufficientReason: formation.rawV3Selection.insufficientReason,
+    rawV3CandidateAudit: formation.rawV3Selection.candidateAudit,
+    finalAllocation: formation.finalAllocation,
+    selectedLongs: formation.selection.selectedLongs.map((row) => row.symbol),
+    selectedShorts: formation.selection.selectedShorts.map((row) => row.symbol),
+    blockedShortsSkipped: formation.selection.blockedShortsSkipped,
+    selectionCandidateAudit: formation.selection.candidateAudit,
+    selectionInsufficientReason: formation.selection.insufficientReason,
+    requiredLongs: formation.selection.requiredLongs,
+    requiredShorts: formation.selection.requiredShorts,
+    availableAlignedLongs: formation.selection.availableAlignedLongs,
+    availableAlignedShorts: formation.selection.availableAlignedShorts,
+    availableExecutionEligibleAlignedLongs: formation.selection.availableExecutionEligibleAlignedLongs,
+    availableExecutionEligibleAlignedShorts: formation.selection.availableExecutionEligibleAlignedShorts,
+    noEntryReason,
+    admission: {
+      scoreGap: input.admissionScoreGap,
+      scoreGapFloor: input.admissionScoreGapFloor,
+      clusterCap: input.maxPerCluster,
+      passed: input.admissionPassed,
+    },
+  };
+}
+
+/** Defensive boundary for any caller of the pure evaluator: v4 may never trust a future bar. */
+function markSlowFastSourcesAtDecision(
+  rows: readonly DynamicMom36RankedSymbol[],
+  decisionInformationCutoffMs: number,
+): DynamicMom36RankedSymbol[] {
+  const sourceAtDecision = (value: number | null | undefined): boolean =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 && value <= decisionInformationCutoffMs;
+  // Dynamic MOM36 requires a synchronous last fully-closed bar for every active symbol.  The
+  // SLOW/FAST source close must be that exact bar, rather than merely any old closed candle: an
+  // older source is stale market data and cannot be treated as current alignment.  Start bars may
+  // be older by their respective 36h/4h lookbacks but still must be closed at the decision cut.
+  const sourceIsCurrent = (value: number | null | undefined): boolean =>
+    sourceAtDecision(value) && value === decisionInformationCutoffMs;
+  return rows.map((row) => ({
+    ...row,
+    slowFastDataValid: row.slowFastDataValid !== false &&
+      sourceIsCurrent(row.slowSourceTimestampMs) &&
+      sourceAtDecision(row.slowStartTimestampMs) &&
+      sourceIsCurrent(row.fastSourceTimestampMs) &&
+      sourceAtDecision(row.fastStartTimestampMs),
+  }));
+}
+
+/**
+ * Pure formation evaluation used by both executable observation construction and the durable
+ * "would have traded" record.  It intentionally has no environment reads: all pool/guard and
+ * continuation outputs are frozen by the caller for this cycle.
+ */
+export function evaluateDynamicMom36Formation(input: DynamicMom36FormationInput): DynamicMom36FormationEvaluation {
+  if (!(input.featureTimestampMs <= input.decisionInformationCutoffMs)) {
+    return {
+      formation: null,
+      snapshot: null,
+      basket: null,
+      noEntryReason: "DYNAMIC_MOM36_FEATURE_TIMESTAMP_AFTER_DECISION_CUTOFF",
+    };
+  }
   const strategyVersion = input.strategyVersion ?? DYNAMIC_MOM36_SHOCK_36H_V1;
-  const v3 = strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
+  const continuationStrategy = isDynamicMom36ContinuationVersion(strategyVersion);
+  const slowFastStrategy = isDynamicMom36SlowFastVersion(strategyVersion);
   const formation = buildDynamicMom36Formation({
-    activeUniverse: input.activeUniverse,
+    activeUniverse: slowFastStrategy
+      ? markSlowFastSourcesAtDecision(input.activeUniverse, input.decisionInformationCutoffMs)
+      : input.activeUniverse,
     maxPerCluster: input.maxPerCluster,
-    shock: v3 ? undefined : resolveFrozenRuntimeShockOverlay(),
-    continuationRuntime: v3 ? input.continuationRuntime ?? null : null,
-    continuationOnly: v3,
+    shock: continuationStrategy ? undefined : resolveFrozenRuntimeShockOverlay(),
+    continuationRuntime: continuationStrategy ? input.continuationRuntime ?? null : null,
+    continuationOnly: continuationStrategy,
+    slowFastRequired: slowFastStrategy,
   });
-  if (formation.vetoed || formation.selection.insufficientReason) return null;
-  if (formation.selection.selectedLongs.length + formation.selection.selectedShorts.length !== 6) return null;
+  const noEntryReason = noEntryReasonForDynamicFormation(input, formation);
+  const snapshot = dynamicMom36Snapshot(input, strategyVersion, formation, noEntryReason);
+  if (noEntryReason) return { formation, snapshot, basket: null, noEntryReason };
   const longCapitalWeight = formation.finalAllocation.longCount / 6;
   const shortCapitalWeight = formation.finalAllocation.shortCount / 6;
   const toLeg = (row: DynamicMom36RankedSymbol): CrossSectionalLeg => ({
@@ -1100,7 +1264,7 @@ export function buildDynamicMom36ShockBasket(input: {
     fastReturnAtOpen: row.fastReturn,
     extensionVolAtOpen: row.extensionVol,
   });
-  return {
+  const basket: CrossSectionalObservation = {
     observationId: `xsec:${DYNAMIC_MOM36_SHOCK_SIGNAL}:${input.openedAtMs}`,
     openedAt: input.now,
     openedAtMs: input.openedAtMs,
@@ -1129,43 +1293,7 @@ export function buildDynamicMom36ShockBasket(input: {
     regimeFlipExit: false,
     formationMode: "PLAIN_MOM36",
     smartFormation: null,
-    dynamicMom36: {
-      strategyVersion,
-      formationTimestamp: input.now,
-      featureTimestamp: new Date(input.featureTimestampMs).toISOString(),
-      decisionInformationCutoff: new Date(input.decisionInformationCutoffMs).toISOString(),
-      activeUniverse: formation.activeUniverse.map((row) => ({
-        symbol: row.symbol,
-        cluster: clusterOf(row.symbol),
-        mom36: row.mom36,
-        price: row.price,
-        longEligible: row.longEligible,
-        shortEligible: row.shortEligible,
-        shortBlocked: row.shortBlocked,
-      })),
-      positiveCount: formation.positiveCount,
-      negativeCount: formation.negativeCount,
-      zeroCount: formation.zeroCount,
-      baseAllocation: formation.baseAllocation,
-      shockModelArtifact: formation.shock.modelArtifactId,
-      shockRawOutput: formation.shock.rawOutput,
-      shockState: formation.shock.state,
-      shockReason: formation.shock.reason,
-      continuation: formation.continuation,
-      baseSelectedLongs: formation.baseSelection.selectedLongs.map((row) => row.symbol),
-      baseSelectedShorts: formation.baseSelection.selectedShorts.map((row) => row.symbol),
-      baseSelectionInsufficientReason: formation.baseSelection.insufficientReason,
-      finalAllocation: formation.finalAllocation,
-      selectedLongs: formation.selection.selectedLongs.map((row) => row.symbol),
-      selectedShorts: formation.selection.selectedShorts.map((row) => row.symbol),
-      blockedShortsSkipped: formation.selection.blockedShortsSkipped,
-      admission: {
-        scoreGap: input.admissionScoreGap,
-        scoreGapFloor: input.admissionScoreGapFloor,
-        clusterCap: input.maxPerCluster,
-        passed: input.admissionPassed,
-      },
-    },
+    dynamicMom36: snapshot,
     exitReason: null,
     grossReturn: null,
     costReturn: null,
@@ -1174,6 +1302,12 @@ export function buildDynamicMom36ShockBasket(input: {
     shortLegReturn: null,
     resolvedAt: null,
   };
+  return { formation, snapshot, basket, noEntryReason: null };
+}
+
+/** Backwards-compatible observation-only facade retained for existing v1/v3 callers and tests. */
+export function buildDynamicMom36ShockBasket(input: DynamicMom36FormationInput): CrossSectionalObservation | null {
+  return evaluateDynamicMom36Formation(input).basket;
 }
 
 /** Rank scored symbols and build an equal-notional long-top-k / short-bottom-k basket. */
@@ -1981,6 +2115,8 @@ interface CrossSectionalState {
   version: number;
   observations: CrossSectionalObservation[];
   lastCycleAt: string | null;
+  /** Latest Dynamic formation attempt, including a no-entry SLOW_AND_FAST audit. */
+  latestDynamicMom36Formation: DynamicMom36FormationSnapshot | null;
 }
 
 export class CrossSectionalStore {
@@ -2003,13 +2139,18 @@ export class CrossSectionalStore {
         if (!existsSync(path)) continue;
         const parsed = JSON.parse(readFileSync(path, "utf-8")) as Partial<CrossSectionalState>;
         if (Array.isArray(parsed.observations)) {
-          return { version: parsed.version ?? 1, observations: parsed.observations, lastCycleAt: parsed.lastCycleAt ?? null };
+          return {
+            version: parsed.version ?? 1,
+            observations: parsed.observations,
+            lastCycleAt: parsed.lastCycleAt ?? null,
+            latestDynamicMom36Formation: parsed.latestDynamicMom36Formation ?? null,
+          };
         }
       } catch {
         // fall through to the next candidate / empty
       }
     }
-    return { version: 1, observations: [], lastCycleAt: null };
+    return { version: 1, observations: [], lastCycleAt: null, latestDynamicMom36Formation: null };
   }
 
   get all(): CrossSectionalObservation[] {
@@ -2026,8 +2167,17 @@ export class CrossSectionalStore {
     return this.state.lastCycleAt;
   }
 
+  get latestDynamicMom36Formation(): DynamicMom36FormationSnapshot | null {
+    return this.state.latestDynamicMom36Formation;
+  }
+
   markCycle(ts: string): void {
     this.state.lastCycleAt = ts;
+  }
+
+  /** Formation-only audit is intentionally durable even when no executable observation was made. */
+  recordDynamicMom36Formation(snapshot: DynamicMom36FormationSnapshot): void {
+    this.state.latestDynamicMom36Formation = snapshot;
   }
 
   add(obs: CrossSectionalObservation): void {
@@ -2148,7 +2298,8 @@ export async function runCrossSectionalCycle(opts: {
   const nowIso = new Date(opts.now).toISOString();
   const dynamicMom36Shock = isDynamicMom36ShockStrategy();
   const dynamicStrategyVersion = crossSectionalStrategyVersion();
-  const dynamicMom36V3 = isDynamicMom36V3Strategy();
+  const dynamicMom36Continuation = isDynamicMom36ContinuationStrategy();
+  const dynamicMom36SlowFast = isDynamicMom36SlowFastStrategy();
   const dynamicMom36ConfigValid = !dynamicMom36Shock || (
     CROSS_SECTIONAL_MOMENTUM_BARS === DYNAMIC_MOM36_LOOKBACK_BARS &&
     CROSS_SECTIONAL_INTERVAL === "1h"
@@ -2301,11 +2452,13 @@ export async function runCrossSectionalCycle(opts: {
     // buildCrossSectionalBasket already uses when a side cannot fill k legs.
     const liquidityStarved = crossSectionalLiquidityStarved(longAllow, shortAllow, liquid);
     let dynamicBlocks: { longBlocklist: string[]; shortBlocklist: string[] } = { longBlocklist: [], shortBlocklist: [] };
+    let dynamicEntryGuardUnavailable = false;
     try {
       dynamicBlocks = await opts.filteredEntryBlocks?.() ?? dynamicBlocks;
     } catch {
       // If current marks cannot be read, fail closed for FILTERED rather than emitting a signal
       // which might duplicate a losing open leg before the executor gets a second chance to stop it.
+      dynamicEntryGuardUnavailable = true;
       dynamicBlocks = { longBlocklist: [...longAllow], shortBlocklist: [...shortAllow] };
     }
     // 2026-08-18: stand down while the universe sits in a deep multi-week drawdown. Measured over
@@ -2326,8 +2479,11 @@ export async function runCrossSectionalCycle(opts: {
       result.standDownMarketReturn = standDown.marketReturn;
     }
     const rerankEnabled = !dynamicMom36Shock && isCrossSectionalSmartFormationRerankEnabled();
-    const baseLongBlocks = new Set(dynamicBlocks.longBlocklist);
-    const baseShortBlocks = new Set([...adaptive.shortBlocklist, ...dynamicBlocks.shortBlocklist]);
+    const lossReentryLongBlocks = new Set(dynamicBlocks.longBlocklist);
+    const lossReentryShortBlocks = new Set(dynamicBlocks.shortBlocklist);
+    const adaptiveShortBlocks = new Set(adaptive.shortBlocklist);
+    const baseLongBlocks = new Set(lossReentryLongBlocks);
+    const baseShortBlocks = new Set([...adaptiveShortBlocks, ...lossReentryShortBlocks]);
     // Dynamic MOM36 keeps its inference universe separate from execution eligibility. In
     // particular, a current short-blocked symbol remains visible to breadth and rank audit; only
     // the later short-leg selection skips it. Every symbol must share the last fully closed bar.
@@ -2360,8 +2516,22 @@ export async function runCrossSectionalCycle(opts: {
           continue;
         }
         const volatility = realizedVolatility(completed.candles);
-        const fastStart = completed.candles[completed.candles.length - 1 - CROSS_SECTIONAL_SMART_FAST_BARS];
+        // Dynamic v4 uses the recovered legacy FAST horizon directly.  It must not inherit the
+        // independently-configurable SMART formation horizon used by old strategies.
+        const slowStart = completed.candles[completed.candles.length - 1 - DYNAMIC_MOM36_LOOKBACK_BARS];
+        const slowSource = completed.candles.at(-1);
+        const fastStart = completed.candles[completed.candles.length - 1 - DYNAMIC_MOM36_SLOW_FAST_FAST_BARS];
         const fastReturn = fastStart && fastStart.close > 0 ? (momentum.price - fastStart.close) / fastStart.close : null;
+        const slowSourceTimestampMs = slowSource ? slowSource.openTime + BAR_MS : null;
+        const slowStartTimestampMs = slowStart ? slowStart.openTime + BAR_MS : null;
+        const fastSourceTimestampMs = slowSourceTimestampMs;
+        const fastStartTimestampMs = fastStart ? fastStart.openTime + BAR_MS : null;
+        const slowFastDataValid = [
+          slowSourceTimestampMs,
+          slowStartTimestampMs,
+          fastSourceTimestampMs,
+          fastStartTimestampMs,
+        ].every((timestamp) => Number.isFinite(timestamp) && timestamp! > 0 && timestamp! <= dynamicDecisionInformationCutoffMs);
         const extensionCloses = completed.candles
           .slice(-CROSS_SECTIONAL_SMART_EXTENSION_BARS)
           .map((candle) => candle.close)
@@ -2377,6 +2547,11 @@ export async function runCrossSectionalCycle(opts: {
           volatility,
           fastReturn,
           extensionVol,
+          slowSourceTimestampMs,
+          slowStartTimestampMs,
+          fastSourceTimestampMs,
+          fastStartTimestampMs,
+          slowFastDataValid,
         });
         // Preserve the exact fully-closed, synchronous candles that generated MOM36.  The v3
         // continuation adapter receives this same snapshot; it never re-fetches, interpolates, or
@@ -2391,11 +2566,11 @@ export async function runCrossSectionalCycle(opts: {
         console.error("[cross-sectional] DYNAMIC_MOM36_SHOCK NO_TRADE: " + dynamicFreshnessReason);
       }
     }
-    // V3 continuation is formation-only and non-blocking.  It receives the completed MOM36
+    // V3/V4 continuation is formation-only and non-blocking.  It receives the completed MOM36
     // snapshot plus BTC/ETH context when available; a short/missing external history is recorded
     // as NO_EDGE by the frozen runtime rather than changing admission or base allocation.
     let dynamicContinuationRuntime: DynamicMom36ContinuationRuntimeResult | null = null;
-    if (dynamicMom36V3) {
+    if (dynamicMom36Continuation) {
       let btcCandles: Candle[] | null = null;
       let ethCandles: Candle[] | null = null;
       try {
@@ -2436,11 +2611,25 @@ export async function runCrossSectionalCycle(opts: {
     ): DynamicMom36RankedSymbol[] => dynamicBaseRows.map((row) => {
       const longEligible = allowed(row.symbol, longAllow, longBlocks);
       const shortEligible = allowed(row.symbol, shortAllow, shortBlocks);
+      const blockReason = (side: "LONG" | "SHORT", executionEligible: boolean) => {
+        if (executionEligible) return null;
+        if (dynamicEntryGuardUnavailable) return "EXECUTION_GUARD_UNAVAILABLE" as const;
+        if ((side === "LONG" ? lossReentryLongBlocks : lossReentryShortBlocks).has(row.symbol)) {
+          return "LOSS_REENTRY_GUARD" as const;
+        }
+        if ((side === "LONG" ? quarantinedLong : quarantinedShort).has(row.symbol)) {
+          return "SYMBOL_RELIABILITY_GUARD" as const;
+        }
+        if (side === "SHORT" && adaptiveShortBlocks.has(row.symbol)) return "SHORT_BLOCKED" as const;
+        return "EXECUTION_INELIGIBLE" as const;
+      };
       return {
         ...row,
         longEligible,
         shortEligible,
         shortBlocked: !shortEligible,
+        longExecutionBlockReason: blockReason("LONG", longEligible),
+        shortExecutionBlockReason: blockReason("SHORT", shortEligible),
       };
     });
     // The Dynamic admission probe uses the SAME score-gap/cluster/liquidity machinery as the
@@ -2563,8 +2752,8 @@ export async function runCrossSectionalCycle(opts: {
         recordRejectedBasket(info);
       },
     });
-    const dynamicBaseline = dynamicMom36Shock && !dynamicFreshnessReason && dynamicFeatureTimestampMs !== null
-      ? buildDynamicMom36ShockBasket({
+    const dynamicBaselineEvaluation = dynamicMom36Shock && !dynamicFreshnessReason && dynamicFeatureTimestampMs !== null
+      ? evaluateDynamicMom36Formation({
           activeUniverse: dynamicRowsFor(baseLongBlocks, baseShortBlocks),
           now: nowIso,
           openedAtMs: opts.now,
@@ -2579,8 +2768,8 @@ export async function runCrossSectionalCycle(opts: {
           continuationRuntime: dynamicContinuationRuntime,
         })
       : null;
-    const dynamicCandidate = dynamicMom36Shock && !dynamicFreshnessReason && dynamicFeatureTimestampMs !== null
-      ? buildDynamicMom36ShockBasket({
+    const dynamicCandidateEvaluation = dynamicMom36Shock && !dynamicFreshnessReason && dynamicFeatureTimestampMs !== null
+      ? evaluateDynamicMom36Formation({
           activeUniverse: dynamicRowsFor(finalLongBlocks, finalShortBlocks),
           now: nowIso,
           openedAtMs: opts.now,
@@ -2595,6 +2784,8 @@ export async function runCrossSectionalCycle(opts: {
           continuationRuntime: dynamicContinuationRuntime,
         })
       : null;
+    const dynamicBaseline = dynamicBaselineEvaluation?.basket ?? null;
+    const dynamicCandidate = dynamicCandidateEvaluation?.basket ?? null;
     const baseline = dynamicMom36Shock ? dynamicBaseline : admissionBaseline;
     const candidateBasket = dynamicMom36Shock ? dynamicCandidate : admissionCandidate;
     let basket = reliabilityUnavailable ? null : candidateBasket;
@@ -2681,16 +2872,25 @@ export async function runCrossSectionalCycle(opts: {
       if (basket) basket.symbolReliability = decision;
     }
     if (dynamicMom36Shock) {
-      const snapshot = dynamicCandidate?.dynamicMom36 ?? dynamicBaseline?.dynamicMom36 ?? null;
+      const evaluatedSnapshot = dynamicCandidateEvaluation?.snapshot ?? dynamicBaselineEvaluation?.snapshot ?? null;
       const admissionReason = dynamicFreshnessReason
         ?? (liquidityStarved ? "current liquidity admission is starved" : null)
         ?? (standDown.standDown ? standDown.reason : null)
         ?? (baselineGap.value ? `score gap ${baselineGap.value.scoreGap.toFixed(6)} below ${baselineGap.value.minScoreGap.toFixed(6)}` : null)
         ?? (reliabilityUnavailable ? `symbol reliability persistence unavailable: ${reliabilityPersistence.reason ?? "unknown"}` : null)
-        ?? (snapshot?.admission.passed ? null : "current production admission did not pass");
+        ?? evaluatedSnapshot?.noEntryReason
+        ?? (evaluatedSnapshot?.admission.passed ? null : "current production admission did not pass");
+      const snapshot = evaluatedSnapshot
+        ? {
+            ...evaluatedSnapshot,
+            noEntryReason: basket ? null : admissionReason ?? "DYNAMIC_MOM36_FORMATION_NOT_EXECUTED",
+          }
+        : null;
+      if (snapshot) opts.store.recordDynamicMom36Formation(snapshot);
       console.info(JSON.stringify({
         event: "dynamic_mom36_formation",
         strategyVersion: dynamicStrategyVersion,
+        slowFastRequired: dynamicMom36SlowFast,
         admissionPass: snapshot?.admission.passed ?? false,
         admissionReason,
         activeUniverseSize: snapshot?.activeUniverse.length ?? dynamicBaseRows.length,
@@ -2704,10 +2904,24 @@ export async function runCrossSectionalCycle(opts: {
         shockConfidence: snapshot?.shockRawOutput.probabilities ?? null,
         shockReason: snapshot?.shockReason ?? null,
         continuation: snapshot?.continuation ?? null,
+        slowFast: snapshot?.slowFast ?? null,
         baseSelectedLongs: snapshot?.baseSelectedLongs ?? [],
         baseSelectedShorts: snapshot?.baseSelectedShorts ?? [],
         baseSelectionInsufficientReason: snapshot?.baseSelectionInsufficientReason ?? null,
+        rawV3SelectedLongs: snapshot?.rawV3SelectedLongs ?? [],
+        rawV3SelectedShorts: snapshot?.rawV3SelectedShorts ?? [],
+        rawV3SelectionInsufficientReason: snapshot?.rawV3SelectionInsufficientReason ?? null,
         finalAllocation: snapshot?.finalAllocation ?? null,
+        requiredLongs: snapshot?.requiredLongs ?? null,
+        requiredShorts: snapshot?.requiredShorts ?? null,
+        availableAlignedLongs: snapshot?.availableAlignedLongs ?? null,
+        availableAlignedShorts: snapshot?.availableAlignedShorts ?? null,
+        availableExecutionEligibleAlignedLongs: snapshot?.availableExecutionEligibleAlignedLongs ?? null,
+        availableExecutionEligibleAlignedShorts: snapshot?.availableExecutionEligibleAlignedShorts ?? null,
+        rawV3CandidateAudit: snapshot?.rawV3CandidateAudit ?? null,
+        selectionCandidateAudit: snapshot?.selectionCandidateAudit ?? null,
+        selectionInsufficientReason: snapshot?.selectionInsufficientReason ?? null,
+        noEntryReason: snapshot?.noEntryReason ?? admissionReason ?? null,
         selectedLongs: snapshot?.selectedLongs ?? [],
         selectedShorts: snapshot?.selectedShorts ?? [],
         blockedSymbolsSkipped: snapshot?.blockedShortsSkipped ?? [],

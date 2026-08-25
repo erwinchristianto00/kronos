@@ -13,10 +13,21 @@
  */
 import { clusterOf, isMajorCluster } from "./correlation-clusters.js";
 import type { DynamicMom36ContinuationRuntimeResult } from "./dynamic-mom36-continuation-runtime.js";
+import {
+  DYNAMIC_MOM36_SLOW_FAST_FAST_BARS,
+  DYNAMIC_MOM36_SLOW_FAST_IMPLEMENTATION_VERSION,
+  DYNAMIC_MOM36_SLOW_FAST_INTERVAL,
+  DYNAMIC_MOM36_SLOW_FAST_POLICY_ID,
+  DYNAMIC_MOM36_SLOW_FAST_SLOW_BARS,
+  evaluateDynamicMom36SlowFast,
+  type DynamicMom36SlowFastDirection,
+} from "./dynamic-mom36-slowfast.js";
 
 export const DYNAMIC_MOM36_SHOCK_36H_V1 = "dynamic-mom36-shock-36h-v1" as const;
 export const DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 =
   "dynamic-mom36-continuation-sl2-mfe30-36h-v3" as const;
+export const DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4 =
+  "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4" as const;
 export const DYNAMIC_MOM36_SHOCK_SIGNAL = "DYNAMIC_MOM36_SHOCK_36H" as const;
 export const DYNAMIC_MOM36_SHOCK_VARIANT = "DYNAMIC_MOM36_SHOCK" as const;
 export const DYNAMIC_MOM36_LOOKBACK_BARS = 36 as const;
@@ -34,7 +45,8 @@ export const DYNAMIC_MOM36_MFE_TRAILING_FRACTION = 1 - DYNAMIC_MOM36_MFE_GIVEBAC
 
 export type DynamicMom36StrategyVersion =
   | typeof DYNAMIC_MOM36_SHOCK_36H_V1
-  | typeof DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
+  | typeof DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3
+  | typeof DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4;
 
 /** There is intentionally no synthetic or trainable fallback model. */
 export const NO_FROZEN_RUNTIME_SHOCK_ARTIFACT = "NO_FROZEN_RUNTIME_SHOCK_MAPPING" as const;
@@ -66,7 +78,25 @@ export type DynamicMom36RankedSymbol = {
   shortEligible: boolean;
   /** Kept separate so a blocked name remains visible in breadth and ranking audit. */
   shortBlocked: boolean;
+  /** Explicit current-guard reason for audit; selection still relies on the existing booleans. */
+  longExecutionBlockReason?: DynamicMom36ExecutionBlockReason | null;
+  /** Explicit current-guard reason for audit; selection still relies on the existing booleans. */
+  shortExecutionBlockReason?: DynamicMom36ExecutionBlockReason | null;
+  /** Fully closed source-bar timestamps for the strict slow/fast audit trail. */
+  slowSourceTimestampMs?: number | null;
+  slowStartTimestampMs?: number | null;
+  fastSourceTimestampMs?: number | null;
+  fastStartTimestampMs?: number | null;
+  /** Caller marks false when a source is stale/future for its decision cut; undefined preserves old v1/v3 fixtures. */
+  slowFastDataValid?: boolean | null;
 };
+
+export type DynamicMom36ExecutionBlockReason =
+  | "SHORT_BLOCKED"
+  | "LOSS_REENTRY_GUARD"
+  | "SYMBOL_RELIABILITY_GUARD"
+  | "EXECUTION_GUARD_UNAVAILABLE"
+  | "EXECUTION_INELIGIBLE";
 
 export type FrozenShockOverlay = {
   modelArtifactId: string;
@@ -400,6 +430,61 @@ export type DynamicMom36Selection = {
   selectedShorts: DynamicMom36RankedSymbol[];
   blockedShortsSkipped: string[];
   insufficientReason: string | null;
+  /** Full ordered side walks, including safety/alignment rejection provenance. */
+  candidateAudit: {
+    long: DynamicMom36CandidateSelectionAudit[];
+    short: DynamicMom36CandidateSelectionAudit[];
+  };
+  requiredLongs: number;
+  requiredShorts: number;
+  /** Sign-aligned candidates before execution eligibility and cluster selection. */
+  availableAlignedLongs: number;
+  availableAlignedShorts: number;
+  /** Alignment plus current execution eligibility, before the per-side cluster cap. */
+  availableExecutionEligibleAlignedLongs: number;
+  availableExecutionEligibleAlignedShorts: number;
+  slowFastApplied: boolean;
+};
+
+export type DynamicMom36CandidateSkipReason =
+  | "SELECTED"
+  | "NOT_REQUIRED_AFTER_QUOTA"
+  | "OPPOSITE_SIDE_SELECTED"
+  | DynamicMom36ExecutionBlockReason
+  | "CLUSTER_GUARD"
+  | "SLOW_FAST_NOT_ALIGNED"
+  | "SLOW_FAST_DATA_MISSING";
+
+export type DynamicMom36CandidateSelectionAudit = {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  mom36Rank: number;
+  mom36: number;
+  fastReturn: number | null;
+  slowDirection: DynamicMom36SlowFastDirection;
+  fastDirection: DynamicMom36SlowFastDirection;
+  slowSourceTimestampMs: number | null;
+  slowStartTimestampMs: number | null;
+  fastSourceTimestampMs: number | null;
+  fastStartTimestampMs: number | null;
+  /** All four closes used by MOM36/FAST4h were present, closed, and no later than the decision cut. */
+  slowFastDataAvailable: boolean;
+  slowFastAligned: boolean;
+  executionEligible: boolean;
+  shortBlocked: boolean;
+  lossReentryBlocked: boolean;
+  clusterBlocked: boolean;
+  selected: boolean;
+  skipReason: DynamicMom36CandidateSkipReason;
+};
+
+export type DynamicMom36SlowFastPolicy = {
+  active: boolean;
+  policyId: string | null;
+  implementationVersion: string | null;
+  interval: string | null;
+  slowBars: number | null;
+  fastBars: number | null;
 };
 
 export type DynamicMom36Formation = {
@@ -414,9 +499,12 @@ export type DynamicMom36Formation = {
    * recomputing ranks from changed code, pool membership, or market data.
   */
   baseSelection: DynamicMom36Selection;
+  /** Exact current V3 selection after V4 allocation, with no SLOW_AND_FAST filtering. */
+  rawV3Selection: DynamicMom36Selection;
   /** v1 has its historic shock snapshot; v3 records formation-only V4 continuation instead. */
   shock: FrozenShockOverlay;
   continuation: FrozenContinuationOverlay | null;
+  slowFast: DynamicMom36SlowFastPolicy;
   finalAllocation: DynamicMom36Allocation;
   vetoed: boolean;
   selection: DynamicMom36Selection;
@@ -512,26 +600,110 @@ function rank(rows: readonly DynamicMom36RankedSymbol[], side: "LONG" | "SHORT")
   });
 }
 
+function finiteOrNull(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function executionSkipReason(
+  row: DynamicMom36RankedSymbol,
+  side: "LONG" | "SHORT",
+): DynamicMom36ExecutionBlockReason {
+  const explicit = side === "LONG" ? row.longExecutionBlockReason : row.shortExecutionBlockReason;
+  if (explicit) return explicit;
+  if (side === "SHORT" && row.shortBlocked) return "SHORT_BLOCKED";
+  return "EXECUTION_INELIGIBLE";
+}
+
+function validSourceTimestamp(value: number | null | undefined): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+/**
+ * The recovered predicate itself is deliberately only a strict sign test.  Dynamic v4 adds this
+ * separate data-availability guard because its persisted formation snapshot must prove that both
+ * endpoints of MOM36 and FAST4h were closed at the decision point.  Missing provenance is never
+ * treated as an aligned signal.
+ */
+function slowFastDataAvailable(row: DynamicMom36RankedSymbol): boolean {
+  return row.slowFastDataValid !== false &&
+    Number.isFinite(row.mom36) &&
+    typeof row.fastReturn === "number" && Number.isFinite(row.fastReturn) &&
+    validSourceTimestamp(row.slowSourceTimestampMs) &&
+    validSourceTimestamp(row.slowStartTimestampMs) &&
+    validSourceTimestamp(row.fastSourceTimestampMs) &&
+    validSourceTimestamp(row.fastStartTimestampMs);
+}
+
 function selectSide(
   rows: readonly DynamicMom36RankedSymbol[],
   side: "LONG" | "SHORT",
   count: number,
   excluded: ReadonlySet<string>,
   maxPerCluster: number,
-): { selected: DynamicMom36RankedSymbol[]; blockedSkipped: string[] } {
+  slowFastApplied: boolean,
+): {
+  selected: DynamicMom36RankedSymbol[];
+  blockedSkipped: string[];
+  audit: DynamicMom36CandidateSelectionAudit[];
+} {
   const selected: DynamicMom36RankedSymbol[] = [];
   const blockedSkipped: string[] = [];
-  for (const row of rank(rows, side)) {
-    if (selected.length >= count) break;
-    if (excluded.has(row.symbol)) continue;
-    if (side === "LONG" ? !row.longEligible : !row.shortEligible) {
+  const audit: DynamicMom36CandidateSelectionAudit[] = [];
+  for (const [index, row] of rank(rows, side).entries()) {
+    const aligned = evaluateDynamicMom36SlowFast(row.mom36, row.fastReturn);
+    const strictSignAligned = side === "LONG" ? aligned.longAligned : aligned.shortAligned;
+    const sourceAvailable = slowFastDataAvailable(row);
+    const slowFastAligned = sourceAvailable && strictSignAligned;
+    const executionEligible = side === "LONG" ? row.longEligible : row.shortEligible;
+    let clusterBlocked = false;
+    let selectedHere = false;
+    let skipReason: DynamicMom36CandidateSkipReason;
+    if (excluded.has(row.symbol)) {
+      skipReason = "OPPOSITE_SIDE_SELECTED";
+    } else if (!executionEligible) {
       if (side === "SHORT" && row.shortBlocked) blockedSkipped.push(row.symbol);
-      continue;
+      skipReason = executionSkipReason(row, side);
+    } else if (selected.length >= count) {
+      skipReason = "NOT_REQUIRED_AFTER_QUOTA";
+    } else {
+      clusterBlocked = !clusterAllowed(row.symbol, selected, maxPerCluster);
+      if (clusterBlocked) {
+        skipReason = "CLUSTER_GUARD";
+      } else if (slowFastApplied && !sourceAvailable) {
+        skipReason = "SLOW_FAST_DATA_MISSING";
+      } else if (slowFastApplied && !strictSignAligned) {
+        // The legacy predicate is a hard per-leg gate. It consumes no cluster capacity and has no
+        // authority over ranking or allocation; keep walking the same MOM36 order.
+        skipReason = "SLOW_FAST_NOT_ALIGNED";
+      } else {
+        selected.push(row);
+        selectedHere = true;
+        skipReason = "SELECTED";
+      }
     }
-    if (!clusterAllowed(row.symbol, selected, maxPerCluster)) continue;
-    selected.push(row);
+    audit.push({
+      symbol: row.symbol,
+      side,
+      mom36Rank: index + 1,
+      mom36: row.mom36,
+      fastReturn: finiteOrNull(row.fastReturn),
+      slowDirection: aligned.slowDirection,
+      fastDirection: aligned.fastDirection,
+      slowSourceTimestampMs: finiteOrNull(row.slowSourceTimestampMs),
+      slowStartTimestampMs: finiteOrNull(row.slowStartTimestampMs),
+      fastSourceTimestampMs: finiteOrNull(row.fastSourceTimestampMs),
+      fastStartTimestampMs: finiteOrNull(row.fastStartTimestampMs),
+      slowFastDataAvailable: sourceAvailable,
+      slowFastAligned,
+      executionEligible,
+      shortBlocked: side === "SHORT" && row.shortBlocked,
+      lossReentryBlocked: executionSkipReason(row, side) === "LOSS_REENTRY_GUARD",
+      clusterBlocked,
+      selected: selectedHere,
+      skipReason,
+    });
   }
-  return { selected, blockedSkipped };
+  return { selected, blockedSkipped, audit };
 }
 
 /**
@@ -543,25 +715,53 @@ export function selectDynamicMom36Legs(
   rows: readonly DynamicMom36RankedSymbol[],
   finalAllocation: DynamicMom36Allocation,
   maxPerCluster: number,
+  opts: { slowFastApplied?: boolean } = {},
 ): DynamicMom36Selection {
-  if (rows.length < 6) {
-    return { selectedLongs: [], selectedShorts: [], blockedShortsSkipped: [], insufficientReason: "active inference universe has fewer than six symbols" };
-  }
+  const slowFastApplied = opts.slowFastApplied === true;
   const longFirst = finalAllocation.longCount >= finalAllocation.shortCount;
   const firstSide: "LONG" | "SHORT" = longFirst ? "LONG" : "SHORT";
   const secondSide: "LONG" | "SHORT" = longFirst ? "SHORT" : "LONG";
   const countFor = (side: "LONG" | "SHORT") => side === "LONG" ? finalAllocation.longCount : finalAllocation.shortCount;
-  const first = selectSide(rows, firstSide, countFor(firstSide), new Set(), maxPerCluster);
-  const second = selectSide(rows, secondSide, countFor(secondSide), new Set(first.selected.map((row) => row.symbol)), maxPerCluster);
+  const first = selectSide(rows, firstSide, countFor(firstSide), new Set(), maxPerCluster, slowFastApplied);
+  const second = selectSide(
+    rows,
+    secondSide,
+    countFor(secondSide),
+    new Set(first.selected.map((row) => row.symbol)),
+    maxPerCluster,
+    slowFastApplied,
+  );
   const selectedLongs = firstSide === "LONG" ? first.selected : second.selected;
   const selectedShorts = firstSide === "SHORT" ? first.selected : second.selected;
+  const longAudit = firstSide === "LONG" ? first.audit : second.audit;
+  const shortAudit = firstSide === "SHORT" ? first.audit : second.audit;
   const blockedShortsSkipped = [...new Set([...first.blockedSkipped, ...second.blockedSkipped])];
   const enough = selectedLongs.length === finalAllocation.longCount && selectedShorts.length === finalAllocation.shortCount;
+  const availability = (audit: DynamicMom36CandidateSelectionAudit[]) => ({
+    aligned: audit.filter((candidate) => candidate.slowFastAligned && candidate.skipReason !== "OPPOSITE_SIDE_SELECTED").length,
+    executionEligibleAligned: audit.filter((candidate) =>
+      candidate.slowFastAligned && candidate.executionEligible && candidate.skipReason !== "OPPOSITE_SIDE_SELECTED",
+    ).length,
+  });
+  const longAvailability = availability(longAudit);
+  const shortAvailability = availability(shortAudit);
   return {
     selectedLongs,
     selectedShorts,
     blockedShortsSkipped,
-    insufficientReason: enough ? null : "insufficient ranked execution-eligible symbols after current pool, blocklist, and cluster guards",
+    insufficientReason: enough
+      ? null
+      : rows.length < 6
+        ? "active inference universe has fewer than six symbols"
+        : "insufficient ranked execution-eligible symbols after current pool, blocklist, and cluster guards",
+    candidateAudit: { long: longAudit, short: shortAudit },
+    requiredLongs: finalAllocation.longCount,
+    requiredShorts: finalAllocation.shortCount,
+    availableAlignedLongs: longAvailability.aligned,
+    availableAlignedShorts: shortAvailability.aligned,
+    availableExecutionEligibleAlignedLongs: longAvailability.executionEligibleAligned,
+    availableExecutionEligibleAlignedShorts: shortAvailability.executionEligibleAligned,
+    slowFastApplied,
   };
 }
 
@@ -571,8 +771,10 @@ export function buildDynamicMom36Formation(input: {
   shock?: FrozenShockOverlay;
   continuation?: FrozenContinuationOverlay | null;
   continuationRuntime?: DynamicMom36ContinuationRuntimeResult | null;
-  /** V3 has no legacy shock fallback: unavailable continuation means base MOM36, never a veto. */
+  /** Continuation versions have no legacy shock fallback: unavailable continuation means base MOM36, never a veto. */
   continuationOnly?: boolean;
+  /** New v4 only: exact recovered legacy per-leg eligibility after the final allocation is frozen. */
+  slowFastRequired?: boolean;
 }): DynamicMom36Formation {
   const activeUniverse = [...input.activeUniverse]
     .filter((row) => Number.isFinite(row.mom36) && Number.isFinite(row.price) && row.price > 0)
@@ -580,6 +782,7 @@ export function buildDynamicMom36Formation(input: {
   const breadth = baseDynamicMom36Allocation(activeUniverse);
   const baseSelection = selectDynamicMom36Legs(activeUniverse, breadth.allocation, input.maxPerCluster);
   const continuationOnly = input.continuationOnly === true;
+  const slowFastRequired = input.slowFastRequired === true;
   // The frozen V1 shock artifact and the V3 continuation artifact are deliberately disjoint.
   // A missing V3 result must not fall through to a future/accidentally-registered V1 shock
   // mapping, because that would turn the mandated BASE fallback into an undeclared veto.
@@ -597,9 +800,22 @@ export function buildDynamicMom36Formation(input: {
     : continuation
       ? { allocation: applyBoundedContinuationOverlay(breadth.allocation, continuation), vetoed: false }
       : applyBoundedShockOverlay(breadth.allocation, shock);
-  const selection = overlay.vetoed
-    ? { selectedLongs: [], selectedShorts: [], blockedShortsSkipped: [], insufficientReason: "frozen shock mapping vetoed this candidate" }
-    : selectDynamicMom36Legs(activeUniverse, overlay.allocation, input.maxPerCluster);
+  const rawV3Selection = selectDynamicMom36Legs(activeUniverse, overlay.allocation, input.maxPerCluster);
+  let selection = overlay.vetoed
+    ? {
+        ...rawV3Selection,
+        selectedLongs: [],
+        selectedShorts: [],
+        insufficientReason: "frozen shock mapping vetoed this candidate",
+      }
+    : slowFastRequired
+      ? selectDynamicMom36Legs(activeUniverse, overlay.allocation, input.maxPerCluster, { slowFastApplied: true })
+      : rawV3Selection;
+  // A raw V3 basket that is complete but loses a leg only once strict side alignment is applied
+  // must never borrow an unaligned candidate or alter the allocation. State this cause explicitly.
+  if (slowFastRequired && rawV3Selection.insufficientReason === null && selection.insufficientReason !== null) {
+    selection = { ...selection, insufficientReason: "INSUFFICIENT_SLOW_FAST_ALIGNED_LEGS" };
+  }
   return {
     activeUniverse,
     positiveCount: breadth.positiveCount,
@@ -607,8 +823,17 @@ export function buildDynamicMom36Formation(input: {
     zeroCount: breadth.zeroCount,
     baseAllocation: breadth.allocation,
     baseSelection,
+    rawV3Selection,
     shock,
     continuation,
+    slowFast: {
+      active: slowFastRequired,
+      policyId: slowFastRequired ? DYNAMIC_MOM36_SLOW_FAST_POLICY_ID : null,
+      implementationVersion: slowFastRequired ? DYNAMIC_MOM36_SLOW_FAST_IMPLEMENTATION_VERSION : null,
+      interval: slowFastRequired ? DYNAMIC_MOM36_SLOW_FAST_INTERVAL : null,
+      slowBars: slowFastRequired ? DYNAMIC_MOM36_SLOW_FAST_SLOW_BARS : null,
+      fastBars: slowFastRequired ? DYNAMIC_MOM36_SLOW_FAST_FAST_BARS : null,
+    },
     finalAllocation: overlay.allocation,
     vetoed: overlay.vetoed,
     selection,
@@ -635,7 +860,27 @@ export function isDynamicMom36V3Version(strategyVersion: string | null | undefin
   return strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
 }
 
+/** V3 and V4 share the same pinned continuation artifact and frozen -2%/MFE/36h exit contract. */
+export function isDynamicMom36ContinuationStrategy(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isDynamicMom36ContinuationVersion(crossSectionalStrategyVersion(env));
+}
+
+export function isDynamicMom36ContinuationVersion(strategyVersion: string | null | undefined): boolean {
+  return strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 ||
+    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4;
+}
+
+/** Only v4 activates the recovered strict SLOW_AND_FAST per-leg predicate. */
+export function isDynamicMom36SlowFastStrategy(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isDynamicMom36SlowFastVersion(crossSectionalStrategyVersion(env));
+}
+
+export function isDynamicMom36SlowFastVersion(strategyVersion: string | null | undefined): boolean {
+  return strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4;
+}
+
 export function isDynamicMom36Version(strategyVersion: string | null | undefined): strategyVersion is DynamicMom36StrategyVersion {
   return strategyVersion === DYNAMIC_MOM36_SHOCK_36H_V1 ||
-    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
+    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 ||
+    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4;
 }

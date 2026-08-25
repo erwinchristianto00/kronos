@@ -388,7 +388,7 @@ import {
   CROSS_SECTIONAL_MIXED_SIGNAL,
 } from "../lib/cross-sectional-edge.js";
 import { DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES } from "../lib/dynamic-mom36-continuation-runtime.js";
-import { isDynamicMom36V3Strategy } from "../lib/dynamic-mom36-shock-strategy.js";
+import { isDynamicMom36ContinuationStrategy } from "../lib/dynamic-mom36-shock-strategy.js";
 import type { CrossSectionalAutoPool } from "../lib/cross-sectional-auto-pool.js";
 import { spotSymbolForCandles, buildWinnersCounterfactualReport } from "../lib/cross-sectional-winners-counterfactual.js";
 import { buildRegimeAxisTimeline } from "../lib/regime-axis-timeline.js";
@@ -3031,7 +3031,7 @@ export async function registerShadowRoutes(
                   // hour is removed, with the same conservative 30-bar acquisition cushion used
                   // by its frozen runtime. This is transport tolerance only, not a MOM36 or
                   // continuation parameter change.
-                  isDynamicMom36V3Strategy() ? DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES + 30 : 0,
+                  isDynamicMom36ContinuationStrategy() ? DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES + 30 : 0,
                   CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0 ? CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS : 0,
                   // 2026-08-18: the 14d stand-down gate needs 336 bars. Deepened ONLY when that gate
                   // is armed, so the default fetch stays exactly what it was — and asking for a

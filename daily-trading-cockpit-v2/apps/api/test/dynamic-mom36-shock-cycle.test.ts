@@ -3,7 +3,10 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Candle } from "@dtc/shared";
-import { DYNAMIC_MOM36_SHOCK_36H_V1 } from "../src/lib/dynamic-mom36-shock-strategy.js";
+import {
+  DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
+  DYNAMIC_MOM36_SHOCK_36H_V1,
+} from "../src/lib/dynamic-mom36-shock-strategy.js";
 
 const HOUR = 3_600_000;
 const cutoff = Date.parse("2026-08-25T12:00:00.000Z");
@@ -35,6 +38,84 @@ describe("Dynamic MOM36 production-cycle integration", () => {
     expect(admission).toContain("if (dynamicMom36ShockStrategyActive)");
     expect(admission).toContain("engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false");
     expect(admission).toContain("armed, kill, drain, transport, and canonical strategy");
+  });
+
+  it("executes v4 strict SLOW_AND_FAST in the actual cycle and persists raw-v3 plus filtered audit", async () => {
+    const overrides: Record<string, string> = {
+      CROSS_SECTIONAL_STRATEGY_VERSION: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
+      CROSS_SECTIONAL_INTERVAL: "1h",
+      CROSS_SECTIONAL_MOMENTUM_BARS: "36",
+      CROSS_SECTIONAL_HORIZON_BARS: "48",
+      CROSS_SECTIONAL_K: "3",
+      CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP: "0.058",
+      CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER: "2",
+      CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST: universe.join(","),
+      CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST: universe.join(","),
+      // v4 must be active through its strategy version, not the retired wrapper switch.
+      CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "0",
+      CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "0",
+      CROSS_SECTIONAL_REGIME_SKEW_ENABLED: "0",
+      CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+      CROSS_SECTIONAL_STAND_DOWN_14D_PCT: "0",
+      CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR: "0",
+      CROSS_SECTIONAL_EDGE_DISABLED: "0",
+    };
+    const before = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+    try {
+      for (const [key, value] of Object.entries(overrides)) process.env[key] = value;
+      vi.resetModules();
+      const edge = await import("../src/lib/cross-sectional-edge.js");
+      const dir = mkdtempSync(join(tmpdir(), "dynamic-mom36-v4-cycle-"));
+      dirs.push(dir);
+      const returns: Record<string, number> = {
+        BTCUSDT: 0.10,
+        ETHUSDT: 0.09,
+        SOLUSDT: 0.08,
+        DOGEUSDT: 0.07,
+        LINKUSDT: 0.06,
+        FETUSDT: 0.05,
+        AAVEUSDT: 0.04,
+        WLDUSDT: -0.03,
+      };
+      const now = cutoff + 5 * 60_000;
+      const store = new edge.CrossSectionalStore(dir);
+      const result = await edge.runCrossSectionalCycle({
+        store,
+        universe,
+        now,
+        fetchCandles: async (symbol) => candlesFor(returns[symbol]!),
+      });
+
+      expect(result.openedDynamicMom36Shock).toBe(1);
+      const observation = store.all.find((candidate) => candidate.variant === "DYNAMIC_MOM36_SHOCK")!;
+      expect(observation.dynamicMom36).toMatchObject({
+        strategyVersion: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
+        slowFast: {
+          active: true,
+          policyId: "slow-fast-mom36-fast4h-strict-sign-v1",
+          implementationVersion: "legacy-d5243fd-strict-sign-verified-v1",
+          interval: "1h",
+          slowBars: 36,
+          fastBars: 4,
+        },
+        rawV3SelectionInsufficientReason: null,
+        selectionInsufficientReason: null,
+      });
+      expect(observation.dynamicMom36?.rawV3SelectedLongs).toHaveLength(5);
+      expect(observation.dynamicMom36?.selectedLongs).toHaveLength(5);
+      expect(observation.dynamicMom36?.selectionCandidateAudit?.long.every((candidate) =>
+        candidate.slowSourceTimestampMs !== null &&
+        candidate.fastSourceTimestampMs !== null &&
+        candidate.slowSourceTimestampMs <= cutoff &&
+        candidate.fastSourceTimestampMs <= cutoff,
+      )).toBe(true);
+      expect(store.latestDynamicMom36Formation).toEqual(observation.dynamicMom36);
+    } finally {
+      for (const [key, value] of before) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   it("keeps blocked WLD in breadth/admission information, then skips it only at final short selection", async () => {

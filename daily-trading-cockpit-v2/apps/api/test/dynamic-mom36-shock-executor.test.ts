@@ -13,6 +13,7 @@ import { CrossSectionalStore, type CrossSectionalObservation } from "../src/lib/
 import type { FuturesMarketReference } from "../src/lib/futures-market-reference-cache.js";
 import {
   DYNAMIC_MOM36_HORIZON_MS,
+  DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
   DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3,
   DYNAMIC_MOM36_SHOCK_36H_V1,
   DYNAMIC_MOM36_SHOCK_SIGNAL,
@@ -455,6 +456,44 @@ describe("Dynamic MOM36 executor — asymmetric live lifecycle", () => {
       expect(run.client.orders.filter((order) => order.reduceOnly)).toHaveLength(6);
     }
   }, DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3));
+
+  it("uses the unchanged frozen -2% / MFE / 36h exit dispatcher for a new v4 basket", async () => withDynamicEnv(async () => {
+    const run = runner(5, { strategyVersion: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4 });
+    await run.executor.tick();
+    const basket = run.store.getState().baskets[0]!;
+    expect(basket).toMatchObject({
+      status: "COMPLETE",
+      strategyVersion: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
+      dynamicMom36V3Exit: { hardCutLossThreshold: -0.02, mfeArmThreshold: 0.03, mfeGivebackFraction: 0.30 },
+    });
+    for (const leg of basket.legs) {
+      const mark = run.client.marks.get(leg.symbol)!;
+      run.client.marks.set(leg.symbol, leg.side === "LONG" ? mark * 0.975 : mark * 1.025);
+    }
+    await run.executor.tick();
+    expect(basket).toMatchObject({ status: "CLOSED", closeReason: "HARD_CUT_LOSS_2" });
+  }, DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4));
+
+  it("surfaces a newer durable v4 no-entry formation instead of hiding it behind an older executable signal", async () => withDynamicEnv(async () => {
+    const run = runner(5, { strategyVersion: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4 });
+    const older = run.signalStore.all[0]!;
+    const noEntry = {
+      ...older.dynamicMom36!,
+      formationTimestamp: new Date(T0 + 60_000).toISOString(),
+      noEntryReason: "INSUFFICIENT_SLOW_FAST_ALIGNED_LEGS",
+      rawV3SelectedLongs: older.longLeg.map((leg) => leg.symbol),
+      selectedLongs: older.longLeg.slice(0, 4).map((leg) => leg.symbol),
+      selectionInsufficientReason: "INSUFFICIENT_SLOW_FAST_ALIGNED_LEGS",
+    };
+    run.signalStore.recordDynamicMom36Formation(noEntry);
+
+    const status = run.executor.getStatus();
+    expect(status.dynamicMom36Status?.latestFormation).toMatchObject({
+      formationTimestamp: new Date(T0 + 60_000).toISOString(),
+      noEntryReason: "INSUFFICIENT_SLOW_FAST_ALIGNED_LEGS",
+      selectionInsufficientReason: "INSUFFICIENT_SLOW_FAST_ALIGNED_LEGS",
+    });
+  }, DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4));
 
   it("uses actual six-leg P&L for v3 MFE protection and labels the 36h cap distinctly", async () => withDynamicEnv(async () => {
     const run = runner(5, { strategyVersion: DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 });

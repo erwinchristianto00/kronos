@@ -39,8 +39,8 @@ import {
   DYNAMIC_MOM36_MFE_TRAILING_FRACTION,
   DYNAMIC_MOM36_SHOCK_36H_V1,
   DYNAMIC_MOM36_SHOCK_VARIANT,
+  isDynamicMom36ContinuationVersion,
   isDynamicMom36ShockVersion,
-  isDynamicMom36V3Version,
 } from "./dynamic-mom36-shock-strategy.js";
 import type { CrossSectionalFormationMode } from "./cross-sectional-runtime-mode.js";
 import { isCrossSectionalSymbolReliabilityEnabled } from "./cross-sectional-symbol-reliability.js";
@@ -1739,7 +1739,8 @@ export function voidClosedCrossSectionalBasketForReporting(
 
 export interface CrossSectionalExecutorOptions {
   client: CrossSectionalExecClient;
-  signalStore: Pick<CrossSectionalStore, "all">;
+  /** Test doubles may omit no-entry formation telemetry; the durable production store supplies it. */
+  signalStore: Pick<CrossSectionalStore, "all"> & Partial<Pick<CrossSectionalStore, "latestDynamicMom36Formation">>;
   store: CrossSectionalExecutorStore;
   /** Master permission gate. Testnet: () => true. Mainnet: () => engine.isArmed(). */
   isAllowed: () => boolean;
@@ -1910,7 +1911,7 @@ export interface CrossSectionalExecutorOptions {
 
 export class CrossSectionalExecutor {
   private readonly client: CrossSectionalExecClient;
-  private readonly signalStore: Pick<CrossSectionalStore, "all">;
+  private readonly signalStore: Pick<CrossSectionalStore, "all"> & Partial<Pick<CrossSectionalStore, "latestDynamicMom36Formation">>;
   private readonly store: CrossSectionalExecutorStore;
   private readonly isAllowed: () => boolean;
   private readonly fillConfirmRetryDelayMs: number;
@@ -2908,6 +2909,11 @@ export class CrossSectionalExecutor {
     const latestDynamicSignal = this.signalStore.all
       .filter((signal) => this.isDynamicSignal(signal))
       .sort((a, b) => b.openedAtMs - a.openedAtMs)[0] ?? null;
+    const latestPersistedDynamicFormation = this.signalStore.latestDynamicMom36Formation ?? null;
+    const latestFormation = latestPersistedDynamicFormation &&
+      (!latestDynamicSignal || Date.parse(latestPersistedDynamicFormation.formationTimestamp) >= latestDynamicSignal.openedAtMs)
+        ? latestPersistedDynamicFormation
+        : latestDynamicSignal?.dynamicMom36 ?? null;
     const dynamicOpenBasket = openBaskets.find((basket) => this.isDynamicBasket(basket)) ?? null;
     const entryAdmission = this.entryAdmissionForSignal(currentSignal);
     const entryAdmissions = st.entryAdmissions ?? [];
@@ -2974,7 +2980,9 @@ export class CrossSectionalExecutor {
             ordinaryMfeGivebackEnabled: false,
             ordinaryContextInvalidationEnabled: false,
             latestSignalId: latestDynamicSignal?.observationId ?? null,
-            latestFormation: latestDynamicSignal?.dynamicMom36 ?? null,
+            // A SLOW_AND_FAST insufficiency deliberately creates no executable observation, so
+            // choose the most recent durable formation attempt instead of an older signal.
+            latestFormation,
             openBasketId: dynamicOpenBasket?.basketId ?? null,
             horizonExitAtMs: dynamicOpenBasket?.horizonExitAtMs ?? null,
             v3Exit: (() => {
@@ -3438,9 +3446,11 @@ export class CrossSectionalExecutor {
   }
 
   private isDynamicV3Basket(basket: Pick<ExecutorBasket, "strategyVersion" | "policyFingerprint" | "dynamicMom36">): boolean {
-    return isDynamicMom36V3Version(basket.strategyVersion) ||
-      isDynamicMom36V3Version(basket.dynamicMom36?.strategyVersion) ||
-      isDynamicMom36V3Version(basket.policyFingerprint?.strategy?.strategyVersion);
+    // The persisted field name remains `dynamicMom36V3Exit` for backward compatibility. V4 is
+    // intentionally covered by the same frozen -2% / +3%-arm / 30%-giveback / 36h exit contract.
+    return isDynamicMom36ContinuationVersion(basket.strategyVersion) ||
+      isDynamicMom36ContinuationVersion(basket.dynamicMom36?.strategyVersion) ||
+      isDynamicMom36ContinuationVersion(basket.policyFingerprint?.strategy?.strategyVersion);
   }
 
   /**
@@ -5400,8 +5410,8 @@ export class CrossSectionalExecutor {
 
     const policyFingerprint = dynamicPolicyFingerprint ?? buildCurrentCrossSectionalPolicyFingerprint(this.nowIso());
     const dynamicV3Signal = dynamicSignal &&
-      isDynamicMom36V3Version(policyFingerprint.strategy.strategyVersion) &&
-      isDynamicMom36V3Version(signal.dynamicMom36?.strategyVersion);
+      isDynamicMom36ContinuationVersion(policyFingerprint.strategy.strategyVersion) &&
+      isDynamicMom36ContinuationVersion(signal.dynamicMom36?.strategyVersion);
     const basket: ExecutorBasket = {
       basketId,
       sourceObservationId: signal.observationId,
