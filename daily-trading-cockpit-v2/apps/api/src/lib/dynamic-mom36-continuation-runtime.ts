@@ -238,7 +238,11 @@ export function evaluateDynamicMom36Continuation(input: {
   });
   const snapshot = service.evaluate(input.candlesBySymbol, input.btcCandles);
   const trajectory = snapshot.trajectory;
-  if (snapshot.fallbackReason || !validTrajectory(trajectory)) {
+  // V4 deliberately labels an unpromoted allocation as shadow-only even though it has already
+  // produced a complete trajectory.  Dynamic MOM36 never consumes V4's allocation object, so that
+  // one status is valid continuation evidence; every other fallback remains a strict NO_EDGE.
+  const shadowOnlyTrajectory = snapshot.fallbackReason === "allocation_inactive_shadow_only";
+  if ((snapshot.fallbackReason && !shadowOnlyTrajectory) || !validTrajectory(trajectory)) {
     return {
       ...base,
       available: false,
@@ -263,6 +267,8 @@ export function evaluateDynamicMom36Continuation(input: {
       featureAtMs: snapshot.featureAtMs,
       modelVersion: snapshot.modelVersion,
       schemaVersion: snapshot.schemaVersion,
+      serviceFallbackReason: snapshot.fallbackReason,
+      allocationActive: snapshot.allocationActive,
       trajectory,
     }),
   };
