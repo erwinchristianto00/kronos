@@ -3,6 +3,7 @@ import {
   buildCurrentCrossSectionalPolicyFingerprint,
   currentCrossSectionalExitPolicy,
   effectiveCrossSectionalRuntime,
+  legacyCrossSectionalExitPolicy,
 } from "../src/lib/cross-sectional-policy.js";
 
 describe("cross-sectional effective runtime policy", () => {
@@ -102,6 +103,58 @@ describe("cross-sectional effective runtime policy", () => {
       takeProfitEnabled: true,
       takeProfitNetReturn: 0.06,
       executionCapHours: 36,
+    });
+  });
+
+  it("freezes Dynamic MOM36 as $25/leg, 1x, one slot, no ordinary exits, while preserving the legacy contract", () => {
+    const env = {
+      CROSS_SECTIONAL_STRATEGY_VERSION: "dynamic-mom36-shock-36h-v1",
+      CROSS_SECTIONAL_POLICY_VERSION: "dynamic-mom36-shock-36h-v1",
+      CROSS_SECTIONAL_INTERVAL: "1h",
+      CROSS_SECTIONAL_HORIZON_BARS: "48",
+      CROSS_SECTIONAL_MOMENTUM_BARS: "36",
+      CROSS_SECTIONAL_EXEC_TP_DISABLED: "0",
+      CROSS_SECTIONAL_EXEC_TP_NET_RETURN: "0.06",
+      CROSS_SECTIONAL_EXEC_STOP_NET_RETURN: "0.03",
+      CROSS_SECTIONAL_EXEC_LEG_USD: "999",
+      CROSS_SECTIONAL_EXEC_LEVERAGE: "99",
+      CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS: "99",
+      CROSS_SECTIONAL_LEGACY_EXEC_LEG_USD: "25",
+      CROSS_SECTIONAL_LEGACY_EXEC_LEVERAGE: "3",
+      CROSS_SECTIONAL_LEGACY_EXEC_MAX_OPEN_BASKETS: "1",
+      CROSS_SECTIONAL_LEGACY_EXEC_TP_DISABLED: "0",
+      CROSS_SECTIONAL_LEGACY_EXEC_TP_NET_RETURN: "0.06",
+      CROSS_SECTIONAL_LEGACY_EXEC_STOP_NET_RETURN: "0",
+      CROSS_SECTIONAL_LEGACY_EXEC_MAX_HOLD_HOURS: "36",
+    } as NodeJS.ProcessEnv;
+    const dynamic = currentCrossSectionalExitPolicy(env);
+    const legacy = legacyCrossSectionalExitPolicy(env);
+    const fingerprint = buildCurrentCrossSectionalPolicyFingerprint("2026-08-25T00:00:00.000Z", env);
+
+    expect(dynamic).toMatchObject({
+      measurementHorizonBars: 36,
+      measurementInterval: "1h",
+      executionCapHours: 36,
+      takeProfitEnabled: false,
+      stopLossEnabled: false,
+      adaptiveExitsEnabled: false,
+      legNotionalUsd: 25,
+      leverage: 1,
+      maxOpenBaskets: 1,
+      ordinaryContextInvalidationEnabled: false,
+    });
+    expect(legacy).toMatchObject({ takeProfitEnabled: true, leverage: 3, legNotionalUsd: 25, maxOpenBaskets: 1 });
+    expect(fingerprint).toMatchObject({
+      strategy: { strategyVersion: "dynamic-mom36-shock-36h-v1", signal: "DYNAMIC_MOM36_SHOCK_36H" },
+      formation: { weighting: "EQUAL_NOTIONAL", formationMode: "PLAIN_MOM36", smartFormationRerank: false },
+      execution: dynamic,
+    });
+    expect(effectiveCrossSectionalRuntime(true, {
+      ...env,
+      CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED: "1",
+    })).toMatchObject({
+      adaptiveExitMode: "OFF",
+      adaptiveExits: { configured: false, effective: false },
     });
   });
 });

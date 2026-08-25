@@ -32,6 +32,11 @@ import {
   type CrossSectionalExitPolicySnapshot,
   type CrossSectionalPolicyFingerprint,
 } from "./cross-sectional-policy.js";
+import {
+  DYNAMIC_MOM36_SHOCK_36H_V1,
+  DYNAMIC_MOM36_SHOCK_VARIANT,
+  isDynamicMom36ShockVersion,
+} from "./dynamic-mom36-shock-strategy.js";
 import type { CrossSectionalFormationMode } from "./cross-sectional-runtime-mode.js";
 import { isCrossSectionalSymbolReliabilityEnabled } from "./cross-sectional-symbol-reliability.js";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -975,8 +980,14 @@ export interface ExecutorBasket {
   sourceObservationId: string;
   signal: string;
   variant: string;
+  /** Explicit version dispatch. Legacy rows may omit this and use their frozen fingerprint. */
+  strategyVersion?: string | null;
   openedAt: string;
   closesAtMs: number;
+  /** Dynamic MOM36 starts its 36h clock only after all six actual fills complete. */
+  horizonExitAtMs?: number | null;
+  /** Immutable source snapshot for post-entry Dynamic MOM36 audit; never recomputed on restart. */
+  dynamicMom36?: CrossSectionalObservation["dynamicMom36"] | null;
   /** Full policy contract frozen before any entry order is sent. Undefined means legacy. */
   policyFingerprint?: CrossSectionalPolicyFingerprint | null;
   /** Optional observation-owned basket geometry, enabled only for dedicated innovation executors. */
@@ -1064,6 +1075,13 @@ export interface ExecutorBasket {
    *  bakal nyampe atau engga, ada yang macet atau engga" (2026-07-07 operator ask). */
   lastNetReturn?: number | null;
   lastNetAt?: string | null;
+  /** Informational Dynamic MOM36 mark path. These fields never trigger a normal exit. */
+  lastGrossPnlUsd?: number | null;
+  lastLongPnlUsd?: number | null;
+  lastShortPnlUsd?: number | null;
+  lastGrossCapitalUsd?: number | null;
+  mfeNetReturn?: number | null;
+  maeNetReturn?: number | null;
   /** Present only for FILTERED baskets born from the testnet Smart Basket v1 formation policy.
    * Legacy/open baskets deliberately do not receive this field, so their lifecycle stays exactly
    * as it was when they were admitted. */
@@ -1655,6 +1673,9 @@ export interface CrossSectionalExecutorOptions {
    *  the other two's getOpenUnexitedLegs().
    */
   siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>;
+  /** Other cross-basket executor stores sharing this account. Dynamic MOM36 uses this to enforce
+   * one globally open basket, not merely one in its own persisted store. */
+  siblingOpenBasketCount?: () => number;
   /** 2026-07-12 fix: dailyRealizedUsd() only ever summed THIS instance's own CLOSED baskets, but
    *  XSEC_DAILY_MAX_LOSS_USD is ONE shared env ceiling checked independently per instance in
    *  maybeOpenBasket — so the REAL combined daily loss across all 3 sibling instances could reach
@@ -1795,6 +1816,7 @@ export class CrossSectionalExecutor {
   private readonly entryHealthGate: () => { allowed: boolean; reason: string | null };
   private readonly entryTrafficLightEnabledFn: () => boolean;
   private readonly siblingOpenLegs: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>;
+  private readonly siblingOpenBasketCount: () => number;
   private readonly siblingDailyRealizedUsd: (nowIso: string) => number;
   private readonly sharedGetPositions: () => ReturnType<CrossSectionalExecClient["getPositions"]>;
   private readonly existingNotionalForSymbolFn: (symbol: string) => number;
@@ -1860,6 +1882,7 @@ export class CrossSectionalExecutor {
       this.laneId === CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID && isCrossSectionalEntryTrafficLightEnabled()
     ));
     this.siblingOpenLegs = opts.siblingOpenLegs ?? (() => []);
+    this.siblingOpenBasketCount = opts.siblingOpenBasketCount ?? (() => 0);
     this.siblingDailyRealizedUsd = opts.siblingDailyRealizedUsd ?? (() => 0);
     this.sharedGetPositions = opts.sharedGetPositions ?? (() => this.client.getPositions());
     this.rawLaneWeightPctFn = opts.rawLaneWeightPct ?? null;
@@ -2231,7 +2254,7 @@ export class CrossSectionalExecutor {
    * has recoverIncompleteBaskets revisit it — and because the client order id is unchanged, a retry
    * that re-places is idempotent at the exchange rather than a second position.
    */
-  private async preplaceMakerLegs(plan: PlannedLeg[], quoteObserveStartMs: number): Promise<void> {
+  private async preplaceMakerLegs(plan: PlannedLeg[], quoteObserveStartMs: number, leverage: number): Promise<void> {
     const pending = plan.filter((p) => p.status === "PENDING" && !p.makerRestingOrderId);
     if (pending.length === 0) return;
 
@@ -2247,7 +2270,7 @@ export class CrossSectionalExecutor {
     // not fire at all, and said so only as "no usable submit-time quote" on each leg.
     await Promise.allSettled(pending.map(async (planned) => {
       try {
-        try { await this.client.setLeverage(planned.symbol, this.leverageFn()); } catch { /* already set */ }
+        try { await this.client.setLeverage(planned.symbol, leverage); } catch { /* already set */ }
         const submitRef = stampSubmitRef(
           buildSubmitRefBase(
             this.readPublicQuoteFn ? this.readPublicQuoteFn(planned.symbol) : null,
@@ -2537,6 +2560,7 @@ export class CrossSectionalExecutor {
   getStatus(): {
     enabled: boolean;
     allowed: boolean;
+    strategyVersion: string;
     laneId: string;
     legUsd: number;
     baseLegUsd: number;
@@ -2558,6 +2582,18 @@ export class CrossSectionalExecutor {
     legacyExitPolicy: CrossSectionalExitPolicySnapshot;
     effectiveRuntime: CrossSectionalEffectiveRuntime;
     currentPolicyFingerprint: CrossSectionalPolicyFingerprint;
+    /** Compact operator-facing state for the versioned Dynamic MOM36 contract. */
+    dynamicMom36Status: {
+      mode: "ARMED" | "BLOCKED";
+      hardBasketStop: "NONE";
+      ordinaryTakeProfitEnabled: false;
+      ordinaryMfeGivebackEnabled: false;
+      ordinaryContextInvalidationEnabled: false;
+      latestSignalId: string | null;
+      latestFormation: CrossSectionalObservation["dynamicMom36"] | null;
+      openBasketId: string | null;
+      horizonExitAtMs: number | null;
+    } | null;
     currentPolicyForwardCohort: CurrentPolicyForwardCohort;
     accountingCounts: { cleanN: number; quarantinedN: number; rejectedN: number };
     /** Realized basket P&L for the current UTC day + the safety-breaker limit (0 = disabled). */
@@ -2642,6 +2678,9 @@ export class CrossSectionalExecutor {
     ));
     const currentExecutionPolicy = currentCrossSectionalExitPolicy();
     const legacyExitPolicy = legacyCrossSectionalExitPolicy();
+    const configuredLegUsd = currentExecutionPolicy.legNotionalUsd ?? this.effectiveLegUsd();
+    const configuredLeverage = currentExecutionPolicy.leverage ?? this.leverageFn();
+    const configuredMaxOpenBaskets = currentExecutionPolicy.maxOpenBaskets ?? this.maxOpenBasketsFn();
     const closed = st.baskets.filter((b) =>
       b.status === "CLOSED" &&
       b.accountingStatus !== "ACCOUNTING_INCOMPLETE" &&
@@ -2659,6 +2698,10 @@ export class CrossSectionalExecutor {
     const signalAgeMs = matching[0] ? nowMs - matching[0].openedAtMs : null;
     const signalMaxAgeMs = this.maxSignalAgeMsFn();
     const currentSignal = matching.find((signal) => signal.status === "OPEN") ?? null;
+    const latestDynamicSignal = this.signalStore.all
+      .filter((signal) => this.isDynamicSignal(signal))
+      .sort((a, b) => b.openedAtMs - a.openedAtMs)[0] ?? null;
+    const dynamicOpenBasket = openBaskets.find((basket) => this.isDynamicBasket(basket)) ?? null;
     const entryAdmission = this.entryAdmissionForSignal(currentSignal);
     const entryAdmissions = st.entryAdmissions ?? [];
     const entryAttempts = st.entryAttempts ?? [];
@@ -2699,10 +2742,11 @@ export class CrossSectionalExecutor {
         unattributedConsumedSignal,
       },
       laneId: this.laneId,
-      legUsd: this.effectiveLegUsd(),
-      baseLegUsd: this.legUsdFn(),
+      strategyVersion: currentPolicyFingerprint.strategy.strategyVersion,
+      legUsd: configuredLegUsd,
+      baseLegUsd: currentExecutionPolicy.legNotionalUsd ?? this.legUsdFn(),
       allocationWeightPct: this.allocationWeightPct(),
-      leverage: this.leverageFn(),
+      leverage: configuredLeverage,
       variant: targetVariant,
       tpNetReturnPct: currentExecutionPolicy.takeProfitEnabled && currentExecutionPolicy.takeProfitNetReturn !== null
         ? currentExecutionPolicy.takeProfitNetReturn * 100
@@ -2715,6 +2759,19 @@ export class CrossSectionalExecutor {
       legacyExitPolicy,
       effectiveRuntime,
       currentPolicyFingerprint,
+      dynamicMom36Status: currentPolicyFingerprint.strategy.strategyVersion === DYNAMIC_MOM36_SHOCK_36H_V1
+        ? {
+            mode: this.enabledFn() && this.isAllowed() ? "ARMED" : "BLOCKED",
+            hardBasketStop: "NONE",
+            ordinaryTakeProfitEnabled: false,
+            ordinaryMfeGivebackEnabled: false,
+            ordinaryContextInvalidationEnabled: false,
+            latestSignalId: latestDynamicSignal?.observationId ?? null,
+            latestFormation: latestDynamicSignal?.dynamicMom36 ?? null,
+            openBasketId: dynamicOpenBasket?.basketId ?? null,
+            horizonExitAtMs: dynamicOpenBasket?.horizonExitAtMs ?? null,
+          }
+        : null,
       currentPolicyForwardCohort: currentPolicyForward,
       accountingCounts: {
         cleanN: cleanClosed.length,
@@ -2723,7 +2780,7 @@ export class CrossSectionalExecutor {
       },
       dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),
       dailyMaxLossUsd: this.dailyMaxLossUsdFn(),
-      maxOpenBaskets: this.maxOpenBasketsFn(),
+      maxOpenBaskets: configuredMaxOpenBaskets,
       openHalted: this.openHalted,
       openBasket: openBaskets[0] ?? null,
       openBaskets,
@@ -2886,11 +2943,21 @@ export class CrossSectionalExecutor {
    * fail-open on unavailable marks because a missing observation is not evidence the ranking died.
    */
   private async revalidateSmartEntry(signal: CrossSectionalObservation): Promise<SmartEntryRevalidation> {
-    if (!this.isSmartBasketSignal(signal)) return { allowed: true, reason: null, at: null, referencePrices: {} };
+    const dynamic = this.isDynamicSignal(signal);
+    const smart = this.isSmartBasketSignal(signal);
+    if (!smart && !dynamic) return { allowed: true, reason: null, at: null, referencePrices: {} };
     let positions: Awaited<ReturnType<CrossSectionalExecClient["getPositions"]>>;
     try {
       positions = await this.sharedGetPositions();
-    } catch {
+    } catch (error) {
+      if (dynamic) {
+        return {
+          allowed: false,
+          reason: `dynamic entry reconciliation unavailable: ${error instanceof Error ? error.message : String(error)}`,
+          at: this.nowIso(),
+          referencePrices: {},
+        };
+      }
       return { allowed: true, reason: null, at: null, referencePrices: {} };
     }
     const marks = new Map(
@@ -2908,6 +2975,14 @@ export class CrossSectionalExecutor {
           mark = await this.liveMultiplierReferencePrice(leg.symbol, mark);
         }
         if (!(typeof mark === "number" && Number.isFinite(mark) && mark > 0)) {
+          if (dynamic) {
+            return {
+              allowed: false,
+              reason: `dynamic entry reconciliation missing a fresh USD-M mark for ${leg.symbol}`,
+              at: this.nowIso(),
+              referencePrices,
+            };
+          }
           if (isCrossSectionalMultiplierContract(leg.symbol)) {
             return {
               allowed: false,
@@ -2920,6 +2995,9 @@ export class CrossSectionalExecutor {
         }
         const liveMark = mark;
         referencePrices[leg.symbol] = liveMark;
+        // Dynamic MOM36 requires the account/mark reconciliation, but deliberately has no
+        // ordinary adverse-drift/context invalidation rule after that check succeeds.
+        if (dynamic) continue;
         // `leg.entryPrice` is intentionally a bare-spot price for this contract family.  Do not
         // compare that number to a futures mark as an adverse drift (it is ~1000x by definition);
         // the futures mark above is the only safe sizing reference and carries no selection change.
@@ -3110,9 +3188,60 @@ export class CrossSectionalExecutor {
     return netReturn <= 0 ? "SMART_CONTEXT_INVALIDATION" : null;
   }
 
+  private isDynamicSignal(signal: Pick<CrossSectionalObservation, "variant" | "dynamicMom36">): boolean {
+    return signal.variant === DYNAMIC_MOM36_SHOCK_VARIANT ||
+      signal.dynamicMom36?.strategyVersion === DYNAMIC_MOM36_SHOCK_36H_V1;
+  }
+
+  private isDynamicBasket(basket: Pick<ExecutorBasket, "variant" | "strategyVersion" | "policyFingerprint" | "dynamicMom36">): boolean {
+    return basket.variant === DYNAMIC_MOM36_SHOCK_VARIANT ||
+      basket.strategyVersion === DYNAMIC_MOM36_SHOCK_36H_V1 ||
+      basket.dynamicMom36?.strategyVersion === DYNAMIC_MOM36_SHOCK_36H_V1 ||
+      isDynamicMom36ShockVersion(basket.policyFingerprint?.strategy?.strategyVersion);
+  }
+
   /** New baskets freeze this at admission; legacy rows read the pre-cutover compatibility contract. */
   private basketExecutionPolicy(basket: ExecutorBasket): CrossSectionalExitPolicySnapshot {
-    return basket.policyFingerprint?.execution ?? legacyCrossSectionalExitPolicy();
+    const legacy = legacyCrossSectionalExitPolicy();
+    const stored = basket.policyFingerprint?.execution;
+    if (!stored) return legacy;
+    // Older fingerprints predate frozen sizing/slot/context fields.  A Dynamic process default of
+    // 1x must never be allowed to reinterpret such an already-open basket as 1x merely because
+    // its historic fingerprint has no `leverage` key.  Fill only absent fields from the explicit
+    // pre-cutover contract; values that a prior basket really froze always win.
+    return {
+      ...legacy,
+      ...stored,
+      legNotionalUsd: stored.legNotionalUsd ?? legacy.legNotionalUsd ?? null,
+      leverage: stored.leverage ?? legacy.leverage ?? null,
+      maxOpenBaskets: stored.maxOpenBaskets ?? legacy.maxOpenBaskets ?? null,
+      ordinaryContextInvalidationEnabled:
+        stored.ordinaryContextInvalidationEnabled ?? legacy.ordinaryContextInvalidationEnabled ?? true,
+    };
+  }
+
+  private basketLeverage(basket: ExecutorBasket): number {
+    const frozen = this.basketExecutionPolicy(basket).leverage;
+    return typeof frozen === "number" && Number.isFinite(frozen) && frozen >= 1
+      ? Math.max(1, Math.floor(frozen))
+      : this.leverageFn();
+  }
+
+  /**
+   * The 36-hour Dynamic MOM36 horizon begins when the final real entry fill is committed, never
+   * at scan time. It is stored before the completion state is persisted so a restart cannot
+   * recompute breadth, alter the allocation, or reset the clock.
+   */
+  private freezeDynamicHorizonOnCompletion(basket: ExecutorBasket): void {
+    if (!this.isDynamicBasket(basket) || basket.status !== "COMPLETE") return;
+    if (typeof basket.horizonExitAtMs === "number" && Number.isFinite(basket.horizonExitAtMs) && basket.horizonExitAtMs > 0) return;
+    const capHours = this.basketExecutionPolicy(basket).executionCapHours ?? 36;
+    const completedAtMs = Date.parse(this.nowIso());
+    if (!(Number.isFinite(completedAtMs) && capHours > 0)) return;
+    basket.horizonExitAtMs = completedAtMs + capHours * 3_600_000;
+    // Keep the legacy field coherent for existing status/UI readers, while closeDueBaskets uses
+    // horizonExitAtMs as the authoritative dynamic value.
+    basket.closesAtMs = basket.horizonExitAtMs;
   }
 
   private shouldUseMakerExit(basket: ExecutorBasket, reason: string): boolean {
@@ -3331,6 +3460,7 @@ export class CrossSectionalExecutor {
         this.bindFourBrainActualFill(basket, basket.legs[basket.legs.length - 1]!);
         ambiguous.status = "FILLED";
         basket.status = basket.legs.length === plan.length ? "COMPLETE" : "PARTIALLY_FILLED";
+        this.freezeDynamicHorizonOnCompletion(basket);
       }
       // else INCONCLUSIVE — never guess, leave `ambiguous` (idx) completely untouched; sweepFrom
       // already excludes it from the generic release pass below.
@@ -3340,6 +3470,46 @@ export class CrossSectionalExecutor {
     // (the common 2-leg-basket case: the ambiguous entry above was the last one, nothing left).
     await this.markRemainingNeverAttempted(basket, sweepFrom, "BASKET_CLOSED_BEFORE_RECOVERY:NEVER_ATTEMPTED");
     this.store.save();
+  }
+
+  /**
+   * Actual-leg mark-to-market for Dynamic MOM36.  Unlike the legacy neutral formula, this uses
+   * the realized entry notional of every leg, so 6L0S, 5L1S, and their bearish mirrors never get
+   * silently divided into fictional 50/50 sides.  The output is telemetry only; dynamic baskets
+   * still exit only through their 36h horizon or an existing exceptional safety/manual path.
+   */
+  private dynamicMarkedBasketPnl(
+    basket: ExecutorBasket,
+    markBySymbol: ReadonlyMap<string, number>,
+  ): { grossPnlUsd: number; netPnlUsd: number; grossCapitalUsd: number; netReturn: number; longPnlUsd: number; shortPnlUsd: number } | null {
+    let grossPnlUsd = 0;
+    let longPnlUsd = 0;
+    let shortPnlUsd = 0;
+    let grossCapitalUsd = 0;
+    for (const leg of basket.legs) {
+      if (leg.exitOrderId !== null || !(leg.qty > 0 && leg.entryPrice > 0)) continue;
+      const mark = markBySymbol.get(leg.symbol);
+      if (!(typeof mark === "number" && Number.isFinite(mark) && mark > 0)) return null;
+      const capital = leg.entryPrice * leg.qty;
+      const pnl = leg.side === "LONG"
+        ? (mark - leg.entryPrice) * leg.qty
+        : (leg.entryPrice - mark) * leg.qty;
+      grossCapitalUsd += capital;
+      grossPnlUsd += pnl;
+      if (leg.side === "LONG") longPnlUsd += pnl;
+      else shortPnlUsd += pnl;
+    }
+    if (!(grossCapitalUsd > 0)) return null;
+    const modeledRoundTripCostUsd = grossCapitalUsd * (CROSS_SECTIONAL_ROUNDTRIP_BPS / 10_000);
+    const netPnlUsd = grossPnlUsd - modeledRoundTripCostUsd;
+    return {
+      grossPnlUsd,
+      netPnlUsd,
+      grossCapitalUsd,
+      netReturn: netPnlUsd / grossCapitalUsd,
+      longPnlUsd,
+      shortPnlUsd,
+    };
   }
 
   /**
@@ -3394,6 +3564,28 @@ export class CrossSectionalExecutor {
       }
     }
     for (const basket of openBaskets) {
+      if (this.isDynamicBasket(basket)) {
+        const marked = this.dynamicMarkedBasketPnl(basket, markBySymbol);
+        if (!marked) continue; // core live mark data is incomplete: no strategy exit decision
+        basket.lastGrossPnlUsd = marked.grossPnlUsd;
+        basket.lastLongPnlUsd = marked.longPnlUsd;
+        basket.lastShortPnlUsd = marked.shortPnlUsd;
+        basket.lastGrossCapitalUsd = marked.grossCapitalUsd;
+        basket.lastNetReturn = marked.netReturn;
+        basket.lastNetAt = pathNow;
+        basket.mfeNetReturn = Math.max(
+          Number.isFinite(basket.mfeNetReturn) ? basket.mfeNetReturn! : Number.NEGATIVE_INFINITY,
+          marked.netReturn,
+        );
+        basket.maeNetReturn = Math.min(
+          Number.isFinite(basket.maeNetReturn) ? basket.maeNetReturn! : Number.POSITIVE_INFINITY,
+          marked.netReturn,
+        );
+        stamped = true;
+        // Explicit strategy isolation: no ordinary TP, MFE giveback, context invalidation, or
+        // numerical stop is reachable for Dynamic MOM36 here.
+        continue;
+      }
       const longLegs = basket.legs.filter((l) => l.side === "LONG");
       const shortLegs = basket.legs.filter((l) => l.side === "SHORT");
       // Bug fix: a basket with real legs on only ONE side (e.g. a legacy pre-migration record — see
@@ -3531,13 +3723,21 @@ export class CrossSectionalExecutor {
   }
 
   private async ensureOpenBasketLeverage(): Promise<void> {
-    const leverage = this.leverageFn();
-    const symbols = new Set<string>();
+    // Leverage is frozen with the basket. A Dynamic 1x deployment must never rewrite an older
+    // still-open 3x basket merely because the process-level default has changed.
+    const symbols = new Map<string, number>();
     for (const basket of this.store.getState().baskets) {
       if (!this.isBasketLive(basket)) continue;
-      for (const leg of basket.legs) symbols.add(leg.symbol);
+      const leverage = this.basketLeverage(basket);
+      for (const leg of basket.legs) {
+        const prior = symbols.get(leg.symbol);
+        // A same-symbol different-leverage collision should be impossible while MAX_OPEN=1. If a
+        // legacy state already contains one, retain the more conservative (lower) setting instead
+        // of silently increasing leverage for either position.
+        symbols.set(leg.symbol, prior === undefined ? leverage : Math.min(prior, leverage));
+      }
     }
-    for (const symbol of symbols) {
+    for (const [symbol, leverage] of symbols) {
       try {
         await this.client.setLeverage(symbol, leverage);
       } catch {
@@ -3557,14 +3757,25 @@ export class CrossSectionalExecutor {
       // finish or abort it; if it's genuinely stuck (e.g. persistently INCONCLUSIVE reconciliation),
       // it now stays visibly incomplete past its horizon instead of being silently mis-closed.
       if (basket.status !== "COMPLETE") continue;
-      // The cap is frozen per admission.  A policy deployment must never retrospectively shorten
-      // (or lengthen) a basket that was already on the exchange.
-      const holdCapHours = this.basketExecutionPolicy(basket).executionCapHours;
-      const holdCapMs = holdCapHours !== null ? holdCapHours * 3_600_000 : 0;
-      const openedMs = Date.parse(basket.openedAt);
-      const cappedDue = holdCapMs > 0 && Number.isFinite(openedMs)
-        ? Math.min(basket.closesAtMs, openedMs + holdCapMs)
-        : basket.closesAtMs;
+      // Dynamic MOM36's horizon is frozen from successful ENTRY COMPLETION. Legacy baskets retain
+      // their historic opened-at / source-signal semantics exactly as before.
+      let cappedDue: number;
+      if (this.isDynamicBasket(basket)) {
+        if (!(typeof basket.horizonExitAtMs === "number" && Number.isFinite(basket.horizonExitAtMs) && basket.horizonExitAtMs > 0)) {
+          this.lastError = `dynamic basket ${basket.basketId} is COMPLETE without horizonExitAtMs; refusing an ambiguous early horizon close`;
+          continue;
+        }
+        cappedDue = basket.horizonExitAtMs;
+      } else {
+        // The cap is frozen per admission. A policy deployment must never retrospectively shorten
+        // (or lengthen) a basket that was already on the exchange.
+        const holdCapHours = this.basketExecutionPolicy(basket).executionCapHours;
+        const holdCapMs = holdCapHours !== null ? holdCapHours * 3_600_000 : 0;
+        const openedMs = Date.parse(basket.openedAt);
+        cappedDue = holdCapMs > 0 && Number.isFinite(openedMs)
+          ? Math.min(basket.closesAtMs, openedMs + holdCapMs)
+          : basket.closesAtMs;
+      }
       if (nowMs < cappedDue) continue;
       // 2026-07-19 real-money audit fix (BUG 2): same per-basket isolation as
       // closeBasketsHittingProfitTarget above — one basket's HORIZON close failing must not block
@@ -4375,7 +4586,9 @@ export class CrossSectionalExecutor {
     // e.g. awaiting restart-recovery reconciliation) still occupies a real slot — it must keep
     // counting against the cap exactly as a fully-open basket already did before this enum grew
     // granularity, or a stuck basket would silently let MORE concurrent baskets open than intended.
-    if (st.baskets.filter((b) => this.isBasketLive(b)).length >= this.maxOpenBasketsFn()) return;
+    const ownOpenBasketCount = st.baskets.filter((b) => this.isBasketLive(b)).length;
+    const globallyOpenBasketCount = ownOpenBasketCount + Math.max(0, this.siblingOpenBasketCount());
+    if (globallyOpenBasketCount >= this.maxOpenBasketsFn()) return;
 
     const nowMs = new Date(this.nowIso()).getTime();
     // Newest FRESH, still-OPEN signal of the target variant we haven't executed yet.
@@ -4393,6 +4606,12 @@ export class CrossSectionalExecutor {
       .sort((a: CrossSectionalObservation, b: CrossSectionalObservation) => b.openedAtMs - a.openedAtMs);
     const signal = candidates[0];
     if (!signal) return;
+    const dynamicSignal = this.isDynamicSignal(signal);
+    const dynamicPolicyFingerprint = dynamicSignal ? buildCurrentCrossSectionalPolicyFingerprint(this.nowIso()) : null;
+    if (dynamicSignal && !isDynamicMom36ShockVersion(dynamicPolicyFingerprint?.strategy.strategyVersion)) {
+      this.skipSignal(signal, "ENTRY_ADMISSION", "Dynamic MOM36 signal received while the runtime policy version is not dynamic-mom36-shock-36h-v1");
+      return;
+    }
 
     // Reliability belongs to formation, not a late per-leg mutation.  Once V1 is active, an
     // unannotated FILTERED signal necessarily predates the deployment and must not slip through
@@ -4412,7 +4631,12 @@ export class CrossSectionalExecutor {
       return;
     }
 
-    const entryAdmission = this.entryAdmissionForSignal(signal);
+    const evaluatedEntryAdmission = this.entryAdmissionForSignal(signal);
+    // The Dynamic policy never changes $25 leg size based on confidence/learning tier. The gate
+    // may still deny a new basket, but an allowed Dynamic basket is always six equal $25 legs.
+    const entryAdmission: CrossSectionalEntryAdmission = dynamicSignal && evaluatedEntryAdmission.allowed
+      ? { ...evaluatedEntryAdmission, sizeMultiplier: 1, learning: false }
+      : evaluatedEntryAdmission;
     if (!entryAdmission.allowed) {
       this.recordEntryAdmission(signal, entryAdmission, "BLOCKED");
       this.recordEntryAttempt(signal, {
@@ -4589,7 +4813,7 @@ export class CrossSectionalExecutor {
     // YELLOW is a real but bounded testnet learning order, not a fake paper result. The same
     // multiplier reaches every leg so the basket remains market-neutral; exchange minimums can
     // still lift a leg to a valid quantity, and the existing per-symbol caps remain authoritative.
-    const equalLegUsd = this.effectiveLegUsd() * entryAdmission.sizeMultiplier;
+    const equalLegUsd = dynamicSignal ? 25 : this.effectiveLegUsd() * entryAdmission.sizeMultiplier;
     if (!(equalLegUsd > 0)) {
       this.skipSignal(signal, "SIZING", "effective per-leg USD is not positive", smartEntry.referencePrices);
       return;
@@ -4749,7 +4973,7 @@ export class CrossSectionalExecutor {
     // placed. Skip-only: it never resizes, never cancels, never opens anything. Disabled by default
     // (threshold 0) so enabling it is an explicit operator act.
     const plannedImbalanceMax = crossSectionalMaxPlanImbalance();
-    if (crossSectionalPlanImbalanceExceeded(plannedLegs, plannedImbalanceMax)) {
+    if (!dynamicSignal && crossSectionalPlanImbalanceExceeded(plannedLegs, plannedImbalanceMax)) {
       const pct = (100 * crossSectionalPlanNotionalImbalance(plannedLegs)).toFixed(2);
       releasePlannedSoFar("PLAN_NOTIONAL_IMBALANCE");
       this.skipSignal(
@@ -4771,14 +4995,18 @@ export class CrossSectionalExecutor {
       return;
     }
 
+    const policyFingerprint = dynamicPolicyFingerprint ?? buildCurrentCrossSectionalPolicyFingerprint(this.nowIso());
     const basket: ExecutorBasket = {
       basketId,
       sourceObservationId: signal.observationId,
       signal: signal.signal,
       variant: signal.variant ?? "RAW",
+      strategyVersion: policyFingerprint.strategy.strategyVersion,
       openedAt: this.nowIso(),
       closesAtMs: signal.openedAtMs + signal.horizonMs,
-      policyFingerprint: buildCurrentCrossSectionalPolicyFingerprint(this.nowIso()),
+      horizonExitAtMs: dynamicSignal ? null : undefined,
+      dynamicMom36: dynamicSignal ? signal.dynamicMom36 ?? null : undefined,
+      policyFingerprint,
       takeProfitReturn: this.respectSignalRiskGeometry ? signal.takeProfitReturn ?? null : undefined,
       stopLossReturn: this.respectSignalRiskGeometry ? signal.stopLossReturn ?? null : undefined,
       riskDistanceAtOpen: Number.isFinite(signal.riskDistanceAtOpen) && signal.riskDistanceAtOpen! > 0
@@ -5050,7 +5278,7 @@ export class CrossSectionalExecutor {
     // what forced the timeout to stay too short to be useful. Books nothing; the loop below still
     // owns every fill, reservation, fallback and recovery decision exactly as before.
     if (isCrossSectionalMakerEntryEnabled()) {
-      await this.preplaceMakerLegs(plan.slice(startIndex), quoteObserveStartMs);
+      await this.preplaceMakerLegs(plan.slice(startIndex), quoteObserveStartMs, this.basketLeverage(basket));
     }
     for (let i = startIndex; i < plan.length; i++) {
       const planned = plan[i]!;
@@ -5102,7 +5330,7 @@ export class CrossSectionalExecutor {
       this.store.save();
       try {
         try {
-          await this.client.setLeverage(planned.symbol, this.leverageFn());
+          await this.client.setLeverage(planned.symbol, this.basketLeverage(basket));
         } catch {
           // best-effort (already set / position exists)
         }
@@ -5177,6 +5405,7 @@ export class CrossSectionalExecutor {
         this.bindFourBrainActualFill(basket, basket.legs[basket.legs.length - 1]!);
         planned.status = "FILLED";
         basket.status = basket.legs.length === plan.length ? "COMPLETE" : "PARTIALLY_FILLED";
+        this.freezeDynamicHorizonOnCompletion(basket);
         this.store.save(); // persist per leg so a crash mid-open still records this filled leg
       } catch (error) {
         const message = (error as Error).message ?? "placeOrder failed";
@@ -5228,6 +5457,7 @@ export class CrossSectionalExecutor {
             this.bindFourBrainActualFill(basket, basket.legs[basket.legs.length - 1]!);
             planned.status = "FILLED";
             basket.status = basket.legs.length === plan.length ? "COMPLETE" : "PARTIALLY_FILLED";
+            this.freezeDynamicHorizonOnCompletion(basket);
             this.store.save();
             continue; // proceed to the next leg this SAME tick, exactly as a normal fill would
           }
@@ -5390,6 +5620,7 @@ export class CrossSectionalExecutor {
             this.bindFourBrainActualFill(basket, basket.legs[basket.legs.length - 1]!);
             ambiguous.status = "FILLED";
             basket.status = basket.legs.length === plan.length ? "COMPLETE" : "PARTIALLY_FILLED";
+            this.freezeDynamicHorizonOnCompletion(basket);
             this.store.save();
           }
           // NOT_PLACED: nothing to adopt — falls through to placeRemainingLegsLocked below, which

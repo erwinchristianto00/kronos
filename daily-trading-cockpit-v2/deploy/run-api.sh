@@ -14,8 +14,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 #
 # Scoped by path to the two policy-governed release roots, so other instances (3101 research, ad-hoc
 # trees) are unaffected and cannot be blocked by a policy that was never written for them. The path
-# also names the instance, so the check picks up instances.<id>.extra — the places testnet
-# deliberately differs from live (capital protection only, never strategy).
+# also names the instance, so an explicitly documented non-strategy instance override can be
+# checked without weakening the shared strategy contract.
 instance=""
 case "$here" in
   /root/kronos-live-releases/*)    instance=3103 ;;

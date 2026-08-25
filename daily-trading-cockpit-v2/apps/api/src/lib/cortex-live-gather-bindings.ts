@@ -40,6 +40,7 @@ import {
   CROSS_SECTIONAL_TREND_LANE_ID,
   CROSS_SECTIONAL_MIXED_LANE_ID,
 } from "./cross-sectional-executor.js";
+import { isDynamicMom36ShockStrategy } from "./dynamic-mom36-shock-strategy.js";
 import { computeLaneEdgeReportFields, type LaneEdgeReportObservationLike } from "./lane-edge-report-fields.js";
 import type {
   CortexGatherDeps,
@@ -76,7 +77,7 @@ const CE_BUCKET_BY_LANE_ID: Record<string, CEBucket> = {
 };
 
 const XSEC_VARIANT_BY_LANE_ID: Record<string, CrossSectionalVariant> = {
-  [CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID]: "FILTERED",
+  [CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID]: isDynamicMom36ShockStrategy() ? "DYNAMIC_MOM36_SHOCK" : "FILTERED",
   [CROSS_SECTIONAL_TREND_LANE_ID]: "TREND_BETA_VOL",
   [CROSS_SECTIONAL_MIXED_LANE_ID]: "MIXED_MEAN_REVERSION",
 };

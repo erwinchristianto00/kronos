@@ -108,6 +108,8 @@ type OpenBasketExitPolicy = {
 type OpenBasketDeadlineInput = {
   openedAt: string;
   closesAtMs: number;
+  /** Dynamic MOM36 persists the actual-fill-based deadline separately for audit clarity. */
+  horizonExitAtMs?: number | null;
   policyFingerprint?: { execution?: OpenBasketExitPolicy | null } | null;
 };
 
@@ -136,9 +138,12 @@ export function scheduledOpenBasketDeadline(
     ? openedAtMs + executionCapHours * 3_600_000
     : null;
   const measurementCloseAtMs = Number.isFinite(basket.closesAtMs) ? basket.closesAtMs : null;
-  const scheduledCloseAtMs = cappedCloseAtMs != null && measurementCloseAtMs != null
+  const frozenActualEntryDeadline = typeof basket.horizonExitAtMs === "number" && Number.isFinite(basket.horizonExitAtMs)
+    ? basket.horizonExitAtMs
+    : null;
+  const scheduledCloseAtMs = frozenActualEntryDeadline ?? (cappedCloseAtMs != null && measurementCloseAtMs != null
     ? Math.min(cappedCloseAtMs, measurementCloseAtMs)
-    : cappedCloseAtMs ?? measurementCloseAtMs;
+    : cappedCloseAtMs ?? measurementCloseAtMs);
   return {
     scheduledCloseAtMs,
     executionCapHours,
@@ -1863,16 +1868,12 @@ export async function registerLiveRoutes(
     };
   });
 
-  // Testnet-only emergency/operator close for the ORIGINAL market-neutral executor.
+  // Emergency/operator close for the primary cross-basket executor in BOTH TESTNET and LIVE.
   // This is deliberately narrower than an account flatten: it requires a loopback caller,
   // an exact basket id, and exactly one live basket in THIS executor before it invokes the
-  // executor's netting-aware reduce-only close path. Trend, mixed, innovation, and all
-  // single-symbol/directional executors are unreachable from here.
+  // executor's netting-aware reduce-only close path. It also drains NEW admissions first, so a
+  // manual close cannot race an immediately-created replacement basket.
   app.post("/api/live/cross-sectional-close", async (request, reply) => {
-    if (process.env.LIVE_BINANCE_ENV !== "testnet") {
-      reply.code(403);
-      return { ok: false, reason: "testnet only" };
-    }
     if (!isLoopbackAddress(request.ip)) {
       reply.code(403);
       return { ok: false, reason: "loopback caller required" };
@@ -1889,6 +1890,10 @@ export async function registerLiveRoutes(
     if (!executor) {
       reply.code(503);
       return { ok: false, reason: "cross-sectional executor disabled" };
+    }
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution engine unavailable; cannot safely drain new admissions" };
     }
 
     const before = executor.getStatus();
@@ -1911,6 +1916,7 @@ export async function registerLiveRoutes(
       };
     }
 
+    const drain = engine.setNewEntriesPaused(true, `operator scoped cross-basket close: ${body.basketId}`);
     const result = await executor.closeAllBasketsOrderly(`OPERATOR_SCOPED_CLOSE:${body.basketId}`);
     const after = executor.getStatus();
     const stillOpen = after.openBaskets.some((basket) => basket.basketId === body.basketId);
@@ -1928,6 +1934,7 @@ export async function registerLiveRoutes(
       ok: true,
       laneId: before.laneId,
       basketId: body.basketId,
+      newEntryDrain: drain,
       result,
       openBasketIds: after.openBaskets.map((basket) => basket.basketId),
     };

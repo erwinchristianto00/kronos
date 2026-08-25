@@ -6,10 +6,9 @@
     "forward silently reverts them to code defaults. That is not hypothetical: the 36h hold policy",
     "was lost exactly this way once (2026-08-05), and nothing failed loudly when it happened.",
     "",
-    "'shared' applies to every policy-governed instance. 'instances.<id>.extra' is where an instance",
-    "DELIBERATELY diverges \u2014 today only testnet, and only on capital protection, never on strategy:",
-    "a paper account has no capital to protect, and its whole job is to produce the evidence that the",
-    "gates elsewhere consume. Strategy keys stay shared so testnet results describe what live runs.",
+    "'shared' applies identically to TESTNET and LIVE for this versioned strategy.",
+    "Instance-specific values belong in 'instances.<id>.extra' only when they cannot alter strategy",
+    "formation, sizing, risk, or exit behavior. This rollout intentionally has no such divergence.",
     "",
     "Apply or verify with deploy/apply-required-env.sh. Run --check after EVERY cutover.",
     "Values here are per-lane policy, never secrets \u2014 API keys stay out of version control."
@@ -28,8 +27,8 @@
       "why": "Retained only as an explicit dormant numeric value. TP is disabled by the separate boolean; deleting this key would silently revive the 0.60% default if that boolean ever drifted."
     },
     "CROSS_SECTIONAL_EXEC_TP_DISABLED": {
-      "value": "0",
-      "why": "Full 6% net take-profit is enabled for newly admitted baskets. The numeric target stays explicitly pinned below; baskets already open retain their frozen exit contract."
+      "value": "1",
+      "why": "Dynamic MOM36 never uses an ordinary TP. The numeric value remains explicitly present only so a future flag drift cannot silently revive the default TP. Existing baskets use their frozen or legacy contract."
     },
     "CROSS_SECTIONAL_SMART_BASKET_V1": {
       "value": "1",
@@ -49,7 +48,7 @@
     },
     "CROSS_SECTIONAL_K": {
       "value": "3",
-      "why": "Canonical 3L/3S basket geometry. Explicitly pinned so a release cannot silently change the number of legs per side."
+      "why": "Legacy admission probe geometry only. Dynamic MOM36 itself freezes one of 6L0S through 0L6S after breadth, always six total legs."
     },
     "CROSS_SECTIONAL_INTERVAL": {
       "value": "1h",
@@ -73,7 +72,7 @@
     },
     "CROSS_SECTIONAL_FILTERED_WEIGHTING": {
       "value": "CAPPED_SCORE_RANK",
-      "why": "Current production weighting; the forward cohort labels every basket so it can be compared without mixing old policies."
+      "why": "Preserved for the existing production admission probe and legacy baskets. Dynamic MOM36 final selection is always six equal $25 legs."
     },
     "CROSS_SECTIONAL_EDGE_MAX_STORED_OBSERVATIONS": {
       "value": "15000",
@@ -88,8 +87,8 @@
       "why": "Reliability V1 is the only side-specific eligibility circuit breaker in this policy. It may quarantine only a symbol+side after two evidence-changing actual NoTP+Hold36h independent-episode evaluations; HEALTHY, DEGRADED, and INSUFFICIENT_DATA never alter Plain MOM36 selection. Pinning the explicit enable flag prevents a future release directory from silently reverting the deployed observer/gate to its safe code default OFF."
     },
     "CROSS_SECTIONAL_MAKER_EXIT_ENABLED": {
-      "value": "1",
-      "why": "Maker-first on the SCHEDULED (HORIZON) close only; stops, emergencies and forced reconciliation still cross immediately. Measured on this account: maker 2.00 bps vs taker 5.00 bps, and the exit side was 100% taker by construction. Moving the modelled round trip 12bps -> 8bps lifted the harness lane from +0.2227% to +0.2627%/basket and t from 1.25 to 1.48 \u2014 larger than every formation variant combined."
+      "value": "0",
+      "why": "Preserves the current market-exit runtime behaviour. Dynamic MOM36's scheduled horizon and every exceptional/manual exit use the established immediate market/reconciliation path."
     },
     "CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS": {
       "value": "20000",
@@ -100,8 +99,8 @@
       "why": "Exit contract retained for an already-open pre-cutover basket that has no policy fingerprint."
     },
     "CROSS_SECTIONAL_LEGACY_EXEC_STOP_NET_RETURN": {
-      "value": "0.06",
-      "why": "Pre-cutover stop retained only for rows with no policy fingerprint; it does not alter a new basket."
+      "value": "0",
+      "why": "The current pre-cutover executor reports no ordinary stop. This fallback is used only for a historical row without a frozen policy fingerprint; it does not alter a new Dynamic basket."
     },
     "CROSS_SECTIONAL_LEGACY_EXEC_TP_NET_RETURN": {
       "value": "0.06",
@@ -119,32 +118,71 @@
       "value": "0",
       "why": "Pre-cutover adaptive exits were operationally disabled; legacy rows preserve that behavior."
     },
+    "CROSS_SECTIONAL_LEGACY_EXEC_LEG_USD": {
+      "value": "25",
+      "why": "Pre-cutover sizing fallback for a persisted basket whose old fingerprint lacks sizing fields. It prevents the Dynamic 1x contract from rewriting an old basket."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_LEVERAGE": {
+      "value": "3",
+      "why": "Observed pre-cutover basket leverage. Used only when a legacy fingerprint did not store leverage."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_MAX_OPEN_BASKETS": {
+      "value": "1",
+      "why": "Observed pre-cutover slot limit retained for legacy compatibility."
+    },
     "CROSS_SECTIONAL_EXEC_TICK_MS": {
       "value": "60000",
       "why": "Executor tick. Was a hardcoded 5 minutes, so a fresh signal waited ~150s on average before anything looked at it \u2014 measured end to end at 239.8s live / 229.9s testnet, almost all of it this interval. No gate is weakened by being asked sooner; the tick is idempotent and single-flighted. Bounded 15s-5m in code."
     },
+    "CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH": {
+      "value": "0",
+      "why": "Dynamic MOM36 uses its versioned admission path directly. Pin the legacy bypass OFF in both environments so testnet/live configuration stays strategy-identical and an old testnet override cannot silently leak into reporting."
+    },
+    "CROSS_SECTIONAL_ENTRY_TRAFFIC_LIGHT": {
+      "value": "0",
+      "why": "The Dynamic policy freezes six equal $25 legs and has no confidence-sized learning tier. Keep the old traffic-light scaler OFF in both environments."
+    },
     "CROSS_SECTIONAL_POLICY_VERSION": {
-      "value": "full-tp6-entry-integrity-v1",
-      "why": "Explicit policy identity for the full-TP 6% cutover plus maker-entry integrity repair. It prevents new forward evidence from being mixed with the prior NoTP policy."
+      "value": "dynamic-mom36-shock-36h-v1",
+      "why": "Immutable policy identity for the Dynamic MOM36 36h rollout. New evidence must never be mixed with the prior full-TP policy."
     },
     "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-      "value": "2026-08-22T02:23:39Z",
-      "why": "Forward-cohort boundary for the full-TP 6% / entry-integrity policy. Prior-policy rows remain in history but are not model-selection evidence for this policy."
+      "value": "2026-08-25T11:01:07Z",
+      "why": "Forward-cohort boundary for Dynamic MOM36. It is set to the release cutover timestamp and does not reclassify prior baskets."
+    },
+    "CROSS_SECTIONAL_STRATEGY_VERSION": {
+      "value": "dynamic-mom36-shock-36h-v1",
+      "why": "Selects the versioned Dynamic MOM36 formation and exit dispatcher for new baskets only."
+    },
+    "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
+      "value": "2026-08-25T11:01:07Z",
+      "why": "Frozen strategy deployment timestamp captured in every new basket fingerprint."
+    },
+    "CROSS_SECTIONAL_EXEC_VARIANT": {
+      "value": "DYNAMIC_MOM36_SHOCK",
+      "why": "Makes the intended execution variant explicit even though app wiring also pins the Dynamic target variant."
+    },
+    "CROSS_SECTIONAL_EXEC_LEG_USD": {
+      "value": "25",
+      "why": "Six fixed equal-notional legs: every Dynamic basket is exactly $150 gross before exchange rounding."
+    },
+    "CROSS_SECTIONAL_EXEC_LEVERAGE": {
+      "value": "1",
+      "why": "Dynamic MOM36 invariant: no leverage increase or confidence scaling."
+    },
+    "CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS": {
+      "value": "1",
+      "why": "Global Dynamic slot limit: an existing cross basket blocks a new portfolio."
+    },
+    "CROSS_SECTIONAL_REGIME_SKEW_ENABLED": {
+      "value": "0",
+      "why": "Legacy regime skew cannot modify Dynamic MOM36 breadth allocation."
     }
   },
   "instances": {
     "3102": {
       "role": "testnet",
-      "extra": {
-        "CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH": {
-          "value": "1",
-          "why": "PERMANENT on testnet, unlike the temporary operator bypass on live. The entry-health gate exists to stop a lane with negative recent evidence from sending orders \u2014 a capital-protection rule, and a paper account has no capital to protect. Worse, it is self-blocking here: the gate reads the shadow report, and a lane that cannot open baskets still cannot produce the executed open/close cycles the operator reviews. The executor's own doc comment draws exactly this line: trading without the evidence is legitimate on testnet, where the point is to generate it, and a very different thing on real money. NOT in 'shared' on purpose \u2014 live's =1 is a dated bypass that must expire, this one must not."
-        },
-        "CROSS_SECTIONAL_ENTRY_TRAFFIC_LIGHT": {
-          "value": "0",
-          "why": "Required for the bypass above to do anything. entryAdmissionForSignal says it outright: when the traffic light is enabled the global bypass is deliberately NOT consulted, and only the narrow YELLOW path may bridge an INCOMPLETE sample. Testnet's verdict is 'rolling edge negative', not incomplete, so YELLOW never applies and it sits RED forever \u2014 unable to produce the executed closes that would clear it. Off here, testnet uses the same legacy admission path live uses, so the two are comparable; live already runs this =0."
-        }
-      }
+      "extra": {}
     },
     "3103": {
       "role": "mainnet",

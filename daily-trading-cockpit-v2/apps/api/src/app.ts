@@ -43,6 +43,11 @@ import {
 } from "./lib/cross-sectional-executor.js";
 import { crossSectionalExecTickMs } from "./lib/cross-sectional-policy.js";
 import { buildCrossSectionalReport, CROSS_SECTIONAL_FILTERED_SIGNAL, CROSS_SECTIONAL_UNIVERSE, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import {
+  DYNAMIC_MOM36_SHOCK_SIGNAL,
+  DYNAMIC_MOM36_SHOCK_VARIANT,
+  isDynamicMom36ShockStrategy,
+} from "./lib/dynamic-mom36-shock-strategy.js";
 import { CrossSectionalSymbolReliabilityStore } from "./lib/cross-sectional-symbol-reliability.js";
 import {
   SingleSymbolLaneExecutor,
@@ -2244,6 +2249,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       };
     };
 
+    const dynamicMom36ShockStrategyActive = isDynamicMom36ShockStrategy();
+
     // Cross-sectional market-neutral EXECUTOR (testnet-first). Env-gated; on mainnet
     // it additionally requires the engine to be ARMED, so the flag alone can never
     // trade real money. Consumes the same store the measurement lane writes.
@@ -2254,6 +2261,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         client: liveClient,
         signalStore: getCrossSectionalStore(),
         store: crossSectionalExecutorStore,
+        targetVariant: dynamicMom36ShockStrategyActive ? DYNAMIC_MOM36_SHOCK_VARIANT : undefined,
+        // These are strategy invariants, not mutable allocation settings. Legacy baskets retain
+        // their own frozen fingerprint and are handled by versioned exit dispatch in the executor.
+        legUsd: dynamicMom36ShockStrategyActive ? () => 25 : undefined,
+        leverage: dynamicMom36ShockStrategyActive ? () => 1 : undefined,
+        maxOpenBaskets: dynamicMom36ShockStrategyActive ? () => 1 : undefined,
         // 2026-07-20 real-money audit fix (round 2): the first pass only swapped canOpenNewEntries()
         // for the manual-directional-blind variant, but every isAllowed() branch still ANDed
         // laneSelectionAllowsLane()/allowsCrossSectionalLane() — both of which ALSO route through
@@ -2263,7 +2276,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // sizing exemption above and skip the lane-selector check ENTIRELY (armed/killed/drain only,
         // via canOpenNewEntriesIgnoringManualDirectional()) — otherwise fall back to the original,
         // fully-coupled behavior so disabling the flag really does disable independence, not just sizing.
-        isAllowed: () => directionalRegimeAllowsBalancedBasket() && crossSectionalMarketNeutralIsAllowed({
+        isAllowed: () =>
+          // `directionalRegimeAllowsBalancedBasket` is the legacy 3L/3S-vs-directional selector.
+          // Applying it to this policy would make the old directional regime override the new
+          // MOM36 breadth engine exactly when breadth calls for 6L0S/0L6S.  Keep every existing
+          // operational/armed/lane admission below, but do not let a legacy *composition* selector
+          // rewrite Dynamic MOM36's authoritative allocation after it has passed admission.
+          (dynamicMom36ShockStrategyActive || directionalRegimeAllowsBalancedBasket()) &&
+          crossSectionalMarketNeutralIsAllowed({
           allocationIndependent: isCrossSectionalAllocationIndependent(),
           canOpenIgnoringManualDirectional: () => engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false,
           canOpenNewEntries: () => engineForGate?.canOpenNewEntries() ?? false,
@@ -2298,6 +2318,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         fourBrainActualFillBindings: fourBrainActualFillBindingsRef ?? undefined,
         fourBrainEntryGate: fourBrainPilotEntryGate,
         entryHealthGate: () => {
+          // Dynamic MOM36's admission is frozen in cross-sectional-edge.ts (pool, freshness,
+          // score gap, cluster, liquidity, cooldown, hard operational guards). The legacy rolling
+          // FILTERED cohort health is not a compatible selector for a newly-versioned strategy and
+          // cannot be allowed to impose confidence sizing or a perpetual cold-start deadlock.
+          if (dynamicMom36ShockStrategyActive) return { allowed: true, reason: null };
           // 2026-08-18: pass the SIGNAL, not just the variant. buildCrossSectionalReport matches on
           // `observationVariant(o) === variant` when no signal is given, and "FILTERED" is the variant
           // of MOM24_FILTERED and MOM36_FILTERED alike. On an instance whose CROSS_SECTIONAL_MOMENTUM_BARS
@@ -2328,6 +2353,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           if (!regimeDecision.allowed) return { allowed: false, reason: regimeDecision.reason };
           return rolling;
         },
+        entryTrafficLightEnabled: dynamicMom36ShockStrategyActive ? () => false : undefined,
         // 2026-07-11 real-money audit fix: FILTERED/TREND/MIXED share ONE netted exchange account —
         // closures over these `let`s so each sees the OTHER TWO's CURRENT legs at tick time, not
         // their (still-null) construction-time value. See CrossSectionalExecutorOptions.siblingOpenLegs.
@@ -2335,6 +2361,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           ...(crossSectionalTrendExecutor?.getOpenUnexitedLegs() ?? []),
           ...(crossSectionalMixedExecutor?.getOpenUnexitedLegs() ?? []),
         ],
+        siblingOpenBasketCount: () =>
+          (crossSectionalTrendExecutor?.getStatus().openBaskets.length ?? 0) +
+          (crossSectionalMixedExecutor?.getStatus().openBaskets.length ?? 0),
         // 2026-07-12 real-money audit fix: XSEC_DAILY_MAX_LOSS_USD is ONE shared ceiling across all
         // 3 sibling instances — see CrossSectionalExecutorOptions.siblingDailyRealizedUsd.
         siblingDailyRealizedUsd: (nowIso) =>
@@ -2388,7 +2417,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // canOpenNewEntriesIgnoringManualDirectional) — see
         // isCrossSectionalTrendMixedAdmissionIndependent's doc comment for why. Off by default;
         // the rest of this ternary is untouched, so disabling the flag is a byte-for-byte revert.
-        isAllowed: () => !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_TREND_LANE_ID)
+        // During a Dynamic MOM36 rollout these legacy executors remain alive only to manage any
+        // pre-existing frozen basket in their own store; they may not create a parallel portfolio.
+        isAllowed: () => dynamicMom36ShockStrategyActive
+          ? false
+          : !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_TREND_LANE_ID)
           ? false
           : isCrossSectionalTrendMixedAdmissionIndependent()
             ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
@@ -2408,6 +2441,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           ...(crossSectionalExecutor?.getOpenUnexitedLegs() ?? []),
           ...(crossSectionalMixedExecutor?.getOpenUnexitedLegs() ?? []),
         ],
+        siblingOpenBasketCount: () =>
+          (crossSectionalExecutor?.getStatus().openBaskets.length ?? 0) +
+          (crossSectionalMixedExecutor?.getStatus().openBaskets.length ?? 0),
         siblingDailyRealizedUsd: (nowIso) =>
           (crossSectionalExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalMixedExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
@@ -2425,7 +2461,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         laneId: CROSS_SECTIONAL_MIXED_LANE_ID,
         // Same 2026-07-08 fix as CROSS_SECTIONAL_TREND above, plus the same 2026-07-22
         // admission-independence bypass (see CROSS_SECTIONAL_TREND's isAllowed above).
-        isAllowed: () => !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_MIXED_LANE_ID)
+        isAllowed: () => dynamicMom36ShockStrategyActive
+          ? false
+          : !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_MIXED_LANE_ID)
           ? false
           : isCrossSectionalTrendMixedAdmissionIndependent()
             ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
@@ -2445,6 +2483,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           ...(crossSectionalExecutor?.getOpenUnexitedLegs() ?? []),
           ...(crossSectionalTrendExecutor?.getOpenUnexitedLegs() ?? []),
         ],
+        siblingOpenBasketCount: () =>
+          (crossSectionalExecutor?.getStatus().openBaskets.length ?? 0) +
+          (crossSectionalTrendExecutor?.getStatus().openBaskets.length ?? 0),
         siblingDailyRealizedUsd: (nowIso) =>
           (crossSectionalExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalTrendExecutor?.getDailyRealizedUsd(nowIso) ?? 0),

@@ -292,6 +292,10 @@ describe("registerLiveRoutes — dashboard account snapshot pressure guard", () 
 });
 
 describe("[operator close] /api/live/cross-sectional-close stays scoped to one market-neutral basket", () => {
+  const operatorDrainEngine = {
+    setNewEntriesPaused: () => ({ enabled: true, effective: true, pausedAt: "2026-07-08T00:00:00.000Z", reason: "test" }),
+  } as unknown as LiveExecutionEngine;
+
   const basket = (basketId: string): ExecutorBasket => ({
     basketId, sourceObservationId: "o1", signal: "MOM24", variant: "FILTERED",
     openedAt: "2026-07-08T00:00:00.000Z", closesAtMs: 0,
@@ -319,7 +323,7 @@ describe("[operator close] /api/live/cross-sectional-close stays scoped to one m
       } as unknown as CrossSectionalExecutor;
 
       app = Fastify();
-      await registerLiveRoutes(app, null, {
+      await registerLiveRoutes(app, operatorDrainEngine, {
         crossSectionalExecutor: () => coreExecutor,
         crossSectionalDirectionalShortExecutor: () => {
           directionalGetterCalls += 1;
@@ -359,7 +363,7 @@ describe("[operator close] /api/live/cross-sectional-close stays scoped to one m
       } as unknown as CrossSectionalExecutor;
 
       app = Fastify();
-      await registerLiveRoutes(app, null, { crossSectionalExecutor: () => coreExecutor });
+      await registerLiveRoutes(app, operatorDrainEngine, { crossSectionalExecutor: () => coreExecutor });
       await app.ready();
       const res = await app.inject({
         method: "POST",

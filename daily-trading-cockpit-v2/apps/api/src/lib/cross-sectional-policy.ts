@@ -16,6 +16,13 @@ import {
   type CrossSectionalFormationMode,
 } from "./cross-sectional-runtime-mode.js";
 import { symbolReliabilityPolicyFingerprint } from "./cross-sectional-symbol-reliability.js";
+import {
+  DYNAMIC_MOM36_SHOCK_SIGNAL,
+  DYNAMIC_MOM36_SHOCK_VARIANT,
+  NO_FROZEN_RUNTIME_SHOCK_ARTIFACT,
+  crossSectionalStrategyVersion,
+  isDynamicMom36ShockStrategy,
+} from "./dynamic-mom36-shock-strategy.js";
 
 export const CURRENT_POLICY_FINGERPRINT_SCHEMA = "CURRENT_POLICY_FORWARD_COHORT_V3" as const;
 
@@ -35,6 +42,12 @@ export type CrossSectionalExitPolicySnapshot = {
   makerExitEnabled: boolean;
   makerExitWaitMs: number | null;
   executorTickMs: number;
+  /** Frozen sizing and slot controls, so an env change cannot alter an open basket. */
+  legNotionalUsd?: number | null;
+  leverage?: number | null;
+  maxOpenBaskets?: number | null;
+  /** Dynamic MOM36 holds through ordinary context changes by explicit policy. */
+  ordinaryContextInvalidationEnabled?: boolean;
 };
 
 export type CrossSectionalPolicyFingerprint = {
@@ -43,8 +56,13 @@ export type CrossSectionalPolicyFingerprint = {
   capturedAt: string;
   forwardCohortStartedAt: string | null;
   strategy: {
+    strategyVersion: string;
     signal: string;
     sourceSha: string;
+    gitHash: string;
+    configHash: string;
+    modelArtifactId: string;
+    deploymentTimestamp: string | null;
     policyVersion: string;
     variant: string;
     momentumBars: number | null;
@@ -70,6 +88,7 @@ export type CrossSectionalPolicyFingerprint = {
 
 export type CrossSectionalEffectiveRuntime = {
   /** Direct, effective behaviour labels for API/dashboard consumers. */
+  strategyVersion: string;
   formationMode: CrossSectionalFormationMode;
   adaptiveExitMode: CrossSectionalAdaptiveExitMode;
   entryRevalidation: boolean;
@@ -128,6 +147,33 @@ export function isCrossSectionalAdaptiveExitEnabled(env: NodeJS.ProcessEnv = pro
 }
 
 export function currentCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process.env): CrossSectionalExitPolicySnapshot {
+  if (isDynamicMom36ShockStrategy(env)) {
+    // This strategy's execution values are frozen by policy, not left as mutable legacy TP/SL or
+    // leverage knobs.  Maker mechanics remain the existing execution engine's responsibility.
+    return {
+      // The legacy shadow lane may retain a different research horizon.  A Dynamic basket itself
+      // is a 36h strategy, and its public policy/status must not advertise that unrelated horizon.
+      measurementHorizonBars: 36,
+      // Dynamic MOM36 means 36 fully closed one-hour candles. Do not merely echo a mutable
+      // legacy env value here: the formation path separately fails closed if it drifts.
+      measurementInterval: "1h",
+      executionCapHours: 36,
+      takeProfitEnabled: false,
+      takeProfitNetReturn: null,
+      stopLossEnabled: false,
+      stopLossNetReturn: null,
+      adaptiveExitsEnabled: false,
+      adaptiveExitMode: "OFF",
+      makerEntryEnabled: env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED === "1",
+      makerExitEnabled: isCrossSectionalMakerExitEnabled(env),
+      makerExitWaitMs: isCrossSectionalMakerExitEnabled(env) ? crossSectionalMakerExitWaitMs(env) : null,
+      executorTickMs: crossSectionalExecTickMs(env),
+      legNotionalUsd: 25,
+      leverage: 1,
+      maxOpenBaskets: 1,
+      ordinaryContextInvalidationEnabled: false,
+    };
+  }
   const takeProfitEnabled = env.CROSS_SECTIONAL_EXEC_TP_DISABLED !== "1";
   const stopLossNetReturn = parsePositiveNumber(env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN);
   return {
@@ -144,6 +190,10 @@ export function currentCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process
     makerExitEnabled: isCrossSectionalMakerExitEnabled(env),
     makerExitWaitMs: isCrossSectionalMakerExitEnabled(env) ? crossSectionalMakerExitWaitMs(env) : null,
     executorTickMs: crossSectionalExecTickMs(env),
+    legNotionalUsd: parsePositiveNumber(env.CROSS_SECTIONAL_EXEC_LEG_USD),
+    leverage: parsePositiveNumber(env.CROSS_SECTIONAL_EXEC_LEVERAGE),
+    maxOpenBaskets: parsePositiveNumber(env.CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS),
+    ordinaryContextInvalidationEnabled: true,
   };
 }
 
@@ -155,7 +205,11 @@ export function currentCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process
 export function legacyCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process.env): CrossSectionalExitPolicySnapshot {
   const legacyEnv: NodeJS.ProcessEnv = {
     ...env,
+    CROSS_SECTIONAL_STRATEGY_VERSION: "legacy-cross-sectional",
     CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS: env.CROSS_SECTIONAL_LEGACY_EXEC_MAX_HOLD_HOURS ?? env.CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS,
+    CROSS_SECTIONAL_EXEC_LEG_USD: env.CROSS_SECTIONAL_LEGACY_EXEC_LEG_USD ?? env.CROSS_SECTIONAL_EXEC_LEG_USD,
+    CROSS_SECTIONAL_EXEC_LEVERAGE: env.CROSS_SECTIONAL_LEGACY_EXEC_LEVERAGE ?? env.CROSS_SECTIONAL_EXEC_LEVERAGE,
+    CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS: env.CROSS_SECTIONAL_LEGACY_EXEC_MAX_OPEN_BASKETS ?? env.CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS,
     CROSS_SECTIONAL_EXEC_TP_DISABLED: env.CROSS_SECTIONAL_LEGACY_EXEC_TP_DISABLED ?? env.CROSS_SECTIONAL_EXEC_TP_DISABLED,
     CROSS_SECTIONAL_EXEC_TP_NET_RETURN: env.CROSS_SECTIONAL_LEGACY_EXEC_TP_NET_RETURN ?? env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN,
     CROSS_SECTIONAL_EXEC_STOP_NET_RETURN: env.CROSS_SECTIONAL_LEGACY_EXEC_STOP_NET_RETURN ?? env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN,
@@ -170,14 +224,24 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
   nowIso: string,
   env: NodeJS.ProcessEnv = process.env,
 ): CrossSectionalPolicyFingerprint {
+  const dynamic = isDynamicMom36ShockStrategy(env);
+  const strategyVersion = crossSectionalStrategyVersion(env);
+  const sourceSha = env.KRONOS_RELEASE_SHA?.trim() || "UNKNOWN_SOURCE_SHA";
   const body = {
     schemaVersion: CURRENT_POLICY_FINGERPRINT_SCHEMA,
     forwardCohortStartedAt: validIso(env.CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT),
     strategy: {
-      signal: env.CROSS_SECTIONAL_FILTERED_SIGNAL?.trim() || `MOM${env.CROSS_SECTIONAL_MOMENTUM_BARS?.trim() || "36"}_FILTERED`,
-      sourceSha: env.KRONOS_RELEASE_SHA?.trim() || "UNKNOWN_SOURCE_SHA",
+      strategyVersion,
+      signal: dynamic
+        ? DYNAMIC_MOM36_SHOCK_SIGNAL
+        : env.CROSS_SECTIONAL_FILTERED_SIGNAL?.trim() || `MOM${env.CROSS_SECTIONAL_MOMENTUM_BARS?.trim() || "36"}_FILTERED`,
+      sourceSha,
+      gitHash: sourceSha,
+      configHash: "PENDING_CONFIG_HASH",
+      modelArtifactId: dynamic ? NO_FROZEN_RUNTIME_SHOCK_ARTIFACT : "NOT_APPLICABLE_LEGACY",
+      deploymentTimestamp: validIso(env.CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT),
       policyVersion: env.CROSS_SECTIONAL_POLICY_VERSION?.trim() || "UNVERSIONED_POLICY",
-      variant: env.CROSS_SECTIONAL_EXEC_VARIANT?.trim() || "FILTERED",
+      variant: dynamic ? DYNAMIC_MOM36_SHOCK_VARIANT : env.CROSS_SECTIONAL_EXEC_VARIANT?.trim() || "FILTERED",
       momentumBars: parsePositiveNumber(env.CROSS_SECTIONAL_MOMENTUM_BARS),
       legsPerSide: parsePositiveNumber(env.CROSS_SECTIONAL_K) ?? 3,
     },
@@ -189,23 +253,32 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
     formation: {
       scoreGap: parseFiniteNumber(env.CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP),
       clusterCap: parseFiniteNumber(env.CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER),
-      weighting: env.CROSS_SECTIONAL_FILTERED_WEIGHTING?.trim().toUpperCase() || "EQUAL_NOTIONAL",
-      formationMode: crossSectionalFormationMode(env),
-      smartFormationRerank: isCrossSectionalSmartFormationRerankEnabled(env),
-      entryRevalidationEnabled: isCrossSectionalSmartBasketLifecycleEnabled(env),
+      // Dynamic allocation is raw MOM36 rank plus six equal $25 legs.  The legacy Smart Formation
+      // settings remain visible in the environment for old baskets, but are not permitted to
+      // silently select or reweight a new Dynamic basket.
+      weighting: dynamic ? "EQUAL_NOTIONAL" : env.CROSS_SECTIONAL_FILTERED_WEIGHTING?.trim().toUpperCase() || "EQUAL_NOTIONAL",
+      formationMode: dynamic ? "PLAIN_MOM36" : crossSectionalFormationMode(env),
+      smartFormationRerank: dynamic ? false : isCrossSectionalSmartFormationRerankEnabled(env),
+      entryRevalidationEnabled: dynamic ? false : isCrossSectionalSmartBasketLifecycleEnabled(env),
       entryHealthBypassed: env.CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH === "1",
     },
     reliability: symbolReliabilityPolicyFingerprint(env),
     execution: currentCrossSectionalExitPolicy(env),
   };
-  const policyId = `xsec-${createHash("sha256").update(JSON.stringify(body)).digest("hex").slice(0, 16)}`;
-  return { ...body, policyId, capturedAt: nowIso };
+  const configHash = `xsec-config-${createHash("sha256").update(JSON.stringify(body)).digest("hex").slice(0, 16)}`;
+  const withConfigHash = {
+    ...body,
+    strategy: { ...body.strategy, configHash },
+  };
+  const policyId = `xsec-${createHash("sha256").update(JSON.stringify(withConfigHash)).digest("hex").slice(0, 16)}`;
+  return { ...withConfigHash, policyId, capturedAt: nowIso };
 }
 
 export function effectiveCrossSectionalRuntime(
   supportsMakerExit: boolean,
   env: NodeJS.ProcessEnv = process.env,
 ): CrossSectionalEffectiveRuntime {
+  const dynamic = isDynamicMom36ShockStrategy(env);
   const rawTick = env.CROSS_SECTIONAL_EXEC_TICK_MS ?? null;
   const parsedTick = rawTick === null ? null : Number.parseInt(rawTick, 10);
   const tickValid = rawTick === null || (parsedTick !== null && Number.isFinite(parsedTick) && parsedTick >= 1_000 && parsedTick <= 300_000);
@@ -229,9 +302,10 @@ export function effectiveCrossSectionalRuntime(
     });
   }
   return {
-    formationMode: crossSectionalFormationMode(env),
-    adaptiveExitMode: crossSectionalAdaptiveExitMode(env),
-    entryRevalidation: isCrossSectionalSmartBasketLifecycleEnabled(env),
+    strategyVersion: crossSectionalStrategyVersion(env),
+    formationMode: dynamic ? "PLAIN_MOM36" : crossSectionalFormationMode(env),
+    adaptiveExitMode: dynamic ? "OFF" : crossSectionalAdaptiveExitMode(env),
+    entryRevalidation: !dynamic && isCrossSectionalSmartBasketLifecycleEnabled(env),
     executorTick: {
       configured: rawTick,
       effectiveMs: crossSectionalExecTickMs(env),
@@ -246,8 +320,8 @@ export function effectiveCrossSectionalRuntime(
       reason: makerConfigured && !makerEffective ? mismatches.find((mismatch) => mismatch.key === "CROSS_SECTIONAL_MAKER_EXIT_ENABLED")?.reason ?? null : null,
     },
     adaptiveExits: {
-      configured: isCrossSectionalAdaptiveExitEnabled(env),
-      effective: isCrossSectionalAdaptiveExitEnabled(env),
+      configured: dynamic ? false : isCrossSectionalAdaptiveExitEnabled(env),
+      effective: dynamic ? false : isCrossSectionalAdaptiveExitEnabled(env),
       state: "EFFECTIVE",
     },
     mismatches,

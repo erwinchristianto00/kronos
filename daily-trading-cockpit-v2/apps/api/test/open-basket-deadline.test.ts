@@ -50,4 +50,15 @@ describe('scheduledOpenBasketDeadline', () => {
       mayExitEarlier: false,
     });
   });
+
+  it('uses a Dynamic basket\'s persisted actual-fill deadline rather than recomputing from scan time', () => {
+    const actualFillDeadline = Date.parse(openedAt) + 36 * 3_600_000 + 47_000;
+    const deadline = scheduledOpenBasketDeadline({
+      openedAt,
+      closesAtMs: measurementCloseAtMs,
+      horizonExitAtMs: actualFillDeadline,
+      policyFingerprint: { execution: { executionCapHours: 36 } },
+    }, null);
+    expect(deadline.scheduledCloseAtMs).toBe(actualFillDeadline);
+  });
 });
