@@ -789,17 +789,37 @@ export class ContinuationDataCollector {
     }
   }
 
-  /** One REST pass performs startup backfill and reconciles any WebSocket gap. */
-  async reconcileOnce(nowMs = this.now()): Promise<{ recorded: number; failed: number }> {
+  /**
+   * Reconcile only the completed Binance candle sources that make a training row usable.
+   *
+   * This deliberately remains separate from the broader diagnostic-source pass: a transport can
+   * accept a WebSocket connection yet deliver no events, and a quiet socket must not make the
+   * required 1m/5m/1h watermarks stale while we wait for an hourly full reconciliation.
+   */
+  async reconcileKlinesOnce(nowMs = this.now()): Promise<{ recorded: number; failed: number }> {
     let recorded = 0;
     let failed = 0;
+    const run = async (task: () => Promise<number>): Promise<void> => {
+      try { recorded += await task(); } catch (error) { failed += 1; this.logger("CONT_COLLECTOR_SOURCE_ERROR", { error: error instanceof Error ? error.message : String(error) }); }
+    };
+    for (const symbol of this.symbols) {
+      for (const interval of CONTINUATION_BINANCE_INTERVALS) await run(() => this.collectBinanceKline(symbol, interval, nowMs));
+    }
+    this.writeHealth(nowMs);
+    return { recorded, failed };
+  }
+
+  /** One REST pass performs startup backfill and reconciles any WebSocket gap. */
+  async reconcileOnce(nowMs = this.now()): Promise<{ recorded: number; failed: number }> {
+    const klineResult = await this.reconcileKlinesOnce(nowMs);
+    let recorded = klineResult.recorded;
+    let failed = klineResult.failed;
     const run = async (task: () => Promise<number>): Promise<void> => {
       try { recorded += await task(); } catch (error) { failed += 1; this.logger("CONT_COLLECTOR_SOURCE_ERROR", { error: error instanceof Error ? error.message : String(error) }); }
     };
     // Keep public endpoint pressure bounded. Sequential per symbol is slower only during startup;
     // it avoids turning a reconnection into a source-wide rate-limit storm.
     for (const symbol of this.symbols) {
-      for (const interval of CONTINUATION_BINANCE_INTERVALS) await run(() => this.collectBinanceKline(symbol, interval, nowMs));
       await run(() => this.collectFunding(symbol, nowMs));
       await run(() => this.collectPremium(symbol, nowMs));
       await run(() => this.collectOpenInterest(symbol, nowMs));

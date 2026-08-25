@@ -87,6 +87,21 @@ describe("continuation data collector", () => {
     expect(ohlcv[0]?.[4]).toBe(102);
   });
 
+  it("can keep only the required completed-kline sources fresh when WebSocket delivery stalls", async () => {
+    const dir = root();
+    const paths = continuationLifecyclePaths(dir);
+    const collector = new ContinuationDataCollector({ paths, symbols: ["BTCUSDT"], nowMs: () => NOW, fetchJson: fetchFixture });
+
+    const result = await collector.reconcileKlinesOnce(NOW);
+    const health = readCollectorHealth(paths);
+
+    expect(result).toEqual({ recorded: 3, failed: 0 });
+    expect(health?.sourceSummary["binance-usdm:kline_1m"]?.freshness).toBe("HEALTHY");
+    expect(health?.sourceSummary["binance-usdm:kline_5m"]?.freshness).toBe("HEALTHY");
+    expect(health?.sourceSummary["binance-usdm:kline_1h"]?.freshness).toBe("HEALTHY");
+    expect(health?.sourceSummary["binance-usdm:funding_rate"]).toBeUndefined();
+  });
+
   it("retains inactive legacy watermarks for audit but excludes them from active V4 required health", async () => {
     const dir = root();
     const paths = continuationLifecyclePaths(dir);
