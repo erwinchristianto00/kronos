@@ -166,6 +166,85 @@ describe("Dynamic MOM36 production-cycle integration", () => {
     }
   });
 
+  it("fails closed when a supplied auto-pool cannot provide six synchronous Dynamic symbols", async () => {
+    const overrides: Record<string, string> = {
+      CROSS_SECTIONAL_STRATEGY_VERSION: DYNAMIC_MOM36_SHOCK_36H_V1,
+      CROSS_SECTIONAL_INTERVAL: "1h",
+      CROSS_SECTIONAL_MOMENTUM_BARS: "36",
+      CROSS_SECTIONAL_HORIZON_BARS: "48",
+      CROSS_SECTIONAL_K: "3",
+      CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP: "0.058",
+      CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER: "2",
+      CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST: universe.join(","),
+      CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST: universe.join(","),
+      CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "0",
+      CROSS_SECTIONAL_REGIME_SKEW_ENABLED: "0",
+      CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+      CROSS_SECTIONAL_STAND_DOWN_14D_PCT: "0",
+      CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR: "0",
+      CROSS_SECTIONAL_EDGE_DISABLED: "0",
+    };
+    const before = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+    try {
+      for (const [key, value] of Object.entries(overrides)) process.env[key] = value;
+      vi.resetModules();
+      const edge = await import("../src/lib/cross-sectional-edge.js");
+      const dir = mkdtempSync(join(tmpdir(), "dynamic-mom36-auto-pool-"));
+      dirs.push(dir);
+      const store = new edge.CrossSectionalStore(dir);
+      // A durable real pool enforces an eight-name floor. This deliberately malformed snapshot
+      // proves that a bad persisted/input pool cannot silently reopen selection to the static list.
+      const activeSymbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "LINKUSDT"];
+      const returns: Record<string, number> = {
+        BTCUSDT: 0.20,
+        ETHUSDT: 0.18,
+        SOLUSDT: 0.16,
+        DOGEUSDT: 0.04,
+        LINKUSDT: 0.02,
+        FETUSDT: -0.03,
+        AAVEUSDT: 0.04,
+        WLDUSDT: -0.03,
+      };
+      const result = await edge.runCrossSectionalCycle({
+        store,
+        universe,
+        now: cutoff + 5 * 60_000,
+        fetchCandles: async (symbol) => candlesFor(returns[symbol]!),
+        filteredExecutionPool: async () => ({
+          version: 1,
+          enabled: true,
+          state: "ACTIVE" as const,
+          source: "BINANCE_USDM_MAINNET_PUBLIC" as const,
+          candidateUniverse: universe,
+          activeSymbols,
+          updatedAt: "2026-08-25T12:00:00.000Z",
+          lastAttemptAt: "2026-08-25T12:00:00.000Z",
+          lastSuccessAt: "2026-08-25T12:00:00.000Z",
+          lastError: null,
+          refreshEveryMs: 900_000,
+          thresholds: {
+            minLiquidityUsdPerHour: 200_000,
+            maxLotFractionOfLeg: 0.5,
+            hysteresisFraction: 0.1,
+            minPoolSize: 8,
+            effectiveLegUsd: 25,
+            oneLotCeilingUsd: 12.5,
+          },
+          reconciliation: null,
+        }),
+      });
+
+      expect(result.autoPoolState).toBe("ACTIVE");
+      expect(result.openedDynamicMom36Shock).toBeUndefined();
+      expect(store.all.some((row) => row.variant === "DYNAMIC_MOM36_SHOCK")).toBe(false);
+    } finally {
+      for (const [key, value] of before) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("fails closed rather than silently redefining MOM36 when the runtime candle interval drifts", async () => {
     const overrides: Record<string, string> = {
       CROSS_SECTIONAL_STRATEGY_VERSION: DYNAMIC_MOM36_SHOCK_36H_V1,

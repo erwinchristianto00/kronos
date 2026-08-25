@@ -30,6 +30,7 @@ import {
   isCrossSectionalBasketReportingExcluded,
   type CrossSectionalExecutor,
 } from "../lib/cross-sectional-executor.js";
+import type { CrossSectionalAutoPool, CrossSectionalAutoPoolSnapshot } from "../lib/cross-sectional-auto-pool.js";
 import type { SymbolReliabilitySnapshot } from "../lib/cross-sectional-symbol-reliability.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
 import {
@@ -1134,6 +1135,11 @@ interface PoolReport {
     held: Array<{ symbol: string; action: string; reason: string }>;
     unmeasured: boolean;
   };
+  /** Runtime membership used for NEW FILTERED baskets. Existing baskets retain frozen legs. */
+  autoPool: CrossSectionalAutoPoolSnapshot | null;
+  /** Compatibility contract for the currently served dashboard overlay. Keep this alias until the
+   * overlay and the versioned API release are cut over together. */
+  automation: CrossSectionalAutoPoolSnapshot | null;
   unevaluatedCriteria: Array<{ code: string; why: string }>;
 }
 let poolReportCache: { atMs: number; report: PoolReport } | null = null;
@@ -1144,6 +1150,8 @@ export async function registerLiveRoutes(
   opts: {
     configErrors?: string[];
     crossSectionalExecutor?: () => CrossSectionalExecutor | null;
+    /** Same durable C1/C2 pool consumed by Dynamic formation; status only on this route. */
+    crossSectionalAutoPool?: () => CrossSectionalAutoPool | null;
     /** API-owned V1 circuit-breaker state; presentation only, never recalculated by the dashboard. */
     symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
     // 2026-07-08: two more instances (TREND_BETA_VOL / MIXED_MEAN_REVERSION), wired alongside the
@@ -2036,12 +2044,32 @@ export async function registerLiveRoutes(
     if (poolReportCache && now - poolReportCache.atMs < 15 * 60_000) return poolReportCache.report;
     const list = (k: string): string[] => (process.env[k] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
     const universe = list("CROSS_SECTIONAL_UNIVERSE");
-    const longAllow = new Set(list("CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST"));
-    const shortAllow = new Set(list("CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST"));
+    const configuredLong = list("CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST");
+    const configuredShort = list("CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST");
     const shortBlock = new Set(list("CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST"));
     const baseLeg = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "") || 25;
     const mult = Number.parseFloat(process.env.CROSS_SECTIONAL_TESTNET_LEARNING_LEG_MULTIPLIER ?? "") || 1;
     const leg = effectiveLegUsd(baseLeg, mult);
+    // Dynamic auto-pool is intentionally symmetric.  If a future operator chooses asymmetric
+    // static sides, report that static policy honestly rather than inventing a side-aware rule.
+    const symmetricConfiguredPool = configuredLong.length === configuredShort.length
+      && configuredLong.every((symbol) => configuredShort.includes(symbol));
+    const autoPoolInput = {
+      candidateUniverse: universe,
+      fallbackSymbols: configuredLong,
+      baseLegUsd: baseLeg,
+      sizeMultiplier: mult,
+    };
+    const autoPoolManager = symmetricConfiguredPool ? opts.crossSectionalAutoPool?.() ?? null : null;
+    // The endpoint can safely await this bounded public-metadata refresh: it is cadence-gated and
+    // gives the operator the actual membership immediately after a process restart, not a static
+    // fallback that happens to be cached for fifteen minutes.
+    const autoPool = autoPoolManager ? await autoPoolManager.refreshIfDue(autoPoolInput) : null;
+    const runtimeSymbols = autoPool?.enabled && autoPool.activeSymbols.length > 0
+      ? autoPool.activeSymbols
+      : null;
+    const longAllow = new Set(runtimeSymbols ?? configuredLong);
+    const shortAllow = new Set(runtimeSymbols ?? configuredShort);
 
     const filters = new Map<string, { minNotional: number | null; stepSize: number | null; minQty: number | null }>();
     const ticks = new Map<string, { price: number; quoteVolume: number }>();
@@ -2160,6 +2188,8 @@ export async function registerLiveRoutes(
           unmeasured: pl.unmeasured,
         };
       })(),
+      autoPool,
+      automation: autoPool,
       unevaluatedCriteria: [
         { code: "C3_LISTING_AGE", why: "butuh satu panggilan riwayat per simbol" },
         { code: "C4_FUNDING_CARRY", why: "butuh riwayat funding per simbol" },
@@ -2277,7 +2307,9 @@ th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;le
     const report = await buildPoolReport();
     const now = Date.parse(report.generatedAt);
     const esc = (v: unknown): string => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] ?? c));
-    const { measured, leg: legInfo, counts, mismatch: mismatchSyms, blockedInPool } = report;
+    const { measured, leg: legInfo, counts, blockedInPool } = report;
+    const autoPool = report.autoPool;
+    const autoPoolEnabled = autoPool?.enabled === true;
     const leg = legInfo.effectiveUsd;
     const baseLeg = legInfo.baseUsd;
     const mult = legInfo.multiplier;
@@ -2331,11 +2363,13 @@ th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;le
 
 ${!measured
   ? `<div class="note">&#9888; <b>Kriteria tidak bisa diukur sekarang</b> &mdash; pembacaan exchange gagal, jadi kolom likuiditas, satu lot dan status di bawah kosong. Ini BUKAN berarti simbol-simbol itu gagal kriteria; belum ada yang diuji. Pool aktif tetap ditampilkan apa adanya.</div>`
+  : autoPool?.state === "STALE_FALLBACK"
+    ? `<div class="note">&#9888; <b>Auto-pool belum memiliki snapshot C1/C2 yang valid.</b> Sementara memakai fallback terakhir dan tidak memperlebar universe. Refresh otomatis akan mencoba lagi; basket yang sudah terbuka tidak disentuh.</div>`
   : plan.changed
-    ? `<div class="note">&#9888; <b>Pool perlu diubah</b>: ${[...plan.adds.map((x) => "tambah " + esc(x.replace("USDT", ""))), ...plan.drops.map((x) => "keluarkan " + esc(x.replace("USDT", "")))].join(" &middot; ")}. Rinciannya di Rekonsiliasi pool di bawah.</div>`
+    ? `<div class="note">&#9888; <b>Pool auto akan merekonsiliasi</b>: ${[...plan.adds.map((x) => "tambah " + esc(x.replace("USDT", ""))), ...plan.drops.map((x) => "keluarkan " + esc(x.replace("USDT", "")))].join(" &middot; ")}. Berlaku otomatis pada refresh berikutnya untuk basket baru; basket terbuka tidak disentuh.</div>`
     : plan.held.length
       ? `<div class="note">&#9679; <b>Tidak ada yang perlu diubah.</b> ${plan.held.map((d) => esc(d.symbol.replace("USDT", ""))).join(", ")} berada di bawah ambang mentah tetapi <b>di dalam pita histeresis</b>, jadi keanggotaannya sengaja dipertahankan &mdash; tanpa pita, simbol di garis batas akan keluar-masuk tiap beberapa jam. Kolom status di bawah tetap menampilkan vonis kriteria mentahnya, karena itu memang fakta.</div>`
-      : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; Pool aktif sama persis dengan hasil kriteria.</div>`}
+      : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; ${autoPoolEnabled ? "Auto-pool aktif; " : ""}pool aktif sama persis dengan hasil kriteria.</div>`}
 
 <h2>Per simbol</h2>
 <div class="wrapx"><table><thead><tr>
@@ -2346,7 +2380,7 @@ ${(() => {
   const act = [...plan.adds.map((x) => ({ symbol: x, action: "ADD", reason: "melewati batas masuk" })), ...plan.drops.map((x) => ({ symbol: x, action: "DROP", reason: "di bawah batas keluar" })), ...plan.held];
   if (plan.unmeasured) return `<h2>Rekonsiliasi pool</h2><div class="note">Tidak ada simbol yang terukur — tidak ada keputusan yang bisa dipercaya, dan rencana ini TIDAK boleh diterapkan.</div>`;
   return `<h2>Rekonsiliasi pool</h2>
-<p class="muted">Pita histeresis <b>&plusmn;10%</b>: masuk perlu &ge; $${Math.round(report.thresholds.minLiquidityUsdPerHour * 1.1).toLocaleString("en-US")}/jam, keluar baru di bawah $${Math.round(report.thresholds.minLiquidityUsdPerHour * 0.9).toLocaleString("en-US")}/jam. Simbol di antara keduanya <b>mempertahankan keanggotaannya</b>. Penerapan masih MANUAL &mdash; allowlist adalah const yang dibaca sekali saat proses start, jadi perubahan butuh edit <code>.env</code> lalu restart.</p>
+<p class="muted">Pita histeresis <b>&plusmn;10%</b>: masuk perlu &ge; $${Math.round(report.thresholds.minLiquidityUsdPerHour * 1.1).toLocaleString("en-US")}/jam, keluar baru di bawah $${Math.round(report.thresholds.minLiquidityUsdPerHour * 0.9).toLocaleString("en-US")}/jam. Simbol di antara keduanya <b>mempertahankan keanggotaannya</b>. ${autoPoolEnabled ? `Auto-pool menyegarkan C1/C2 tiap ${Math.round((autoPool?.refreshEveryMs ?? 900000) / 60000)} menit dari USD-M mainnet dan hanya berlaku untuk basket baru.` : "Auto-pool tidak aktif; daftar statis ditampilkan apa adanya."}</p>
 ${act.length ? `<div class="wrapx"><table><thead><tr><th>simbol</th><th>tindakan</th><th>alasan</th></tr></thead><tbody>${act.map((d) => `<tr><td class="sym">${esc(d.symbol.replace("USDT", ""))}</td><td class="mono">${esc(d.action)}</td><td class="muted">${esc(d.reason)}</td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">Tidak ada simbol yang butuh perhatian.</p>`}
 `;
 })()}

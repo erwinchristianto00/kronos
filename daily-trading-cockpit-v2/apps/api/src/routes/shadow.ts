@@ -387,6 +387,7 @@ import {
   CROSS_SECTIONAL_TREND_SIGNAL,
   CROSS_SECTIONAL_MIXED_SIGNAL,
 } from "../lib/cross-sectional-edge.js";
+import type { CrossSectionalAutoPool } from "../lib/cross-sectional-auto-pool.js";
 import { spotSymbolForCandles, buildWinnersCounterfactualReport } from "../lib/cross-sectional-winners-counterfactual.js";
 import { buildRegimeAxisTimeline } from "../lib/regime-axis-timeline.js";
 import { buildTpSweepReport } from "../lib/cross-sectional-tp-sweep.js";
@@ -496,6 +497,8 @@ export async function registerShadowRoutes(
     symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
     /** Returns true only after formation provenance is durable; false holds a new V1 basket. */
     symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
+    /** Durable C1/C2 membership source shared with the executed Dynamic formation path. */
+    crossSectionalAutoPool?: CrossSectionalAutoPool;
     /** Lazy getter for the four-brain shadow tick's metrics aggregator (created after this
      *  registration, inside app.ts's `if (!isTest)` block, on instances that even construct it).
      *  null on any instance where four-brain shadow mode has never enabled (fail-open — see the
@@ -519,6 +522,31 @@ export async function registerShadowRoutes(
   } = {},
 ): Promise<void> {
   const overlayStore = new JsonExternalRotationOverlayStore(opts.externalOverlayDataDir ?? "data");
+  /**
+   * Automatic membership deliberately needs a symmetric Dynamic long/short candidate set. If a
+   * future operator creates asymmetric static sides, do not silently redefine that policy: retain
+   * its static list until an explicit side-aware auto-pool contract is introduced.
+   */
+  const autoPoolInput = () => {
+    const configured = getCrossSectionalFilteredConfig();
+    const long = configured.longAllowlist;
+    const short = configured.shortAllowlist;
+    if (long.length !== short.length || long.some((symbol) => !short.includes(symbol))) return null;
+    const baseLeg = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "");
+    const multiplier = Number.parseFloat(process.env.CROSS_SECTIONAL_TESTNET_LEARNING_LEG_MULTIPLIER ?? "");
+    return {
+      candidateUniverse: [...CROSS_SECTIONAL_UNIVERSE],
+      fallbackSymbols: long,
+      baseLegUsd: Number.isFinite(baseLeg) && baseLeg > 0 ? baseLeg : 25,
+      sizeMultiplier: Number.isFinite(multiplier) && multiplier > 0 ? multiplier : 1,
+    };
+  };
+  // Public metadata only: it cannot create, change, or close a basket. Priming at process start
+  // ensures the first formation after a deploy does not sit on a static fallback waiting for cadence.
+  const initialAutoPoolInput = autoPoolInput();
+  if (initialAutoPoolInput && opts.crossSectionalAutoPool) {
+    void opts.crossSectionalAutoPool.refreshIfDue(initialAutoPoolInput).catch(() => undefined);
+  }
   if (opts.notificationService) {
     opts.notificationService.setSnapshotProvider(() => {
       const scanStatus = opts.coreScanAutoRefreshController?.getStatus() ?? null;
@@ -936,6 +964,12 @@ export async function registerShadowRoutes(
 
   // Cross-sectional market-neutral measurement lane — report + open/closed baskets (report-only).
   app.get("/api/shadow/cross-sectional-report", async () => {
+    // The dashboard must show the same current membership that a new formation will use. This is
+    // cadence-gated by the pool itself (15m), so a page refresh never turns into exchange polling.
+    const reportAutoPoolInput = autoPoolInput();
+    if (reportAutoPoolInput && opts.crossSectionalAutoPool) {
+      await opts.crossSectionalAutoPool.refreshIfDue(reportAutoPoolInput).catch(() => undefined);
+    }
     const store = getCrossSectionalStore();
     // Testnet can deliberately start a fresh evidence era without deleting the older store. The
     // cutoff is configured per deployment via CROSS_SECTIONAL_REPORT_START_AT; absent/invalid means
@@ -1002,13 +1036,26 @@ export async function registerShadowRoutes(
       // necessarily the filter that this testnet executor is using today.
       filteredConfig: (() => {
         const configured = getCrossSectionalFilteredConfig();
-        const execution = getCrossSectionalFilteredExecutionFilters(store);
+        const input = autoPoolInput();
+        const autoPool = input ? opts.crossSectionalAutoPool?.getSnapshot(input) ?? null : null;
+        // The durable C1/C2 pool is a strict ceiling on the old configured candidate list.  Never
+        // pass an empty list here: downstream `allowed()` treats that as allow-everything.
+        const activePool = autoPool?.enabled && autoPool.activeSymbols.length > 0
+          ? autoPool.activeSymbols
+          : null;
+        const execution = getCrossSectionalFilteredExecutionFilters(store, activePool ? {
+          baseLongAllowlist: activePool,
+          baseShortAllowlist: activePool,
+        } : {});
         const executionUniverse = new Set(CROSS_SECTIONAL_UNIVERSE);
         // The testnet deployment can narrow CROSS_SECTIONAL_UNIVERSE for an exchange constraint
         // (for example BTC's minimum notional). Reflect that same universe in the report so an
         // allowlist entry is never presented as executable when the runner cannot select it.
         const executable = (symbols: readonly string[]) => symbols.filter((symbol) => executionUniverse.has(symbol));
-        const configuredSymbols = new Set([...configured.longAllowlist, ...configured.shortAllowlist]);
+        const configuredSymbols = new Set([
+          ...(activePool ?? configured.longAllowlist),
+          ...(activePool ?? configured.shortAllowlist),
+        ]);
         return {
           ...configured,
           executionUniverse: [...CROSS_SECTIONAL_UNIVERSE],
@@ -1017,16 +1064,28 @@ export async function registerShadowRoutes(
           executionShortAllowlist: executable(execution.shortAllowlist),
           executionShortBlocklist: execution.shortBlocklist,
           adaptiveDemotionActive: !execution.adaptiveDisabled,
+          autoPool,
         };
       })(),
       adaptiveConfig: getCrossSectionalAdaptiveConfig(),
       // Retained for audit only.  Do not label this the active FILTERED pool without checking
       // filteredConfig.adaptiveDemotionActive above.
       adaptiveSymbolFilters: (() => {
-        const adaptive = deriveAdaptiveSymbolFilters(store);
+        const input = autoPoolInput();
+        const autoPool = input ? opts.crossSectionalAutoPool?.getSnapshot(input) ?? null : null;
+        const activePool = autoPool?.enabled && autoPool.activeSymbols.length > 0
+          ? autoPool.activeSymbols
+          : null;
+        const adaptive = deriveAdaptiveSymbolFilters(store, activePool ? {
+          baseLongAllowlist: activePool,
+          baseShortAllowlist: activePool,
+        } : {});
         return {
           ...adaptive,
-          executionUsesThis: !getCrossSectionalFilteredExecutionFilters(store).adaptiveDisabled,
+          executionUsesThis: !getCrossSectionalFilteredExecutionFilters(store, activePool ? {
+            baseLongAllowlist: activePool,
+            baseShortAllowlist: activePool,
+          } : {}).adaptiveDisabled,
         };
       })(),
       openBaskets: raw.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
@@ -2942,6 +3001,12 @@ export async function registerShadowRoutes(
             filteredEntryBlocks: opts.crossSectionalReentryBlocksGetter,
             symbolReliabilitySnapshotGetter: opts.symbolReliabilitySnapshotGetter,
             symbolReliabilityDecisionRecorder: opts.symbolReliabilityDecisionRecorder,
+            filteredExecutionPool: async () => {
+              const input = autoPoolInput();
+              return input && opts.crossSectionalAutoPool
+                ? opts.crossSectionalAutoPool.refreshIfDue(input)
+                : null;
+            },
             // spotSymbolForCandles: 1000x-multiplier futures contracts (1000PEPEUSDT, …) have no
             // spot pair under that name — fetch the bare spot symbol instead. Returns are price
             // RATIOS, so the 1000x scaling cancels; the rest of the pipeline (scoring, allowlist

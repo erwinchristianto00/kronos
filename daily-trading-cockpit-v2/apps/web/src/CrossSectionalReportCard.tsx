@@ -406,6 +406,16 @@ type PoolReport = {
   /** The actionable verdict, hysteresis-aware. `mismatch` above is the RAW threshold comparison —
    *  true per symbol, but not a reason to change anything on its own. */
   reconciliation?: { changed: boolean; adds: string[]; drops: string[]; held: Array<{ symbol: string; action: string; reason: string }>; unmeasured: boolean };
+  /** Same durable C1/C2 membership consumed by the backend for new Dynamic baskets. */
+  autoPool?: {
+    enabled: boolean;
+    state: 'DISABLED' | 'ACTIVE' | 'STALE_FALLBACK';
+    source: 'BINANCE_USDM_MAINNET_PUBLIC' | null;
+    activeSymbols: string[];
+    updatedAt: string | null;
+    lastError: string | null;
+    refreshEveryMs: number;
+  } | null;
   blockedInPool: string[];
   btc: { oneLotUsd: number | null; legNeededUsd: number | null };
   unevaluatedCriteria: Array<{ code: string; why: string }>;
@@ -449,9 +459,10 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
   const activeShort = executionShort.filter((symbol) => !executionShortBlocked.includes(symbol));
   const poolsIdentical = executionLong.length === executionShort.length
     && executionLong.every((symbol) => executionShort.includes(symbol));
-  // The executor reads its allowlists from env; so does the criteria report. If the two disagree the
-  // panel is describing a pool the executor is not using, which must never pass silently.
+  // Both endpoints read one durable runtime pool. If the two disagree, the dashboard is describing
+  // a membership source the formation path is not using, which must never pass silently.
   const countDrift = pool && (pool.counts.poolLong !== executionLong.length || pool.counts.poolShort !== executionShort.length);
+  const refreshMinutes = pool?.autoPool?.refreshEveryMs ? Math.round(pool.autoPool.refreshEveryMs / 60_000) : null;
 
   const label = (text: string, n: number, color: string) => <strong style={{ color }}>{text} ({n})</strong>;
 
@@ -459,7 +470,7 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
     <div>
       <strong style={{ color: C.text }}>Pool FILTERED yang dipakai sekarang</strong>
       <div style={{ color: C.dim, fontSize: 11.5, marginTop: 2, lineHeight: 1.5 }}>
-        Daftar long dan short <b style={{ color: C.text }}>diturunkan dari kriteria</b>, bukan dipilih tangan.
+        Daftar long dan short <b style={{ color: C.text }}>diturunkan dari C1/C2 USD-M</b>, bukan dipilih tangan.
         {pool?.measured && <> Leg efektif <b style={{ color: C.text }}>{usd(pool.leg.effectiveUsd)}</b> ({usd(pool.leg.baseUsd, 0)} × {pool.leg.multiplier}) ·
         C1 likuiditas ≥ ${Math.round(pool.thresholds.minLiquidityUsdPerHour / 1000)}k/jam ·
         C2 satu lot ≤ {usd(pool.leg.oneLotCeilingUsd)} ({(pool.thresholds.maxLotFractionOfLeg * 100).toFixed(0)}% leg)</>}
@@ -468,21 +479,25 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
 
     {poolError && <Banner tone="warn">Kriteria tidak bisa dibaca (endpoint pool gagal). Daftar di bawah tetap yang dipakai executor, tapi belum diuji terhadap kriteria apa pun.</Banner>}
     {pool && !pool.measured && <Banner tone="warn">⚠ Kriteria tidak bisa diukur sekarang — pembacaan exchange gagal. Ini <b>bukan</b> berarti simbol-simbolnya gagal kriteria; belum ada yang diuji.</Banner>}
-    {/* Reads the RECONCILIATION, not the raw mismatch. This panel used to compute its own verdict
-        from `mismatch` and cried wolf over WIF — $199,118 against a $200,000 floor, 0.44% under —
-        while the API page's hysteresis said nothing needed changing. Two surfaces, two answers,
-        same symbol. The decision now lives in one place and both read it. */}
+    {pool?.autoPool?.state === 'ACTIVE' && <Banner tone="ok">
+      ✓ Auto-pool aktif · refresh C1/C2 tiap {refreshMinutes ?? 15} menit dari USD-M mainnet · berlaku untuk basket baru saja.
+    </Banner>}
+    {pool?.autoPool?.state === 'STALE_FALLBACK' && <Banner tone="warn">
+      ⚠ Auto-pool belum punya snapshot valid; sementara memakai fallback terakhir tanpa memperlebar universe. Refresh otomatis akan mencoba lagi. Basket terbuka tidak disentuh.
+    </Banner>}
+    {/* Reads the hysteresis-aware reconciliation, never the raw mismatch. The action is executed
+        automatically by the shared runtime pool; this panel is only reporting the next refresh. */}
     {pool?.measured && pool.reconciliation?.changed && <Banner tone="warn">
-      ⚠ Pool perlu diubah: {[
+      ⚠ Pool auto akan memperbarui: {[
         ...pool.reconciliation.adds.map((s) => `tambah ${s.replace('USDT', '')}`),
         ...pool.reconciliation.drops.map((s) => `keluarkan ${s.replace('USDT', '')}`),
-      ].join(' · ')}. Penerapan manual — allowlist dibaca sekali saat proses start.
+      ].join(' · ')}. Berlaku pada refresh berikutnya untuk basket baru; basket terbuka tidak disentuh.
     </Banner>}
     {pool?.measured && pool.reconciliation && !pool.reconciliation.changed && pool.reconciliation.held.length > 0 && <Banner tone="ok">
       ● Tidak ada yang perlu diubah. {pool.reconciliation.held.map((d) => d.symbol.replace('USDT', '')).join(', ')} di bawah ambang mentah tetapi <strong style={{ color: C.text }}>di dalam pita histeresis ±10%</strong>, jadi keanggotaannya sengaja dipertahankan — tanpa pita, simbol di garis batas keluar-masuk tiap beberapa jam dan menulis ulang pool yang dibandingkan overlap guard.
     </Banner>}
-    {pool?.measured && pool.reconciliation && !pool.reconciliation.changed && pool.reconciliation.held.length === 0 && <Banner tone="ok">✓ Ke-{pool.counts.poolLong} simbol pool sama persis dengan hasil kriteria C1 &amp; C2.</Banner>}
-    {countDrift && <Banner tone="warn">⚠ Kriteria menghitung {pool.counts.poolLong} long / {pool.counts.poolShort} short, executor memakai {executionLong.length} / {executionShort.length}. Panel ini dan executor tidak membaca daftar yang sama.</Banner>}
+    {pool?.measured && pool.reconciliation && !pool.reconciliation.changed && pool.reconciliation.held.length === 0 && pool.autoPool?.state !== 'ACTIVE' && <Banner tone="ok">✓ Ke-{pool.counts.poolLong} simbol pool sama persis dengan hasil kriteria C1 &amp; C2.</Banner>}
+    {countDrift && <Banner tone="warn">⚠ Pool runtime menghitung {pool.counts.poolLong} long / {pool.counts.poolShort} short, laporan formation menampilkan {executionLong.length} / {executionShort.length}. Data sedang tidak sinkron; tidak ada membership baru yang diasumsikan dari panel ini.</Banner>}
 
     <div>{label('POOL LONG — hasil kriteria C1 & C2', executionLong.length, C.good)}<InlineSymbolList symbols={executionLong} color={C.good} /></div>
     <div>

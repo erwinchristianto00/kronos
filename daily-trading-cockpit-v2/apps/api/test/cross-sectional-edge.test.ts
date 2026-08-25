@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import type { Candle } from "@dtc/shared";
 import {
   deriveAdaptiveSymbolFilters,
+  getCrossSectionalFilteredExecutionFilters,
+  shouldApplyCandleLiquidityFloor,
   crossSectionalMomentumScore,
   buildCrossSectionalBasket,
   buildFilteredCrossSectionalBasket,
@@ -1408,6 +1410,25 @@ describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard oper
       resolvedAt: T0,
     };
   }
+
+  it("[AUTO-POOL-CEILING] uses a runtime C1/C2 list as a strict execution ceiling and preserves the manual short block", () => {
+    withEnv({ CROSS_SECTIONAL_ADAPTIVE_DISABLED: "1" }, () => {
+      const filters = getCrossSectionalFilteredExecutionFilters(freshStore(), {
+        baseLongAllowlist: ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        baseShortAllowlist: ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        baseShortBlocklist: ["SOLUSDT"],
+      });
+      expect(filters.longAllowlist).toEqual(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+      expect(filters.shortAllowlist).toEqual(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+      expect(filters.shortBlocklist).toEqual(["SOLUSDT"]);
+    });
+  });
+
+  it("[AUTO-POOL-VENUE] skips the unrelated spot candle-liquidity floor only after a valid USD-M pool is active", () => {
+    expect(shouldApplyCandleLiquidityFloor(null)).toBe(true);
+    expect(shouldApplyCandleLiquidityFloor({ enabled: true, state: "STALE_FALLBACK" } as never)).toBe(true);
+    expect(shouldApplyCandleLiquidityFloor({ enabled: true, state: "ACTIVE" } as never)).toBe(false);
+  });
 
   it("keeps allowlists inside operator filters while demoting measured losers", () => {
     const store = freshStore();

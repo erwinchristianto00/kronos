@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFil
 import { dirname, resolve } from "node:path";
 
 import { clusterOf, isMajorCluster } from "./correlation-clusters.js";
+import type { CrossSectionalAutoPoolSnapshot } from "./cross-sectional-auto-pool.js";
 import { recordRejectedBasket } from "./rejected-basket-recorder.js";
 import { evaluateMarketStandDown, standDownThresholdPct } from "./market-drawdown-standdown.js";
 import {
@@ -1371,6 +1372,16 @@ export function crossSectionalLiquidityStarved(
   return longAllow.size === 0 || shortAllow.size === 0;
 }
 
+/**
+ * Momentum scoring can use spot candles for ratio continuity, but the auto-pool's C1 verdict is
+ * venue-correct USD-M liquidity. Once that durable pool is ACTIVE, do not reject a futures leg a
+ * second time on unrelated spot volume. Before the first successful refresh, retain the existing
+ * candle floor rather than silently relaxing admission.
+ */
+export function shouldApplyCandleLiquidityFloor(autoPool: CrossSectionalAutoPoolSnapshot | null): boolean {
+  return !(autoPool?.enabled === true && autoPool.state === "ACTIVE");
+}
+
 // ── Auto-updating symbol filters (operator: "ikutin filtered symbol, auto update
 // terus blacklist dan whitelist nya") ────────────────────────────────────────
 //
@@ -1497,6 +1508,10 @@ export function deriveAdaptiveSymbolFilters(
      *  unaffected. */
     minEligiblePerSideLong?: number;
     minEligiblePerSideShort?: number;
+    /** Runtime C1/C2 ceiling. It can only narrow the fixed candidate universe. */
+    baseLongAllowlist?: readonly string[];
+    baseShortAllowlist?: readonly string[];
+    baseShortBlocklist?: readonly string[];
   } = {},
 ): AdaptiveSymbolFilters {
   const minLegSamples = opts.minLegSamples ?? 3;
@@ -1505,12 +1520,15 @@ export function deriveAdaptiveSymbolFilters(
   const sinceMs = opts.sinceMs ?? getCrossSectionalAdaptiveSinceMs();
   const hardMinLegSamples = Math.max(minLegSamples, crossSectionalAdaptiveHardMinLegSamples());
   const hardMinClosedBaskets = crossSectionalAdaptiveHardMinClosedBaskets();
+  const baseLongAllowlist = new Set(opts.baseLongAllowlist ?? CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST);
+  const baseShortAllowlist = new Set(opts.baseShortAllowlist ?? CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST);
+  const baseShortBlocklist = new Set(opts.baseShortBlocklist ?? CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST);
   if (isCrossSectionalAdaptiveDemotionFrozen()) {
     return {
-      longAllowlist: [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST].sort(),
-      shortAllowlist: [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST].sort(),
+      longAllowlist: [...baseLongAllowlist].sort(),
+      shortAllowlist: [...baseShortAllowlist].sort(),
       longBlocklist: [],
-      shortBlocklist: [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST].sort(),
+      shortBlocklist: [...baseShortBlocklist].sort(),
       longScoreAdjustmentBySymbol: {},
       shortScoreAdjustmentBySymbol: {},
       provenance: {
@@ -1585,9 +1603,9 @@ export function deriveAdaptiveSymbolFilters(
     }
   }
 
-  const longAllowRaw = new Set<string>([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST]);
+  const longAllowRaw = new Set<string>(baseLongAllowlist);
   for (const s of hardDemotedLong) longAllowRaw.delete(s);
-  const shortAllowRaw = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST]);
+  const shortAllowRaw = new Set<string>(baseShortAllowlist);
   for (const s of hardDemotedShort) shortAllowRaw.delete(s);
 
   // Floor (2026-07-07 audit): demotion has no natural recovery path — a demoted symbol only
@@ -1601,10 +1619,10 @@ export function deriveAdaptiveSymbolFilters(
   // staying locked out forever with nothing left to remeasure it.
   const longFloorApplied = longAllowRaw.size < minEligiblePerSideLong;
   const shortFloorApplied = shortAllowRaw.size < minEligiblePerSideShort;
-  const longAllow = longFloorApplied ? new Set(CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST) : longAllowRaw;
-  const shortAllow = shortFloorApplied ? new Set(CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST) : shortAllowRaw;
+  const longAllow = longFloorApplied ? new Set(baseLongAllowlist) : longAllowRaw;
+  const shortAllow = shortFloorApplied ? new Set(baseShortAllowlist) : shortAllowRaw;
   const shortBlock = new Set<string>([
-    ...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
+    ...baseShortBlocklist,
     ...(shortFloorApplied ? [] : hardDemotedShort),
   ]);
   const longBlock = new Set<string>(longFloorApplied ? [] : hardDemotedLong);
@@ -1651,6 +1669,10 @@ export function getCrossSectionalFilteredExecutionFilters(
   opts: {
     minEligiblePerSideLong?: number;
     minEligiblePerSideShort?: number;
+    /** Empty must never flow through: an empty allowlist means allow-everything downstream. */
+    baseLongAllowlist?: readonly string[];
+    baseShortAllowlist?: readonly string[];
+    baseShortBlocklist?: readonly string[];
   } = {},
 ): {
   longAllowlist: string[];
@@ -1662,18 +1684,26 @@ export function getCrossSectionalFilteredExecutionFilters(
   adaptiveDisabled: boolean;
 } {
   const adaptiveDisabled = isCrossSectionalAdaptiveDisabled();
+  const baseLongAllowlist = opts.baseLongAllowlist ?? [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST];
+  const baseShortAllowlist = opts.baseShortAllowlist ?? [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST];
+  const baseShortBlocklist = opts.baseShortBlocklist ?? [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST];
   if (adaptiveDisabled) {
     return {
-      longAllowlist: [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST],
-      shortAllowlist: [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST],
-      shortBlocklist: [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST],
+      longAllowlist: [...baseLongAllowlist],
+      shortAllowlist: [...baseShortAllowlist],
+      shortBlocklist: [...baseShortBlocklist],
       longScoreAdjustmentBySymbol: {},
       shortScoreAdjustmentBySymbol: {},
       adaptiveMode: getCrossSectionalAdaptiveMode(),
       adaptiveDisabled: true,
     };
   }
-  const adaptive = deriveAdaptiveSymbolFilters(store, opts);
+  const adaptive = deriveAdaptiveSymbolFilters(store, {
+    ...opts,
+    baseLongAllowlist,
+    baseShortAllowlist,
+    baseShortBlocklist,
+  });
   return {
     longAllowlist: adaptive.longAllowlist,
     shortAllowlist: adaptive.shortAllowlist,
@@ -2060,6 +2090,8 @@ export interface CrossSectionalCycleResult {
   openedTrend?: number;
   openedMixed?: number;
   openedDynamicMom36Shock?: number;
+  /** Runtime C1/C2 pool state observed by this formation cycle. */
+  autoPoolState?: CrossSectionalAutoPoolSnapshot["state"];
   resolved: number;
   expired: number;
 }
@@ -2084,6 +2116,8 @@ export async function runCrossSectionalCycle(opts: {
   symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
   /** Returns true only after a reliability decision is durable; otherwise a would-be basket is held. */
   symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
+  /** Durable C1/C2 membership inside the fixed candidate universe. A failure preserves fallback lists. */
+  filteredExecutionPool?: () => Promise<CrossSectionalAutoPoolSnapshot | null>;
 }): Promise<CrossSectionalCycleResult> {
   const result: CrossSectionalCycleResult = { opened: 0, resolved: 0, expired: 0 };
   const nowIso = new Date(opts.now).toISOString();
@@ -2200,9 +2234,25 @@ export async function runCrossSectionalCycle(opts: {
     const skew = !dynamicMom36Shock && isCrossSectionalRegimeSkewEnabled()
       ? regimeSkewedK(CROSS_SECTIONAL_K, opts.axisScore ?? null)
       : null;
+    let managedPool: CrossSectionalAutoPoolSnapshot | null = null;
+    try {
+      managedPool = await opts.filteredExecutionPool?.() ?? null;
+    } catch {
+      // Never pass [] to allowed(): it means "allow everything". The proven fallback lists remain
+      // the only safe source if public pool resolution itself is unavailable.
+      managedPool = null;
+    }
+    const activePool = managedPool && managedPool.activeSymbols.length > 0
+      ? managedPool.activeSymbols.filter((symbol) => opts.universe.includes(symbol))
+      : [];
+    if (managedPool) result.autoPoolState = managedPool.state;
     const adaptive = getCrossSectionalFilteredExecutionFilters(opts.store, {
       minEligiblePerSideLong: skew?.longK,
       minEligiblePerSideShort: skew?.shortK,
+      ...(activePool.length > 0 ? {
+        baseLongAllowlist: activePool,
+        baseShortAllowlist: activePool,
+      } : {}),
     });
     // In the new-cohort soft phase, evidence changes ranking but not eligibility. This preserves
     // momentum opportunity while still steering a tie/near-tie away from a measured loser; only the
@@ -2211,7 +2261,7 @@ export async function runCrossSectionalCycle(opts: {
     // Liquidity floor (default OFF — see CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR). Applied to
     // the ALLOWLISTS rather than to `scored`, so it narrows only the FILTERED basket: RAW stays the
     // unmodified OOS control, and TREND/MIXED keep reading their own env lists untouched.
-    const liquid = CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0
+    const liquid = CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0 && shouldApplyCandleLiquidityFloor(managedPool)
       ? liquidCrossSectionalSymbols(candlesBySymbol, CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR)
       : null;
     const longAllow = narrowAllowlistToLiquid(adaptive.longAllowlist, liquid);
@@ -2659,6 +2709,7 @@ export async function runCrossSectionalCycleGuarded(opts: {
   filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
   symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
   symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
+  filteredExecutionPool?: () => Promise<CrossSectionalAutoPoolSnapshot | null>;
 }): Promise<CrossSectionalCycleResult | null> {
   if (cycleRunning) return null;
   cycleRunning = true;
