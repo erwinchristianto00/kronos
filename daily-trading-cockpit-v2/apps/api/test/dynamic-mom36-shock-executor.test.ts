@@ -238,6 +238,7 @@ function runner(longCount: number, opts: { siblingOpenBasketCount?: () => number
     client,
     executor,
     store,
+    signalStore,
     dataDir,
     setNow(ms: number) { nowMs = ms; },
   };
@@ -304,6 +305,65 @@ describe("Dynamic MOM36 executor — asymmetric live lifecycle", () => {
     expect(basket).toMatchObject({ status: "CLOSED", closeReason: "OPERATOR_SCOPED_CLOSE:test" });
     expect(run.client.orders.filter((order) => order.reduceOnly)).toHaveLength(6);
     expect(Array.from(run.client.positions.values()).every((qty) => Math.abs(qty) < 1e-9)).toBe(true);
+  }));
+
+  it("defers a fresh Dynamic signal while a USD-M mark is unavailable, then opens it once the mark returns", async () => withDynamicEnv(async () => {
+    const run = runner(3);
+    const signal = run.signalStore.all[0]!;
+    const watermarkBefore = run.store.getState().lastSeenSignalMs;
+    run.client.marks.delete("AVAXUSDT");
+
+    await run.executor.tick();
+
+    expect(run.store.getState().baskets).toHaveLength(0);
+    expect(run.client.orders).toHaveLength(0);
+    expect(run.store.getState().lastSeenSignalMs).toBe(watermarkBefore);
+    expect(run.store.getState().entryAttempts?.at(-1)).toMatchObject({
+      sourceObservationId: signal.observationId,
+      stage: "SMART_ENTRY_REVALIDATION",
+      outcome: "DEFERRED",
+      reason: "dynamic entry reconciliation missing a fresh USD-M mark for AVAXUSDT",
+      watermarkAdvanced: false,
+    });
+
+    run.client.marks.set("AVAXUSDT", 140);
+    await run.executor.tick();
+
+    expect(run.store.getState().baskets).toHaveLength(1);
+    expect(run.store.getState().baskets[0]).toMatchObject({ status: "COMPLETE", sourceObservationId: signal.observationId });
+    expect(run.client.orders).toHaveLength(6);
+  }));
+
+  it("recovers only a still-fresh Dynamic signal consumed by the pre-fix transient-mark skip", async () => withDynamicEnv(async () => {
+    const run = runner(3);
+    const signal = run.signalStore.all[0]!;
+    const state = run.store.getState();
+    state.lastSeenSignalMs = signal.openedAtMs;
+    state.entryAttempts?.push({
+      at: new Date(T0).toISOString(),
+      sourceObservationId: signal.observationId,
+      sourceOpenedAtMs: signal.openedAtMs,
+      variant: DYNAMIC_MOM36_SHOCK_VARIANT,
+      signal: DYNAMIC_MOM36_SHOCK_SIGNAL,
+      longSymbols: signal.longLeg.map((leg) => leg.symbol),
+      shortSymbols: signal.shortLeg.map((leg) => leg.symbol),
+      stage: "SMART_ENTRY_REVALIDATION",
+      outcome: "SKIPPED",
+      reason: "dynamic entry reconciliation missing a fresh USD-M mark for AVAXUSDT",
+      referencePrices: {},
+      watermarkAdvanced: true,
+    });
+    run.store.save();
+
+    await run.executor.tick();
+
+    expect(run.store.getState().baskets).toHaveLength(1);
+    expect(run.store.getState().baskets[0]).toMatchObject({ status: "COMPLETE", sourceObservationId: signal.observationId });
+    expect(run.client.orders).toHaveLength(6);
+    expect(run.store.getState().entryAttempts?.at(-2)).toMatchObject({
+      outcome: "DEFERRED",
+      watermarkAdvanced: false,
+    });
   }));
 
   it("accounts for asymmetric 5L1S P&L by actual leg dollars and preserves its frozen horizon across restart", async () => withDynamicEnv(async () => {

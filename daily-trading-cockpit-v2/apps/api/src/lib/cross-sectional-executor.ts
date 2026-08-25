@@ -696,6 +696,12 @@ export interface SmartBasketRuntime {
 
 interface SmartEntryRevalidation {
   allowed: boolean;
+  /**
+   * A Dynamic signal with a temporarily unavailable USD-M account mark has not failed its
+   * selection or risk gates.  Keep that one fresh signal eligible for a later executor tick;
+   * every ordinary Smart Basket rejection remains a permanent skip as before.
+   */
+  retryable?: boolean;
   reason: string | null;
   at: string | null;
   referencePrices: Record<string, number>;
@@ -2207,6 +2213,78 @@ export class CrossSectionalExecutor {
     this.openHalted = reason;
   }
 
+  /**
+   * A retryable defer deliberately leaves lastSeenSignalMs untouched.  It is used only for the
+   * Dynamic USD-M mark reconciliation path: without every fresh executable mark we must not
+   * place an order, but consuming an otherwise-valid hourly signal would turn a brief feed/cache
+   * gap into a permanent missed entry.
+   */
+  private deferSignal(
+    signal: CrossSectionalObservation,
+    stage: CrossSectionalEntryAttemptStage,
+    reason: string,
+    referencePrices: Record<string, number> = {},
+  ): void {
+    this.recordEntryAttempt(signal, {
+      stage,
+      outcome: "DEFERRED",
+      reason,
+      referencePrices,
+      watermarkAdvanced: false,
+    });
+    this.store.save();
+    this.openHalted = reason;
+  }
+
+  private isRetryableDynamicMarkRevalidationReason(reason: string | null): boolean {
+    return typeof reason === "string" && (
+      reason.startsWith("dynamic entry reconciliation unavailable:") ||
+      reason.startsWith("dynamic entry reconciliation missing a fresh USD-M mark for ")
+    );
+  }
+
+  /**
+   * Versions before the retryable Dynamic revalidation fix wrote a permanent SKIPPED watermark
+   * for a transient missing USD-M mark.  Recover only that exact, still-fresh, latest Dynamic
+   * signal so a rolling deploy cannot silently discard it.  This never manufactures a signal,
+   * relaxes its gates, or revives an already-planned basket; a new or non-retryable watermark
+   * always wins.
+   */
+  private restoreFreshRetryableDynamicSignal(state: ExecutorState, nowMs: number): void {
+    const signal = this.signalStore.all
+      .filter((candidate) =>
+        candidate.status === "OPEN" &&
+        (candidate.variant ?? "RAW") === this.targetVariant &&
+        this.isDynamicSignal(candidate) &&
+        candidate.openedAtMs === state.lastSeenSignalMs &&
+        nowMs - candidate.openedAtMs <= this.maxSignalAgeMsFn(),
+      )
+      .sort((a, b) => b.openedAtMs - a.openedAtMs)[0];
+    if (!signal) return;
+    if (state.baskets.some((basket) => basket.sourceObservationId === signal.observationId)) return;
+
+    const prior = [...(state.entryAttempts ?? [])]
+      .reverse()
+      .find((event) => event.sourceObservationId === signal.observationId);
+    if (
+      !prior ||
+      prior.stage !== "SMART_ENTRY_REVALIDATION" ||
+      prior.outcome !== "SKIPPED" ||
+      prior.watermarkAdvanced !== true ||
+      !this.isRetryableDynamicMarkRevalidationReason(prior.reason)
+    ) return;
+
+    state.lastSeenSignalMs = signal.openedAtMs - 1;
+    this.recordEntryAttempt(signal, {
+      stage: "SMART_ENTRY_REVALIDATION",
+      outcome: "DEFERRED",
+      reason: `retrying fresh Dynamic signal after transient USD-M mark reconciliation: ${prior.reason}`,
+      referencePrices: prior.referencePrices,
+      watermarkAdvanced: false,
+    });
+    this.store.save();
+  }
+
   /** Thin wrapper over the shared resolveConfirmedFillPrice, injecting this executor's
    *  test-overridable retry delay and a lane-tagged log line. See binance-futures-private.ts
    *  for why this confirmation step exists (basket xb-mr2x7s6e's real-world avgPrice=0 case). */
@@ -2953,6 +3031,7 @@ export class CrossSectionalExecutor {
       if (dynamic) {
         return {
           allowed: false,
+          retryable: true,
           reason: `dynamic entry reconciliation unavailable: ${error instanceof Error ? error.message : String(error)}`,
           at: this.nowIso(),
           referencePrices: {},
@@ -2978,6 +3057,7 @@ export class CrossSectionalExecutor {
           if (dynamic) {
             return {
               allowed: false,
+              retryable: true,
               reason: `dynamic entry reconciliation missing a fresh USD-M mark for ${leg.symbol}`,
               at: this.nowIso(),
               referencePrices,
@@ -4591,6 +4671,7 @@ export class CrossSectionalExecutor {
     if (globallyOpenBasketCount >= this.maxOpenBasketsFn()) return;
 
     const nowMs = new Date(this.nowIso()).getTime();
+    this.restoreFreshRetryableDynamicSignal(st, nowMs);
     // Newest FRESH, still-OPEN signal of the target variant we haven't executed yet.
     // Default FILTERED: symbol-filtered baskets whose allow/blocklists auto-update from
     // measured per-leg returns (see deriveAdaptiveSymbolFilters).
@@ -4748,14 +4829,12 @@ export class CrossSectionalExecutor {
 
     const smartEntry = await this.revalidateSmartEntry(signal);
     if (!smartEntry.allowed) {
-      // This is a defer-to-next-scan decision, not a permanent symbol rejection.  Advancing the
-      // watermark prevents a five-minute loop from repeatedly chasing the exact same stale rank.
-      this.skipSignal(
-        signal,
-        "SMART_ENTRY_REVALIDATION",
-        smartEntry.reason ?? "smart entry revalidation rejected basket",
-        smartEntry.referencePrices,
-      );
+      const reason = smartEntry.reason ?? "smart entry revalidation rejected basket";
+      if (smartEntry.retryable) {
+        this.deferSignal(signal, "SMART_ENTRY_REVALIDATION", reason, smartEntry.referencePrices);
+      } else {
+        this.skipSignal(signal, "SMART_ENTRY_REVALIDATION", reason, smartEntry.referencePrices);
+      }
       return;
     }
 
