@@ -10,6 +10,7 @@ import {
   type ExecutorBasket,
 } from "../src/lib/cross-sectional-executor.js";
 import { CrossSectionalStore, type CrossSectionalObservation } from "../src/lib/cross-sectional-edge.js";
+import type { FuturesMarketReference } from "../src/lib/futures-market-reference-cache.js";
 import {
   DYNAMIC_MOM36_HORIZON_MS,
   DYNAMIC_MOM36_SHOCK_36H_V1,
@@ -211,7 +212,10 @@ function dynamicSignal(
   };
 }
 
-function runner(longCount: number, opts: { siblingOpenBasketCount?: () => number } = {}) {
+function runner(longCount: number, opts: {
+  siblingOpenBasketCount?: () => number;
+  warmFuturesMarketReference?: (symbol: string) => Promise<FuturesMarketReference | null>;
+} = {}) {
   let nowMs = T0;
   const dataDir = tempDir("dynamic-mom36-executor");
   const signalStore = new CrossSectionalStore(dataDir);
@@ -229,6 +233,7 @@ function runner(longCount: number, opts: { siblingOpenBasketCount?: () => number
     leverage: () => 1,
     maxOpenBaskets: () => 1,
     ...(opts.siblingOpenBasketCount ? { siblingOpenBasketCount: opts.siblingOpenBasketCount } : {}),
+    ...(opts.warmFuturesMarketReference ? { warmFuturesMarketReference: opts.warmFuturesMarketReference } : {}),
     entryHealthGate: () => ({ allowed: true, reason: null }),
     entryTrafficLightEnabled: () => false,
     nowIso: () => new Date(nowMs).toISOString(),
@@ -332,6 +337,27 @@ describe("Dynamic MOM36 executor — asymmetric live lifecycle", () => {
     expect(run.store.getState().baskets).toHaveLength(1);
     expect(run.store.getState().baskets[0]).toMatchObject({ status: "COMPLETE", sourceObservationId: signal.observationId });
     expect(run.client.orders).toHaveLength(6);
+  }));
+
+  it("recovers a missing flat Dynamic leg mark only from an exact-symbol USD-M reference", async () => withDynamicEnv(async () => {
+    const run = runner(3, {
+      warmFuturesMarketReference: async (symbol) => symbol === "AVAXUSDT"
+        ? { symbol, price: 140, atMs: T0, source: "USD_M_MARK_PRICE" }
+        : null,
+    });
+    run.client.marks.delete("AVAXUSDT");
+
+    await run.executor.tick();
+
+    const basket = run.store.getState().baskets[0]!;
+    expect(basket).toMatchObject({ status: "COMPLETE" });
+    expect(run.client.orders).toHaveLength(6);
+    expect(basket.legs.find((leg) => leg.symbol === "AVAXUSDT")?.entryPrice).toBe(140);
+    expect(run.store.getState().entryAttempts?.at(-1)).toMatchObject({
+      stage: "BASKET_RESERVED",
+      outcome: "ADMITTED",
+      referencePrices: expect.objectContaining({ AVAXUSDT: 140 }),
+    });
   }));
 
   it("recovers only a still-fresh Dynamic signal consumed by the pre-fix transient-mark skip", async () => withDynamicEnv(async () => {

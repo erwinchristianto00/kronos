@@ -2965,13 +2965,12 @@ export class CrossSectionalExecutor {
   }
 
   /**
-   * A zero-position row on Binance's positionRisk endpoint can legitimately carry markPrice=0
-   * for a multiplier perpetual, even while that contract is actively tradable.  The measurement
-   * signal's bare-spot price remains unsafe for sizing.  Prefer the short-lived,
-   * exact-symbol USD-M mark cache and fall back only to its USD-M execution-book
-   * midpoint; a spot cache value is deliberately not even considered here.
+   * Binance positionRisk can omit a flat contract or return markPrice=0 even while its USD-M
+   * perpetual is actively tradable.  Prefer the short-lived exact-symbol USD-M mark cache and
+   * then its USD-M execution-book midpoint; positionRisk is a same-environment final fallback.
+   * A spot cache value is deliberately never reachable from here.
    */
-  private async liveMultiplierReferencePrice(symbol: string, mark: unknown = null): Promise<number | null> {
+  private async liveFuturesReferencePrice(symbol: string, mark: unknown = null): Promise<number | null> {
     const cachedReference = this.readFuturesMarketReferenceFn?.(symbol);
     const cached = verifiedFuturesMarketReferencePrice(symbol, cachedReference);
     if (cached !== null) {
@@ -3050,8 +3049,13 @@ export class CrossSectionalExecutor {
     for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
       for (const leg of legs) {
         let mark: number | null | undefined = marks.get(leg.symbol);
-        if (isCrossSectionalMultiplierContract(leg.symbol)) {
-          mark = await this.liveMultiplierReferencePrice(leg.symbol, mark);
+        const accountMarkAvailable = typeof mark === "number" && Number.isFinite(mark) && mark > 0;
+        // Dynamic MOM36 requires an executable USD-M mark for EVERY leg.  A flat non-multiplier
+        // can be absent from positionRisk (as ARBUSDT was in production); recover only that
+        // missing account mark through the exact-symbol USD-M reference cache.  Multiplier
+        // contracts always take the same path because their bare signal price is a different unit.
+        if (isCrossSectionalMultiplierContract(leg.symbol) || (dynamic && !accountMarkAvailable)) {
+          mark = await this.liveFuturesReferencePrice(leg.symbol, mark);
         }
         if (!(typeof mark === "number" && Number.isFinite(mark) && mark > 0)) {
           if (dynamic) {
@@ -4934,7 +4938,7 @@ export class CrossSectionalExecutor {
         const f = filters.get(leg.symbol);
         let liveReferencePrice = smartEntry.referencePrices[leg.symbol];
         if (isCrossSectionalMultiplierContract(leg.symbol) && !(liveReferencePrice > 0)) {
-          const recovered = await this.liveMultiplierReferencePrice(leg.symbol);
+          const recovered = await this.liveFuturesReferencePrice(leg.symbol);
           if (recovered !== null) {
             smartEntry.referencePrices[leg.symbol] = recovered;
             liveReferencePrice = recovered;
