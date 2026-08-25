@@ -16,4 +16,4 @@ root="${CONTINUATION_LIFECYCLE_ROOT:-/root/kronos-continuation}"
 exec nice -n 19 ionice -c 3 env \
   NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=384}" \
   PYTHONPATH="${CONTINUATION_PYTHONPATH:-${PYTHONPATH:-/root/pylibs}}" \
-  ./node_modules/.bin/tsx scripts/continuation-lifecycle.ts "--root=$root"
+  "$here/../node_modules/.bin/tsx" scripts/continuation-lifecycle.ts "--root=$root"
