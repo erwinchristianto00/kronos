@@ -87,6 +87,19 @@ describe("continuation data collector", () => {
     expect(ohlcv[0]?.[4]).toBe(102);
   });
 
+  it("retains inactive legacy watermarks for audit but excludes them from active V4 required health", async () => {
+    const dir = root();
+    const paths = continuationLifecyclePaths(dir);
+    const oldPopulation = new ContinuationDataCollector({ paths, symbols: ["BTCUSDT", "RNDRUSDT"], nowMs: () => NOW, fetchJson: fetchFixture });
+    await oldPopulation.reconcileOnce(NOW);
+    const activePopulation = new ContinuationDataCollector({ paths, symbols: ["BTCUSDT"], nowMs: () => NOW, fetchJson: fetchFixture });
+    const health = activePopulation.writeHealth(NOW + 1);
+
+    expect(health.watermarks["binance-usdm:kline_1h:RNDRUSDT"]).toBeDefined();
+    expect(health.sourceSummary["binance-usdm:kline_1h"]?.freshness).toBe("HEALTHY");
+    expect(health.sourceSummary["binance-usdm:kline_1h"]?.required).toBe(true);
+  });
+
   it("ingests only final WebSocket candles and updates the same materialized series", () => {
     const dir = root();
     const paths = continuationLifecyclePaths(dir);

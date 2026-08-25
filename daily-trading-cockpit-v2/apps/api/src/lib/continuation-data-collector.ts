@@ -341,6 +341,16 @@ export class ContinuationDataCollector {
     return this.watermarks[key] ?? (this.watermarks[key] = emptyWatermark(source, dataType, symbol, nowMs));
   }
 
+  /**
+   * A previous collector may have persisted watermarks for retired executor symbols. Keep those
+   * records for audit, but never let one stale legacy kline poison the health of the exact V4
+   * training population selected for this process.
+   */
+  private isInactiveBinanceKline(watermark: ContinuationWatermark): boolean {
+    return watermark.source === "binance-usdm" && watermark.dataType.startsWith("kline_") &&
+      (watermark.symbol === null || !this.symbols.includes(watermark.symbol));
+  }
+
   private touchError(source: string, dataType: string, symbol: string | null, error: unknown, nowMs: number): void {
     const watermark = this.watermark(source, dataType, symbol, nowMs);
     watermark.updatedAt = continuationNowIso(nowMs);
@@ -808,6 +818,7 @@ export class ContinuationDataCollector {
     for (const watermark of Object.values(this.watermarks)) watermark.freshness = freshnessFor(watermark, nowMs);
     const grouped = new Map<string, ContinuationWatermark[]>();
     for (const watermark of Object.values(this.watermarks)) {
+      if (this.isInactiveBinanceKline(watermark)) continue;
       const key = `${watermark.source}:${watermark.dataType}`;
       const rows = grouped.get(key) ?? [];
       rows.push(watermark);
