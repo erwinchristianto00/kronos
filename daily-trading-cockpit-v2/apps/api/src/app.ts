@@ -2276,21 +2276,24 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // sizing exemption above and skip the lane-selector check ENTIRELY (armed/killed/drain only,
         // via canOpenNewEntriesIgnoringManualDirectional()) — otherwise fall back to the original,
         // fully-coupled behavior so disabling the flag really does disable independence, not just sizing.
-        isAllowed: () =>
-          // `directionalRegimeAllowsBalancedBasket` is the legacy 3L/3S-vs-directional selector.
-          // Applying it to this policy would make the old directional regime override the new
-          // MOM36 breadth engine exactly when breadth calls for 6L0S/0L6S.  Keep every existing
-          // operational/armed/lane admission below, but do not let a legacy *composition* selector
-          // rewrite Dynamic MOM36's authoritative allocation after it has passed admission.
-          (dynamicMom36ShockStrategyActive || directionalRegimeAllowsBalancedBasket()) &&
-          crossSectionalMarketNeutralIsAllowed({
-          allocationIndependent: isCrossSectionalAllocationIndependent(),
-          canOpenIgnoringManualDirectional: () => engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false,
-          canOpenNewEntries: () => engineForGate?.canOpenNewEntries() ?? false,
-          unifiedOrchestratorEnabled: unifiedOrchestrator?.isEnabled() ?? false,
-          allowsCrossSectionalLane: () => unifiedOrchestrator?.allowsCrossSectionalLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false,
-          laneSelectionAllowsLane: () => engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false,
-        }),
+        isAllowed: () => {
+          if (dynamicMom36ShockStrategyActive) {
+            // Dynamic MOM36 owns its 6L0S...0L6S allocation. A manual directional selector has
+            // no compatible per-symbol bias for that frozen basket and must not turn a valid
+            // breadth admission into NO_TRADE. `canOpenNewEntriesIgnoringManualDirectional()`
+            // still enforces the engine's armed, kill, drain, transport, and canonical strategy
+            // safety gates; it removes only that legacy composition short-circuit.
+            return engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false;
+          }
+          return directionalRegimeAllowsBalancedBasket() && crossSectionalMarketNeutralIsAllowed({
+            allocationIndependent: isCrossSectionalAllocationIndependent(),
+            canOpenIgnoringManualDirectional: () => engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false,
+            canOpenNewEntries: () => engineForGate?.canOpenNewEntries() ?? false,
+            unifiedOrchestratorEnabled: unifiedOrchestrator?.isEnabled() ?? false,
+            allowsCrossSectionalLane: () => unifiedOrchestrator?.allowsCrossSectionalLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false,
+            laneSelectionAllowsLane: () => engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false,
+          });
+        },
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? 0,
         // 2026-07-22 bug-hunt fix: this executor's real basket closes were never wired into
         // cortex-real-attribution.ts at all (see CrossSectionalExecutorOptions.rawLaneWeightPct /

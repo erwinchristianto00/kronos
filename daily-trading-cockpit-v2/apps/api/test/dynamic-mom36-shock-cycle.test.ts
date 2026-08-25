@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Candle } from "@dtc/shared";
@@ -25,6 +25,18 @@ function candlesFor(mom36: number): Candle[] {
 }
 
 describe("Dynamic MOM36 production-cycle integration", () => {
+  it("does not let the legacy manual-directional selector suppress a Dynamic breadth basket", () => {
+    const source = readFileSync(new URL("../src/app.ts", import.meta.url), "utf8");
+    const start = source.indexOf("isAllowed: () => {");
+    const end = source.indexOf("laneWeightPct:", start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const admission = source.slice(start, end);
+    expect(admission).toContain("if (dynamicMom36ShockStrategyActive)");
+    expect(admission).toContain("engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false");
+    expect(admission).toContain("armed, kill, drain, transport, and canonical strategy");
+  });
+
   it("keeps blocked WLD in breadth/admission information, then skips it only at final short selection", async () => {
     const overrides: Record<string, string> = {
       CROSS_SECTIONAL_STRATEGY_VERSION: DYNAMIC_MOM36_SHOCK_36H_V1,
