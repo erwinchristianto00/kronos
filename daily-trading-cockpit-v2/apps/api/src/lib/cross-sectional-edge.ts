@@ -2253,6 +2253,14 @@ export async function runCrossSectionalCycle(opts: {
     if (dynamicMom36Shock) {
       const staleOrMissing: string[] = [];
       for (const symbol of opts.universe) {
+        // Dynamic inference is defined over the CURRENT executable pool.  The broader
+        // cross-sectional universe intentionally retains retired/report-only symbols for
+        // legacy markout work; a stale one outside both execution pools must not make the
+        // active pool look asynchronous or block every new Dynamic formation.
+        //
+        // Short blocks deliberately do NOT apply here: they remain final-selection-only so
+        // breadth and admission continue to see the complete executable pool.
+        if (!allowed(symbol, longAllow, null) && !allowed(symbol, shortAllow, null)) continue;
         const completed = completedCandlesForDynamicMom36(candlesBySymbol[symbol] ?? [], dynamicDecisionInformationCutoffMs);
         // Synchronous inference: a stale symbol cannot be silently mixed with the latest bar.
         if (!completed || completed.featureTimestampMs !== dynamicDecisionInformationCutoffMs) {
@@ -2264,9 +2272,6 @@ export async function runCrossSectionalCycle(opts: {
           staleOrMissing.push(symbol);
           continue;
         }
-        // Pool membership is a current production input. Blocklists are deliberately excluded here
-        // because they are execution-only and must not rewrite breadth.
-        if (!allowed(symbol, longAllow, null) && !allowed(symbol, shortAllow, null)) continue;
         const volatility = realizedVolatility(completed.candles);
         const fastStart = completed.candles[completed.candles.length - 1 - CROSS_SECTIONAL_SMART_FAST_BARS];
         const fastReturn = fastStart && fastStart.close > 0 ? (momentum.price - fastStart.close) / fastStart.close : null;
@@ -2581,7 +2586,14 @@ export async function runCrossSectionalCycle(opts: {
   // Dynamic MOM36 owns the only post-cutover cross-basket formation path. Existing observations
   // were resolved above, but no legacy TREND/MIXED shadow candidate is allowed to appear alongside
   // it and be mistaken for an executable alternate strategy.
-  if (dynamicMom36Shock) return result;
+  if (dynamicMom36Shock) {
+    // Dynamic observations are executable signals. Persist both the newly formed observation and
+    // cycle watermark before returning so a restart cannot erase the signal or make the report
+    // falsely appear stale.
+    opts.store.markCycle(nowIso);
+    opts.store.save();
+    return result;
+  }
   if (!isCrossSectionalAdaptiveDisabled() && regimeContext?.regimeClass && regimeContext.regimeClass !== "UNKNOWN") {
     if (
       (regimeContext.regimeClass === "TREND_LONG" || regimeContext.regimeClass === "TREND_SHORT") &&

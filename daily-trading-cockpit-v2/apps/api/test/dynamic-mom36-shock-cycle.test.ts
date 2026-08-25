@@ -74,10 +74,11 @@ describe("Dynamic MOM36 production-cycle integration", () => {
         AAVEUSDT: 0.04,
         WLDUSDT: -0.03,
       };
+      const now = cutoff + 5 * 60_000;
       const result = await edge.runCrossSectionalCycle({
         store,
         universe,
-        now: cutoff + 5 * 60_000,
+        now,
         fetchCandles: async (symbol) => candlesFor(returns[symbol]!),
       });
 
@@ -96,6 +97,67 @@ describe("Dynamic MOM36 production-cycle integration", () => {
       expect(observation.dynamicMom36?.blockedShortsSkipped).toContain("WLDUSDT");
       expect(observation.shortLeg.map((leg) => leg.symbol)).not.toContain("WLDUSDT");
       expect([...observation.longLeg, ...observation.shortLeg]).toHaveLength(6);
+      expect(store.lastCycleAt).toBe(new Date(now).toISOString());
+
+      // A Dynamic formation must survive a process restart; the pre-fix early return skipped save().
+      const restored = new edge.CrossSectionalStore(dir);
+      expect(restored.lastCycleAt).toBe(new Date(now).toISOString());
+      expect(restored.all.some((row) => row.observationId === observation.observationId)).toBe(true);
+    } finally {
+      for (const [key, value] of before) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it("ignores a stale legacy symbol outside the active execution pool", async () => {
+    const rawUniverse = [...universe, "RNDRUSDT"];
+    const overrides: Record<string, string> = {
+      CROSS_SECTIONAL_STRATEGY_VERSION: DYNAMIC_MOM36_SHOCK_36H_V1,
+      CROSS_SECTIONAL_INTERVAL: "1h",
+      CROSS_SECTIONAL_MOMENTUM_BARS: "36",
+      CROSS_SECTIONAL_HORIZON_BARS: "48",
+      CROSS_SECTIONAL_K: "3",
+      CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP: "0.058",
+      CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER: "2",
+      CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST: universe.join(","),
+      CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST: universe.join(","),
+      CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "0",
+      CROSS_SECTIONAL_REGIME_SKEW_ENABLED: "0",
+      CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+      CROSS_SECTIONAL_STAND_DOWN_14D_PCT: "0",
+      CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR: "0",
+      CROSS_SECTIONAL_EDGE_DISABLED: "0",
+    };
+    const before = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+    try {
+      for (const [key, value] of Object.entries(overrides)) process.env[key] = value;
+      vi.resetModules();
+      const edge = await import("../src/lib/cross-sectional-edge.js");
+      const dir = mkdtempSync(join(tmpdir(), "dynamic-mom36-excluded-stale-"));
+      dirs.push(dir);
+      const returns: Record<string, number> = {
+        BTCUSDT: 0.10,
+        ETHUSDT: 0.09,
+        SOLUSDT: 0.08,
+        DOGEUSDT: 0.07,
+        LINKUSDT: 0.06,
+        FETUSDT: 0.05,
+        AAVEUSDT: 0.04,
+        WLDUSDT: -0.03,
+      };
+      const store = new edge.CrossSectionalStore(dir);
+      const result = await edge.runCrossSectionalCycle({
+        store,
+        universe: rawUniverse,
+        now: cutoff + 5 * 60_000,
+        fetchCandles: async (symbol) => symbol === "RNDRUSDT" ? [] : candlesFor(returns[symbol]!),
+      });
+
+      expect(result.openedDynamicMom36Shock).toBe(1);
+      const observation = store.all.find((row) => row.variant === "DYNAMIC_MOM36_SHOCK")!;
+      expect(observation.dynamicMom36?.activeUniverse.map((row) => row.symbol)).not.toContain("RNDRUSDT");
     } finally {
       for (const [key, value] of before) {
         if (value === undefined) delete process.env[key];
