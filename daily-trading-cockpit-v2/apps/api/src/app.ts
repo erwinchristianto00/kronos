@@ -42,8 +42,21 @@ import {
   crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
 import { crossSectionalExecTickMs } from "./lib/cross-sectional-policy.js";
-import { buildCrossSectionalReport, CROSS_SECTIONAL_FILTERED_SIGNAL, CROSS_SECTIONAL_UNIVERSE, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import {
+  buildCrossSectionalReport,
+  CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
+  CROSS_SECTIONAL_FILTERED_SIGNAL,
+  CROSS_SECTIONAL_UNIVERSE,
+  getCrossSectionalFilteredConfig,
+  getCrossSectionalReportSinceMs,
+  getCrossSectionalStore,
+} from "./lib/cross-sectional-edge.js";
 import { CrossSectionalAutoPool } from "./lib/cross-sectional-auto-pool.js";
+import {
+  DAILY_RANGE_LANE_ID,
+  DailyRangeAcceptanceLane,
+  DailyRangeLaneStore,
+} from "./lib/daily-4h-range-acceptance-lane.js";
 import {
   DYNAMIC_MOM36_SHOCK_SIGNAL,
   DYNAMIC_MOM36_SHOCK_VARIANT,
@@ -1082,6 +1095,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // the four-brain path never mutates it.
   let liveExecutionStore: LiveExecutionStore | null = null;
   let crossSectionalExecutor: CrossSectionalExecutor | null = null;
+  // The daily range lane is deliberately nullable everywhere except the
+  // testnet-only construction below.  No live process can construct it.
+  let dailyRangeLane: DailyRangeAcceptanceLane | null = null;
   // Source-chain telemetry is process-local and read-only. It deliberately has
   // no path to an order, an eligibility override, or an execution setting.
   let futuresReferenceHealth: FuturesReferenceHealthTracker | null = null;
@@ -1500,12 +1516,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // needs a synchronous per-symbol claim plus the executor's direct final exchange recheck.
     const entrySymbolsInFlight = new Set<string>();
     const singleSymbolEntryClaims = {
-      tryClaimEntrySymbol: (symbol: string) => {
+      tryClaimEntrySymbol: (symbol: string, owner = "OTHER_LANE") => {
+        // A durable daily-range lease means this one-way-netted symbol has an
+        // exchange-native bracket whose exact quantity must remain untouched.
+        // Its own entry/canary is allowed to claim after it persisted that lease;
+        // every other current or future entry lane is refused.
+        if (owner !== DAILY_RANGE_LANE_ID && owner !== "DRCANARY" && dailyRangeLane?.isSymbolLeased(symbol)) return false;
         if (entrySymbolsInFlight.has(symbol)) return false;
         entrySymbolsInFlight.add(symbol);
         return true;
       },
-      releaseEntrySymbol: (symbol: string) => {
+      releaseEntrySymbol: (symbol: string, _owner = "OTHER_LANE") => {
         entrySymbolsInFlight.delete(symbol);
         // The direct entry check may have discovered a new position. Do not let the shared
         // monitoring snapshot keep reporting the pre-entry flat account for another 30 seconds.
@@ -1516,6 +1537,40 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       timelineExitGate: (symbol: string, direction: "LONG" | "SHORT") =>
         singleSymbolPriceTimeline?.exitGate(symbol, direction) ?? Promise.resolve({ shouldExit: false, reason: null }),
     };
+    // Completely isolated, Testnet-only lane. It has no mainnet switch: the
+    // construction condition itself is the live boundary. It starts DISARMED;
+    // its scheduler only reconciles/records until a passing exchange canary is
+    // persisted and an operator arms this lane through its own endpoint.
+    if (!isTest && liveConfig.env === "testnet") {
+      const dailyRangeUniverse = () => {
+        const configured = getCrossSectionalFilteredConfig();
+        const fallbackSymbols = [...new Set([...configured.longAllowlist, ...configured.shortAllowlist])];
+        const pool = crossSectionalAutoPool.getSnapshot({
+          candidateUniverse: CROSS_SECTIONAL_UNIVERSE,
+          fallbackSymbols,
+          baseLegUsd: 25,
+          sizeMultiplier: 1,
+        });
+        return {
+          symbols: pool.activeSymbols,
+          source: `CROSS_SECTIONAL_AUTO_POOL:${pool.state}`,
+        };
+      };
+      dailyRangeLane = new DailyRangeAcceptanceLane({
+        client: liveClient,
+        store: new DailyRangeLaneStore("data"),
+        getUniverse: dailyRangeUniverse,
+        getShortBlocklist: () => CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
+        entryClaims: singleSymbolEntryClaims,
+        environment: "testnet",
+      });
+      const tickDailyRangeLane = (): void => {
+        void dailyRangeLane?.tick();
+      };
+      setTimeout(tickDailyRangeLane, 20_000);
+      setInterval(tickDailyRangeLane, 30_000);
+      console.log(`[daily-range-lane] READY environment=testnet version=${DAILY_RANGE_LANE_ID} control=DISARMED`);
+    }
     // Shared account-exposure coordinator (account-exposure-coordinator.ts) — the reserve-then-
     // commit-then-release capacity ledger for EVERY SingleSymbolLaneExecutor/CrossSectionalExecutor
     // real exchange-entry path, mainnet AND innovation-testnet lanes alike. Constructed ONCE here,
@@ -1685,12 +1740,28 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // single-instance fix addressed would otherwise recur for every one of the new instances' own
       // open legs. 2026-07-11: reuses the shared allCrossSectionalLaneExecutors()/
       // allSingleSymbolLaneExecutors() closures above instead of its own duplicated literal array.
-      externalManagedNetQty: () =>
-        computeExternalManagedNetQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
+      externalManagedNetQty: () => {
+        const net = computeExternalManagedNetQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors());
+        // Testnet-only daily-range ownership must also be visible to the legacy
+        // mirror's reconciliation. Otherwise it would label the lane's exact
+        // exchange position an orphan; Live never receives this extra claim.
+        if (liveConfig.env === "testnet") {
+          for (const [symbol, qty] of dailyRangeLane?.managedNetQty() ?? []) {
+            net.set(symbol, (net.get(symbol) ?? 0) + qty);
+          }
+        }
+        return net;
+      },
       // 2026-08-17 maker-entry disarm fix: resting post-only entry orders are not yet legs, so the
       // net claim above cannot see them — reconcile() needs them as a separate tolerance band.
       externalPendingEntryQty: () =>
         computeExternalPendingEntryQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
+      ...(liveConfig.env === "testnet" ? {
+        externalEntryBlockReason: (symbol: string) => {
+          const lease = dailyRangeLane?.isSymbolLeased(symbol);
+          return lease ? `daily range lane lease ${lease.tradeId} (${lease.status})` : null;
+        },
+      } : {}),
       // 2026-07-11 real-money audit fix: same shared closures as externalManagedNetQty above, so the
       // account-wide kill-switch (killSwitchTrip) can finally see real losses/gains from these lanes
       // instead of only its own mirror/directional-slot ledger — see live-executor-wiring.ts's
@@ -2378,6 +2449,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           (crossSectionalTrendExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalMixedExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
         sharedGetPositions,
+        ...(liveConfig.env === "testnet" ? {
+          isSymbolEntryBlocked: (symbol: string) => {
+            const lease = dailyRangeLane?.isSymbolLeased(symbol);
+            return lease ? `daily range lane lease ${lease.tradeId} (${lease.status})` : null;
+          },
+          tryClaimEntrySymbol: singleSymbolEntryClaims.tryClaimEntrySymbol,
+          releaseEntrySymbol: singleSymbolEntryClaims.releaseEntrySymbol,
+        } : {}),
         // 2026-07-19 real-money audit fix: see CrossSectionalExecutorOptions.existingNotionalForSymbol
         // and live-executor-wiring.ts's computeNotionalPerSymbol doc comment — closes the gap where
         // this lane's ETHUSDT/SOLUSDT legs had zero visibility into the 9 single-symbol lanes'
@@ -2456,6 +2535,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           (crossSectionalExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalMixedExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
         sharedGetPositions,
+        ...(liveConfig.env === "testnet" ? {
+          isSymbolEntryBlocked: (symbol: string) => {
+            const lease = dailyRangeLane?.isSymbolLeased(symbol);
+            return lease ? `daily range lane lease ${lease.tradeId} (${lease.status})` : null;
+          },
+          tryClaimEntrySymbol: singleSymbolEntryClaims.tryClaimEntrySymbol,
+          releaseEntrySymbol: singleSymbolEntryClaims.releaseEntrySymbol,
+        } : {}),
         // Same 2026-07-19 real-money audit fix as the foundation instance above.
         existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(crossSectionalTrendExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
@@ -2498,6 +2585,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           (crossSectionalExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalTrendExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
         sharedGetPositions,
+        ...(liveConfig.env === "testnet" ? {
+          isSymbolEntryBlocked: (symbol: string) => {
+            const lease = dailyRangeLane?.isSymbolLeased(symbol);
+            return lease ? `daily range lane lease ${lease.tradeId} (${lease.status})` : null;
+          },
+          tryClaimEntrySymbol: singleSymbolEntryClaims.tryClaimEntrySymbol,
+          releaseEntrySymbol: singleSymbolEntryClaims.releaseEntrySymbol,
+        } : {}),
         // Same 2026-07-19 real-money audit fix as the foundation instance above.
         existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(crossSectionalMixedExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
@@ -3183,6 +3278,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
               .filter((candidate): candidate is CrossSectionalExecutor => candidate !== null && candidate !== executor)
               .reduce((sum, candidate) => sum + candidate.getDailyRealizedUsd(nowIso), 0),
           sharedGetPositions,
+          ...(liveConfig.env === "testnet" ? {
+            isSymbolEntryBlocked: (symbol: string) => {
+              const lease = dailyRangeLane?.isSymbolLeased(symbol);
+              return lease ? `daily range lane lease ${lease.tradeId} (${lease.status})` : null;
+            },
+            tryClaimEntrySymbol: singleSymbolEntryClaims.tryClaimEntrySymbol,
+            releaseEntrySymbol: singleSymbolEntryClaims.releaseEntrySymbol,
+          } : {}),
           existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(executor, symbol),
           maxNotionalPerSymbolAcrossLanes,
           ...sharedExposureReservation,
@@ -4641,11 +4744,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       setTimeout(runDirectionEntryReconciliation, 120_000);
       setInterval(runDirectionEntryReconciliation, 15 * 60_000);
     }
+
   }
 
   await registerLiveRoutes(app, liveEngine, {
     configErrors: liveConfig.enabled ? liveConfig.configErrors : [],
     crossSectionalExecutor: () => crossSectionalExecutor,
+    dailyRangeLane: () => dailyRangeLane,
     crossSectionalAutoPool: () => crossSectionalAutoPool,
     symbolReliabilitySnapshotGetter: currentSymbolReliabilitySnapshot,
     crossSectionalTrendExecutor: () => crossSectionalTrendExecutor,

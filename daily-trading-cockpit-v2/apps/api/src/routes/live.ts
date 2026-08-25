@@ -33,6 +33,7 @@ import {
 } from "../lib/cross-sectional-executor.js";
 import type { CrossSectionalAutoPool, CrossSectionalAutoPoolSnapshot } from "../lib/cross-sectional-auto-pool.js";
 import type { SymbolReliabilitySnapshot } from "../lib/cross-sectional-symbol-reliability.js";
+import type { DailyRangeAcceptanceLane } from "../lib/daily-4h-range-acceptance-lane.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
 import {
   CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
@@ -1168,6 +1169,8 @@ export async function registerLiveRoutes(
   opts: {
     configErrors?: string[];
     crossSectionalExecutor?: () => CrossSectionalExecutor | null;
+    /** Isolated, structurally Testnet-only daily 4h range acceptance lane. */
+    dailyRangeLane?: () => DailyRangeAcceptanceLane | null;
     /** Same durable C1/C2 pool consumed by Dynamic formation; status only on this route. */
     crossSectionalAutoPool?: () => CrossSectionalAutoPool | null;
     /** API-owned V1 circuit-breaker state; presentation only, never recalculated by the dashboard. */
@@ -1959,6 +1962,129 @@ export async function registerLiveRoutes(
       regimeSkewCounterfactual: executor.getRegimeSkewCounterfactual(),
       symbolReliability: opts.symbolReliabilitySnapshotGetter?.() ?? null,
     };
+  });
+
+  // ── Daily 4h range-acceptance lane (Testnet-only, isolated from MOM36) ────
+  app.get("/api/live/daily-range-lane/status", async () => {
+    const lane = opts.dailyRangeLane?.() ?? null;
+    if (!lane) {
+      return { enabled: false, reason: "daily range lane is available only in the Testnet runtime" };
+    }
+    return { enabled: true, ...lane.getStatus() };
+  });
+
+  app.get("/api/live/daily-range-lane/history", async (request, reply) => {
+    const lane = opts.dailyRangeLane?.() ?? null;
+    if (!lane) {
+      reply.code(503);
+      return { ok: false, reason: "daily range lane is unavailable outside Testnet" };
+    }
+    const query = (request.query ?? {}) as { kind?: string; limit?: string | number };
+    const kind = query.kind;
+    if (kind !== "levels" && kind !== "signals" && kind !== "trades") {
+      reply.code(400);
+      return { ok: false, reason: "kind must be levels, signals, or trades" };
+    }
+    const parsedLimit = typeof query.limit === "number" ? query.limit : Number.parseInt(query.limit ?? "500", 10);
+    return { ok: true, kind, rows: lane.history(kind, Number.isFinite(parsedLimit) ? parsedLimit : 500) };
+  });
+
+  app.get("/api/live/daily-range-lane/export/:kind", async (request, reply) => {
+    const lane = opts.dailyRangeLane?.() ?? null;
+    if (!lane) {
+      reply.code(503);
+      return { ok: false, reason: "daily range lane is unavailable outside Testnet" };
+    }
+    const params = request.params as { kind?: string };
+    const kind = params.kind;
+    if (kind !== "levels" && kind !== "signals" && kind !== "trades") {
+      reply.code(400);
+      return { ok: false, reason: "kind must be levels, signals, or trades" };
+    }
+    const query = (request.query ?? {}) as { format?: string };
+    if (query.format === "csv") {
+      reply.type("text/csv; charset=utf-8");
+      return lane.exportCsv(kind);
+    }
+    return { ok: true, kind, rows: lane.history(kind, 10_000) };
+  });
+
+  app.post("/api/live/daily-range-lane/canary", async (request, reply) => {
+    if (!isLoopbackAddress(request.ip) || process.env.LIVE_BINANCE_ENV !== "testnet") {
+      reply.code(403);
+      return { ok: false, reason: "Testnet loopback caller required" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string };
+    if (body.confirm !== "RUN_DAILY_RANGE_CANARY") {
+      reply.code(400);
+      return { ok: false, reason: 'canary requires body {"confirm":"RUN_DAILY_RANGE_CANARY"}' };
+    }
+    const lane = opts.dailyRangeLane?.() ?? null;
+    if (!lane) {
+      reply.code(503);
+      return { ok: false, reason: "daily range lane is unavailable" };
+    }
+    const evidence = await lane.runCanary();
+    if (evidence.status !== "PASSED") reply.code(409);
+    return { ok: evidence.status === "PASSED", evidence };
+  });
+
+  app.post("/api/live/daily-range-lane/arm", async (request, reply) => {
+    if (!isLoopbackAddress(request.ip) || process.env.LIVE_BINANCE_ENV !== "testnet") {
+      reply.code(403);
+      return { ok: false, reason: "Testnet loopback caller required" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string };
+    if (body.confirm !== "ARM_DAILY_RANGE_LANE") {
+      reply.code(400);
+      return { ok: false, reason: 'arm requires body {"confirm":"ARM_DAILY_RANGE_LANE"}' };
+    }
+    const lane = opts.dailyRangeLane?.() ?? null;
+    if (!lane) {
+      reply.code(503);
+      return { ok: false, reason: "daily range lane is unavailable" };
+    }
+    const result = lane.arm();
+    if (!result.ok) reply.code(409);
+    return result;
+  });
+
+  app.post("/api/live/daily-range-lane/disarm", async (request, reply) => {
+    if (!isLoopbackAddress(request.ip) || process.env.LIVE_BINANCE_ENV !== "testnet") {
+      reply.code(403);
+      return { ok: false, reason: "Testnet loopback caller required" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string; reason?: string };
+    if (body.confirm !== "DISARM_DAILY_RANGE_LANE") {
+      reply.code(400);
+      return { ok: false, reason: 'disarm requires body {"confirm":"DISARM_DAILY_RANGE_LANE"}' };
+    }
+    const lane = opts.dailyRangeLane?.() ?? null;
+    if (!lane) {
+      reply.code(503);
+      return { ok: false, reason: "daily range lane is unavailable" };
+    }
+    return lane.disarm(typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : "operator manual disarm");
+  });
+
+  app.post("/api/live/daily-range-lane/close", async (request, reply) => {
+    if (!isLoopbackAddress(request.ip) || process.env.LIVE_BINANCE_ENV !== "testnet") {
+      reply.code(403);
+      return { ok: false, reason: "Testnet loopback caller required" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string; tradeId?: string };
+    if (body.confirm !== "CLOSE_DAILY_RANGE_TRADE" || typeof body.tradeId !== "string" || !body.tradeId.trim()) {
+      reply.code(400);
+      return { ok: false, reason: 'close requires body {"confirm":"CLOSE_DAILY_RANGE_TRADE","tradeId":"..."}' };
+    }
+    const lane = opts.dailyRangeLane?.() ?? null;
+    if (!lane) {
+      reply.code(503);
+      return { ok: false, reason: "daily range lane is unavailable" };
+    }
+    const result = await lane.manualCloseTrade(body.tradeId.trim());
+    if (!result.ok) reply.code(409);
+    return result;
   });
 
   // Emergency/operator close for the primary cross-basket executor in BOTH TESTNET and LIVE.

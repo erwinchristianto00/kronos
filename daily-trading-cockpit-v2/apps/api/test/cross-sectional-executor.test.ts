@@ -279,6 +279,8 @@ class FakeExecClient implements CrossSectionalExecClient {
 }
 
 function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; rawLaneWeightPct?: number; cortexRealAttribution?: CortexRealAttributionStore; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; maxOpenBaskets?: number; entryHealthAllowed?: boolean; entryHealthReason?: string | null; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number; respectSignalRiskGeometry?: boolean;
+  isSymbolEntryBlocked?: (symbol: string) => string | null;
+  tryClaimEntrySymbol?: (symbol: string, owner?: string) => boolean;
   smartBasketEnabled?: boolean; smartMaxAdverseEntryDriftVol?: number; smartMinAdverseEntryDriftPct?: number; smartInvalidationScans?: number; smartMfeArmNetReturn?: number; smartMfeGivebackFraction?: number;
   reserveExposure?: (req: { executorId: string; symbol: string; direction: "LONG" | "SHORT"; requestedNotionalUsd: number; clientOrderId: string; basketId?: string }) => { ok: boolean; reservationId: string | null; reason?: string };
   commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
@@ -315,6 +317,8 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
       ? { entryHealthGate: () => ({ allowed: opts.entryHealthAllowed!, reason: opts.entryHealthAllowed ? null : (opts.entryHealthReason ?? "rolling edge negative") }) }
       : {}),
     ...(opts.siblingOpenLegs !== undefined ? { siblingOpenLegs: opts.siblingOpenLegs } : {}),
+    ...(opts.isSymbolEntryBlocked !== undefined ? { isSymbolEntryBlocked: opts.isSymbolEntryBlocked } : {}),
+    ...(opts.tryClaimEntrySymbol !== undefined ? { tryClaimEntrySymbol: opts.tryClaimEntrySymbol } : {}),
     ...(opts.existingNotionalForSymbol !== undefined ? { existingNotionalForSymbol: opts.existingNotionalForSymbol } : {}),
     ...(opts.maxNotionalPerSymbolAcrossLanes !== undefined
       ? { maxNotionalPerSymbolAcrossLanes: () => opts.maxNotionalPerSymbolAcrossLanes! }
@@ -5721,6 +5725,42 @@ describe("cross-sectional-executor — pre-open netting guard (2026-08-15)", () 
     expect(client.placed.length).toBe(0); // prevention, not repair — nothing was ever sent
     expect(executor.getStatus().openHalted).toContain("netting guard");
     expect(executor.getStatus().openHalted).toContain("SOLUSDT");
+  });
+
+  it("[DAILY-RANGE-LEASE] a symbol with an isolated daily-bracket lease skips a new basket before any reservation or order", async () => {
+    const client = new FakeExecClient();
+    const { executor, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      isSymbolEntryBlocked: (symbol) => symbol === "SOLUSDT" ? "daily range lane lease drra1-open (OPEN)" : null,
+    });
+    await executor.tick();
+    expect(store.getState().baskets).toHaveLength(0);
+    expect(client.placed).toHaveLength(0);
+    expect(executor.getStatus().openHalted).toContain("daily range lane lease");
+  });
+
+  it("[DAILY-RANGE-LEASE] aborts a clean reserved basket if a durable lease appears before cross-lane placement", async () => {
+    const client = new FakeExecClient();
+    let ownershipChecks = 0;
+    const { executor, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      // Admission checks SOL and DOGE first.  The lease arrives immediately
+      // afterwards, in the gap before this executor can pre-place maker legs.
+      isSymbolEntryBlocked: (symbol) => {
+        ownershipChecks += 1;
+        return ownershipChecks > 2 && symbol === "SOLUSDT" ? "daily range lane lease drra1-open (OPEN)" : null;
+      },
+      tryClaimEntrySymbol: (symbol) => symbol !== "SOLUSDT",
+    });
+    await executor.tick();
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().baskets).toHaveLength(1);
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("ABORTED");
+    expect(basket.closeReason).toBe("SYMBOL_OWNED_BY_OTHER_STRATEGY:SOLUSDT");
+    expect(basket.plan?.every((leg) => leg.status === "NEVER_ATTEMPTED")).toBe(true);
   });
 });
 

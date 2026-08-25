@@ -77,6 +77,23 @@ describe("binance-futures-private signing", () => {
     expect(urls[0]).toContain("testnet.binancefuture.com/fapi/v1/premiumIndex?symbol=1000PEPEUSDT");
   });
 
+  it("reads completed USD-M klines from the selected execution base without a spot fallback", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify([[
+        1_700_000_000_000, "100", "103", "99", "102", "12.5", 1_700_000_299_999,
+      ]]), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    const rows = await client.getKlines("SOLUSDT", "5m", { startTime: 1_700_000_000_000, limit: 1 });
+    expect(rows).toEqual([{
+      openTime: 1_700_000_000_000, closeTime: 1_700_000_299_999,
+      open: 100, high: 103, low: 99, close: 102, volume: 12.5,
+    }]);
+    expect(urls[0]).toContain("testnet.binancefuture.com/fapi/v1/klines?symbol=SOLUSDT&interval=5m");
+  });
+
   it("does not amplify an HTTP 418 IP ban with immediate signed GET retries", async () => {
     const urls: string[] = [];
     const nowMs = 1_700_000_000_000;

@@ -1806,6 +1806,18 @@ export interface CrossSectionalExecutorOptions {
    *  short-TTL shared cache across all 3 instances; defaults to the direct client call (existing
    *  single-instance behavior/tests unchanged). */
   sharedGetPositions?: () => ReturnType<CrossSectionalExecClient["getPositions"]>;
+  /**
+   * A durable ownership check supplied by app.ts for lanes which own a full
+   * one-way-netted symbol (currently the isolated daily-range testnet lane).
+   * It is consulted before a new basket is reserved, then backed by the atomic
+   * in-flight claim below immediately before any order can be dispatched.
+   */
+  isSymbolEntryBlocked?: (symbol: string) => string | null;
+  /** Shared short-lived claim across entry paths.  It covers maker pre-placement
+   * as well as market placement, so two lanes cannot submit on the same symbol
+   * between their separate exchange-account snapshots. */
+  tryClaimEntrySymbol?: (symbol: string, owner?: string) => boolean;
+  releaseEntrySymbol?: (symbol: string, owner?: string) => void;
   /** 2026-07-19 real-money audit fix: notional (USD) already committed to a symbol by every
    *  OTHER executor sharing this netted Binance account — the 9 SingleSymbolLaneExecutor
    *  instances AND the 2 sibling CrossSectionalExecutor instances (never `self`; app.ts wires
@@ -1942,6 +1954,9 @@ export class CrossSectionalExecutor {
   private readonly siblingOpenBasketCount: () => number;
   private readonly siblingDailyRealizedUsd: (nowIso: string) => number;
   private readonly sharedGetPositions: () => ReturnType<CrossSectionalExecClient["getPositions"]>;
+  private readonly isSymbolEntryBlocked: (symbol: string) => string | null;
+  private readonly tryClaimEntrySymbol: (symbol: string, owner?: string) => boolean;
+  private readonly releaseEntrySymbol: (symbol: string, owner?: string) => void;
   private readonly existingNotionalForSymbolFn: (symbol: string) => number;
   private readonly maxNotionalPerSymbolAcrossLanesFn: () => number;
   private readonly reserveExposureFn: (req: ExposureReserveRequest) => ExposureReserveResult;
@@ -2008,6 +2023,9 @@ export class CrossSectionalExecutor {
     this.siblingOpenBasketCount = opts.siblingOpenBasketCount ?? (() => 0);
     this.siblingDailyRealizedUsd = opts.siblingDailyRealizedUsd ?? (() => 0);
     this.sharedGetPositions = opts.sharedGetPositions ?? (() => this.client.getPositions());
+    this.isSymbolEntryBlocked = opts.isSymbolEntryBlocked ?? (() => null);
+    this.tryClaimEntrySymbol = opts.tryClaimEntrySymbol ?? (() => true);
+    this.releaseEntrySymbol = opts.releaseEntrySymbol ?? (() => {});
     this.rawLaneWeightPctFn = opts.rawLaneWeightPct ?? null;
     this.cortexRealAttribution = opts.cortexRealAttribution ?? null;
     this.executionFillRecorder = opts.executionFillRecorder ?? null;
@@ -5082,6 +5100,22 @@ export class CrossSectionalExecutor {
       }
     }
 
+    // One-way Binance accounts do not keep lot ownership.  A daily-range lane
+    // with a live reduce-only bracket owns the symbol end-to-end; even a same-
+    // direction basket leg would silently change the quantity its exit can
+    // close.  Skip this *new* Dynamic basket before reservations or orders.
+    const ownershipBlocks = [...signal.longLeg, ...signal.shortLeg]
+      .map((leg) => ({ symbol: leg.symbol, reason: this.isSymbolEntryBlocked(leg.symbol) }))
+      .filter((row): row is { symbol: string; reason: string } => row.reason !== null);
+    if (ownershipBlocks.length > 0) {
+      this.skipSignal(
+        signal,
+        "NETTING_GUARD",
+        `symbol owned by another isolated strategy — ${ownershipBlocks.map((row) => `${row.symbol}: ${row.reason}`).join("; ")}`,
+      );
+      return;
+    }
+
     if (this.overlapGuardEnabledFn()) {
       try {
         const positions = await this.sharedGetPositions();
@@ -5681,6 +5715,42 @@ export class CrossSectionalExecutor {
    */
   private async placeRemainingLegsLocked(basket: ExecutorBasket, startIndex: number): Promise<void> {
     const plan = basket.plan ?? [];
+    // Claim every still-unfilled symbol BEFORE maker pre-placement.  The maker
+    // path can submit several orders concurrently, so a per-leg claim inside
+    // the sequential resolver would be too late to prevent a cross-lane race.
+    const claimedSymbols: string[] = [];
+    for (const symbol of [...new Set(plan.slice(startIndex).filter((p) => p.status !== "FILLED").map((p) => p.symbol))]) {
+      if (!this.tryClaimEntrySymbol(symbol, this.laneId)) {
+        for (const claimed of claimedSymbols) this.releaseEntrySymbol(claimed, this.laneId);
+        // A short-lived claim can simply mean another executor is currently
+        // evaluating the symbol; leave the basket recoverable in that case.
+        // A durable daily-range lease is different: a clean RESERVED basket
+        // must never keep retrying into a symbol that has an exchange-side
+        // bracket owned by another strategy.  Abort only before ANY order or
+        // fill exists; an already-live partial basket must finish/reconcile
+        // rather than be silently abandoned.
+        const durableBlockReason = this.isSymbolEntryBlocked(symbol);
+        const hasOrderInFlight = plan.some((entry) => entry.status === "PLACING" || Boolean(entry.makerRestingOrderId));
+        if (durableBlockReason && basket.legs.length === 0 && !hasOrderInFlight) {
+          await this.markRemainingNeverAttempted(
+            basket,
+            startIndex,
+            `SYMBOL_OWNED_BY_OTHER_STRATEGY:${symbol}:${durableBlockReason}`,
+          );
+          basket.status = "ABORTED";
+          basket.closedAt = this.nowIso();
+          basket.closeReason = `SYMBOL_OWNED_BY_OTHER_STRATEGY:${symbol}`;
+          this.store.save();
+          this.lastError =
+            `basket ${basket.basketId}: aborted before entry; ${symbol} is owned by another strategy (${durableBlockReason})`;
+        } else {
+          this.lastError = `basket ${basket.basketId}: entry claim refused for ${symbol}; deferring without sending an order`;
+        }
+        return;
+      }
+      claimedSymbols.push(symbol);
+    }
+    try {
     // 2026-08-15: warm the shared quote cache for every leg still to place, ONCE and in PARALLEL,
     // before any order goes out. Warming per-leg instead would put a book fetch (up to ~750ms)
     // between consecutive placements and stretch a 6-leg basket's open window from ~1s to ~4.5s —
@@ -5958,6 +6028,9 @@ export class CrossSectionalExecutor {
       } catch (error) {
         this.lastError = (error as Error).message ?? "post-completion kill-switch close failed";
       }
+    }
+    } finally {
+      for (const symbol of claimedSymbols) this.releaseEntrySymbol(symbol, this.laneId);
     }
   }
 

@@ -143,6 +143,17 @@ export interface FuturesSymbolFilters {
   quantityPrecision: number;
 }
 
+/** A USD-M futures candle from the same selected venue as private execution. */
+export interface FuturesKline {
+  openTime: number;
+  closeTime: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
 export interface FuturesBalance {
   asset: string;
   balance: number;
@@ -844,6 +855,43 @@ export class BinanceFuturesPrivateClient {
     }
     const markPrice = toNum(row.markPrice);
     return markPrice > 0 ? markPrice : null;
+  }
+
+  /**
+   * Read USD-M candles from the selected execution environment.  It never falls
+   * back to spot data: range levels must be executable on the venue we trade.
+   */
+  async getKlines(
+    symbol: string,
+    interval: "1m" | "5m" | "4h",
+    opts: { startTime?: number; endTime?: number; limit?: number } = {},
+  ): Promise<FuturesKline[]> {
+    const parsed = await this.requestPublic("/fapi/v1/klines", {
+      symbol,
+      interval,
+      startTime: opts.startTime,
+      endTime: opts.endTime,
+      limit: opts.limit,
+    });
+    if (!Array.isArray(parsed)) {
+      throw new BinanceFuturesPrivateError("invalid_response", `klines response missing for ${symbol}/${interval}`);
+    }
+    const candles: FuturesKline[] = [];
+    for (const row of parsed) {
+      if (!Array.isArray(row) || row.length < 7) continue;
+      const openTime = toNum(row[0]);
+      const open = toNum(row[1]);
+      const high = toNum(row[2]);
+      const low = toNum(row[3]);
+      const close = toNum(row[4]);
+      const volume = toNum(row[5]);
+      const closeTime = toNum(row[6]);
+      if (!Number.isFinite(openTime) || !Number.isFinite(closeTime) || !(open > 0) || !(high > 0) || !(low > 0) || !(close > 0)) {
+        continue;
+      }
+      candles.push({ openTime, closeTime, open, high, low, close, volume });
+    }
+    return candles;
   }
 
   async getExchangeFilters(): Promise<Map<string, FuturesSymbolFilters>> {

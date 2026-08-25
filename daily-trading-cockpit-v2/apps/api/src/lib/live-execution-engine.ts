@@ -1299,6 +1299,13 @@ export interface LiveExecutionEngineOptions {
    *  band — never as a net claim, which would corrupt every netting consumer. See
    *  live-executor-wiring.ts's computeExternalPendingEntryQty for why the split exists. */
   externalPendingEntryQty?: () => Map<string, number>;
+  /**
+   * Narrow symbol-ownership veto for an isolated Testnet lane. Unlike the
+   * ordinary netting guard, a same-side entry is also unsafe because one-way
+   * Binance has no lot ownership and could change that lane's bracket quantity.
+   * Omitted by every incumbent configuration, preserving existing behavior.
+   */
+  externalEntryBlockReason?: (symbol: string) => string | null;
   /** Shared strategy/regime admission gate. It affects NEW exposure only; exits always continue. */
   newEntryGate?: () => LiveNewEntryGateDecision;
   /** 2026-08 manual-directional canonical-regime enforcement fix: an ADDITIONAL, independent gate
@@ -2121,6 +2128,7 @@ export class LiveExecutionEngine {
   private readonly fillConfirmRetryDelayMs: number;
   private readonly externalManagedNetQty: () => Map<string, number>;
   private readonly externalPendingEntryQty: () => Map<string, number>;
+  private readonly externalEntryBlockReason: (symbol: string) => string | null;
   private readonly newEntryGate: () => LiveNewEntryGateDecision;
   private readonly regimeSafetyGate: () => LiveNewEntryGateDecision;
   private readonly getExternalRealizedPnlUsd: () => { today: number; allTime: number };
@@ -2197,6 +2205,7 @@ export class LiveExecutionEngine {
     this.fillConfirmRetryDelayMs = options.fillConfirmRetryDelayMs ?? 400;
     this.externalManagedNetQty = options.externalManagedNetQty ?? (() => new Map());
     this.externalPendingEntryQty = options.externalPendingEntryQty ?? (() => new Map());
+    this.externalEntryBlockReason = options.externalEntryBlockReason ?? (() => null);
     this.newEntryGate = options.newEntryGate ?? (() => ({ allowed: true, reason: null }));
     this.regimeSafetyGate = options.regimeSafetyGate ?? (() => ({ allowed: true, reason: null }));
     this.getExternalRealizedPnlUsd = options.getExternalRealizedPnlUsd ?? (() => ({ today: 0, allTime: 0 }));
@@ -7017,6 +7026,11 @@ export class LiveExecutionEngine {
     const paper = planned[0]!.paper;
     const plan = this.combinedPlan(planned, filters);
     if (!plan.ok) return;
+    const ownershipBlock = this.externalEntryBlockReason(paper.symbol);
+    if (ownershipBlock) {
+      console.warn(`[live-execution-engine] skip ${paper.direction} ${paper.symbol}: ${ownershipBlock}`);
+      return;
+    }
     // ENTRY-side netting guard (2026-07-08 REAL-MONEY incident: a SHORT SUI intent opened while
     // two baskets held LONG SUI — in one-way mode the "entry" order just SOLD 47.5 of the baskets'
     // longs, its reduce-only exits then -2022-rejected against the still-net-long position, and

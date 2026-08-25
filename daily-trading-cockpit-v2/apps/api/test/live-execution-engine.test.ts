@@ -415,6 +415,7 @@ export function makeEngine(opts: {
   nowIso?: () => string;
   marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
   externalManagedNetQty?: () => Map<string, number>;
+  externalEntryBlockReason?: (symbol: string) => string | null;
   getExternalRealizedPnlUsd?: () => { today: number; allTime: number };
   onKillSwitchEngaged?: (reason: string) => Promise<void>;
   laneDirectionForId?: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
@@ -438,6 +439,7 @@ export function makeEngine(opts: {
     marketDataClient: opts.marketDataClient,
     fillConfirmRetryDelayMs: 0,
     externalManagedNetQty: opts.externalManagedNetQty,
+    externalEntryBlockReason: opts.externalEntryBlockReason,
     getExternalRealizedPnlUsd: opts.getExternalRealizedPnlUsd,
     onKillSwitchEngaged: opts.onKillSwitchEngaged,
     laneDirectionForId: opts.laneDirectionForId,
@@ -4685,6 +4687,21 @@ describe("netted-position closes act on the ENGINE SHARE only (never the basket'
     await engine.tick();
     expect(store.getState().intents).toHaveLength(1);
     expect(store.getState().intents[0]!.state).toBe("OPEN");
+  });
+
+  it("[DAILY-RANGE-OWNERSHIP] a Testnet-only isolated lease blocks even a same-direction legacy mirror entry", async () => {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("ETHUSDT", -EXT);
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore([paperOrder()]), // SHORT ETHUSDT: same direction as the external claim
+      externalManagedNetQty: () => new Map([["ETHUSDT", -EXT]]),
+      externalEntryBlockReason: (symbol) => symbol === "ETHUSDT" ? "daily range lane lease drra1-open (OPEN)" : null,
+    });
+    await engine.arm();
+    await engine.tick();
+    expect(store.getState().intents).toHaveLength(0);
+    expect(client.placed.filter((p) => p.type === "MARKET")).toHaveLength(0);
   });
 
   it("[MISSING-QTY-ALERT] reconcile reports (without disarming) when managed exposure was consumed", async () => {
