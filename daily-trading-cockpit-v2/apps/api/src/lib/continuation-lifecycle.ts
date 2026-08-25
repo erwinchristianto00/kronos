@@ -30,6 +30,12 @@ export const CONTINUATION_NORMALIZATION_VERSION = "tree-native-missing-v1" as co
 /** New feeds stay diagnostic until an explicit feature-set strategy revision authorizes them. */
 export const CONTINUATION_SOURCE_COVERAGE_VERSION = "v4-frozen-primary-sources-v1" as const;
 export const CONTINUATION_HORIZONS = [6, 12, 24, 36] as const;
+/** Exact frozen V4 cross-sectional population; do not inherit retired legacy executor symbols. */
+export const CONTINUATION_V4_PRIMARY_SYMBOLS = [
+  "1000PEPEUSDT", "ADAUSDT", "APTUSDT", "ARBUSDT", "AVAXUSDT", "BNBUSDT", "DOGEUSDT",
+  "FETUSDT", "INJUSDT", "LDOUSDT", "NEARUSDT", "OPUSDT", "SEIUSDT", "SOLUSDT",
+  "SUIUSDT", "TAOUSDT", "UNIUSDT", "WIFUSDT", "WLDUSDT", "XRPUSDT",
+] as const;
 export const CONTINUATION_REQUIRED_NEW_MATURE_ROWS = 168 as const;
 export const CONTINUATION_MIN_RETRAIN_INTERVAL_MS = 7 * 24 * 3_600_000;
 export const CONTINUATION_MAX_LOCK_AGE_MS = 12 * 3_600_000;

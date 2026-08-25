@@ -29,7 +29,7 @@ JSON views are separately copied into `materialized/` after SHA verification.
 
 | Source | Data | Status | Training role now |
 | --- | --- | --- | --- |
-| Binance USD-M | completed 1m/5m/1h OHLCV and taker-buy volume | required | V4 1H price/flow foundation |
+| Binance USD-M | completed 1m/5m/1h OHLCV and taker-buy volume for the exact 20-symbol V4 population plus BTC/ETH anchors | required | V4 1H price/flow foundation |
 | Binance USD-M | funding, mark/index premium, OI, taker ratio | optional | frozen V4 funding route; other data diagnostic |
 | Bybit/OKX/Coinbase | 1H price and volume for existing symbols | optional | existing V4 venue-agreement route |
 | OKX | filled liquidations | optional | forward diagnostic only |

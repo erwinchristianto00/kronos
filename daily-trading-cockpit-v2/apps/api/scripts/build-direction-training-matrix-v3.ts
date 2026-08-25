@@ -14,6 +14,7 @@ import {
   CONTINUATION_FEATURE_SCHEMA_VERSION,
   CONTINUATION_NORMALIZATION_VERSION,
   CONTINUATION_SOURCE_COVERAGE_VERSION,
+  CONTINUATION_V4_PRIMARY_SYMBOLS,
 } from "../src/lib/continuation-lifecycle.js";
 import {
   DIRECTION_MODEL_MIN_BARS,
@@ -30,11 +31,7 @@ import {
 import { buildCrossSectionalBasket, type ScoredSymbol } from "../src/lib/cross-sectional-edge.js";
 import { baseDynamicMom36Allocation } from "../src/lib/dynamic-mom36-shock-strategy.js";
 
-const UNIVERSE = [
-  "1000PEPEUSDT", "ADAUSDT", "APTUSDT", "ARBUSDT", "AVAXUSDT", "BNBUSDT", "DOGEUSDT",
-  "FETUSDT", "INJUSDT", "LDOUSDT", "NEARUSDT", "OPUSDT", "SEIUSDT", "SOLUSDT",
-  "SUIUSDT", "TAOUSDT", "UNIUSDT", "WIFUSDT", "WLDUSDT", "XRPUSDT",
-];
+const UNIVERSE = CONTINUATION_V4_PRIMARY_SYMBOLS;
 const VENUES = ["bybit", "okx", "coinbase"];
 const MOM_BARS = 36;
 const K = 3;

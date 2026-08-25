@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   ContinuationDataCollector,
+  CONTINUATION_COLLECTOR_SYMBOLS,
   parseBinanceKlineRows,
   parseBinanceWsKline,
 } from "../src/lib/continuation-data-collector.js";
@@ -40,6 +41,13 @@ function fetchFixture(urlText: string): Promise<unknown> {
 }
 
 describe("continuation data collector", () => {
+  it("uses the exact frozen V4 population instead of retired legacy executor symbols", () => {
+    expect(CONTINUATION_COLLECTOR_SYMBOLS).toHaveLength(22);
+    expect(CONTINUATION_COLLECTOR_SYMBOLS).toContain("BTCUSDT");
+    expect(CONTINUATION_COLLECTOR_SYMBOLS).toContain("1000PEPEUSDT");
+    expect(CONTINUATION_COLLECTOR_SYMBOLS).not.toContain("RNDRUSDT");
+  });
+
   it("accepts only completed, internally-consistent Binance klines", () => {
     const completed = parseBinanceKlineRows(
       [[NOW - 3_600_000, "100", "103", "99", "102", "120", NOW - 1, "", 5, "64", ""]],

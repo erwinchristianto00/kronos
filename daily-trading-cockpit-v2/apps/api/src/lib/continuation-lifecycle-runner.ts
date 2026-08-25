@@ -12,7 +12,6 @@ import {
   type DirectionTrajectoryArtifact,
   validateTrajectoryArtifact,
 } from "./direction-model-runtime.js";
-import { CROSS_SECTIONAL_UNIVERSE } from "./cross-sectional-edge.js";
 import {
   readApprovedChampionArtifact,
   readChampionPointer,
@@ -36,6 +35,7 @@ import {
   CONTINUATION_NORMALIZATION_VERSION,
   CONTINUATION_REQUIRED_NEW_MATURE_ROWS,
   CONTINUATION_SOURCE_COVERAGE_VERSION,
+  CONTINUATION_V4_PRIMARY_SYMBOLS,
   acquireContinuationLock,
   acknowledgeLifecycleCommand,
   appendRunHistory,
@@ -333,14 +333,14 @@ function latestCommonCompletedCandleTimestamp(paths: ContinuationLifecyclePaths)
   const directory = resolve(paths.materialized, "ohlcv");
   if (!existsSync(directory)) return null;
   const latest: number[] = [];
-  for (const symbol of CROSS_SECTIONAL_UNIVERSE) {
+  for (const symbol of CONTINUATION_V4_PRIMARY_SYMBOLS) {
     const timestamp = latestOpenTime(resolve(directory, `${symbol}.json`));
     if (timestamp === null) return null;
     latest.push(timestamp);
   }
   // The historical V4 matrix requires its whole cross-sectional population. A single missing
   // symbol must therefore block training rather than changing the population unseen.
-  if (latest.length !== CROSS_SECTIONAL_UNIVERSE.length) return null;
+  if (latest.length !== CONTINUATION_V4_PRIMARY_SYMBOLS.length) return null;
   return Math.min(...latest);
 }
 

@@ -7,10 +7,10 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { CROSS_SECTIONAL_UNIVERSE } from "./cross-sectional-edge.js";
 import {
   CONTINUATION_LIFECYCLE_SCHEMA_VERSION,
   CONTINUATION_RAW_SCHEMA_VERSION,
+  CONTINUATION_V4_PRIMARY_SYMBOLS,
   appendRawEvent,
   collectorHealthFile,
   continuationLifecyclePaths,
@@ -36,7 +36,7 @@ export const CONTINUATION_INTERVAL_MS: Record<ContinuationBinanceInterval, numbe
 };
 
 export const CONTINUATION_COLLECTOR_SYMBOLS = Array.from(new Set([
-  ...CROSS_SECTIONAL_UNIVERSE,
+  ...CONTINUATION_V4_PRIMARY_SYMBOLS,
   "BTCUSDT",
   "ETHUSDT",
 ])).sort();
