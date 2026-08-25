@@ -17,12 +17,17 @@ import {
 } from "./cross-sectional-runtime-mode.js";
 import { symbolReliabilityPolicyFingerprint } from "./cross-sectional-symbol-reliability.js";
 import {
+  DYNAMIC_MOM36_HARD_CUT_LOSS,
+  DYNAMIC_MOM36_MFE_ARM_THRESHOLD,
+  DYNAMIC_MOM36_MFE_GIVEBACK_FRACTION,
+  DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3,
   DYNAMIC_MOM36_SHOCK_SIGNAL,
   DYNAMIC_MOM36_SHOCK_VARIANT,
   NO_FROZEN_RUNTIME_SHOCK_ARTIFACT,
   crossSectionalStrategyVersion,
   isDynamicMom36ShockStrategy,
 } from "./dynamic-mom36-shock-strategy.js";
+import { DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID } from "./dynamic-mom36-continuation-runtime.js";
 
 export const CURRENT_POLICY_FINGERPRINT_SCHEMA = "CURRENT_POLICY_FORWARD_COHORT_V3" as const;
 
@@ -48,6 +53,13 @@ export type CrossSectionalExitPolicySnapshot = {
   maxOpenBaskets?: number | null;
   /** Dynamic MOM36 holds through ordinary context changes by explicit policy. */
   ordinaryContextInvalidationEnabled?: boolean;
+  /** Strategy-versioned v3 basket exit contract. Null/undefined means not a v3 basket. */
+  dynamicV3Exit?: {
+    hardCutLossNetReturn: number;
+    mfeArmNetReturn: number;
+    mfeGivebackFraction: number;
+    horizonHours: number;
+  } | null;
 };
 
 export type CrossSectionalPolicyFingerprint = {
@@ -148,6 +160,7 @@ export function isCrossSectionalAdaptiveExitEnabled(env: NodeJS.ProcessEnv = pro
 
 export function currentCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process.env): CrossSectionalExitPolicySnapshot {
   if (isDynamicMom36ShockStrategy(env)) {
+    const dynamicV3 = crossSectionalStrategyVersion(env) === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
     // This strategy's execution values are frozen by policy, not left as mutable legacy TP/SL or
     // leverage knobs.  Maker mechanics remain the existing execution engine's responsibility.
     return {
@@ -172,6 +185,14 @@ export function currentCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process
       leverage: 1,
       maxOpenBaskets: 1,
       ordinaryContextInvalidationEnabled: false,
+      dynamicV3Exit: dynamicV3
+        ? {
+            hardCutLossNetReturn: DYNAMIC_MOM36_HARD_CUT_LOSS,
+            mfeArmNetReturn: DYNAMIC_MOM36_MFE_ARM_THRESHOLD,
+            mfeGivebackFraction: DYNAMIC_MOM36_MFE_GIVEBACK_FRACTION,
+            horizonHours: 36,
+          }
+        : null,
     };
   }
   const takeProfitEnabled = env.CROSS_SECTIONAL_EXEC_TP_DISABLED !== "1";
@@ -226,6 +247,7 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
 ): CrossSectionalPolicyFingerprint {
   const dynamic = isDynamicMom36ShockStrategy(env);
   const strategyVersion = crossSectionalStrategyVersion(env);
+  const dynamicV3 = strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
   const sourceSha = env.KRONOS_RELEASE_SHA?.trim() || "UNKNOWN_SOURCE_SHA";
   const body = {
     schemaVersion: CURRENT_POLICY_FINGERPRINT_SCHEMA,
@@ -238,7 +260,9 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
       sourceSha,
       gitHash: sourceSha,
       configHash: "PENDING_CONFIG_HASH",
-      modelArtifactId: dynamic ? NO_FROZEN_RUNTIME_SHOCK_ARTIFACT : "NOT_APPLICABLE_LEGACY",
+      modelArtifactId: dynamicV3
+        ? DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID
+        : dynamic ? NO_FROZEN_RUNTIME_SHOCK_ARTIFACT : "NOT_APPLICABLE_LEGACY",
       deploymentTimestamp: validIso(env.CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT),
       policyVersion: env.CROSS_SECTIONAL_POLICY_VERSION?.trim() || "UNVERSIONED_POLICY",
       variant: dynamic ? DYNAMIC_MOM36_SHOCK_VARIANT : env.CROSS_SECTIONAL_EXEC_VARIANT?.trim() || "FILTERED",

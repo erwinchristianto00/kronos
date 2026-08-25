@@ -33,9 +33,14 @@ import {
   type CrossSectionalPolicyFingerprint,
 } from "./cross-sectional-policy.js";
 import {
+  DYNAMIC_MOM36_HARD_CUT_LOSS,
+  DYNAMIC_MOM36_MFE_ARM_THRESHOLD,
+  DYNAMIC_MOM36_MFE_GIVEBACK_FRACTION,
+  DYNAMIC_MOM36_MFE_TRAILING_FRACTION,
   DYNAMIC_MOM36_SHOCK_36H_V1,
   DYNAMIC_MOM36_SHOCK_VARIANT,
   isDynamicMom36ShockVersion,
+  isDynamicMom36V3Version,
 } from "./dynamic-mom36-shock-strategy.js";
 import type { CrossSectionalFormationMode } from "./cross-sectional-runtime-mode.js";
 import { isCrossSectionalSymbolReliabilityEnabled } from "./cross-sectional-symbol-reliability.js";
@@ -981,6 +986,109 @@ export function evaluateCrossSectionalFormationCohort(
   };
 }
 
+/**
+ * Persisted only for new v3 baskets.  It is deliberately separate from generic MFE telemetry so
+ * an older Dynamic v1 basket can never acquire a new -2% stop simply by restarting under v3.
+ */
+export type DynamicMom36V3ExitState = {
+  version: "DYNAMIC_MOM36_V3_EXIT";
+  hardCutLossThreshold: number;
+  mfeArmThreshold: number;
+  mfeGivebackFraction: number;
+  mfeTrailingFraction: number;
+  mfeTrailArmed: boolean;
+  peakMfeReturn: number | null;
+  mfeTrailingFloor: number | null;
+  /** Last evaluated full-basket net return, on the same actual-notional/cost basis as the stop. */
+  lastObservedReturn: number | null;
+  lastObservedAt: string | null;
+  /** Preserved when a gap crosses both the MFE floor and hard loss boundary. */
+  mfeFloorWasBreached: boolean;
+  exitTrigger?: {
+    reason: "HARD_CUT_LOSS_2" | "MFE_GIVEBACK_30" | "HORIZON_36H";
+    observedReturn: number;
+    observedAt: string;
+    peakMfeReturn: number | null;
+    mfeTrailingFloor: number | null;
+    mfeFloorWasBreached: boolean;
+  } | null;
+  realizedNetReturn?: number | null;
+  /**
+   * Canonical 36h observation retains the HOLD counterfactual under this immutable source id.
+   * It is a forward audit link only; never an order, rebalance, or post-exit decision input.
+   */
+  forwardCounterfactual?: {
+    sourceObservationId: string;
+    horizonAtMs: number | null;
+    status: "PENDING_CANONICAL_36H" | "AVAILABLE_IN_CANONICAL_OBSERVATION";
+  } | null;
+};
+
+export type DynamicMom36V3ExitReason = "HARD_CUT_LOSS_2" | "MFE_GIVEBACK_30";
+
+/** Numerical representation tolerance only; it never changes the published percentage thresholds. */
+const DYNAMIC_MOM36_EXIT_COMPARISON_EPSILON = 1e-12;
+
+function atOrBelowDynamicMom36Boundary(value: number, boundary: number): boolean {
+  return value <= boundary + DYNAMIC_MOM36_EXIT_COMPARISON_EPSILON;
+}
+
+/**
+ * Pure, persisted v3 exit machine. It deliberately owns no exchange access: caller reconciliation
+ * decides whether a mark is valid, then this function records one deterministic protective intent.
+ * Keeping it pure makes exact boundary, restart, one-sided, and gap semantics testable directly.
+ */
+export function advanceDynamicMom36V3ExitState(
+  state: DynamicMom36V3ExitState,
+  currentReturn: number,
+  observedAt: string,
+): DynamicMom36V3ExitReason | null {
+  if (!Number.isFinite(currentReturn)) return null;
+  state.lastObservedReturn = currentReturn;
+  state.lastObservedAt = observedAt;
+  const priorFloor = state.mfeTrailArmed && Number.isFinite(state.mfeTrailingFloor)
+    ? state.mfeTrailingFloor!
+    : null;
+  const floorWasBreached = priorFloor !== null && atOrBelowDynamicMom36Boundary(currentReturn, priorFloor);
+  // Deterministic priority for a violent gap: hard loss is the recorded exit even when an armed
+  // MFE floor is also below the observed mark. One caller emits one close request.
+  if (atOrBelowDynamicMom36Boundary(currentReturn, state.hardCutLossThreshold)) {
+    state.mfeFloorWasBreached ||= floorWasBreached;
+    state.exitTrigger = {
+      reason: "HARD_CUT_LOSS_2",
+      observedReturn: currentReturn,
+      observedAt,
+      peakMfeReturn: state.peakMfeReturn,
+      mfeTrailingFloor: state.mfeTrailingFloor,
+      mfeFloorWasBreached: floorWasBreached,
+    };
+    return "HARD_CUT_LOSS_2";
+  }
+  const peak = Math.max(0, currentReturn, Number.isFinite(state.peakMfeReturn) ? state.peakMfeReturn! : Number.NEGATIVE_INFINITY);
+  state.peakMfeReturn = peak;
+  if (peak >= state.mfeArmThreshold) state.mfeTrailArmed = true;
+  if (!state.mfeTrailArmed) return null;
+  const candidateFloor = peak * state.mfeTrailingFraction;
+  state.mfeTrailingFloor = Math.max(
+    Number.isFinite(state.mfeTrailingFloor) ? state.mfeTrailingFloor! : Number.NEGATIVE_INFINITY,
+    candidateFloor,
+  );
+  const currentFloor = state.mfeTrailingFloor;
+  if (atOrBelowDynamicMom36Boundary(currentReturn, currentFloor)) {
+    state.mfeFloorWasBreached = true;
+    state.exitTrigger = {
+      reason: "MFE_GIVEBACK_30",
+      observedReturn: currentReturn,
+      observedAt,
+      peakMfeReturn: state.peakMfeReturn,
+      mfeTrailingFloor: currentFloor,
+      mfeFloorWasBreached: true,
+    };
+    return "MFE_GIVEBACK_30";
+  }
+  return null;
+}
+
 export interface ExecutorBasket {
   basketId: string;
   sourceObservationId: string;
@@ -994,6 +1102,8 @@ export interface ExecutorBasket {
   horizonExitAtMs?: number | null;
   /** Immutable source snapshot for post-entry Dynamic MOM36 audit; never recomputed on restart. */
   dynamicMom36?: CrossSectionalObservation["dynamicMom36"] | null;
+  /** Frozen v3 exit state; undefined/null means legacy/v1 semantics. */
+  dynamicMom36V3Exit?: DynamicMom36V3ExitState | null;
   /** Full policy contract frozen before any entry order is sent. Undefined means legacy. */
   policyFingerprint?: CrossSectionalPolicyFingerprint | null;
   /** Optional observation-owned basket geometry, enabled only for dedicated innovation executors. */
@@ -1816,6 +1926,13 @@ export class CrossSectionalExecutor {
   private ticking = false;
   private lastError: string | null = null;
   private openHalted: string | null = null;
+  /**
+   * A v3 protective intent is durable, but one tick must never launch two close passes for the
+   * same basket (the mark phase runs before the horizon phase).  This transient set is reset at
+   * the start of each single-flight tick; a partially filled close is therefore retried on the
+   * next tick without emitting duplicate reduce-only orders in the current one.
+   */
+  private dynamicV3CloseAttemptedThisTick = new Set<string>();
   /** See claimBasket/releaseBasket's own doc comment (ground truth #8, concurrent-close race). */
   private busyBasketIds = new Set<string>();
   private readonly dailyMaxLossUsdFn: () => number;
@@ -2663,7 +2780,7 @@ export class CrossSectionalExecutor {
     /** Compact operator-facing state for the versioned Dynamic MOM36 contract. */
     dynamicMom36Status: {
       mode: "ARMED" | "BLOCKED";
-      hardBasketStop: "NONE";
+      hardBasketStop: "NONE" | "HARD_CUT_LOSS_2";
       ordinaryTakeProfitEnabled: false;
       ordinaryMfeGivebackEnabled: false;
       ordinaryContextInvalidationEnabled: false;
@@ -2671,6 +2788,18 @@ export class CrossSectionalExecutor {
       latestFormation: CrossSectionalObservation["dynamicMom36"] | null;
       openBasketId: string | null;
       horizonExitAtMs: number | null;
+      v3Exit: {
+        currentBasketReturn: number | null;
+        hardSLNetReturn: number;
+        distanceToHardCut: number | null;
+        peakMfeReturn: number | null;
+        mfeTrailArmed: boolean;
+        mfeArmThreshold: number;
+        mfeTrailingFloor: number | null;
+        distanceToMfeFloor: number | null;
+        ageHours: number | null;
+        horizonRemainingHours: number | null;
+      } | null;
     } | null;
     currentPolicyForwardCohort: CurrentPolicyForwardCohort;
     accountingCounts: { cleanN: number; quarantinedN: number; rejectedN: number };
@@ -2837,10 +2966,10 @@ export class CrossSectionalExecutor {
       legacyExitPolicy,
       effectiveRuntime,
       currentPolicyFingerprint,
-      dynamicMom36Status: currentPolicyFingerprint.strategy.strategyVersion === DYNAMIC_MOM36_SHOCK_36H_V1
+      dynamicMom36Status: isDynamicMom36ShockVersion(currentPolicyFingerprint.strategy.strategyVersion)
         ? {
             mode: this.enabledFn() && this.isAllowed() ? "ARMED" : "BLOCKED",
-            hardBasketStop: "NONE",
+            hardBasketStop: dynamicOpenBasket && this.isDynamicV3Basket(dynamicOpenBasket) ? "HARD_CUT_LOSS_2" : "NONE",
             ordinaryTakeProfitEnabled: false,
             ordinaryMfeGivebackEnabled: false,
             ordinaryContextInvalidationEnabled: false,
@@ -2848,6 +2977,30 @@ export class CrossSectionalExecutor {
             latestFormation: latestDynamicSignal?.dynamicMom36 ?? null,
             openBasketId: dynamicOpenBasket?.basketId ?? null,
             horizonExitAtMs: dynamicOpenBasket?.horizonExitAtMs ?? null,
+            v3Exit: (() => {
+              if (!dynamicOpenBasket || !this.isDynamicV3Basket(dynamicOpenBasket)) return null;
+              const state = dynamicOpenBasket.dynamicMom36V3Exit ?? null;
+              if (!state) return null;
+              const now = nowMs;
+              const opened = Date.parse(dynamicOpenBasket.openedAt);
+              const deadline = dynamicOpenBasket.horizonExitAtMs ?? null;
+              return {
+                currentBasketReturn: dynamicOpenBasket.lastNetReturn ?? null,
+                hardSLNetReturn: state.hardCutLossThreshold,
+                distanceToHardCut: Number.isFinite(dynamicOpenBasket.lastNetReturn)
+                  ? dynamicOpenBasket.lastNetReturn! - state.hardCutLossThreshold
+                  : null,
+                peakMfeReturn: state.peakMfeReturn,
+                mfeTrailArmed: state.mfeTrailArmed,
+                mfeArmThreshold: state.mfeArmThreshold,
+                mfeTrailingFloor: state.mfeTrailingFloor,
+                distanceToMfeFloor: Number.isFinite(dynamicOpenBasket.lastNetReturn) && Number.isFinite(state.mfeTrailingFloor)
+                  ? dynamicOpenBasket.lastNetReturn! - state.mfeTrailingFloor!
+                  : null,
+                ageHours: Number.isFinite(opened) ? (now - opened) / 3_600_000 : null,
+                horizonRemainingHours: deadline !== null ? Math.max(0, deadline - now) / 3_600_000 : null,
+              };
+            })(),
           }
         : null,
       currentPolicyForwardCohort: currentPolicyForward,
@@ -3284,6 +3437,76 @@ export class CrossSectionalExecutor {
       isDynamicMom36ShockVersion(basket.policyFingerprint?.strategy?.strategyVersion);
   }
 
+  private isDynamicV3Basket(basket: Pick<ExecutorBasket, "strategyVersion" | "policyFingerprint" | "dynamicMom36">): boolean {
+    return isDynamicMom36V3Version(basket.strategyVersion) ||
+      isDynamicMom36V3Version(basket.dynamicMom36?.strategyVersion) ||
+      isDynamicMom36V3Version(basket.policyFingerprint?.strategy?.strategyVersion);
+  }
+
+  /**
+   * Restore/repair v3's frozen exit state without consulting mutable environment controls.  This
+   * makes the first post-restart mark evaluation enforce the same basket-level hard stop that was
+   * active before restart, even if an older persisted row missed only this additive field.
+   */
+  private dynamicV3ExitState(basket: ExecutorBasket): DynamicMom36V3ExitState | null {
+    if (!this.isDynamicV3Basket(basket)) return null;
+    const frozen = this.basketExecutionPolicy(basket).dynamicV3Exit;
+    const prior = basket.dynamicMom36V3Exit;
+    const hardCut = Number.isFinite(prior?.hardCutLossThreshold)
+      ? prior!.hardCutLossThreshold
+      : frozen?.hardCutLossNetReturn ?? DYNAMIC_MOM36_HARD_CUT_LOSS;
+    const mfeArm = Number.isFinite(prior?.mfeArmThreshold)
+      ? prior!.mfeArmThreshold
+      : frozen?.mfeArmNetReturn ?? DYNAMIC_MOM36_MFE_ARM_THRESHOLD;
+    const giveback = Number.isFinite(prior?.mfeGivebackFraction)
+      ? prior!.mfeGivebackFraction
+      : frozen?.mfeGivebackFraction ?? DYNAMIC_MOM36_MFE_GIVEBACK_FRACTION;
+    const state: DynamicMom36V3ExitState = {
+      version: "DYNAMIC_MOM36_V3_EXIT",
+      hardCutLossThreshold: hardCut,
+      mfeArmThreshold: mfeArm,
+      mfeGivebackFraction: giveback,
+      mfeTrailingFraction: 1 - giveback,
+      mfeTrailArmed: prior?.mfeTrailArmed === true,
+      peakMfeReturn: Number.isFinite(prior?.peakMfeReturn) ? prior!.peakMfeReturn : null,
+      mfeTrailingFloor: Number.isFinite(prior?.mfeTrailingFloor) ? prior!.mfeTrailingFloor : null,
+      lastObservedReturn: Number.isFinite(prior?.lastObservedReturn) ? prior!.lastObservedReturn : null,
+      lastObservedAt: prior?.lastObservedAt ?? null,
+      mfeFloorWasBreached: prior?.mfeFloorWasBreached === true,
+      exitTrigger: prior?.exitTrigger ?? null,
+      realizedNetReturn: Number.isFinite(prior?.realizedNetReturn) ? prior!.realizedNetReturn : null,
+      forwardCounterfactual: prior?.forwardCounterfactual &&
+          typeof prior.forwardCounterfactual.sourceObservationId === "string" &&
+          prior.forwardCounterfactual.sourceObservationId
+        ? {
+            sourceObservationId: prior.forwardCounterfactual.sourceObservationId,
+            horizonAtMs: Number.isFinite(prior.forwardCounterfactual.horizonAtMs)
+              ? prior.forwardCounterfactual.horizonAtMs
+              : null,
+            status: prior.forwardCounterfactual.status === "AVAILABLE_IN_CANONICAL_OBSERVATION"
+              ? "AVAILABLE_IN_CANONICAL_OBSERVATION"
+              : "PENDING_CANONICAL_36H",
+          }
+        : {
+            sourceObservationId: basket.sourceObservationId,
+            horizonAtMs: basket.horizonExitAtMs ?? null,
+            status: "PENDING_CANONICAL_36H",
+          },
+    };
+    basket.dynamicMom36V3Exit = state;
+    return state;
+  }
+
+  private evaluateDynamicV3Exit(
+    basket: ExecutorBasket,
+    currentReturn: number,
+    observedAt: string,
+  ): DynamicMom36V3ExitReason | null {
+    const state = this.dynamicV3ExitState(basket);
+    if (!state) return null;
+    return advanceDynamicMom36V3ExitState(state, currentReturn, observedAt);
+  }
+
   /** New baskets freeze this at admission; legacy rows read the pre-cutover compatibility contract. */
   private basketExecutionPolicy(basket: ExecutorBasket): CrossSectionalExitPolicySnapshot {
     const legacy = legacyCrossSectionalExitPolicy();
@@ -3326,6 +3549,31 @@ export class CrossSectionalExecutor {
     // Keep the legacy field coherent for existing status/UI readers, while closeDueBaskets uses
     // horizonExitAtMs as the authoritative dynamic value.
     basket.closesAtMs = basket.horizonExitAtMs;
+    if (this.isDynamicV3Basket(basket)) {
+      const state = this.dynamicV3ExitState(basket);
+      if (state?.forwardCounterfactual) state.forwardCounterfactual.horizonAtMs = basket.horizonExitAtMs;
+    }
+  }
+
+  /**
+   * The canonical observation lane continues to resolve its original HOLD36 markout even after a
+   * v3 protective exit. This attaches a durable, read-only link once that source result exists;
+   * it never feeds entry, exit, or sizing.
+   */
+  private refreshDynamicV3ForwardCounterfactualLinks(): void {
+    const observationById = new Map(this.signalStore.all.map((observation) => [observation.observationId, observation]));
+    let changed = false;
+    for (const basket of this.store.getState().baskets) {
+      if (!this.isDynamicV3Basket(basket)) continue;
+      const state = this.dynamicV3ExitState(basket);
+      const link = state?.forwardCounterfactual;
+      if (!link || link.status === "AVAILABLE_IN_CANONICAL_OBSERVATION") continue;
+      const source = observationById.get(link.sourceObservationId);
+      if (!source || source.status === "OPEN") continue;
+      link.status = "AVAILABLE_IN_CANONICAL_OBSERVATION";
+      changed = true;
+    }
+    if (changed) this.store.save();
   }
 
   private shouldUseMakerExit(basket: ExecutorBasket, reason: string): boolean {
@@ -3341,6 +3589,7 @@ export class CrossSectionalExecutor {
   async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
+    this.dynamicV3CloseAttemptedThisTick.clear();
     // 2026-07-19 real-money audit fix (BUG 2): reset HERE, at the top, not unconditionally after
     // every phase runs. closeBasketsHittingProfitTarget()/closeDueBaskets() now catch and record
     // per-basket close failures internally (see their own per-basket try/catch) so ONE wedged
@@ -3356,6 +3605,7 @@ export class CrossSectionalExecutor {
       await this.retryOrphanedLegFlattens();
       await this.closeBasketsHittingProfitTarget();
       await this.closeDueBaskets();
+      this.refreshDynamicV3ForwardCounterfactualLinks();
       await this.ensureOpenBasketLeverage();
       // Restart-recovery (see recoverIncompleteBaskets' own doc comment): gated on isAllowed() —
       // the SAME master armed/testnet gate maybeOpenBasket itself requires — because resuming a
@@ -3559,8 +3809,9 @@ export class CrossSectionalExecutor {
   /**
    * Actual-leg mark-to-market for Dynamic MOM36.  Unlike the legacy neutral formula, this uses
    * the realized entry notional of every leg, so 6L0S, 5L1S, and their bearish mirrors never get
-   * silently divided into fictional 50/50 sides.  The output is telemetry only; dynamic baskets
-   * still exit only through their 36h horizon or an existing exceptional safety/manual path.
+   * silently divided into fictional 50/50 sides. v1 keeps its horizon-only lifecycle; v3 applies
+   * its separately frozen basket-level hard cut and MFE trail to this same actual-notional,
+   * cost-adjusted return basis.
    */
   private dynamicMarkedBasketPnl(
     basket: ExecutorBasket,
@@ -3666,8 +3917,28 @@ export class CrossSectionalExecutor {
           marked.netReturn,
         );
         stamped = true;
-        // Explicit strategy isolation: no ordinary TP, MFE giveback, context invalidation, or
-        // numerical stop is reachable for Dynamic MOM36 here.
+        if (this.isDynamicV3Basket(basket)) {
+          const state = this.dynamicV3ExitState(basket);
+          // Once a protective/horizon intent is persisted, it owns all still-live legs until the
+          // exchange reconciliation proves the basket flat.  Re-evaluating only the residual legs
+          // after a partial fill could otherwise make a recovered mark look safe and strand them.
+          const pendingExitReason = state?.exitTrigger?.reason ?? null;
+          const exitReason = pendingExitReason ?? this.evaluateDynamicV3Exit(basket, marked.netReturn, pathNow);
+          if (exitReason) {
+            // Persist the observed trigger/floor before any exchange round trip.  If a partial
+            // close is interrupted, retry sees the same intent and can safely finish remaining
+            // reduce-only legs without inventing a fresh signal.
+            this.store.save();
+            this.dynamicV3CloseAttemptedThisTick.add(basket.basketId);
+            try {
+              await this.closeBasket(basket, exitReason);
+            } catch (error) {
+              this.lastError = (error as Error).message ?? "dynamic v3 protective close failed";
+            }
+          }
+        }
+        // v1 remains telemetry + horizon only.  V3 is isolated above from ordinary TP, Smart
+        // context/MFE, V4 reversal, MOM invalidation, and legacy per-side stop paths.
         continue;
       }
       const longLegs = basket.legs.filter((l) => l.side === "LONG");
@@ -3861,11 +4132,38 @@ export class CrossSectionalExecutor {
           : basket.closesAtMs;
       }
       if (nowMs < cappedDue) continue;
+      // The v3 mark pass already owns a same-tick protective close.  Do not double-submit a
+      // residual market close merely because the 36h horizon is also due; its persisted intent is
+      // retried safely on the next executor tick if reconciliation did not finish.
+      if (this.isDynamicV3Basket(basket) && this.dynamicV3CloseAttemptedThisTick.has(basket.basketId)) continue;
       // 2026-07-19 real-money audit fix (BUG 2): same per-basket isolation as
       // closeBasketsHittingProfitTarget above — one basket's HORIZON close failing must not block
       // every OTHER due basket from being closed this tick.
       try {
-        await this.closeBasket(basket, "HORIZON");
+        const v3State = this.isDynamicV3Basket(basket) ? this.dynamicV3ExitState(basket) : null;
+        const pendingProtectiveReason = v3State?.exitTrigger?.reason === "HARD_CUT_LOSS_2" ||
+          v3State?.exitTrigger?.reason === "MFE_GIVEBACK_30"
+          ? v3State.exitTrigger.reason
+          : null;
+        const reason = pendingProtectiveReason ?? (this.isDynamicV3Basket(basket) ? "HORIZON_36H" : "HORIZON");
+        if (this.isDynamicV3Basket(basket)) {
+          const state = v3State;
+          if (state) {
+            if (!pendingProtectiveReason) {
+              state.exitTrigger = {
+                reason: "HORIZON_36H",
+                observedReturn: Number.isFinite(state.lastObservedReturn) ? state.lastObservedReturn! : 0,
+                observedAt: this.nowIso(),
+                peakMfeReturn: state.peakMfeReturn,
+                mfeTrailingFloor: state.mfeTrailingFloor,
+                mfeFloorWasBreached: state.mfeFloorWasBreached,
+              };
+            }
+            this.store.save();
+          }
+          this.dynamicV3CloseAttemptedThisTick.add(basket.basketId);
+        }
+        await this.closeBasket(basket, reason);
       } catch (error) {
         this.lastError = (error as Error).message ?? "horizon close failed";
       }
@@ -4546,7 +4844,15 @@ export class CrossSectionalExecutor {
     const finalMeanShort = finalShortLegs.length
       ? finalShortLegs.reduce((sum, l) => sum + finalLegReturn(l, "SHORT"), 0) / finalShortLegs.length
       : 0;
-    basket.lastNetReturn = finalMeanLong / 2 + finalMeanShort / 2 - CROSS_SECTIONAL_ROUNDTRIP_BPS / 10_000;
+    if (this.isDynamicV3Basket(basket)) {
+      const deployedCapitalUsd = basket.legs.reduce((sum, leg) => sum + leg.entryPrice * leg.qty, 0);
+      const realizedReturn = deployedCapitalUsd > 0 ? (basket.netPnlUsd ?? 0) / deployedCapitalUsd : null;
+      basket.lastNetReturn = realizedReturn;
+      const state = this.dynamicV3ExitState(basket);
+      if (state) state.realizedNetReturn = realizedReturn;
+    } else {
+      basket.lastNetReturn = finalMeanLong / 2 + finalMeanShort / 2 - CROSS_SECTIONAL_ROUNDTRIP_BPS / 10_000;
+    }
     basket.lastNetAt = basket.closedAt;
     // Close each causal leg only when BOTH exchange fills and BOTH commissions are present.  The
     // incumbent basket P&L can still use its documented aggregate fallback, but Four-Brain must
@@ -4694,7 +5000,21 @@ export class CrossSectionalExecutor {
     const dynamicSignal = this.isDynamicSignal(signal);
     const dynamicPolicyFingerprint = dynamicSignal ? buildCurrentCrossSectionalPolicyFingerprint(this.nowIso()) : null;
     if (dynamicSignal && !isDynamicMom36ShockVersion(dynamicPolicyFingerprint?.strategy.strategyVersion)) {
-      this.skipSignal(signal, "ENTRY_ADMISSION", "Dynamic MOM36 signal received while the runtime policy version is not dynamic-mom36-shock-36h-v1");
+      this.skipSignal(signal, "ENTRY_ADMISSION", "Dynamic MOM36 signal received while the runtime policy version is not a supported Dynamic MOM36 version");
+      return;
+    }
+    // A v1 signal produced before a v3 cutover must never be executed with v3's new stop/trail
+    // contract (or vice versa).  It remains immutable historical evidence; only a fresh formation
+    // whose frozen strategy version matches this runtime may reserve a new basket.
+    if (
+      dynamicSignal &&
+      signal.dynamicMom36?.strategyVersion !== dynamicPolicyFingerprint?.strategy.strategyVersion
+    ) {
+      this.skipSignal(
+        signal,
+        "ENTRY_ADMISSION",
+        `Dynamic MOM36 signal strategy ${signal.dynamicMom36?.strategyVersion ?? "MISSING"} does not match runtime ${dynamicPolicyFingerprint?.strategy.strategyVersion ?? "MISSING"}`,
+      );
       return;
     }
 
@@ -5079,6 +5399,9 @@ export class CrossSectionalExecutor {
     }
 
     const policyFingerprint = dynamicPolicyFingerprint ?? buildCurrentCrossSectionalPolicyFingerprint(this.nowIso());
+    const dynamicV3Signal = dynamicSignal &&
+      isDynamicMom36V3Version(policyFingerprint.strategy.strategyVersion) &&
+      isDynamicMom36V3Version(signal.dynamicMom36?.strategyVersion);
     const basket: ExecutorBasket = {
       basketId,
       sourceObservationId: signal.observationId,
@@ -5089,6 +5412,28 @@ export class CrossSectionalExecutor {
       closesAtMs: signal.openedAtMs + signal.horizonMs,
       horizonExitAtMs: dynamicSignal ? null : undefined,
       dynamicMom36: dynamicSignal ? signal.dynamicMom36 ?? null : undefined,
+      dynamicMom36V3Exit: dynamicV3Signal
+        ? {
+            version: "DYNAMIC_MOM36_V3_EXIT",
+            hardCutLossThreshold: DYNAMIC_MOM36_HARD_CUT_LOSS,
+            mfeArmThreshold: DYNAMIC_MOM36_MFE_ARM_THRESHOLD,
+            mfeGivebackFraction: DYNAMIC_MOM36_MFE_GIVEBACK_FRACTION,
+            mfeTrailingFraction: DYNAMIC_MOM36_MFE_TRAILING_FRACTION,
+            mfeTrailArmed: false,
+            peakMfeReturn: null,
+            mfeTrailingFloor: null,
+            lastObservedReturn: null,
+            lastObservedAt: null,
+            mfeFloorWasBreached: false,
+            exitTrigger: null,
+            realizedNetReturn: null,
+            forwardCounterfactual: {
+              sourceObservationId: signal.observationId,
+              horizonAtMs: null,
+              status: "PENDING_CANONICAL_36H",
+            },
+          }
+        : undefined,
       policyFingerprint,
       takeProfitReturn: this.respectSignalRiskGeometry ? signal.takeProfitReturn ?? null : undefined,
       stopLossReturn: this.respectSignalRiskGeometry ? signal.stopLossReturn ?? null : undefined,

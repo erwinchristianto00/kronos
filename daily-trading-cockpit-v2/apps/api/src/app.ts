@@ -4669,6 +4669,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     unifiedOrchestrator: () => unifiedOrchestrator,
     unifiedProposalStore: () => unifiedProposalStore,
     singleSymbolPriceTimeline: () => singleSymbolPriceTimeline,
+    marketCandles: (symbol, interval, limit) => binanceClient.getFuturesCandles(symbol, interval, limit),
     futuresReferenceHealth: () => futuresReferenceHealth?.snapshot() ?? null,
     probeFuturesReferenceHealth: (symbols) =>
       probeFuturesReferenceHealth ? probeFuturesReferenceHealth(symbols) : Promise.resolve(null),

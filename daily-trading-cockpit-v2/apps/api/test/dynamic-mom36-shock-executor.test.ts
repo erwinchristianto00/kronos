@@ -13,9 +13,11 @@ import { CrossSectionalStore, type CrossSectionalObservation } from "../src/lib/
 import type { FuturesMarketReference } from "../src/lib/futures-market-reference-cache.js";
 import {
   DYNAMIC_MOM36_HORIZON_MS,
+  DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3,
   DYNAMIC_MOM36_SHOCK_36H_V1,
   DYNAMIC_MOM36_SHOCK_SIGNAL,
   DYNAMIC_MOM36_SHOCK_VARIANT,
+  type DynamicMom36StrategyVersion,
 } from "../src/lib/dynamic-mom36-shock-strategy.js";
 
 const T0 = Date.parse("2026-08-25T00:00:00.000Z");
@@ -32,10 +34,13 @@ function tempDir(label: string): string {
   return dir;
 }
 
-function withDynamicEnv<T>(fn: () => Promise<T>): Promise<T> {
+function withDynamicEnv<T>(
+  fn: () => Promise<T>,
+  strategyVersion: DynamicMom36StrategyVersion = DYNAMIC_MOM36_SHOCK_36H_V1,
+): Promise<T> {
   const overrides: Record<string, string> = {
-    CROSS_SECTIONAL_STRATEGY_VERSION: DYNAMIC_MOM36_SHOCK_36H_V1,
-    CROSS_SECTIONAL_POLICY_VERSION: DYNAMIC_MOM36_SHOCK_36H_V1,
+    CROSS_SECTIONAL_STRATEGY_VERSION: strategyVersion,
+    CROSS_SECTIONAL_POLICY_VERSION: strategyVersion,
     CROSS_SECTIONAL_EXEC_TP_DISABLED: "1",
     CROSS_SECTIONAL_MAKER_ENTRY_ENABLED: "0",
     CROSS_SECTIONAL_MAKER_EXIT_ENABLED: "0",
@@ -62,6 +67,8 @@ class DynamicFakeClient {
   readonly leverageCalls: Array<{ symbol: string; leverage: number }> = [];
   readonly marks = new Map<string, number>();
   readonly positions = new Map<string, number>();
+  /** One injected close failure proves a v3 protective intent survives partial settlement. */
+  readonly failNextReduceFor = new Set<string>();
   private sequence = 0;
 
   constructor() {
@@ -91,6 +98,9 @@ class DynamicFakeClient {
   }
 
   async placeOrder(params: { symbol: string; side: string; quantity: number; reduceOnly?: boolean; newClientOrderId?: string }): Promise<FuturesOrder> {
+    if (params.reduceOnly && this.failNextReduceFor.delete(params.symbol)) {
+      throw new Error(`injected temporary reduce-only failure for ${params.symbol}`);
+    }
     this.orders.push(params);
     const delta = params.side === "BUY" ? params.quantity : -params.quantity;
     this.positions.set(params.symbol, (this.positions.get(params.symbol) ?? 0) + delta);
@@ -140,6 +150,7 @@ function dynamicSignal(
   id: string,
   longCount: number,
   openedAtMs = T0 - 60_000,
+  strategyVersion: DynamicMom36StrategyVersion = DYNAMIC_MOM36_SHOCK_36H_V1,
 ): CrossSectionalObservation {
   const leg = (symbol: string, index: number) => ({
     symbol,
@@ -178,7 +189,8 @@ function dynamicSignal(
     formationMode: "PLAIN_MOM36",
     smartFormation: null,
     dynamicMom36: {
-      strategyVersion: DYNAMIC_MOM36_SHOCK_36H_V1,
+      strategyVersion,
+      formationTimestamp: new Date(openedAtMs).toISOString(),
       featureTimestamp: new Date(openedAtMs).toISOString(),
       decisionInformationCutoff: new Date(openedAtMs).toISOString(),
       activeUniverse: SYMBOLS.map((symbol, index) => ({
@@ -197,6 +209,7 @@ function dynamicSignal(
       shockRawOutput: { artifactPresent: false, mappingPresent: false, fallback: "NO_EDGE" },
       shockState: "NO_EDGE",
       shockReason: "test",
+      continuation: null,
       finalAllocation: { longCount, shortCount: 6 - longCount, label: (["0L6S", "1L5S", "2L4S", "3L3S", "4L2S", "5L1S", "6L0S"] as const)[longCount]! },
       selectedLongs: longLeg.map((item) => item.symbol),
       selectedShorts: shortLeg.map((item) => item.symbol),
@@ -215,13 +228,14 @@ function dynamicSignal(
 function runner(longCount: number, opts: {
   siblingOpenBasketCount?: () => number;
   warmFuturesMarketReference?: (symbol: string) => Promise<FuturesMarketReference | null>;
+  strategyVersion?: DynamicMom36StrategyVersion;
 } = {}) {
   let nowMs = T0;
   const dataDir = tempDir("dynamic-mom36-executor");
   const signalStore = new CrossSectionalStore(dataDir);
   const store = new CrossSectionalExecutorStore(dataDir, "executor.json", T0 - 2 * 60_000);
   const client = new DynamicFakeClient();
-  signalStore.add(dynamicSignal(`dynamic-${longCount}`, longCount));
+  signalStore.add(dynamicSignal(`dynamic-${longCount}`, longCount, T0 - 60_000, opts.strategyVersion));
   const executor = new CrossSectionalExecutor({
     client: client as unknown as CrossSectionalExecClient,
     signalStore,
@@ -417,6 +431,103 @@ describe("Dynamic MOM36 executor — asymmetric live lifecycle", () => {
       horizonExitAtMs: frozenDeadline,
       dynamicMom36: { finalAllocation: { label: "5L1S" } },
     });
+  }));
+
+  it("applies the v3 -2% basket hard cut identically to 6L0S and 0L6S actual-notional baskets", async () => withDynamicEnv(async () => {
+    for (const longCount of [6, 0]) {
+      const run = runner(longCount, { strategyVersion: DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 });
+      await run.executor.tick();
+      const basket = run.store.getState().baskets[0]!;
+      expect(basket).toMatchObject({
+        status: "COMPLETE",
+        strategyVersion: DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3,
+        dynamicMom36V3Exit: { hardCutLossThreshold: -0.02, mfeArmThreshold: 0.03, mfeGivebackFraction: 0.30 },
+      });
+      for (const leg of basket.legs) {
+        const mark = run.client.marks.get(leg.symbol)!;
+        run.client.marks.set(leg.symbol, leg.side === "LONG" ? mark * 0.975 : mark * 1.025);
+      }
+      await run.executor.tick();
+      expect(basket.status, `${longCount}L${6 - longCount}S`).toBe("CLOSED");
+      expect(basket.closeReason).toBe("HARD_CUT_LOSS_2");
+      expect(basket.dynamicMom36V3Exit?.exitTrigger).toMatchObject({ reason: "HARD_CUT_LOSS_2" });
+      expect(basket.dynamicMom36V3Exit?.exitTrigger?.observedReturn ?? 0).toBeLessThan(-0.02);
+      expect(run.client.orders.filter((order) => order.reduceOnly)).toHaveLength(6);
+    }
+  }, DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3));
+
+  it("uses actual six-leg P&L for v3 MFE protection and labels the 36h cap distinctly", async () => withDynamicEnv(async () => {
+    const run = runner(5, { strategyVersion: DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 });
+    await run.executor.tick();
+    const basket = run.store.getState().baskets[0]!;
+    for (const leg of basket.legs) {
+      const mark = run.client.marks.get(leg.symbol)!;
+      run.client.marks.set(leg.symbol, leg.side === "LONG" ? mark * 1.05 : mark * 0.95);
+    }
+    await run.executor.tick();
+    expect(basket.status).toBe("COMPLETE");
+    expect(basket.dynamicMom36V3Exit).toMatchObject({ mfeTrailArmed: true });
+    const peak = basket.dynamicMom36V3Exit?.peakMfeReturn ?? 0;
+    expect(peak).toBeGreaterThan(0.04);
+    expect(basket.dynamicMom36V3Exit?.mfeTrailingFloor ?? 0).toBeCloseTo(peak * 0.70, 12);
+
+    for (const leg of basket.legs) {
+      const mark = 100 + SYMBOLS.indexOf(leg.symbol as (typeof SYMBOLS)[number]) * 10;
+      run.client.marks.set(leg.symbol, leg.side === "LONG" ? mark * 1.034 : mark * 0.966);
+    }
+    await run.executor.tick();
+    expect(basket).toMatchObject({ status: "CLOSED", closeReason: "MFE_GIVEBACK_30" });
+    expect(basket.dynamicMom36V3Exit?.exitTrigger).toMatchObject({ reason: "MFE_GIVEBACK_30" });
+
+    const horizonRun = runner(0, { strategyVersion: DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 });
+    await horizonRun.executor.tick();
+    const horizonBasket = horizonRun.store.getState().baskets[0]!;
+    horizonRun.setNow(T0 + DYNAMIC_MOM36_HORIZON_MS);
+    await horizonRun.executor.tick();
+    expect(horizonBasket).toMatchObject({ status: "CLOSED", closeReason: "HORIZON_36H" });
+    expect(horizonBasket.dynamicMom36V3Exit?.exitTrigger).toMatchObject({ reason: "HORIZON_36H" });
+  }, DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3));
+
+  it("retries a persisted v3 hard-cut intent after a partial close even when the remaining leg mark recovers", async () => withDynamicEnv(async () => {
+    const run = runner(6, { strategyVersion: DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 });
+    await run.executor.tick();
+    const basket = run.store.getState().baskets[0]!;
+    const residual = basket.legs[0]!.symbol;
+    run.client.failNextReduceFor.add(residual);
+    for (const leg of basket.legs) {
+      const mark = run.client.marks.get(leg.symbol)!;
+      run.client.marks.set(leg.symbol, mark * 0.97);
+    }
+
+    await run.executor.tick();
+    expect(basket.status).toBe("COMPLETE");
+    expect(basket.dynamicMom36V3Exit?.exitTrigger).toMatchObject({ reason: "HARD_CUT_LOSS_2" });
+    expect(run.client.orders.filter((order) => order.reduceOnly)).toHaveLength(5);
+
+    // Only the residual leg remains.  Its mark now looks harmless, so retry must come from the
+    // persisted protective intent rather than a new threshold crossing.
+    run.client.marks.set(residual, basket.legs[0]!.entryPrice);
+    await run.executor.tick();
+
+    expect(basket).toMatchObject({ status: "CLOSED", closeReason: "HARD_CUT_LOSS_2" });
+    const reduceOrders = run.client.orders.filter((order) => order.reduceOnly);
+    expect(reduceOrders).toHaveLength(6);
+    expect(reduceOrders.filter((order) => order.symbol === residual)).toHaveLength(1);
+    expect(Array.from(run.client.positions.values()).every((qty) => Math.abs(qty) < 1e-9)).toBe(true);
+  }, DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3));
+
+  it("does not retrofit a v1 Dynamic basket with the v3 hard cut", async () => withDynamicEnv(async () => {
+    const run = runner(6);
+    await run.executor.tick();
+    const basket = run.store.getState().baskets[0]!;
+    for (const leg of basket.legs) {
+      const mark = run.client.marks.get(leg.symbol)!;
+      run.client.marks.set(leg.symbol, mark * 0.97);
+    }
+    await run.executor.tick();
+    expect(basket.status).toBe("COMPLETE");
+    expect(basket.dynamicMom36V3Exit).toBeUndefined();
+    expect(run.client.orders.filter((order) => order.reduceOnly)).toHaveLength(0);
   }));
 
   it("never opens a second Dynamic basket while another cross-basket executor owns the global slot", async () => withDynamicEnv(async () => {

@@ -387,6 +387,8 @@ import {
   CROSS_SECTIONAL_TREND_SIGNAL,
   CROSS_SECTIONAL_MIXED_SIGNAL,
 } from "../lib/cross-sectional-edge.js";
+import { DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES } from "../lib/dynamic-mom36-continuation-runtime.js";
+import { isDynamicMom36V3Strategy } from "../lib/dynamic-mom36-shock-strategy.js";
 import type { CrossSectionalAutoPool } from "../lib/cross-sectional-auto-pool.js";
 import { spotSymbolForCandles, buildWinnersCounterfactualReport } from "../lib/cross-sectional-winners-counterfactual.js";
 import { buildRegimeAxisTimeline } from "../lib/regime-axis-timeline.js";
@@ -3022,6 +3024,14 @@ export async function registerShadowRoutes(
                 CROSS_SECTIONAL_INTERVAL,
                 Math.max(
                   CROSS_SECTIONAL_MOMENTUM_BARS + 5,
+                  // V3's frozen V4 continuation runtime requires 200 completed 1h bars.  This
+                  // changes only public-data depth; MOM36 still reads exactly its canonical 36h
+                  // lookback and falls back to BASE if the extra history is unavailable.
+                  // Keep the V4 service's full 200 *completed* bars after the current forming
+                  // hour is removed, with the same conservative 30-bar acquisition cushion used
+                  // by its frozen runtime. This is transport tolerance only, not a MOM36 or
+                  // continuation parameter change.
+                  isDynamicMom36V3Strategy() ? DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES + 30 : 0,
                   CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0 ? CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS : 0,
                   // 2026-08-18: the 14d stand-down gate needs 336 bars. Deepened ONLY when that gate
                   // is armed, so the default fetch stays exactly what it was — and asking for a

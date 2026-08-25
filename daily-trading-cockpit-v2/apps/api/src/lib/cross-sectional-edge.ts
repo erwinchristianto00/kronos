@@ -32,18 +32,28 @@ import {
   type CrossSectionalFormationMode,
 } from "./cross-sectional-runtime-mode.js";
 import {
+  DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3,
   DYNAMIC_MOM36_SHOCK_36H_V1,
   DYNAMIC_MOM36_HORIZON_MS,
   DYNAMIC_MOM36_LOOKBACK_BARS,
   DYNAMIC_MOM36_SHOCK_SIGNAL,
   DYNAMIC_MOM36_SHOCK_VARIANT,
   buildDynamicMom36Formation,
+  crossSectionalStrategyVersion,
   isDynamicMom36ShockStrategy,
+  isDynamicMom36V3Strategy,
+  type DynamicMom36StrategyVersion,
+  type FrozenContinuationOverlay,
   resolveFrozenRuntimeShockOverlay,
   type DynamicMom36Allocation,
   type DynamicMom36RankedSymbol,
   type DynamicMom36ShockState,
 } from "./dynamic-mom36-shock-strategy.js";
+import {
+  DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES,
+  evaluateDynamicMom36Continuation,
+  type DynamicMom36ContinuationRuntimeResult,
+} from "./dynamic-mom36-continuation-runtime.js";
 
 function envNumPos(key: string, fallback: number): number {
   const v = Number(process.env[key]);
@@ -556,7 +566,9 @@ export interface CrossSectionalSmartFormation {
 
 /** Immutable formation evidence for the live Dynamic MOM36 policy. */
 export interface DynamicMom36FormationSnapshot {
-  strategyVersion: typeof DYNAMIC_MOM36_SHOCK_36H_V1;
+  strategyVersion: DynamicMom36StrategyVersion;
+  /** Timestamp at which the immutable breadth/continuation/ranking snapshot was formed. */
+  formationTimestamp: string;
   featureTimestamp: string;
   decisionInformationCutoff: string;
   activeUniverse: Array<{
@@ -576,6 +588,11 @@ export interface DynamicMom36FormationSnapshot {
   shockRawOutput: Record<string, unknown>;
   shockState: DynamicMom36ShockState;
   shockReason: string | null;
+  /**
+   * v3 formation-only V4 trajectory evidence.  Null for the retained v1 shock policy; unavailable
+   * V4 reads persist a NO_EDGE object rather than blocking the canonical MOM36 basket.
+   */
+  continuation: FrozenContinuationOverlay | null;
   /** Base-only legs are retained even when the bounded shock overlay changes the final rung. */
   baseSelectedLongs: string[];
   baseSelectedShorts: string[];
@@ -1054,13 +1071,19 @@ export function buildDynamicMom36ShockBasket(input: {
   admissionScoreGap: number | null;
   admissionScoreGapFloor: number;
   admissionPassed: boolean;
+  strategyVersion?: DynamicMom36StrategyVersion;
+  continuationRuntime?: DynamicMom36ContinuationRuntimeResult | null;
 }): CrossSectionalObservation | null {
   if (!input.admissionPassed) return null;
   if (!(input.featureTimestampMs <= input.decisionInformationCutoffMs)) return null;
+  const strategyVersion = input.strategyVersion ?? DYNAMIC_MOM36_SHOCK_36H_V1;
+  const v3 = strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
   const formation = buildDynamicMom36Formation({
     activeUniverse: input.activeUniverse,
     maxPerCluster: input.maxPerCluster,
-    shock: resolveFrozenRuntimeShockOverlay(),
+    shock: v3 ? undefined : resolveFrozenRuntimeShockOverlay(),
+    continuationRuntime: v3 ? input.continuationRuntime ?? null : null,
+    continuationOnly: v3,
   });
   if (formation.vetoed || formation.selection.insufficientReason) return null;
   if (formation.selection.selectedLongs.length + formation.selection.selectedShorts.length !== 6) return null;
@@ -1107,7 +1130,8 @@ export function buildDynamicMom36ShockBasket(input: {
     formationMode: "PLAIN_MOM36",
     smartFormation: null,
     dynamicMom36: {
-      strategyVersion: DYNAMIC_MOM36_SHOCK_36H_V1,
+      strategyVersion,
+      formationTimestamp: input.now,
       featureTimestamp: new Date(input.featureTimestampMs).toISOString(),
       decisionInformationCutoff: new Date(input.decisionInformationCutoffMs).toISOString(),
       activeUniverse: formation.activeUniverse.map((row) => ({
@@ -1127,6 +1151,7 @@ export function buildDynamicMom36ShockBasket(input: {
       shockRawOutput: formation.shock.rawOutput,
       shockState: formation.shock.state,
       shockReason: formation.shock.reason,
+      continuation: formation.continuation,
       baseSelectedLongs: formation.baseSelection.selectedLongs.map((row) => row.symbol),
       baseSelectedShorts: formation.baseSelection.selectedShorts.map((row) => row.symbol),
       baseSelectionInsufficientReason: formation.baseSelection.insufficientReason,
@@ -2122,6 +2147,8 @@ export async function runCrossSectionalCycle(opts: {
   const result: CrossSectionalCycleResult = { opened: 0, resolved: 0, expired: 0 };
   const nowIso = new Date(opts.now).toISOString();
   const dynamicMom36Shock = isDynamicMom36ShockStrategy();
+  const dynamicStrategyVersion = crossSectionalStrategyVersion();
+  const dynamicMom36V3 = isDynamicMom36V3Strategy();
   const dynamicMom36ConfigValid = !dynamicMom36Shock || (
     CROSS_SECTIONAL_MOMENTUM_BARS === DYNAMIC_MOM36_LOOKBACK_BARS &&
     CROSS_SECTIONAL_INTERVAL === "1h"
@@ -2129,7 +2156,7 @@ export async function runCrossSectionalCycle(opts: {
   if (!dynamicMom36ConfigValid) {
     console.error(JSON.stringify({
       event: "dynamic_mom36_formation",
-      strategyVersion: DYNAMIC_MOM36_SHOCK_36H_V1,
+      strategyVersion: dynamicStrategyVersion,
       admissionPass: false,
       admissionReason: `CROSS_SECTIONAL_MOMENTUM_BARS=${CROSS_SECTIONAL_MOMENTUM_BARS}, CROSS_SECTIONAL_INTERVAL=${CROSS_SECTIONAL_INTERVAL}; strategy requires ${DYNAMIC_MOM36_LOOKBACK_BARS} x 1h fully closed candles`,
       activeUniverseSize: 0,
@@ -2307,6 +2334,7 @@ export async function runCrossSectionalCycle(opts: {
     const dynamicDecisionInformationCutoffMs = Math.floor(opts.now / BAR_MS) * BAR_MS;
     type DynamicBaseRow = Omit<DynamicMom36RankedSymbol, "longEligible" | "shortEligible" | "shortBlocked">;
     const dynamicBaseRows: DynamicBaseRow[] = [];
+    const dynamicCompletedCandlesBySymbol: Record<string, Candle[]> = {};
     let dynamicFeatureTimestampMs: number | null = null;
     let dynamicFreshnessReason: string | null = null;
     if (dynamicMom36Shock) {
@@ -2350,6 +2378,10 @@ export async function runCrossSectionalCycle(opts: {
           fastReturn,
           extensionVol,
         });
+        // Preserve the exact fully-closed, synchronous candles that generated MOM36.  The v3
+        // continuation adapter receives this same snapshot; it never re-fetches, interpolates, or
+        // looks at an in-progress bar after the base allocation has been determined.
+        dynamicCompletedCandlesBySymbol[symbol] = completed.candles;
         dynamicFeatureTimestampMs = completed.featureTimestampMs;
       }
       if (staleOrMissing.length > 0 || dynamicBaseRows.length < 6) {
@@ -2357,6 +2389,45 @@ export async function runCrossSectionalCycle(opts: {
           ? "MOM36 history/prices not synchronous for: " + staleOrMissing.join(",")
           : "active inference universe has fewer than six valid MOM36 rows";
         console.error("[cross-sectional] DYNAMIC_MOM36_SHOCK NO_TRADE: " + dynamicFreshnessReason);
+      }
+    }
+    // V3 continuation is formation-only and non-blocking.  It receives the completed MOM36
+    // snapshot plus BTC/ETH context when available; a short/missing external history is recorded
+    // as NO_EDGE by the frozen runtime rather than changing admission or base allocation.
+    let dynamicContinuationRuntime: DynamicMom36ContinuationRuntimeResult | null = null;
+    if (dynamicMom36V3) {
+      let btcCandles: Candle[] | null = null;
+      let ethCandles: Candle[] | null = null;
+      try {
+        const [btcRaw, ethRaw] = await Promise.all([
+          opts.fetchCandles("BTCUSDT"),
+          opts.fetchCandles("ETHUSDT"),
+        ]);
+        const btcCompleted = completedCandlesForDynamicMom36(btcRaw, dynamicDecisionInformationCutoffMs);
+        const ethCompleted = completedCandlesForDynamicMom36(ethRaw, dynamicDecisionInformationCutoffMs);
+        btcCandles = btcCompleted?.featureTimestampMs === dynamicDecisionInformationCutoffMs ? btcCompleted.candles : null;
+        ethCandles = ethCompleted?.featureTimestampMs === dynamicDecisionInformationCutoffMs ? ethCompleted.candles : null;
+      } catch {
+        // The adapter below will retain the exact failure reason/fallback, and base MOM36 proceeds.
+      }
+      const continuationCandles: Record<string, readonly Candle[]> = {
+        ...dynamicCompletedCandlesBySymbol,
+        ...(btcCandles ? { BTCUSDT: btcCandles } : {}),
+        ...(ethCandles ? { ETHUSDT: ethCandles } : {}),
+      };
+      dynamicContinuationRuntime = evaluateDynamicMom36Continuation({
+        candlesBySymbol: continuationCandles,
+        btcCandles,
+        nowMs: opts.now,
+      });
+      if (!dynamicContinuationRuntime.available) {
+        console.warn(JSON.stringify({
+          event: "dynamic_mom36_continuation_no_edge",
+          strategyVersion: dynamicStrategyVersion,
+          reason: dynamicContinuationRuntime.fallbackReason,
+          activeUniverseSize: dynamicBaseRows.length,
+          requiredBars: DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES,
+        }));
       }
     }
     const dynamicRowsFor = (
@@ -2504,6 +2575,8 @@ export async function runCrossSectionalCycle(opts: {
           admissionScoreGap: admissionBaseline?.scoreGap ?? baselineGap.value?.scoreGap ?? null,
           admissionScoreGapFloor: CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
           admissionPassed: admissionBaseline !== null,
+          strategyVersion: dynamicStrategyVersion as DynamicMom36StrategyVersion,
+          continuationRuntime: dynamicContinuationRuntime,
         })
       : null;
     const dynamicCandidate = dynamicMom36Shock && !dynamicFreshnessReason && dynamicFeatureTimestampMs !== null
@@ -2518,6 +2591,8 @@ export async function runCrossSectionalCycle(opts: {
           admissionScoreGap: admissionCandidate?.scoreGap ?? finalGap.value?.scoreGap ?? null,
           admissionScoreGapFloor: CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
           admissionPassed: admissionCandidate !== null,
+          strategyVersion: dynamicStrategyVersion as DynamicMom36StrategyVersion,
+          continuationRuntime: dynamicContinuationRuntime,
         })
       : null;
     const baseline = dynamicMom36Shock ? dynamicBaseline : admissionBaseline;
@@ -2615,7 +2690,7 @@ export async function runCrossSectionalCycle(opts: {
         ?? (snapshot?.admission.passed ? null : "current production admission did not pass");
       console.info(JSON.stringify({
         event: "dynamic_mom36_formation",
-        strategyVersion: DYNAMIC_MOM36_SHOCK_36H_V1,
+        strategyVersion: dynamicStrategyVersion,
         admissionPass: snapshot?.admission.passed ?? false,
         admissionReason,
         activeUniverseSize: snapshot?.activeUniverse.length ?? dynamicBaseRows.length,
@@ -2628,6 +2703,7 @@ export async function runCrossSectionalCycle(opts: {
         shockState: snapshot?.shockState ?? "NO_EDGE",
         shockConfidence: snapshot?.shockRawOutput.probabilities ?? null,
         shockReason: snapshot?.shockReason ?? null,
+        continuation: snapshot?.continuation ?? null,
         baseSelectedLongs: snapshot?.baseSelectedLongs ?? [],
         baseSelectedShorts: snapshot?.baseSelectedShorts ?? [],
         baseSelectionInsufficientReason: snapshot?.baseSelectionInsufficientReason ?? null,

@@ -6,6 +6,7 @@
  * echoed by any endpoint.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import type { Candle } from "@dtc/shared";
 import {
   isOverlayClose, realisedNetR, replayOwnExit, positionCostR, summariseCounterfactual,
   ownExitParamsFromEnv, type DirectionalClosedPosition, type Bar, type CounterfactualRow,
@@ -77,6 +78,23 @@ import {
  *  appears inline in realtime-short-mirror.ts (PROFIT_CORE_SHORT_TRAIL_LANE_ID) — not re-exported
  *  from anywhere routes/live.ts already imports, so it's spelled out here to avoid a wider import. */
 const PROFIT_CORE_SHORT_TRAIL_LANE_ID = "PROFIT_CORE_SHORT_TRAIL";
+
+// The served dashboard asks only for these operator review windows.  Bounding both interval and
+// count keeps a chart refresh from becoming an arbitrary market-data proxy.
+const OPEN_BASKET_CHART_LIMITS = {
+  "15m": 192, // 48h: 36h basket plus entry context
+  "1h": 168,  // seven days
+  "4h": 120,  // twenty days
+} as const;
+type OpenBasketChartInterval = keyof typeof OPEN_BASKET_CHART_LIMITS;
+
+function isOpenBasketChartInterval(value: unknown): value is OpenBasketChartInterval {
+  return typeof value === "string" && Object.hasOwn(OPEN_BASKET_CHART_LIMITS, value);
+}
+
+function validOpenBasketChartSymbol(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Z0-9]{4,30}$/.test(value);
+}
 
 /** Canonical choices for the operator allocation selector. Keep this server-owned so newly
  * wired executors do not disappear just because a frontend fallback list was not updated. */
@@ -1182,6 +1200,8 @@ export async function registerLiveRoutes(
     unifiedOrchestrator?: () => UnifiedTestnetOrchestrator | null;
     unifiedProposalStore?: () => UnifiedTestnetProposalStore | null;
     singleSymbolPriceTimeline?: () => SingleSymbolPriceTimelineService | null;
+    /** Bounded completed public USD-M candles for the read-only open-basket chart. */
+    marketCandles?: (symbol: string, interval: OpenBasketChartInterval, limit: number) => Promise<Candle[]>;
     /** Read-only USD-M sizing-reference diagnostics. Never reaches any order route. */
     futuresReferenceHealth?: () => FuturesReferenceHealthSnapshot | null;
     /** Optional, bounded public-USD-M refresh for a diagnostic watch list. */
@@ -1209,6 +1229,21 @@ export async function registerLiveRoutes(
   const readDashboardAccountSnapshot = engine
     ? createDashboardAccountSnapshotReader(engine, opts.dashboardAccountSnapshot)
     : null;
+  const openBasketChartCache = new Map<string, { cachedAtMs: number; candles: Candle[] }>();
+  const readOpenBasketChartCandles = async (
+    symbol: string,
+    interval: OpenBasketChartInterval,
+  ): Promise<Candle[]> => {
+    const source = opts.marketCandles;
+    if (!source) throw new Error("public USD-M candle source unavailable");
+    const key = `${symbol}:${interval}`;
+    const nowMs = Date.now();
+    const cached = openBasketChartCache.get(key);
+    if (cached && nowMs - cached.cachedAtMs < 30_000) return cached.candles;
+    const candles = await source(symbol, interval, OPEN_BASKET_CHART_LIMITS[interval]);
+    openBasketChartCache.set(key, { cachedAtMs: nowMs, candles });
+    return candles;
+  };
   const copyHeader = (headers: Record<string, unknown>, name: string): string | undefined => {
     const value = headers[name];
     return typeof value === "string" ? value : Array.isArray(value) ? String(value[0] ?? "") : undefined;
@@ -1303,6 +1338,56 @@ export async function registerLiveRoutes(
       return { enabled: false, reason: "single-symbol timeline unavailable because live market runtime is disabled" };
     }
     return { enabled: true, ...(await timeline.getSnapshot()) };
+  });
+
+  // Read-only chart feed for the currently served Open Basket panel.  It uses public USD-M
+  // candles only; no order client, account state, or forming candle can reach this route.
+  app.get("/api/live/open-basket-chart", async (request, reply) => {
+    const query = request.query as { symbol?: unknown; interval?: unknown };
+    const symbol = typeof query.symbol === "string" ? query.symbol.trim().toUpperCase() : "";
+    if (!validOpenBasketChartSymbol(symbol)) {
+      reply.code(400);
+      return { ok: false, reason: "valid USD-M symbol is required" };
+    }
+    if (!isOpenBasketChartInterval(query.interval)) {
+      reply.code(400);
+      return { ok: false, reason: "interval must be one of 15m, 1h, 4h" };
+    }
+    try {
+      const candles = await readOpenBasketChartCandles(symbol, query.interval);
+      const clean = candles
+        .filter((candle) =>
+          Number.isFinite(candle.openTime) &&
+          Number.isFinite(candle.open) &&
+          Number.isFinite(candle.high) &&
+          Number.isFinite(candle.low) &&
+          Number.isFinite(candle.close) &&
+          Number.isFinite(candle.volume),
+        )
+        .map((candle) => ({
+          openTime: candle.openTime,
+          open: candle.open,
+          high: candle.high,
+          low: candle.low,
+          close: candle.close,
+          volume: candle.volume,
+        }));
+      return {
+        ok: true,
+        symbol,
+        interval: query.interval,
+        source: "BINANCE_USDM_PUBLIC" as const,
+        completedOnly: true,
+        asOf: new Date().toISOString(),
+        candles: clean,
+      };
+    } catch (error) {
+      reply.code(503);
+      return {
+        ok: false,
+        reason: error instanceof Error ? error.message : "public USD-M candle source unavailable",
+      };
+    }
   });
 
   app.post("/api/live/arm", async (request, reply) => {

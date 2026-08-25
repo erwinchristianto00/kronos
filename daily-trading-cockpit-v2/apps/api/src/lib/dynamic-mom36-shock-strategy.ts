@@ -12,13 +12,29 @@
  * lets TESTNET and LIVE make the exact same decision from the same snapshot.
  */
 import { clusterOf, isMajorCluster } from "./correlation-clusters.js";
+import type { DynamicMom36ContinuationRuntimeResult } from "./dynamic-mom36-continuation-runtime.js";
 
 export const DYNAMIC_MOM36_SHOCK_36H_V1 = "dynamic-mom36-shock-36h-v1" as const;
+export const DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 =
+  "dynamic-mom36-continuation-sl2-mfe30-36h-v3" as const;
 export const DYNAMIC_MOM36_SHOCK_SIGNAL = "DYNAMIC_MOM36_SHOCK_36H" as const;
 export const DYNAMIC_MOM36_SHOCK_VARIANT = "DYNAMIC_MOM36_SHOCK" as const;
 export const DYNAMIC_MOM36_LOOKBACK_BARS = 36 as const;
 export const DYNAMIC_MOM36_HORIZON_HOURS = 36 as const;
 export const DYNAMIC_MOM36_HORIZON_MS = DYNAMIC_MOM36_HORIZON_HOURS * 3_600_000;
+export const DYNAMIC_MOM36_DIRECTION_DEADBAND = 0.05 as const;
+export const DYNAMIC_MOM36_PERSISTENCE_DEADBAND = 0.05 as const;
+export const DYNAMIC_MOM36_CONFIRM_MIN_VOTES = 3 as const;
+export const DYNAMIC_MOM36_LOW_REVERSAL_RISK = 0.25 as const;
+export const DYNAMIC_MOM36_HIGH_REVERSAL_RISK = 0.50 as const;
+export const DYNAMIC_MOM36_HARD_CUT_LOSS = -0.02 as const;
+export const DYNAMIC_MOM36_MFE_ARM_THRESHOLD = 0.03 as const;
+export const DYNAMIC_MOM36_MFE_GIVEBACK_FRACTION = 0.30 as const;
+export const DYNAMIC_MOM36_MFE_TRAILING_FRACTION = 1 - DYNAMIC_MOM36_MFE_GIVEBACK_FRACTION;
+
+export type DynamicMom36StrategyVersion =
+  | typeof DYNAMIC_MOM36_SHOCK_36H_V1
+  | typeof DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
 
 /** There is intentionally no synthetic or trainable fallback model. */
 export const NO_FROZEN_RUNTIME_SHOCK_ARTIFACT = "NO_FROZEN_RUNTIME_SHOCK_MAPPING" as const;
@@ -63,6 +79,43 @@ export type FrozenShockOverlay = {
   vetoAllowed: boolean;
 };
 
+export type DynamicMom36ContinuationVote = "BULLISH" | "BEARISH" | "NEUTRAL";
+export type DynamicMom36PersistenceDirection = "PERSIST_UP" | "PERSIST_DOWN" | "PERSIST_NEUTRAL";
+export type DynamicMom36ContinuationDecision = "NO_EDGE" | "CONFIRM_LONG" | "CONFIRM_SHORT" | "CONFLICT_LONG" | "CONFLICT_SHORT";
+export type DynamicMom36ReversalRiskBand = "LOW" | "MODERATE" | "HIGH";
+
+export type FrozenContinuationOverlay = {
+  continuationArtifactId: string;
+  artifactSha256: string | null;
+  schemaVersion: number | null;
+  featureVersion: string | null;
+  calibrationVersion: string | null;
+  runtimeFunction: string | null;
+  available: boolean;
+  reason: string | null;
+  featureAtMs: number | null;
+  horizons: Array<{
+    horizon: 6 | 12 | 24 | 36;
+    pUp: number;
+    pNeutral: number;
+    pDown: number;
+    directionMargin: number;
+    vote: DynamicMom36ContinuationVote;
+  }>;
+  bullVotes: number;
+  bearVotes: number;
+  neutralVotes: number;
+  agreementScore: number | null;
+  persistenceScore: number | null;
+  persistenceDirection: DynamicMom36PersistenceDirection;
+  topPath: string | null;
+  pathProbabilities: Record<string, number>;
+  reversalRisk: number | null;
+  reversalRiskBand: DynamicMom36ReversalRiskBand | null;
+  decision: DynamicMom36ContinuationDecision;
+  rawOutput: Record<string, unknown>;
+};
+
 const SHOCK_STATES = new Set<DynamicMom36ShockState>([
   "NO_EDGE",
   "CONFIRM_LONG",
@@ -92,6 +145,207 @@ function noEdgeShockOverlay(reason: string, raw: unknown, modelArtifactId: strin
     reason,
     vetoAllowed: false,
   };
+}
+
+const CONTINUATION_HORIZONS = [6, 12, 24, 36] as const;
+const BULLISH_PERSISTENT_PATHS = new Set(["PERSISTENT_UP", "EARLY_UP_THEN_FLAT"]);
+const BEARISH_PERSISTENT_PATHS = new Set(["PERSISTENT_DOWN", "EARLY_DOWN_THEN_FLAT"]);
+const NO_FROZEN_RUNTIME_CONTINUATION_ARTIFACT = "NO_FROZEN_RUNTIME_CONTINUATION_ARTIFACT" as const;
+
+function noEdgeContinuationOverlay(
+  reason: string,
+  raw: unknown,
+  artifactId: string = NO_FROZEN_RUNTIME_CONTINUATION_ARTIFACT,
+): FrozenContinuationOverlay {
+  return {
+    continuationArtifactId: artifactId,
+    artifactSha256: null,
+    schemaVersion: null,
+    featureVersion: null,
+    calibrationVersion: null,
+    runtimeFunction: null,
+    available: false,
+    reason,
+    featureAtMs: null,
+    horizons: [],
+    bullVotes: 0,
+    bearVotes: 0,
+    neutralVotes: 0,
+    agreementScore: null,
+    persistenceScore: null,
+    persistenceDirection: "PERSIST_NEUTRAL",
+    topPath: null,
+    pathProbabilities: {},
+    reversalRisk: null,
+    reversalRiskBand: null,
+    decision: "NO_EDGE",
+    rawOutput: jsonSafeRecord(raw),
+  };
+}
+
+function continuationVote(margin: number): DynamicMom36ContinuationVote {
+  if (margin >= DYNAMIC_MOM36_DIRECTION_DEADBAND) return "BULLISH";
+  if (margin <= -DYNAMIC_MOM36_DIRECTION_DEADBAND) return "BEARISH";
+  return "NEUTRAL";
+}
+
+function persistenceDirection(score: number): DynamicMom36PersistenceDirection {
+  if (score >= DYNAMIC_MOM36_PERSISTENCE_DEADBAND) return "PERSIST_UP";
+  if (score <= -DYNAMIC_MOM36_PERSISTENCE_DEADBAND) return "PERSIST_DOWN";
+  return "PERSIST_NEUTRAL";
+}
+
+function reversalRiskBand(risk: number): DynamicMom36ReversalRiskBand {
+  if (risk < DYNAMIC_MOM36_LOW_REVERSAL_RISK) return "LOW";
+  if (risk < DYNAMIC_MOM36_HIGH_REVERSAL_RISK) return "MODERATE";
+  return "HIGH";
+}
+
+function finiteProbability(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+/**
+ * Strictly normalize the actual V4 trajectory service result.  The decision below deliberately
+ * ignores the V4 allocation ladder: V4 supplies continuation evidence only, while this strategy's
+ * fixed, one-rung mapping remains the sole allocator.
+ */
+export function normalizeFrozenV4ContinuationOverlay(
+  raw: unknown,
+  baseAllocation: DynamicMom36Allocation,
+): FrozenContinuationOverlay {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return noEdgeContinuationOverlay("frozen continuation runtime unavailable", raw);
+  }
+  const candidate = raw as DynamicMom36ContinuationRuntimeResult;
+  const artifactId = typeof candidate.artifactId === "string" && candidate.artifactId
+    ? candidate.artifactId
+    : NO_FROZEN_RUNTIME_CONTINUATION_ARTIFACT;
+  if (candidate.available !== true || !candidate.trajectory) {
+    return noEdgeContinuationOverlay(candidate.fallbackReason ?? "frozen continuation runtime unavailable", raw, artifactId);
+  }
+  if (candidate.schemaVersion !== 4 || candidate.trajectory.schemaVersion !== 4) {
+    return noEdgeContinuationOverlay("frozen continuation schema mismatch", raw, artifactId);
+  }
+  const trajectory = candidate.trajectory;
+  if (
+    !Number.isFinite(trajectory.persistenceScore) ||
+    !finiteProbability(trajectory.reversalRisk) ||
+    typeof trajectory.topPath !== "string" ||
+    !trajectory.topPath ||
+    !(typeof candidate.featureAtMs === "number" && Number.isFinite(candidate.featureAtMs) && candidate.featureAtMs > 0)
+  ) {
+    return noEdgeContinuationOverlay("frozen continuation output is missing persistence/path/risk", raw, artifactId);
+  }
+  const pathProbabilities: Record<string, number> = {};
+  for (const [path, probability] of Object.entries(trajectory.pathProbabilities ?? {})) {
+    if (!finiteProbability(probability)) {
+      return noEdgeContinuationOverlay("frozen continuation path probabilities are invalid", raw, artifactId);
+    }
+    pathProbabilities[path] = probability;
+  }
+  if (!Object.keys(pathProbabilities).length || !Object.hasOwn(pathProbabilities, trajectory.topPath)) {
+    return noEdgeContinuationOverlay("frozen continuation output is missing its top-path probability", raw, artifactId);
+  }
+  const rows = new Map(trajectory.horizons.map((row) => [row.horizon, row]));
+  const horizons: FrozenContinuationOverlay["horizons"] = [];
+  for (const horizon of CONTINUATION_HORIZONS) {
+    const row = rows.get(horizon);
+    if (!row || !finiteProbability(row.pStrongUp) || !finiteProbability(row.pNeutral) || !finiteProbability(row.pStrongDown)) {
+      return noEdgeContinuationOverlay("frozen continuation is missing a valid 6/12/24/36h probability row", raw, artifactId);
+    }
+    const directionMargin = row.pStrongUp - row.pStrongDown;
+    if (!Number.isFinite(directionMargin)) {
+      return noEdgeContinuationOverlay("frozen continuation direction margin is non-finite", raw, artifactId);
+    }
+    horizons.push({
+      horizon,
+      pUp: row.pStrongUp,
+      pNeutral: row.pNeutral,
+      pDown: row.pStrongDown,
+      directionMargin,
+      vote: continuationVote(directionMargin),
+    });
+  }
+  const bullVotes = horizons.filter((row) => row.vote === "BULLISH").length;
+  const bearVotes = horizons.filter((row) => row.vote === "BEARISH").length;
+  const neutralVotes = horizons.filter((row) => row.vote === "NEUTRAL").length;
+  const persistence = persistenceDirection(trajectory.persistenceScore);
+  const riskBand = reversalRiskBand(trajectory.reversalRisk);
+  const strictBullish =
+    bullVotes >= DYNAMIC_MOM36_CONFIRM_MIN_VOTES &&
+    bearVotes <= 1 &&
+    persistence === "PERSIST_UP" &&
+    BULLISH_PERSISTENT_PATHS.has(trajectory.topPath) &&
+    trajectory.reversalRisk < DYNAMIC_MOM36_LOW_REVERSAL_RISK;
+  const strictBearish =
+    bearVotes >= DYNAMIC_MOM36_CONFIRM_MIN_VOTES &&
+    bullVotes <= 1 &&
+    persistence === "PERSIST_DOWN" &&
+    BEARISH_PERSISTENT_PATHS.has(trajectory.topPath) &&
+    trajectory.reversalRisk < DYNAMIC_MOM36_LOW_REVERSAL_RISK;
+  let decision: DynamicMom36ContinuationDecision = "NO_EDGE";
+  if (baseAllocation.longCount > 3) {
+    if (strictBullish) decision = "CONFIRM_LONG";
+    else if (
+      (bearVotes >= DYNAMIC_MOM36_CONFIRM_MIN_VOTES && persistence === "PERSIST_DOWN") ||
+      (trajectory.topPath === "UP_THEN_REVERSAL" && trajectory.reversalRisk >= DYNAMIC_MOM36_HIGH_REVERSAL_RISK && bearVotes >= 2)
+    ) decision = "CONFLICT_LONG";
+  } else if (baseAllocation.longCount < 3) {
+    if (strictBearish) decision = "CONFIRM_SHORT";
+    else if (
+      (bullVotes >= DYNAMIC_MOM36_CONFIRM_MIN_VOTES && persistence === "PERSIST_UP") ||
+      (trajectory.topPath === "DOWN_THEN_REVERSAL" && trajectory.reversalRisk >= DYNAMIC_MOM36_HIGH_REVERSAL_RISK && bullVotes >= 2)
+    ) decision = "CONFLICT_SHORT";
+  } else if (strictBullish) {
+    decision = "CONFIRM_LONG";
+  } else if (strictBearish) {
+    decision = "CONFIRM_SHORT";
+  }
+  return {
+    continuationArtifactId: artifactId,
+    artifactSha256: typeof candidate.artifactSha256 === "string" ? candidate.artifactSha256 : null,
+    schemaVersion: candidate.schemaVersion,
+    featureVersion: typeof candidate.featureVersion === "string" ? candidate.featureVersion : null,
+    calibrationVersion: typeof candidate.calibrationVersion === "string" ? candidate.calibrationVersion : null,
+    runtimeFunction: typeof candidate.runtimeFunction === "string" ? candidate.runtimeFunction : null,
+    available: true,
+    reason: null,
+    featureAtMs: typeof candidate.featureAtMs === "number" && Number.isFinite(candidate.featureAtMs) ? candidate.featureAtMs : null,
+    horizons,
+    bullVotes,
+    bearVotes,
+    neutralVotes,
+    agreementScore: (bullVotes - bearVotes) / CONTINUATION_HORIZONS.length,
+    persistenceScore: trajectory.persistenceScore,
+    persistenceDirection: persistence,
+    topPath: trajectory.topPath,
+    pathProbabilities,
+    reversalRisk: trajectory.reversalRisk,
+    reversalRiskBand: riskBand,
+    decision,
+    rawOutput: jsonSafeRecord(candidate.rawOutput),
+  };
+}
+
+/** One adjacent allocation rung only. Continuation never vetoes and never crosses neutral. */
+export function applyBoundedContinuationOverlay(
+  base: DynamicMom36Allocation,
+  continuation: Pick<FrozenContinuationOverlay, "decision">,
+): DynamicMom36Allocation {
+  let longCount = base.longCount;
+  if (base.longCount > 3) {
+    if (continuation.decision === "CONFIRM_LONG") longCount = Math.min(6, longCount + 1);
+    else if (continuation.decision === "CONFLICT_LONG") longCount = Math.max(3, longCount - 1);
+  } else if (base.longCount < 3) {
+    if (continuation.decision === "CONFIRM_SHORT") longCount = Math.max(0, longCount - 1);
+    else if (continuation.decision === "CONFLICT_SHORT") longCount = Math.min(3, longCount + 1);
+  } else if (continuation.decision === "CONFIRM_LONG") {
+    longCount = 4;
+  } else if (continuation.decision === "CONFIRM_SHORT") {
+    longCount = 2;
+  }
+  return allocation(longCount);
 }
 
 /**
@@ -158,9 +412,11 @@ export type DynamicMom36Formation = {
    * The exact unmodified Dynamic MOM36 selection. This is immutable audit evidence only: it
    * lets later forward research compare a bounded shock action against the base portfolio without
    * recomputing ranks from changed code, pool membership, or market data.
-   */
+  */
   baseSelection: DynamicMom36Selection;
+  /** v1 has its historic shock snapshot; v3 records formation-only V4 continuation instead. */
   shock: FrozenShockOverlay;
+  continuation: FrozenContinuationOverlay | null;
   finalAllocation: DynamicMom36Allocation;
   vetoed: boolean;
   selection: DynamicMom36Selection;
@@ -313,14 +569,34 @@ export function buildDynamicMom36Formation(input: {
   activeUniverse: readonly DynamicMom36RankedSymbol[];
   maxPerCluster: number;
   shock?: FrozenShockOverlay;
+  continuation?: FrozenContinuationOverlay | null;
+  continuationRuntime?: DynamicMom36ContinuationRuntimeResult | null;
+  /** V3 has no legacy shock fallback: unavailable continuation means base MOM36, never a veto. */
+  continuationOnly?: boolean;
 }): DynamicMom36Formation {
   const activeUniverse = [...input.activeUniverse]
     .filter((row) => Number.isFinite(row.mom36) && Number.isFinite(row.price) && row.price > 0)
     .sort((a, b) => b.mom36 - a.mom36 || a.symbol.localeCompare(b.symbol));
   const breadth = baseDynamicMom36Allocation(activeUniverse);
   const baseSelection = selectDynamicMom36Legs(activeUniverse, breadth.allocation, input.maxPerCluster);
-  const shock = input.shock ?? resolveFrozenRuntimeShockOverlay();
-  const overlay = applyBoundedShockOverlay(breadth.allocation, shock);
+  const continuationOnly = input.continuationOnly === true;
+  // The frozen V1 shock artifact and the V3 continuation artifact are deliberately disjoint.
+  // A missing V3 result must not fall through to a future/accidentally-registered V1 shock
+  // mapping, because that would turn the mandated BASE fallback into an undeclared veto.
+  const shock = continuationOnly
+    ? noEdgeShockOverlay("v3 uses continuation-only formation", null)
+    : input.shock ?? resolveFrozenRuntimeShockOverlay();
+  const continuation = input.continuation ??
+    (input.continuationRuntime
+      ? normalizeFrozenV4ContinuationOverlay(input.continuationRuntime, breadth.allocation)
+      : continuationOnly
+        ? noEdgeContinuationOverlay("frozen continuation runtime unavailable", null)
+        : null);
+  const overlay = continuationOnly
+    ? { allocation: applyBoundedContinuationOverlay(breadth.allocation, continuation!), vetoed: false }
+    : continuation
+      ? { allocation: applyBoundedContinuationOverlay(breadth.allocation, continuation), vetoed: false }
+      : applyBoundedShockOverlay(breadth.allocation, shock);
   const selection = overlay.vetoed
     ? { selectedLongs: [], selectedShorts: [], blockedShortsSkipped: [], insufficientReason: "frozen shock mapping vetoed this candidate" }
     : selectDynamicMom36Legs(activeUniverse, overlay.allocation, input.maxPerCluster);
@@ -332,6 +608,7 @@ export function buildDynamicMom36Formation(input: {
     baseAllocation: breadth.allocation,
     baseSelection,
     shock,
+    continuation,
     finalAllocation: overlay.allocation,
     vetoed: overlay.vetoed,
     selection,
@@ -343,9 +620,22 @@ export function crossSectionalStrategyVersion(env: NodeJS.ProcessEnv = process.e
 }
 
 export function isDynamicMom36ShockStrategy(env: NodeJS.ProcessEnv = process.env): boolean {
-  return crossSectionalStrategyVersion(env) === DYNAMIC_MOM36_SHOCK_36H_V1;
+  return isDynamicMom36Version(crossSectionalStrategyVersion(env));
 }
 
 export function isDynamicMom36ShockVersion(strategyVersion: string | null | undefined): boolean {
-  return strategyVersion === DYNAMIC_MOM36_SHOCK_36H_V1;
+  return isDynamicMom36Version(strategyVersion);
+}
+
+export function isDynamicMom36V3Strategy(env: NodeJS.ProcessEnv = process.env): boolean {
+  return crossSectionalStrategyVersion(env) === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
+}
+
+export function isDynamicMom36V3Version(strategyVersion: string | null | undefined): boolean {
+  return strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
+}
+
+export function isDynamicMom36Version(strategyVersion: string | null | undefined): strategyVersion is DynamicMom36StrategyVersion {
+  return strategyVersion === DYNAMIC_MOM36_SHOCK_36H_V1 ||
+    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
 }
