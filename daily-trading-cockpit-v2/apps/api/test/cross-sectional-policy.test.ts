@@ -157,4 +157,29 @@ describe("cross-sectional effective runtime policy", () => {
       adaptiveExits: { configured: false, effective: false },
     });
   });
+
+  it("persists v4 continuation and recovered SLOW_AND_FAST provenance without reviving the legacy env wrapper", () => {
+    const env = {
+      CROSS_SECTIONAL_STRATEGY_VERSION: "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
+      CROSS_SECTIONAL_POLICY_VERSION: "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
+      CROSS_SECTIONAL_INTERVAL: "1h",
+      CROSS_SECTIONAL_MOMENTUM_BARS: "36",
+      CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "0",
+    } as NodeJS.ProcessEnv;
+    const fingerprint = buildCurrentCrossSectionalPolicyFingerprint("2026-08-26T00:00:00.000Z", env);
+    const exit = currentCrossSectionalExitPolicy(env);
+
+    expect(fingerprint.strategy).toMatchObject({
+      strategyVersion: "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
+      continuationArtifactId: "dm-36h-v4-20260824T153338Z:sha256:4b49fd53aeb271185cd79f652f98ea1b50eb1395771cc6309a7a5964c9563114",
+      slowFastPolicyId: "slow-fast-mom36-fast4h-strict-sign-v1",
+      slowFastImplementationVersion: "legacy-d5243fd-strict-sign-verified-v1",
+    });
+    expect(exit.dynamicV3Exit).toMatchObject({
+      hardCutLossNetReturn: -0.02,
+      mfeArmNetReturn: 0.03,
+      mfeGivebackFraction: 0.30,
+      horizonHours: 36,
+    });
+  });
 });

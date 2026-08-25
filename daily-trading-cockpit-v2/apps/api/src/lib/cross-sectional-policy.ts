@@ -20,14 +20,21 @@ import {
   DYNAMIC_MOM36_HARD_CUT_LOSS,
   DYNAMIC_MOM36_MFE_ARM_THRESHOLD,
   DYNAMIC_MOM36_MFE_GIVEBACK_FRACTION,
-  DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3,
   DYNAMIC_MOM36_SHOCK_SIGNAL,
   DYNAMIC_MOM36_SHOCK_VARIANT,
   NO_FROZEN_RUNTIME_SHOCK_ARTIFACT,
   crossSectionalStrategyVersion,
+  isDynamicMom36ContinuationStrategy,
+  isDynamicMom36ContinuationVersion,
   isDynamicMom36ShockStrategy,
+  isDynamicMom36SlowFastStrategy,
+  isDynamicMom36SlowFastVersion,
 } from "./dynamic-mom36-shock-strategy.js";
 import { DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID } from "./dynamic-mom36-continuation-runtime.js";
+import {
+  DYNAMIC_MOM36_SLOW_FAST_IMPLEMENTATION_VERSION,
+  DYNAMIC_MOM36_SLOW_FAST_POLICY_ID,
+} from "./dynamic-mom36-slowfast.js";
 
 export const CURRENT_POLICY_FINGERPRINT_SCHEMA = "CURRENT_POLICY_FORWARD_COHORT_V3" as const;
 
@@ -74,6 +81,10 @@ export type CrossSectionalPolicyFingerprint = {
     gitHash: string;
     configHash: string;
     modelArtifactId: string;
+    /** Additive fields: absent only on pre-v4 persisted fingerprints. */
+    continuationArtifactId?: string | null;
+    slowFastPolicyId?: string | null;
+    slowFastImplementationVersion?: string | null;
     deploymentTimestamp: string | null;
     policyVersion: string;
     variant: string;
@@ -160,7 +171,7 @@ export function isCrossSectionalAdaptiveExitEnabled(env: NodeJS.ProcessEnv = pro
 
 export function currentCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process.env): CrossSectionalExitPolicySnapshot {
   if (isDynamicMom36ShockStrategy(env)) {
-    const dynamicV3 = crossSectionalStrategyVersion(env) === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
+    const dynamicContinuation = isDynamicMom36ContinuationStrategy(env);
     // This strategy's execution values are frozen by policy, not left as mutable legacy TP/SL or
     // leverage knobs.  Maker mechanics remain the existing execution engine's responsibility.
     return {
@@ -185,7 +196,7 @@ export function currentCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process
       leverage: 1,
       maxOpenBaskets: 1,
       ordinaryContextInvalidationEnabled: false,
-      dynamicV3Exit: dynamicV3
+      dynamicV3Exit: dynamicContinuation
         ? {
             hardCutLossNetReturn: DYNAMIC_MOM36_HARD_CUT_LOSS,
             mfeArmNetReturn: DYNAMIC_MOM36_MFE_ARM_THRESHOLD,
@@ -247,7 +258,8 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
 ): CrossSectionalPolicyFingerprint {
   const dynamic = isDynamicMom36ShockStrategy(env);
   const strategyVersion = crossSectionalStrategyVersion(env);
-  const dynamicV3 = strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3;
+  const dynamicContinuation = isDynamicMom36ContinuationVersion(strategyVersion);
+  const dynamicSlowFast = isDynamicMom36SlowFastVersion(strategyVersion);
   const sourceSha = env.KRONOS_RELEASE_SHA?.trim() || "UNKNOWN_SOURCE_SHA";
   const body = {
     schemaVersion: CURRENT_POLICY_FINGERPRINT_SCHEMA,
@@ -260,9 +272,12 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
       sourceSha,
       gitHash: sourceSha,
       configHash: "PENDING_CONFIG_HASH",
-      modelArtifactId: dynamicV3
+      modelArtifactId: dynamicContinuation
         ? DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID
         : dynamic ? NO_FROZEN_RUNTIME_SHOCK_ARTIFACT : "NOT_APPLICABLE_LEGACY",
+      continuationArtifactId: dynamicContinuation ? DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID : null,
+      slowFastPolicyId: dynamicSlowFast ? DYNAMIC_MOM36_SLOW_FAST_POLICY_ID : null,
+      slowFastImplementationVersion: dynamicSlowFast ? DYNAMIC_MOM36_SLOW_FAST_IMPLEMENTATION_VERSION : null,
       deploymentTimestamp: validIso(env.CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT),
       policyVersion: env.CROSS_SECTIONAL_POLICY_VERSION?.trim() || "UNVERSIONED_POLICY",
       variant: dynamic ? DYNAMIC_MOM36_SHOCK_VARIANT : env.CROSS_SECTIONAL_EXEC_VARIANT?.trim() || "FILTERED",
