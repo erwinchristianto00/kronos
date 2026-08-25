@@ -201,6 +201,23 @@ describe("registerLiveRoutes — Symbol Reliability V1 runtime contract", () => 
   });
 });
 
+describe("registerLiveRoutes — continuation lifecycle observability", () => {
+  it("serves lifecycle status without requiring a trading engine or mutating an executor", async () => {
+    app = Fastify();
+    await registerLiveRoutes(app, null);
+    await app.ready();
+
+    const response = await app.inject({ method: "GET", url: "/api/live/cross-sectional/continuation-lifecycle/status" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      configured: false,
+      mode: "AUTO_PROMOTION_STRICT_GATE",
+      pendingCommands: [],
+      runtimeArtifact: { source: "BOOTSTRAP_PINNED" },
+    });
+  });
+});
+
 describe("registerLiveRoutes — dashboard account snapshot pressure guard", () => {
   it("coalesces concurrent dashboard routes onto one USD-M account read", async () => {
     let calls = 0;

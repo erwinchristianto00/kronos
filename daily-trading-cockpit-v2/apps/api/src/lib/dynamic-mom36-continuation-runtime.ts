@@ -9,6 +9,13 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Candle } from "@dtc/shared";
+import { readApprovedChampionArtifact } from "./continuation-champion-registry.js";
+import {
+  CONTINUATION_LABEL_VERSION,
+  CONTINUATION_NORMALIZATION_VERSION,
+  CONTINUATION_SOURCE_COVERAGE_VERSION,
+  continuationLifecyclePaths,
+} from "./continuation-lifecycle.js";
 import { DirectionModelService } from "./direction-model-service.js";
 import type { TrajectoryPrediction } from "./direction-model-runtime.js";
 import type { Bar, MultiSourceInput } from "./direction-model-features.js";
@@ -32,8 +39,8 @@ export type DynamicMom36ContinuationRuntimeResult = {
   artifactId: string;
   artifactSha256: string | null;
   schemaVersion: number | null;
-  featureVersion: typeof DYNAMIC_MOM36_CONTINUATION_FEATURE_VERSION;
-  calibrationVersion: typeof DYNAMIC_MOM36_CONTINUATION_CALIBRATION_VERSION;
+  featureVersion: string;
+  calibrationVersion: string;
   runtimeFunction: typeof DYNAMIC_MOM36_CONTINUATION_RUNTIME_FUNCTION;
   featureAtMs: number | null;
   fallbackReason: string | null;
@@ -44,9 +51,14 @@ export type DynamicMom36ContinuationRuntimeResult = {
 
 type ArtifactRead = {
   raw: unknown | null;
+  artifactId: string;
   sha256: string | null;
   reason: string | null;
+  warning: string | null;
   schemaVersion: number | null;
+  featureVersion: string;
+  calibrationVersion: string;
+  source: "BOOTSTRAP_PINNED" | "REGISTRY_CURRENT" | "REGISTRY_PREVIOUS";
 };
 
 type MultiSourceRead = Omit<MultiSourceInput, "eth">;
@@ -59,14 +71,28 @@ function configuredArtifactPath(env: NodeJS.ProcessEnv = process.env): string {
   return configured ? resolve(configured) : resolve(process.cwd(), "data/direction-model-v4.json");
 }
 
-function readPinnedArtifact(env: NodeJS.ProcessEnv = process.env): ArtifactRead {
+function readBootstrapPinnedArtifact(env: NodeJS.ProcessEnv = process.env): ArtifactRead {
   const path = configuredArtifactPath(env);
   try {
-    if (!existsSync(path)) return { raw: null, sha256: null, reason: "artifact_missing", schemaVersion: null };
+    if (!existsSync(path)) {
+      return {
+        raw: null, artifactId: DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID, sha256: null,
+        reason: "artifact_missing", warning: null, schemaVersion: null,
+        featureVersion: DYNAMIC_MOM36_CONTINUATION_FEATURE_VERSION,
+        calibrationVersion: DYNAMIC_MOM36_CONTINUATION_CALIBRATION_VERSION,
+        source: "BOOTSTRAP_PINNED",
+      };
+    }
     const bytes = readFileSync(path);
     const sha256 = createHash("sha256").update(bytes).digest("hex");
     if (sha256 !== DYNAMIC_MOM36_CONTINUATION_ARTIFACT_SHA256) {
-      return { raw: null, sha256, reason: "artifact_sha256_mismatch", schemaVersion: null };
+      return {
+        raw: null, artifactId: DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID, sha256,
+        reason: "artifact_sha256_mismatch", warning: null, schemaVersion: null,
+        featureVersion: DYNAMIC_MOM36_CONTINUATION_FEATURE_VERSION,
+        calibrationVersion: DYNAMIC_MOM36_CONTINUATION_CALIBRATION_VERSION,
+        source: "BOOTSTRAP_PINNED",
+      };
     }
     const raw = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
     const schemaVersion = typeof raw.schemaVersion === "number" ? raw.schemaVersion : null;
@@ -79,17 +105,104 @@ function readPinnedArtifact(env: NodeJS.ProcessEnv = process.env): ArtifactRead 
       temperature === null || Math.abs(temperature - 1.1) > 1e-9 ||
       !horizons || horizons.length !== 4 || ![6, 12, 24, 36].every((horizon) => horizons.includes(horizon))
     ) {
-      return { raw: null, sha256, reason: "artifact_identity_or_schema_mismatch", schemaVersion };
+      return {
+        raw: null, artifactId: DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID, sha256,
+        reason: "artifact_identity_or_schema_mismatch", warning: null, schemaVersion,
+        featureVersion: DYNAMIC_MOM36_CONTINUATION_FEATURE_VERSION,
+        calibrationVersion: DYNAMIC_MOM36_CONTINUATION_CALIBRATION_VERSION,
+        source: "BOOTSTRAP_PINNED",
+      };
     }
-    return { raw, sha256, reason: null, schemaVersion };
+    return {
+      raw, artifactId: DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID, sha256, reason: null, warning: null, schemaVersion,
+      featureVersion: DYNAMIC_MOM36_CONTINUATION_FEATURE_VERSION,
+      calibrationVersion: DYNAMIC_MOM36_CONTINUATION_CALIBRATION_VERSION,
+      source: "BOOTSTRAP_PINNED",
+    };
   } catch (error) {
     return {
       raw: null,
+      artifactId: DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID,
       sha256: null,
       reason: `artifact_read_error:${error instanceof Error ? error.message : "unknown"}`,
+      warning: null,
       schemaVersion: null,
+      featureVersion: DYNAMIC_MOM36_CONTINUATION_FEATURE_VERSION,
+      calibrationVersion: DYNAMIC_MOM36_CONTINUATION_CALIBRATION_VERSION,
+      source: "BOOTSTRAP_PINNED",
     };
   }
+}
+
+/**
+ * V4 starts from the frozen verified artifact. Once the lifecycle is configured, an immutable
+ * shared pointer may replace it for FUTURE formation only. A malformed current pointer first
+ * falls back to its previous approved record, then to the known V4 bootstrap bytes; the trade
+ * path never writes the registry and never guesses a replacement.
+ */
+export function readDynamicMom36ContinuationArtifact(env: NodeJS.ProcessEnv = process.env): ArtifactRead {
+  const configuredRoot = env.CONTINUATION_LIFECYCLE_ROOT?.trim();
+  if (configuredRoot) {
+    const registry = readApprovedChampionArtifact(continuationLifecyclePaths(configuredRoot));
+    if (registry.artifact) {
+      const { record, raw, source } = registry.artifact;
+      if (
+        record.featureSchemaVersion === DYNAMIC_MOM36_CONTINUATION_FEATURE_VERSION &&
+        record.labelVersion === CONTINUATION_LABEL_VERSION &&
+        record.normalizationVersion === CONTINUATION_NORMALIZATION_VERSION &&
+        record.sourceCoverageVersion === CONTINUATION_SOURCE_COVERAGE_VERSION
+      ) {
+        return {
+          raw,
+          artifactId: record.artifactId,
+          sha256: record.artifactSha256,
+          reason: null,
+          warning: registry.reason,
+          schemaVersion: record.modelSchemaVersion,
+          featureVersion: record.featureSchemaVersion,
+          calibrationVersion: record.calibrationVersion,
+          source,
+        };
+      }
+      const bootstrap = readBootstrapPinnedArtifact(env);
+      return {
+        ...bootstrap,
+        warning: `registry_schema_incompatible:feature=${record.featureSchemaVersion};label=${record.labelVersion};normalization=${record.normalizationVersion};sourceCoverage=${record.sourceCoverageVersion}`,
+      };
+    }
+    const bootstrap = readBootstrapPinnedArtifact(env);
+    return {
+      ...bootstrap,
+      warning: registry.reason ? `registry_unavailable:${registry.reason}` : "registry_unavailable",
+    };
+  }
+  return readBootstrapPinnedArtifact(env);
+}
+
+/** Small read-only status for the lifecycle API; model bytes/trees never leave the process. */
+export function dynamicMom36ContinuationArtifactStatus(env: NodeJS.ProcessEnv = process.env): {
+  artifactId: string;
+  artifactSha256: string | null;
+  schemaVersion: number | null;
+  featureVersion: string;
+  calibrationVersion: string;
+  source: ArtifactRead["source"];
+  available: boolean;
+  reason: string | null;
+  warning: string | null;
+} {
+  const artifact = readDynamicMom36ContinuationArtifact(env);
+  return {
+    artifactId: artifact.artifactId,
+    artifactSha256: artifact.sha256,
+    schemaVersion: artifact.schemaVersion,
+    featureVersion: artifact.featureVersion,
+    calibrationVersion: artifact.calibrationVersion,
+    source: artifact.source,
+    available: artifact.raw !== null,
+    reason: artifact.reason,
+    warning: artifact.warning,
+  };
 }
 
 /**
@@ -98,7 +211,13 @@ function readPinnedArtifact(env: NodeJS.ProcessEnv = process.env): ArtifactRead 
  * their documented missing route; they never alter MOM36 admission or cause an order failure.
  */
 function readV4MultiSource(env: NodeJS.ProcessEnv = process.env): MultiSourceRead | null {
-  const root = env.KRONOS_RAW_DIR ?? "/root/xsec-sim/raw";
+  const lifecycleRoot = env.CONTINUATION_LIFECYCLE_ROOT?.trim();
+  const lifecycleMaterializedRaw = lifecycleRoot ? resolve(lifecycleRoot, "materialized", "raw") : null;
+  const root = env.KRONOS_RAW_DIR?.trim()
+    ? resolve(env.KRONOS_RAW_DIR)
+    : lifecycleMaterializedRaw && existsSync(lifecycleMaterializedRaw)
+      ? lifecycleMaterializedRaw
+      : "/root/xsec-sim/raw";
   const now = Date.now();
   if (multiSourceCache && multiSourceCache.root === root && now - multiSourceCache.atMs < 3_600_000) {
     return multiSourceCache.value;
@@ -204,15 +323,15 @@ export function evaluateDynamicMom36Continuation(input: {
   env?: NodeJS.ProcessEnv;
 }): DynamicMom36ContinuationRuntimeResult {
   const env = input.env ?? process.env;
-  const artifact = readPinnedArtifact(env);
+  const artifact = readDynamicMom36ContinuationArtifact(env);
   const base = {
     // Keep the formation snapshot self-identifying: version alone is not a pinned artifact.
-    // The full immutable identity couples the exact V4 version to its verified bytes.
-    artifactId: DYNAMIC_MOM36_CONTINUATION_ARTIFACT_ID,
+    // The full immutable identity couples every approved champion to its verified bytes.
+    artifactId: artifact.artifactId,
     artifactSha256: artifact.sha256,
     schemaVersion: artifact.schemaVersion,
-    featureVersion: DYNAMIC_MOM36_CONTINUATION_FEATURE_VERSION,
-    calibrationVersion: DYNAMIC_MOM36_CONTINUATION_CALIBRATION_VERSION,
+    featureVersion: artifact.featureVersion,
+    calibrationVersion: artifact.calibrationVersion,
     runtimeFunction: DYNAMIC_MOM36_CONTINUATION_RUNTIME_FUNCTION,
   } as const;
   if (!artifact.raw) {
@@ -222,7 +341,12 @@ export function evaluateDynamicMom36Continuation(input: {
       featureAtMs: null,
       fallbackReason: artifact.reason ?? "artifact_unavailable",
       trajectory: null,
-      rawOutput: { artifactPath: configuredArtifactPath(env), artifactReason: artifact.reason ?? "artifact_unavailable" },
+      rawOutput: {
+        artifactPath: configuredArtifactPath(env),
+        artifactSource: artifact.source,
+        artifactReason: artifact.reason ?? "artifact_unavailable",
+        artifactWarning: artifact.warning,
+      },
     };
   }
   // This environment is strategy-private.  The generic Direction Model allocation switch stays
@@ -255,6 +379,8 @@ export function evaluateDynamicMom36Continuation(input: {
         featureAtMs: snapshot.featureAtMs,
         modelVersion: snapshot.modelVersion,
         schemaVersion: snapshot.schemaVersion,
+        artifactSource: artifact.source,
+        artifactWarning: artifact.warning,
         fallbackReason: snapshot.fallbackReason ?? "invalid_trajectory_output",
       }),
     };
@@ -269,6 +395,8 @@ export function evaluateDynamicMom36Continuation(input: {
       featureAtMs: snapshot.featureAtMs,
       modelVersion: snapshot.modelVersion,
       schemaVersion: snapshot.schemaVersion,
+      artifactSource: artifact.source,
+      artifactWarning: artifact.warning,
       serviceFallbackReason: snapshot.fallbackReason,
       allocationActive: snapshot.allocationActive,
       trajectory,

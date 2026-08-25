@@ -62,6 +62,17 @@ import { getCortexRealAttributionStore } from "../lib/cortex-real-attribution.js
 import { getFundingFeeRecorder, withFundingFeeRecording } from "../lib/funding-fee-recorder.js";
 import { sumExternalClosedFeesUsd, sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
 import { getCrossSectionalReportSinceMs, CROSS_SECTIONAL_HORIZON_MS } from "../lib/cross-sectional-edge.js";
+import { continuationChampionDetail } from "../lib/continuation-champion-registry.js";
+import {
+  continuationLifecyclePaths,
+  queuedLifecycleCommands,
+  queueLifecycleCommand,
+  readCollectorHealth,
+  readLabelMaturationStatus,
+  readLifecycleStatus,
+  type ContinuationLifecycleCommand,
+} from "../lib/continuation-lifecycle.js";
+import { dynamicMom36ContinuationArtifactStatus } from "../lib/dynamic-mom36-continuation-runtime.js";
 import type { UnifiedTestnetOrchestrator } from "../lib/unified-testnet-orchestrator.js";
 import type { UnifiedTestnetProposalStore } from "../lib/unified-testnet-proposal-source.js";
 import {
@@ -1229,6 +1240,7 @@ export async function registerLiveRoutes(
   const copyReplayGuard = opts.copySecurity?.replayGuard ?? new CopyReplayGuard(copySecurityDataDir);
   const copyAuditLogger = opts.copySecurity?.auditLogger ?? new CopyAuditLogger(copySecurityDataDir);
   const copyNowMs = (): number => opts.copySecurity?.nowMs?.() ?? Date.now();
+  const continuationPaths = () => continuationLifecyclePaths();
   const readDashboardAccountSnapshot = engine
     ? createDashboardAccountSnapshotReader(engine, opts.dashboardAccountSnapshot)
     : null;
@@ -2085,6 +2097,64 @@ export async function registerLiveRoutes(
     const result = await lane.manualCloseTrade(body.tradeId.trim());
     if (!result.ok) reply.code(409);
     return result;
+  });
+
+  /**
+   * Read-only continuation lifecycle health. This is deliberately independent of executor state:
+   * a collector/trainer issue can surface here without pausing or changing a basket process.
+   */
+  app.get("/api/live/cross-sectional/continuation-lifecycle/status", async () => {
+    const paths = continuationPaths();
+    const status = readLifecycleStatus(paths);
+    const collector = readCollectorHealth(paths);
+    const labelMaturation = readLabelMaturationStatus(paths);
+    return {
+      configured: Boolean(process.env.CONTINUATION_LIFECYCLE_ROOT?.trim()),
+      mode: status?.mode ?? "AUTO_PROMOTION_STRICT_GATE",
+      lifecycle: status,
+      collector: collector ?? status?.collector ?? null,
+      labelMaturation,
+      runtimeArtifact: dynamicMom36ContinuationArtifactStatus(),
+      pendingCommands: queuedLifecycleCommands(paths).map((command) => ({
+        commandId: command.commandId,
+        command: command.command,
+        requestedAt: command.requestedAt,
+      })),
+    };
+  });
+
+  /** Model detail stays compact: provenance/metrics only, never model-tree or raw-market data. */
+  app.get("/api/live/cross-sectional/continuation-lifecycle/model", async () => {
+    const paths = continuationPaths();
+    return {
+      ...continuationChampionDetail(paths),
+      runtimeArtifact: dynamicMom36ContinuationArtifactStatus(),
+    };
+  });
+
+  /**
+   * Commands are local-only and asynchronous. The API writes a request for the low-priority
+   * lifecycle owner; it cannot synchronously train, promote or rollback while serving traffic.
+   */
+  app.post("/api/live/cross-sectional/continuation-lifecycle/control", async (request, reply) => {
+    if (!isLoopbackAddress(request.ip)) {
+      reply.code(403);
+      return { ok: false, reason: "loopback caller required" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string; command?: ContinuationLifecycleCommand };
+    const allowed: ContinuationLifecycleCommand[] = [
+      "PAUSE_TRAINING", "RESUME_TRAINING", "INTEGRITY_CHECK", "TRAIN_CHALLENGER",
+      "DISABLE_AUTO_PROMOTION", "ENABLE_AUTO_PROMOTION", "ROLLBACK_CHAMPION",
+    ];
+    if (body.confirm !== "QUEUE_CONTINUATION_LIFECYCLE_COMMAND" || !body.command || !allowed.includes(body.command)) {
+      reply.code(400);
+      return {
+        ok: false,
+        reason: "requires {confirm:'QUEUE_CONTINUATION_LIFECYCLE_COMMAND',command:'PAUSE_TRAINING|RESUME_TRAINING|INTEGRITY_CHECK|TRAIN_CHALLENGER|DISABLE_AUTO_PROMOTION|ENABLE_AUTO_PROMOTION|ROLLBACK_CHAMPION'}",
+      };
+    }
+    const queued = queueLifecycleCommand(body.command, continuationPaths());
+    return { ok: true, queued };
   });
 
   // Emergency/operator close for the primary cross-basket executor in BOTH TESTNET and LIVE.

@@ -185,6 +185,10 @@
     "CROSS_SECTIONAL_REGIME_SKEW_ENABLED": {
       "value": "0",
       "why": "Legacy regime skew cannot modify Dynamic MOM36 breadth allocation."
+    },
+    "CONTINUATION_LIFECYCLE_ROOT": {
+      "value": "/root/kronos-continuation",
+      "why": "Canonical shared continuation registry and data root outside both release directories. TESTNET and LIVE read the same approved immutable champion pointer; collector/trainer failures cannot alter entry, sizing, exit, or an already-open basket."
     }
   },
   "instances": {
