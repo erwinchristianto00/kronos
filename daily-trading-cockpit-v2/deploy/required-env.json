@@ -209,8 +209,8 @@
       "role": "mainnet",
       "extra": {
         "KRONOS_RELEASE_SHA": {
-          "value": "80507ee62e120a76426fd4f968da9ccba8935c49",
-          "why": "Exact source identity for the Live-only Plain MOM36 policy fence. Every new basket fingerprint records this immutable commit, rather than inheriting the prior Dynamic release SHA."
+          "value": "41cc9f46975ce74e51814e6747a1b90301086edd",
+          "why": "Exact source identity for the Live-only Dynamic MOM36 V5 policy fence. Every new basket fingerprint records this immutable V5 parity commit, rather than inheriting a prior Plain or Dynamic V1 identity."
         },
         "CROSS_SECTIONAL_POLICY_VERSION": {
           "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
