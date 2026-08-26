@@ -82,6 +82,24 @@ const HTTP_429_FALLBACK_COOLDOWN_MS = 5_000;
  */
 export const DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS = 4_000;
 const DEFAULT_MAX_RECENT_TRANSPORT_EVENTS = 40;
+
+/**
+ * A missing environment variable must retain Testnet's protective default.
+ * `Number(\"\") === 0`, so do not parse a blank value as an intentional opt-out.
+ */
+export function resolveSignedReadMinIntervalMs(
+  env: LiveBinanceEnv,
+  configuredRaw: string | undefined,
+): number {
+  const value = configuredRaw?.trim();
+  if (value) {
+    const configured = Number(value);
+    if (Number.isFinite(configured) && configured >= 0 && configured <= 60_000) {
+      return Math.floor(configured);
+    }
+  }
+  return env === "testnet" ? DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS : 0;
+}
 // Re-fetch exchange filters (tickSize/stepSize/minQty/minNotional) periodically instead of caching
 // them for the process lifetime. Binance occasionally updates a symbol's LOT_SIZE/PRICE_FILTER/
 // MIN_NOTIONAL specs; without a TTL, a long-running process (days between restarts) would keep

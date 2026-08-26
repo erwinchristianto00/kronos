@@ -6,6 +6,7 @@ import {
   buildQueryString,
   resolveLiveBinanceBaseUrl,
   resolveLiveBinanceEnv,
+  resolveSignedReadMinIntervalMs,
   signQueryString,
   withBinanceTransportSource,
 } from "../src/lib/binance-futures-private.js";
@@ -35,6 +36,15 @@ describe("binance-futures-private signing", () => {
     expect(resolveLiveBinanceEnv(undefined)).toBeNull();
     expect(resolveLiveBinanceBaseUrl("testnet")).toContain("testnet.binancefuture.com");
     expect(resolveLiveBinanceBaseUrl("mainnet")).toContain("fapi.binance.com");
+  });
+
+  it("keeps the protective Testnet signed-read budget when the optional env is missing or blank", () => {
+    expect(resolveSignedReadMinIntervalMs("testnet", undefined)).toBe(4_000);
+    expect(resolveSignedReadMinIntervalMs("testnet", "")).toBe(4_000);
+    expect(resolveSignedReadMinIntervalMs("testnet", "  ")).toBe(4_000);
+    expect(resolveSignedReadMinIntervalMs("testnet", "1500")).toBe(1_500);
+    expect(resolveSignedReadMinIntervalMs("testnet", "0")).toBe(0);
+    expect(resolveSignedReadMinIntervalMs("mainnet", undefined)).toBe(0);
   });
 
   it("reads the public book ticker from the same selected execution base", async () => {

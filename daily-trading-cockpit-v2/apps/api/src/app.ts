@@ -24,7 +24,7 @@ import { registerOutcomesRoutes } from "./routes/outcomes.js";
 import { registerScanRoute } from "./routes/scan.js";
 import { registerShadowRoutes } from "./routes/shadow.js";
 import { registerTradingAssistantRoutes } from "./routes/trading-assistant.js";
-import { BinanceFuturesPrivateClient, DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS, type BinanceFuturesRateLimitStatus } from "./lib/binance-futures-private.js";
+import { BinanceFuturesPrivateClient, resolveSignedReadMinIntervalMs, type BinanceFuturesRateLimitStatus } from "./lib/binance-futures-private.js";
 import { FuturesMarketReferenceCache } from "./lib/futures-market-reference-cache.js";
 import {
   FuturesReferenceHealthTracker,
@@ -1346,13 +1346,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   const fourBrainOutcomeDataDirRuntime = fourBrainTestnetFocusEnabled ? "data/four-brain-testnet-focus" : "data";
   fourBrainExactFillCohortSinceMs = resolveFourBrainExactFillCohortSinceMs();
   if (liveConfig.enabled && liveConfig.configErrors.length === 0 && liveConfig.env) {
-    const configuredSignedReadIntervalMs = Number(process.env.LIVE_BINANCE_SIGNED_READ_MIN_INTERVAL_MS ?? "");
-    const signedReadMinIntervalMs = Number.isFinite(configuredSignedReadIntervalMs) &&
-      configuredSignedReadIntervalMs >= 0 && configuredSignedReadIntervalMs <= 60_000
-      ? Math.floor(configuredSignedReadIntervalMs)
-      : liveConfig.env === "testnet"
-        ? DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS
-        : 0;
+    const signedReadMinIntervalMs = resolveSignedReadMinIntervalMs(
+      liveConfig.env,
+      process.env.LIVE_BINANCE_SIGNED_READ_MIN_INTERVAL_MS,
+    );
     const liveClient = new BinanceFuturesPrivateClient({
       apiKey: liveConfig.apiKey,
       apiSecret: liveConfig.apiSecret,
