@@ -1264,9 +1264,26 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     liveEngineGetter: () => liveEngine,
     crossSectionalReentryBlocksGetter: async () => {
       const blocks = await crossSectionalExecutor?.getLossReentryBlocks() ?? [];
+      // The isolated Testnet daily lane has exchange-side brackets in Binance's one-way account.
+      // Do not wait for the executor's final NETTING_GUARD to reject an otherwise formed basket:
+      // exclude every durable daily lease from BOTH prospective sides while walking the fixed MOM36
+      // ranking. This never changes breadth/admission, never closes the daily trade, and records a
+      // distinct provenance reason rather than mislabelling the lease as a loss re-entry block.
+      const dailyLeaseSymbols = dailyRangeLane?.getActiveLeaseSymbols() ?? [];
+      const dailyLeaseReasons = Object.fromEntries(
+        dailyLeaseSymbols.map((symbol) => [symbol, "SYMBOL_OWNED_BY_DAILY_RANGE" as const]),
+      );
       return {
-        longBlocklist: blocks.filter((block) => block.side === "LONG").map((block) => block.symbol),
-        shortBlocklist: blocks.filter((block) => block.side === "SHORT").map((block) => block.symbol),
+        longBlocklist: [...new Set([
+          ...blocks.filter((block) => block.side === "LONG").map((block) => block.symbol),
+          ...dailyLeaseSymbols,
+        ])],
+        shortBlocklist: [...new Set([
+          ...blocks.filter((block) => block.side === "SHORT").map((block) => block.symbol),
+          ...dailyLeaseSymbols,
+        ])],
+        longBlockReasons: dailyLeaseReasons,
+        shortBlockReasons: dailyLeaseReasons,
       };
     },
     crossSectionalAutoPool,

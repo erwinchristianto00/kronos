@@ -102,6 +102,8 @@ export type DynamicMom36RankedSymbol = {
 export type DynamicMom36ExecutionBlockReason =
   | "SHORT_BLOCKED"
   | "LOSS_REENTRY_GUARD"
+  /** A testnet-only isolated lane has a durable one-way-netting lease on this symbol. */
+  | "SYMBOL_OWNED_BY_DAILY_RANGE"
   | "SYMBOL_RELIABILITY_GUARD"
   | "EXECUTION_GUARD_UNAVAILABLE"
   | "EXECUTION_INELIGIBLE";

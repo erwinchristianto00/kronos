@@ -50,6 +50,7 @@ import {
   type FrozenContinuationOverlay,
   resolveFrozenRuntimeShockOverlay,
   type DynamicMom36Allocation,
+  type DynamicMom36ExecutionBlockReason,
   type DynamicMom36RankedSymbol,
   type DynamicMom36ShockState,
 } from "./dynamic-mom36-shock-strategy.js";
@@ -2288,6 +2289,22 @@ export interface CrossSectionalCycleResult {
 }
 
 /**
+ * Current execution-owned eligibility blocks for a newly forming FILTERED basket.
+ *
+ * The symbol remains in the frozen inference/admission universe.  These blocks apply only when
+ * the already-fixed Dynamic MOM36 allocation walks its ranked candidates, so breadth and score-gap
+ * evidence cannot be changed by an open position in another lane.  Reasons are optional to retain
+ * compatibility with the existing loss-reentry getter while making a one-way-netting lease explicit
+ * in immutable formation provenance.
+ */
+export interface CrossSectionalFormationEntryBlocks {
+  longBlocklist: string[];
+  shortBlocklist: string[];
+  longBlockReasons?: Partial<Record<string, DynamicMom36ExecutionBlockReason>>;
+  shortBlockReasons?: Partial<Record<string, DynamicMom36ExecutionBlockReason>>;
+}
+
+/**
  * One measurement cycle: fetch the universe once, resolve matured open baskets against the latest
  * closes, then open at most one new basket per interval bucket. Pure data accrual — report-only.
  */
@@ -2301,8 +2318,8 @@ export async function runCrossSectionalCycle(opts: {
    *  CROSS_SECTIONAL_REGIME_SKEW_ENABLED=1 to tilt the FILTERED (executed) basket's leg counts
    *  toward the regime-favored side. Omit/null -> unskewed 3/3-style symmetry, same as before. */
   axisScore?: number | null;
-  /** Execution-owned blocks for losing same-symbol/same-side open exposure. */
-  filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
+  /** Execution-owned blocks for losing same-symbol/same-side exposure and isolated-lane leases. */
+  filteredEntryBlocks?: () => Promise<CrossSectionalFormationEntryBlocks>;
   /** Actual-fill, independent-episode circuit-breaker state. Null/unavailable blocks new V1 formation. */
   symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
   /** Returns true only after a reliability decision is durable; otherwise a would-be basket is held. */
@@ -2467,7 +2484,7 @@ export async function runCrossSectionalCycle(opts: {
     // side means "no eligible candidates this cycle": skip the basket, same fail-closed convention
     // buildCrossSectionalBasket already uses when a side cannot fill k legs.
     const liquidityStarved = crossSectionalLiquidityStarved(longAllow, shortAllow, liquid);
-    let dynamicBlocks: { longBlocklist: string[]; shortBlocklist: string[] } = { longBlocklist: [], shortBlocklist: [] };
+    let dynamicBlocks: CrossSectionalFormationEntryBlocks = { longBlocklist: [], shortBlocklist: [] };
     let dynamicEntryGuardUnavailable = false;
     try {
       dynamicBlocks = await opts.filteredEntryBlocks?.() ?? dynamicBlocks;
@@ -2495,11 +2512,11 @@ export async function runCrossSectionalCycle(opts: {
       result.standDownMarketReturn = standDown.marketReturn;
     }
     const rerankEnabled = !dynamicMom36Shock && isCrossSectionalSmartFormationRerankEnabled();
-    const lossReentryLongBlocks = new Set(dynamicBlocks.longBlocklist);
-    const lossReentryShortBlocks = new Set(dynamicBlocks.shortBlocklist);
+    const executionOwnedLongBlocks = new Set(dynamicBlocks.longBlocklist);
+    const executionOwnedShortBlocks = new Set(dynamicBlocks.shortBlocklist);
     const adaptiveShortBlocks = new Set(adaptive.shortBlocklist);
-    const baseLongBlocks = new Set(lossReentryLongBlocks);
-    const baseShortBlocks = new Set([...adaptiveShortBlocks, ...lossReentryShortBlocks]);
+    const baseLongBlocks = new Set(executionOwnedLongBlocks);
+    const baseShortBlocks = new Set([...adaptiveShortBlocks, ...executionOwnedShortBlocks]);
     // Dynamic MOM36 keeps its inference universe separate from execution eligibility. In
     // particular, a current short-blocked symbol remains visible to breadth and rank audit; only
     // the later short-leg selection skips it. Every symbol must share the last fully closed bar.
@@ -2630,7 +2647,11 @@ export async function runCrossSectionalCycle(opts: {
       const blockReason = (side: "LONG" | "SHORT", executionEligible: boolean) => {
         if (executionEligible) return null;
         if (dynamicEntryGuardUnavailable) return "EXECUTION_GUARD_UNAVAILABLE" as const;
-        if ((side === "LONG" ? lossReentryLongBlocks : lossReentryShortBlocks).has(row.symbol)) {
+        const explicitReason = side === "LONG"
+          ? dynamicBlocks.longBlockReasons?.[row.symbol]
+          : dynamicBlocks.shortBlockReasons?.[row.symbol];
+        if (explicitReason) return explicitReason;
+        if ((side === "LONG" ? executionOwnedLongBlocks : executionOwnedShortBlocks).has(row.symbol)) {
           return "LOSS_REENTRY_GUARD" as const;
         }
         if ((side === "LONG" ? quarantinedLong : quarantinedShort).has(row.symbol)) {
@@ -3017,7 +3038,7 @@ export async function runCrossSectionalCycleGuarded(opts: {
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   regimeContext?: CrossSectionalRegimeContext | null;
   axisScore?: number | null;
-  filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
+  filteredEntryBlocks?: () => Promise<CrossSectionalFormationEntryBlocks>;
   symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
   symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
   filteredExecutionPool?: () => Promise<CrossSectionalAutoPoolSnapshot | null>;

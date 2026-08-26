@@ -351,11 +351,16 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       takeProfitPrice: trade.takeProfitPrice,
       lastReconcileError: null,
     })]);
+    expect(lane.getActiveLeaseSymbols()).toEqual(["AAAUSDT"]);
 
     // A submitted/reconciling entry is deliberately not attributed until an exact
-    // fill and still-open position are both proven.
+    // fill and still-open position are both proven. It nevertheless remains a
+    // one-way-netting lease, so a forming cross-sectional basket must skip it.
     trade.status = "ENTRY_RECONCILING";
     expect(lane.getOpenPositionClaims()).toEqual([]);
+    expect(lane.getActiveLeaseSymbols()).toEqual(["AAAUSDT"]);
+    trade.status = "CLOSED";
+    expect(lane.getActiveLeaseSymbols()).toEqual([]);
   });
 
   it("records actual fills, fees, entry/exit slippage, and cancels both owned siblings on a controlled lane close", async () => {

@@ -619,6 +619,19 @@ export class DailyRangeAcceptanceLane {
   }
 
   /**
+   * Symbols held by this lane in Binance's one-way/netted account.  This includes unresolved
+   * entry/reconciliation states as well as filled positions: a forming cross-sectional basket
+   * must skip all of them rather than discovering the conflict only at executor submission.
+   */
+  getActiveLeaseSymbols(): string[] {
+    return [...new Set(
+      this.store.getState().trades
+        .filter((trade) => !isTerminalTradeStatus(trade.status))
+        .map((trade) => trade.symbol),
+    )].sort();
+  }
+
+  /**
    * Report exact filled, still-open daily-range ownership to the shared account
    * view. Pending submissions deliberately do not appear here: before a fill is
    * proven, presenting requested quantity as an exchange position would invent

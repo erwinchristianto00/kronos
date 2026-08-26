@@ -386,6 +386,7 @@ import {
   getCrossSectionalFilteredExecutionFilters,
   CROSS_SECTIONAL_TREND_SIGNAL,
   CROSS_SECTIONAL_MIXED_SIGNAL,
+  type CrossSectionalFormationEntryBlocks,
 } from "../lib/cross-sectional-edge.js";
 import { DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES } from "../lib/dynamic-mom36-continuation-runtime.js";
 import { isDynamicMom36ContinuationStrategy } from "../lib/dynamic-mom36-shock-strategy.js";
@@ -493,8 +494,8 @@ export async function registerShadowRoutes(
     /** Lazy getter for the live-execution engine (created after this registration). Used READ-ONLY
      *  (sync getStatus, no I/O) to compute the order-reconciliation readiness gate. */
     liveEngineGetter?: () => { getStatus: () => unknown } | null;
-    /** Testnet only: prevents a newly ranked FILTERED basket from reusing a live losing leg. */
-    crossSectionalReentryBlocksGetter?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
+    /** Testnet only: prevents a new FILTERED basket from reusing a guarded leg or isolated-lane lease. */
+    crossSectionalReentryBlocksGetter?: () => Promise<CrossSectionalFormationEntryBlocks>;
     /** Actual-fill Reliability V1 snapshot; this is the only path allowed to quarantine a symbol-side. */
     symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
     /** Returns true only after formation provenance is durable; false holds a new V1 basket. */

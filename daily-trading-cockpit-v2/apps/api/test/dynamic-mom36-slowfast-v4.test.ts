@@ -172,6 +172,26 @@ describe("Dynamic MOM36 v4 — recovered legacy SLOW_AND_FAST", () => {
     });
   });
 
+  it("skips a daily-range-owned symbol on either prospective side with explicit provenance", () => {
+    const selection = selectDynamicMom36Legs([
+      row("SOL", 0.10), row("SUI", 0.09), row("DOGE", 0.08), row("XRP", 0.07),
+      row("OP", -0.10, -0.01, {
+        longEligible: false,
+        shortEligible: false,
+        shortBlocked: true,
+        longExecutionBlockReason: "SYMBOL_OWNED_BY_DAILY_RANGE",
+        shortExecutionBlockReason: "SYMBOL_OWNED_BY_DAILY_RANGE",
+      }),
+      row("ARB", -0.09, -0.01), row("SEI", -0.08, -0.01),
+    ], allocation(4), 0);
+
+    expect(selection.selectedShorts.map((candidate) => candidate.symbol)).toEqual(["ARB", "SEI"]);
+    expect(selection.candidateAudit.short.find((candidate) => candidate.symbol === "OP")).toMatchObject({
+      executionEligible: false,
+      skipReason: "SYMBOL_OWNED_BY_DAILY_RANGE",
+    });
+  });
+
   it("does not fall back to raw MOM36 when five longs are required but only four align", () => {
     const rows = [
       row("SOL", 0.10, 0.01), row("SUI", 0.09, 0.01), row("DOGE", 0.08, -0.01),
