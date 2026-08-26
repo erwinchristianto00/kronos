@@ -3213,7 +3213,58 @@ export class DailyRangeAcceptanceLane {
       const stopActive = algos.some((algo) => algo.algoId === trade.stopAlgoOrderId || algo.clientAlgoId === trade.stopClientAlgoId);
       const tpActive = algos.some((algo) => algo.algoId === trade.takeProfitAlgoOrderId || algo.clientAlgoId === trade.takeProfitClientAlgoId);
       if (!stopActive || !tpActive) {
-        trade.lastReconcileError = `protective bracket missing while position remains (stop=${stopActive}, tp=${tpActive})`;
+        // Position risk and open conditional orders are separate Binance
+        // snapshots. A native TP/SL can disappear from the latter just after
+        // the former was read, even though that position has already gone
+        // flat. Never turn that transition into a false naked-position alarm.
+        let refreshedPosition: FuturesPosition | null;
+        let refreshedAlgos: FuturesAlgoOrder[];
+        try {
+          // Read in this order: if a native exit settles while the algo book is
+          // being refreshed, the following position read observes flatness and
+          // lets normal exit reconciliation prove the fill.
+          refreshedAlgos = await this.client.getOpenAlgoOrders(trade.symbol);
+          refreshedPosition = await this.readVisiblePosition(trade.symbol);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          trade.lastReconcileError = `bracket transition recheck unavailable: ${message}`;
+          this.store.save();
+          continue;
+        }
+        if (!refreshedPosition) {
+          await this.finalizeFlatTrade(trade, refreshedAlgos);
+          continue;
+        }
+        const refreshedStopActive = refreshedAlgos.some((algo) => algo.algoId === trade.stopAlgoOrderId || algo.clientAlgoId === trade.stopClientAlgoId);
+        const refreshedTpActive = refreshedAlgos.some((algo) => algo.algoId === trade.takeProfitAlgoOrderId || algo.clientAlgoId === trade.takeProfitClientAlgoId);
+        if (refreshedStopActive && refreshedTpActive) {
+          this.updateExcursions(trade, refreshedPosition.markPrice);
+          trade.lastReconcileError = null;
+          if (trade.status === "PROTECTING") trade.status = "OPEN";
+          continue;
+        }
+        if (Math.sign(refreshedPosition.positionAmt) !== directionSign(trade.direction) || Math.abs(Math.abs(refreshedPosition.positionAmt) - trade.entryQty) > Math.max(EPSILON, trade.entryQty * 1e-6)) {
+          trade.lastReconcileError = `P0 ownership mismatch after bracket recheck: exchange=${refreshedPosition.positionAmt}, laneQty=${trade.entryQty ?? "null"}`;
+          this.store.disarm(iso(this.nowMs()), `ownership mismatch on ${trade.symbol}`);
+          this.store.save();
+          continue;
+        }
+        // A native conditional order may already have triggered while its
+        // reduce-only fill is still settling. Its historical identity is more
+        // authoritative than a transient open-position snapshot, so wait for
+        // normal exit reconciliation instead of submitting a second close.
+        const [refreshedStop, refreshedTp] = await Promise.all([
+          this.queryAlgoSafely(trade.stopAlgoOrderId),
+          this.queryAlgoSafely(trade.takeProfitAlgoOrderId),
+        ]);
+        if (algoLooksTriggered(refreshedStop) || algoLooksTriggered(refreshedTp)) {
+          trade.status = "EXIT_RECONCILING";
+          trade.lastReconcileError = "native exit transition observed; awaiting settled exchange position";
+          this.store.save();
+          this.scheduleImmediateReconcile();
+          continue;
+        }
+        trade.lastReconcileError = `protective bracket missing while position remains (stop=${refreshedStopActive}, tp=${refreshedTpActive})`;
         this.store.disarm(iso(this.nowMs()), `missing bracket on ${trade.symbol}`);
         this.store.save();
         await this.emergencyFlatten(trade, "ENTRY_ABORT_PROTECTION_FAILED", "missing exchange-native bracket while position open");

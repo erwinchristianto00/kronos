@@ -75,6 +75,7 @@ class FakeDailyClient implements DailyRangeExecClient {
   readonly orders = new Map<string, FuturesOrder>();
   readonly ordersByClientId = new Map<string, FuturesOrder>();
   readonly algos = new Map<string, FuturesAlgoOrder>();
+  readonly algoHistory = new Map<string, FuturesAlgoOrder>();
   readonly fills: FuturesUserTrade[] = [];
   readonly fiveMinuteReadSymbols = new Set<string>();
   readonly entryCoverageSnapshots: string[][] = [];
@@ -82,6 +83,8 @@ class FakeDailyClient implements DailyRangeExecClient {
   beforeEntry: (() => void) | null = null;
   failNextEntry = false;
   bookTimeOffsetMs = 0;
+  /** A native exit may settle between Binance's separate position and algo-book reads. */
+  nativeExitOnNextOpenAlgoRead: string | null = null;
   /** Simulates a terminal partial MARKET fill: safe handling must bracket the
    * actual quantity rather than treating the requested quantity as fact. */
   nextEntryPartialFill: { qty: number; status: "CANCELED" | "EXPIRED" } | null = null;
@@ -92,11 +95,22 @@ class FakeDailyClient implements DailyRangeExecClient {
     return new Map(symbols.map((symbol) => [symbol, filter(symbol)]));
   }
   async getPositions(symbol?: string): Promise<FuturesPosition[]> {
-    const rows = [...this.positions.values()];
+    // Real REST responses are snapshots. Returning clones matters for the
+    // native-exit race fixture below: an algo read can settle a position after
+    // this call has already returned its earlier non-zero observation.
+    const rows = [...this.positions.values()].map((row) => ({ ...row }));
     return symbol ? rows.filter((row) => row.symbol === symbol) : rows;
   }
   async getOpenOrders(_symbol?: string): Promise<FuturesOrder[]> { return []; }
   async getOpenAlgoOrders(symbol?: string): Promise<FuturesAlgoOrder[]> {
+    const exiting = this.nativeExitOnNextOpenAlgoRead;
+    if (exiting && (symbol === undefined || symbol === exiting)) {
+      this.nativeExitOnNextOpenAlgoRead = null;
+      this.positions.delete(exiting);
+      for (const [algoId, algo] of this.algos) {
+        if (algo.symbol === exiting) this.algos.delete(algoId);
+      }
+    }
     const rows = [...this.algos.values()];
     return symbol ? rows.filter((row) => row.symbol === symbol) : rows;
   }
@@ -172,7 +186,7 @@ class FakeDailyClient implements DailyRangeExecClient {
     return order;
   }
   async queryAlgoOrder(algoId: string): Promise<FuturesAlgoOrder> {
-    const algo = this.algos.get(algoId);
+    const algo = this.algos.get(algoId) ?? this.algoHistory.get(algoId);
     if (!algo) throw new Error("algo not found");
     return algo;
   }
@@ -572,6 +586,65 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect(lane.getActiveLeaseSymbols()).toEqual(["AAAUSDT"]);
     trade.status = "CLOSED";
     expect(lane.getActiveLeaseSymbols()).toEqual([]);
+  });
+
+  it("does not false-disarm when a native exit settles between position and algo snapshots", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeLane(client, now);
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value, "SHORT");
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    const trade = store.getState().trades[0]!;
+
+    // getPositions() first returns a live snapshot, then the next algo-book
+    // read simulates a native exit that has already flattened the account.
+    client.nativeExitOnNextOpenAlgoRead = "AAAUSDT";
+    await (lane as unknown as { reconcileOpenTrades(): Promise<void> }).reconcileOpenTrades();
+
+    expect(store.getState().control.mode).toBe("ARMED");
+    expect(trade.status).toBe("EXIT_RECONCILING");
+    expect(trade.lastReconcileError).toContain("exchange is flat");
+    expect(client.placed.filter((order) => order.reduceOnly)).toHaveLength(0);
+  });
+
+  it("still disarms and flattens when a refreshed owned position is genuinely missing a bracket", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeLane(client, now);
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value, "SHORT");
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    const trade = store.getState().trades[0]!;
+    client.algos.delete(trade.stopAlgoOrderId!);
+
+    await (lane as unknown as { reconcileOpenTrades(): Promise<void> }).reconcileOpenTrades();
+
+    expect(store.getState().control.mode).toBe("DISARMED");
+    expect(client.placed.filter((order) => order.reduceOnly)).toHaveLength(1);
+  });
+
+  it("waits for a triggered native exit instead of racing it with a second close", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeLane(client, now);
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value, "SHORT");
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    const trade = store.getState().trades[0]!;
+    const takeProfit = client.algos.get(trade.takeProfitAlgoOrderId!)!;
+    client.algos.delete(takeProfit.algoId);
+    client.algoHistory.set(takeProfit.algoId, { ...takeProfit, algoStatus: "FINISHED", actualOrderId: "native-exit" });
+
+    await (lane as unknown as { reconcileOpenTrades(): Promise<void> }).reconcileOpenTrades();
+
+    expect(store.getState().control.mode).toBe("ARMED");
+    expect(trade.status).toBe("EXIT_RECONCILING");
+    expect(trade.lastReconcileError).toContain("native exit transition");
+    expect(client.placed.filter((order) => order.reduceOnly)).toHaveLength(0);
   });
 
   it("records actual fills, fees, entry/exit slippage, and cancels both owned siblings on a controlled lane close", async () => {
