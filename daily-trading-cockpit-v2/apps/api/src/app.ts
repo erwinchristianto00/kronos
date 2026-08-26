@@ -1423,6 +1423,47 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // make a valid USD-M book usable when no same-name spot symbol exists.
       return spotMid ?? executionMid;
     };
+    // Cross baskets place Binance USD-M orders. Keep their book source physically separate from
+    // `currentPublicPrice`: that helper intentionally retains a Spot fallback for unrelated
+    // single-symbol gates, whereas a cross-basket maker price must never come from a different
+    // venue. A missing/timed-out/non-two-sided USD-M book is null; the executor then rejects the
+    // complete entry before its first order.
+    const crossSectionalExecutionQuoteCache = new Map<string, PublicQuoteSnapshot>();
+    const readCrossSectionalExecutionQuote = (symbol: string): PublicQuoteSnapshot | null =>
+      crossSectionalExecutionQuoteCache.get(symbol) ?? null;
+    const rememberCrossSectionalExecutionQuote = (symbol: string, snapshot: PublicQuoteSnapshot): void => {
+      if (!crossSectionalExecutionQuoteCache.has(symbol) && crossSectionalExecutionQuoteCache.size >= MAX_PUBLIC_QUOTE_SYMBOLS) {
+        const oldest = crossSectionalExecutionQuoteCache.keys().next();
+        if (!oldest.done) crossSectionalExecutionQuoteCache.delete(oldest.value);
+      }
+      crossSectionalExecutionQuoteCache.set(symbol, snapshot);
+    };
+    const warmCrossSectionalExecutionQuote = async (symbol: string): Promise<number | null> => {
+      const executionBook = await Promise.race([
+        liveClient.getBookTicker(symbol).catch(() => null),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 750)),
+      ]);
+      const bid = executionBook?.bid ?? null;
+      const ask = executionBook?.ask ?? null;
+      if (
+        !(typeof bid === "number" && Number.isFinite(bid) && bid > 0) ||
+        !(typeof ask === "number" && Number.isFinite(ask) && ask >= bid)
+      ) {
+        // A prior quote belongs to an earlier submission; retaining it would defeat the fresh
+        // all-leg guard below on a new basket.
+        crossSectionalExecutionQuoteCache.delete(symbol);
+        return null;
+      }
+      const snapshot: PublicQuoteSnapshot = {
+        bid,
+        ask,
+        mid: (bid + ask) / 2,
+        atMs: Date.now(),
+        venue: "BINANCE_USDM_BOOK_TICKER",
+      };
+      rememberCrossSectionalExecutionQuote(symbol, snapshot);
+      return snapshot.mid;
+    };
     singleSymbolPriceTimeline = new SingleSymbolPriceTimelineService(
       (symbol, interval, limit) => binanceClient.getCandles(symbol, interval, limit),
       { enabledForExecution: process.env.SINGLE_SYMBOL_TIMELINE_EXEC_ENABLED === "1" },
@@ -2304,16 +2345,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // cortex-real-attribution.ts at all (see CrossSectionalExecutorOptions.rawLaneWeightPct /
         // .cortexRealAttribution doc comments) — same pattern as every other lane below.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? 100,
-        // 2026-08-15: submit-time reference quote for every basket leg. `warmPublicQuote` is the
-        // SAME currentPublicPrice the single-symbol lanes already use — it fetches the USD-M book
-        // ticker and populates the shared cache as a side effect — and `readPublicQuote` is the
-        // synchronous read of that cache. Cross-basket previously had only Binance's MARK price
-        // (via getPositions), which is not the book: a market BUY lifts the ask, so `fill - mark`
-        // folds half the spread into what looks like slippage and the two cannot be separated
-        // afterwards. Both are optional in the executor and every failure path is swallowed there,
-        // so this can only ever add a record — never block or delay a placement.
-        readPublicQuote,
-        warmPublicQuote: currentPublicPrice,
+        // A cross basket is allowed to use only a fresh two-sided USD-M book. Spot is intentionally
+        // absent from this path; a bad reference rejects the complete basket instead of creating a
+        // partial hedge or a maker order priced from a different venue.
+        requireExecutionVenueQuote: true,
+        readPublicQuote: readCrossSectionalExecutionQuote,
+        warmPublicQuote: warmCrossSectionalExecutionQuote,
         readFuturesMarketReference: (symbol) => futuresMarketReferenceCache.read(symbol),
         warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
         futuresReferenceHealth: futuresReferenceHealthTracker,
@@ -2439,6 +2476,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
         // 2026-07-22 bug-hunt fix: see the FILTERED instance above.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
+        requireExecutionVenueQuote: true,
+        readPublicQuote: readCrossSectionalExecutionQuote,
+        warmPublicQuote: warmCrossSectionalExecutionQuote,
         readFuturesMarketReference: (symbol) => futuresMarketReferenceCache.read(symbol),
         warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
         futuresReferenceHealth: futuresReferenceHealthTracker,
@@ -2481,6 +2521,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
         // 2026-07-22 bug-hunt fix: see the FILTERED instance above.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
+        requireExecutionVenueQuote: true,
+        readPublicQuote: readCrossSectionalExecutionQuote,
+        warmPublicQuote: warmCrossSectionalExecutionQuote,
         readFuturesMarketReference: (symbol) => futuresMarketReferenceCache.read(symbol),
         warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
         futuresReferenceHealth: futuresReferenceHealthTracker,
@@ -3165,6 +3208,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           isAllowed: () => innovationAllowed(descriptor.laneId),
           laneWeightPct: () => innovationWeight(descriptor.laneId),
           rawLaneWeightPct: () => innovationWeight(descriptor.laneId),
+          requireExecutionVenueQuote: true,
+          readPublicQuote: readCrossSectionalExecutionQuote,
+          warmPublicQuote: warmCrossSectionalExecutionQuote,
           cortexRealAttribution: getCortexRealAttributionStore(),
           executionFillRecorder: getExecutionFillRecorder(),
           entryHealthGate: () => innovationCampaignAdmissionForLane(descriptor.laneId),
