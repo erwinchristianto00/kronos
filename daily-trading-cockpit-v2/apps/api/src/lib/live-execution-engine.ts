@@ -832,6 +832,8 @@ function lineageFromPaperOrder(order: PaperOrder): LiveIntentCausalLineage | und
 
 export type LivePerformanceView = "hourly" | "daily" | "weekly" | "monthly" | "yearly";
 export type LivePerformancePeriod = "fixed";
+/** Calendar used only by the operator-facing performance read model. Execution and risk remain UTC. */
+export type LivePerformanceTimeZone = "UTC" | "Asia/Taipei";
 export type LivePerformanceRegimeFilter =
   | "all"
   | "long"
@@ -870,6 +872,8 @@ export interface LiveLanePerformanceSeriesLane {
   losses: number;
   winRatePct: number | null;
   symbols: string[];
+  /** Latest proven close contributing to this row. External lanes do not appear in account.closedLanes. */
+  lastClosedAt?: string | null;
   regimes: Array<{
     family: LiveRegimeFamily;
     bucket: LiveRegimeBucket;
@@ -888,6 +892,7 @@ export interface LiveLanePerformanceSeriesReport {
   since: string;
   until: string;
   anchor: string | null;
+  timeZone: LivePerformanceTimeZone;
   regimeFilter: LivePerformanceRegimeFilter;
   regimeOptions: Array<{ value: LivePerformanceRegimeFilter; label: string }>;
   bucketStarts: string[];
@@ -1618,6 +1623,10 @@ function normalizePerformancePeriod(_raw: string | null | undefined): LivePerfor
   return "fixed";
 }
 
+function normalizePerformanceTimeZone(raw: string | null | undefined): LivePerformanceTimeZone {
+  return raw === "Asia/Taipei" ? "Asia/Taipei" : "UTC";
+}
+
 function normalizeRegimeFilter(raw: string | null | undefined): LivePerformanceRegimeFilter {
   return LIVE_PERFORMANCE_REGIME_OPTIONS.some((option) => option.value === raw)
     ? raw as LivePerformanceRegimeFilter
@@ -1710,10 +1719,16 @@ function bucketStartForMs(ms: number, bucketStartsMs: number[], untilMs: number)
   return picked;
 }
 
-function performanceWindow(input: {
+/**
+ * Builds calendar buckets without changing any execution timestamp.  The engine ledger is UTC,
+ * but the dashboard is operated in Taipei; adding a fixed offset before calendar arithmetic and
+ * removing it afterward makes an Asia/Taipei "day" run from 16:00Z to 16:00Z.  Taipei has no DST.
+ */
+export function performanceWindow(input: {
   view: LivePerformanceView;
   anchor?: string | null;
   nowMs: number;
+  timeZone?: LivePerformanceTimeZone;
 }): {
   sinceMs: number;
   untilMs: number;
@@ -1723,91 +1738,97 @@ function performanceWindow(input: {
   bucketStartsMs: number[];
   bucketForMs: (ms: number) => number | null;
 } {
-  const nowDayStart = startOfUtcDay(input.nowMs);
-  if (input.view === "hourly") {
-    const sinceMs = parseAnchorDay(input.anchor, input.nowMs);
-    const untilMs = sinceMs + DAY_MS;
-    const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, HOUR_MS);
+  const offsetMs = input.timeZone === "Asia/Taipei" ? 8 * HOUR_MS : 0;
+  const toCalendarMs = (utcMs: number) => utcMs + offsetMs;
+  const fromCalendarMs = (calendarMs: number) => calendarMs - offsetMs;
+  const nowCalendarMs = toCalendarMs(input.nowMs);
+  const buildWindow = (
+    sinceCalendarMs: number,
+    untilCalendarMs: number,
+    bucketStartsCalendarMs: number[],
+    anchor: string | null,
+    periodLabel: string,
+    bucketMs: number | null,
+  ) => {
+    const sinceMs = fromCalendarMs(sinceCalendarMs);
+    const untilMs = fromCalendarMs(untilCalendarMs);
+    const bucketStartsMs = bucketStartsCalendarMs.map(fromCalendarMs);
     return {
       sinceMs,
       untilMs,
-      anchor: isoDay(sinceMs),
-      periodLabel: isoDay(sinceMs),
-      bucketMs: HOUR_MS,
+      anchor,
+      periodLabel,
+      bucketMs,
       bucketStartsMs,
-      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
+      bucketForMs: (ms: number) => bucketStartForMs(ms, bucketStartsMs, untilMs),
     };
+  };
+  if (input.view === "hourly") {
+    const sinceCalendarMs = parseAnchorDay(input.anchor, nowCalendarMs);
+    const untilCalendarMs = sinceCalendarMs + DAY_MS;
+    return buildWindow(
+      sinceCalendarMs,
+      untilCalendarMs,
+      buildFixedBucketStarts(sinceCalendarMs, untilCalendarMs, HOUR_MS),
+      isoDay(sinceCalendarMs),
+      isoDay(sinceCalendarMs),
+      HOUR_MS,
+    );
   }
   if (input.view === "monthly") {
-    const sinceMs = parseAnchorYear(input.anchor, input.nowMs);
-    const untilMs = addUtcMonths(sinceMs, 12);
-    const bucketStartsMs = Array.from({ length: 12 }, (_, index) => addUtcMonths(sinceMs, index));
-    return {
-      sinceMs,
-      untilMs,
-      anchor: isoYear(sinceMs),
-      periodLabel: isoYear(sinceMs),
-      bucketMs: null,
-      bucketStartsMs,
-      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
-    };
+    const sinceCalendarMs = parseAnchorYear(input.anchor, nowCalendarMs);
+    const untilCalendarMs = addUtcMonths(sinceCalendarMs, 12);
+    return buildWindow(
+      sinceCalendarMs,
+      untilCalendarMs,
+      Array.from({ length: 12 }, (_, index) => addUtcMonths(sinceCalendarMs, index)),
+      isoYear(sinceCalendarMs),
+      isoYear(sinceCalendarMs),
+      null,
+    );
   }
   if (input.view === "yearly") {
-    const sinceMs = parseAnchorEndYear(input.anchor, input.nowMs);
-    const bucketStartsMs = Array.from({ length: 3 }, (_, index) => Date.UTC(new Date(sinceMs).getUTCFullYear() + index, 0, 1));
-    const untilMs = Date.UTC(new Date(sinceMs).getUTCFullYear() + 3, 0, 1);
-    const startYear = isoYear(sinceMs);
+    const sinceCalendarMs = parseAnchorEndYear(input.anchor, nowCalendarMs);
+    const bucketStartsCalendarMs = Array.from({ length: 3 }, (_, index) => Date.UTC(new Date(sinceCalendarMs).getUTCFullYear() + index, 0, 1));
+    const untilCalendarMs = Date.UTC(new Date(sinceCalendarMs).getUTCFullYear() + 3, 0, 1);
+    const startYear = isoYear(sinceCalendarMs);
     const endYear = `${Number(startYear) + 2}`;
-    return {
-      sinceMs,
-      untilMs,
-      anchor: endYear,
-      periodLabel: `${startYear}-${endYear}`,
-      bucketMs: null,
-      bucketStartsMs,
-      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
-    };
+    return buildWindow(sinceCalendarMs, untilCalendarMs, bucketStartsCalendarMs, endYear, `${startYear}-${endYear}`, null);
   }
   if (input.view === "daily") {
-    const sinceMs = parseAnchorMonth(input.anchor, input.nowMs);
-    const untilMs = addUtcMonths(sinceMs, 1);
-    const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, DAY_MS);
-    return {
-      sinceMs,
-      untilMs,
-      anchor: isoMonth(sinceMs),
-      periodLabel: isoMonth(sinceMs),
-      bucketMs: DAY_MS,
-      bucketStartsMs,
-      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
-    };
+    const sinceCalendarMs = parseAnchorMonth(input.anchor, nowCalendarMs);
+    const untilCalendarMs = addUtcMonths(sinceCalendarMs, 1);
+    return buildWindow(
+      sinceCalendarMs,
+      untilCalendarMs,
+      buildFixedBucketStarts(sinceCalendarMs, untilCalendarMs, DAY_MS),
+      isoMonth(sinceCalendarMs),
+      isoMonth(sinceCalendarMs),
+      DAY_MS,
+    );
   }
   if (input.view === "weekly") {
-    const sinceMs = parseAnchorMonth(input.anchor, input.nowMs);
-    const untilMs = addUtcMonths(sinceMs, 1);
-    const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, WEEK_MS);
-    return {
-      sinceMs,
-      untilMs,
-      anchor: isoMonth(sinceMs),
-      periodLabel: isoMonth(sinceMs),
-      bucketMs: WEEK_MS,
-      bucketStartsMs,
-      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
-    };
+    const sinceCalendarMs = parseAnchorMonth(input.anchor, nowCalendarMs);
+    const untilCalendarMs = addUtcMonths(sinceCalendarMs, 1);
+    return buildWindow(
+      sinceCalendarMs,
+      untilCalendarMs,
+      buildFixedBucketStarts(sinceCalendarMs, untilCalendarMs, WEEK_MS),
+      isoMonth(sinceCalendarMs),
+      isoMonth(sinceCalendarMs),
+      WEEK_MS,
+    );
   }
-  const untilMs = nowDayStart + DAY_MS;
-  const sinceMs = nowDayStart;
-  const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, DAY_MS);
-  return {
-    sinceMs,
-    untilMs,
-    anchor: null,
-    periodLabel: isoDay(sinceMs),
-    bucketMs: DAY_MS,
-    bucketStartsMs,
-    bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
-  };
+  const sinceCalendarMs = startOfUtcDay(nowCalendarMs);
+  const untilCalendarMs = sinceCalendarMs + DAY_MS;
+  return buildWindow(
+    sinceCalendarMs,
+    untilCalendarMs,
+    buildFixedBucketStarts(sinceCalendarMs, untilCalendarMs, DAY_MS),
+    null,
+    isoDay(sinceCalendarMs),
+    DAY_MS,
+  );
 }
 
 function classifyLivePerformanceRegime(input: {
@@ -3216,6 +3237,8 @@ export class LiveExecutionEngine {
     view?: string | null;
     period?: string | null;
     anchor?: string | null;
+    /** Calendar boundary for this presentation query only; ledger timestamps stay UTC. */
+    timeZone?: string | null;
     regime?: string | null;
     /** Optional narrow cohort. Empty means the complete, auditable live ledger. */
     laneIds?: readonly string[] | null;
@@ -3227,12 +3250,14 @@ export class LiveExecutionEngine {
     const period = normalizePerformancePeriod(options.period);
     const viewConfig = LIVE_PERFORMANCE_VIEWS[view];
     const regimeFilter = normalizeRegimeFilter(options.regime);
+    const timeZone = normalizePerformanceTimeZone(options.timeZone);
     const untilMs = new Date(this.nowIso()).getTime();
     const safeNowMs = Number.isFinite(untilMs) ? untilMs : Date.now();
     const window = performanceWindow({
       view,
       anchor: options.anchor,
       nowMs: safeNowMs,
+      timeZone,
     });
     const requestedSinceMs = options.since ? Date.parse(options.since) : Number.NaN;
     const cohortSinceMs = Number.isFinite(requestedSinceMs)
@@ -3252,6 +3277,7 @@ export class LiveExecutionEngine {
       symbols: Set<string>;
       regimeCounts: Map<string, { family: LiveRegimeFamily; bucket: LiveRegimeBucket; count: number }>;
       buckets: Map<string, Omit<LiveLanePerformanceSeriesPoint, "cumulativePnlUsd">>;
+      lastClosedAt: string | null;
     }>();
 
     for (const intent of this.store.getState().intents) {
@@ -3306,6 +3332,7 @@ export class LiveExecutionEngine {
           symbols: new Set<string>(),
           regimeCounts: new Map<string, { family: LiveRegimeFamily; bucket: LiveRegimeBucket; count: number }>(),
           buckets: new Map<string, Omit<LiveLanePerformanceSeriesPoint, "cumulativePnlUsd">>(),
+          lastClosedAt: null,
         };
         row.realizedPnlUsd += allocatedRealized;
         row.feesUsd += fees * share;
@@ -3313,6 +3340,7 @@ export class LiveExecutionEngine {
         if (allocatedRealized > 0) row.wins += 1;
         if (allocatedRealized < 0) row.losses += 1;
         row.symbols.add(intent.symbol);
+        if (row.lastClosedAt === null || closedAt > row.lastClosedAt) row.lastClosedAt = closedAt;
 
         const regimeKey = `${classified.family}|${classified.bucket}`;
         const regimeRow = row.regimeCounts.get(regimeKey) ?? { ...classified, count: 0 };
@@ -3360,6 +3388,7 @@ export class LiveExecutionEngine {
         losses: row.losses,
         winRatePct: row.closedCount > 0 ? (row.wins / row.closedCount) * 100 : null,
         symbols: Array.from(row.symbols).sort(),
+        lastClosedAt: row.lastClosedAt,
         regimes: Array.from(row.regimeCounts.values()).sort((left, right) => right.count - left.count),
         points,
       };
@@ -3375,6 +3404,7 @@ export class LiveExecutionEngine {
       since: new Date(cohortSinceMs).toISOString(),
       until: new Date(window.untilMs).toISOString(),
       anchor: window.anchor,
+      timeZone,
       regimeFilter,
       regimeOptions: LIVE_PERFORMANCE_REGIME_OPTIONS,
       bucketStarts,

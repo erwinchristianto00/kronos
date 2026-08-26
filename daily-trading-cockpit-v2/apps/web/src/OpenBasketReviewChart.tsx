@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type MutableRefObject, type ReactNode } from 'react';
 import {
   CandlestickSeries,
   ColorType,
@@ -29,7 +29,7 @@ const C = {
 const REFRESH_MS = 30_000;
 // Keep the two candle cards deliberately tall. Structural S/R, EMA20/EMA50 and the
 // 5m acceptance levels are otherwise visually compressed on a wide dashboard.
-const CANDLE_CHART_HEIGHT = 460;
+const CANDLE_CHART_HEIGHT = 540;
 const VOLUME_PANE_HEIGHT = 84;
 const HISTORICAL_INTERVALS = [
   { value: '15m', label: '15m' },
@@ -111,6 +111,8 @@ type AcceptanceEvent = {
   side: 'LONG' | 'SHORT';
 };
 
+type CandleViewport = { from: number; to: number };
+
 function formatPrice(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return '—';
   const digits = value < 0.0001 ? 10 : value < 0.01 ? 8 : value < 1 ? 6 : value < 100 ? 4 : 2;
@@ -189,6 +191,8 @@ function CandlePane({
   error,
   showMovingAverages = false,
   showStructuralTrendlines = false,
+  viewportKey,
+  viewportStore,
 }: {
   title: string;
   candles: Candle[];
@@ -198,6 +202,9 @@ function CandlePane({
   error?: string | null;
   showMovingAverages?: boolean;
   showStructuralTrendlines?: boolean;
+  /** Per leg/timeframe state survives the 30s completed-candle refresh. */
+  viewportKey: string;
+  viewportStore: MutableRefObject<Map<string, CandleViewport>>;
 }) {
   const host = useRef<HTMLDivElement | null>(null);
 
@@ -271,17 +278,31 @@ function CandlePane({
         series.setData(trendline.points.map((point) => ({ time: toTime(point.openTime), value: point.value })));
       }
     }
-    chart.timeScale().fitContent();
+    // The parent refreshes completed candles every 30 seconds.  Recreating the lightweight-charts
+    // instance is fine for fresh overlays, but it must not throw an operator back to fitContent
+    // after they intentionally panned/zoomed to inspect an earlier structure.
+    const saveViewport = () => {
+      const range = chart.timeScale().getVisibleLogicalRange();
+      if (range && Number.isFinite(range.from) && Number.isFinite(range.to)) {
+        viewportStore.current.set(viewportKey, { from: range.from, to: range.to });
+      }
+    };
+    const savedViewport = viewportStore.current.get(viewportKey);
+    if (savedViewport) chart.timeScale().setVisibleLogicalRange(savedViewport);
+    else chart.timeScale().fitContent();
+    chart.timeScale().subscribeVisibleLogicalRangeChange(saveViewport);
     const resize = () => chart.resize(Math.max(1, node.clientWidth), CANDLE_CHART_HEIGHT);
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(resize);
     observer?.observe(node);
     window.addEventListener('resize', resize);
     return () => {
+      saveViewport();
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(saveViewport);
       observer?.disconnect();
       window.removeEventListener('resize', resize);
       chart.remove();
     };
-  }, [candles, levels, showMovingAverages, showStructuralTrendlines]);
+  }, [candles, levels, showMovingAverages, showStructuralTrendlines, viewportKey, viewportStore]);
 
   return <div style={{ minWidth: 0, border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden', background: C.sub }}>
     <div style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}`, color: C.text, fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
@@ -303,6 +324,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   const [historicalSeries, setHistoricalSeries] = useState<IntervalChartResponse | null>(null);
   const [historicalSeriesError, setHistoricalSeriesError] = useState<string | null>(null);
   const [historicalLoading, setHistoricalLoading] = useState(false);
+  const viewportStore = useRef<Map<string, CandleViewport>>(new Map());
   const chartEndpoint = leg
     ? leg.chartEndpoint ?? `${apiPrefix}/live/open-basket-chart?symbol=${encodeURIComponent(leg.symbol)}`
     : null;
@@ -468,9 +490,9 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
           {' '}EMA20/EMA50 juga memakai completed candle saja; tidak mengubah formation, entry, sizing, atau exit.
         </> : <span>Level 4H UTC belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
       </div>
-      <div style={{ padding: 12, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 12 }}>
-        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines />
-        <CandlePane title={isDailyRange ? '5m · EMA20/EMA50 + breakout / breakdown + acceptance + native bracket' : '5m · EMA20/EMA50 + breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages />
+      <div className="candle-review-chart-stack">
+        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines viewportKey={`${leg.key}:historical:${historicalInterval}`} viewportStore={viewportStore} />
+        <CandlePane title={isDailyRange ? '5m · EMA20/EMA50 + breakout / breakdown + acceptance + native bracket' : '5m · EMA20/EMA50 + breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages viewportKey={`${leg.key}:5m`} viewportStore={viewportStore} />
       </div>
       {reference && <div style={{ padding: '0 12px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55 }}>
         Status acceptance sekarang: <strong style={{ color: latestAcceptance === 'LONG' ? C.good : latestAcceptance === 'SHORT' ? C.bad : C.text }}>{latestAcceptance ? `${latestAcceptance} confirmed` : 'belum ada dua close 5m berturut-turut'}</strong>.

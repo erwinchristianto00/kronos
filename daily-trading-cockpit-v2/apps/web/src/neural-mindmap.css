@@ -2251,7 +2251,8 @@ i.health-diagnostic {
 }
 
 .testnet-statusbar {
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  /* Eight readable tiles: row two keeps unrealized, realized today and realized all-time adjacent. */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .testnet-grid {
@@ -2374,6 +2375,14 @@ i.health-diagnostic {
   margin-top: 6px;
   color: #e6f4ee;
   font-size: 16px;
+}
+
+/* Historical structure and 5m execution context need their own full-width canvas. */
+.candle-review-chart-stack {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  padding: 14px;
 }
 
 .cross-open-basket-table th,

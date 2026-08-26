@@ -4,7 +4,7 @@ import './neural-mindmap.css';
 // table/accordion primitives also used by the Research dashboard's InnovationLanesCard.
 import { Disclosure, LaneMaturityTable, laneEdgeBadge, type LaneMaturityRow } from './LaneMaturityTable';
 import CrossSectionalReportCard from './CrossSectionalReportCard';
-import DailyRangeReportCard, { type DailyRangeHeadlineSummary } from './DailyRangeReportCard';
+import DailyRangeReportCard from './DailyRangeReportCard';
 import ContinuationLifecycleCard from './ContinuationLifecycleCard';
 
 const REFRESH_MS = 5_000;
@@ -357,6 +357,7 @@ interface LanePerformanceSeries {
   since: string;
   until: string;
   anchor: string | null;
+  timeZone?: string;
   regimeFilter: string;
   /** Closed cross-basket audit P&L before the selected chart period; never blended into its curve. */
   crossSectionalAuditBeforePeriod?: { closedBaskets: number; totalNetPnlUsd: number; lastClosedAt: string | null } | null;
@@ -372,6 +373,7 @@ interface LanePerformanceSeries {
     losses: number;
     winRatePct: number | null;
     symbols: string[];
+    lastClosedAt?: string | null;
     regimes: Array<{
       family: string;
       bucket: string;
@@ -379,6 +381,28 @@ interface LanePerformanceSeries {
     }>;
     points: LanePerformancePoint[];
   }>;
+}
+
+interface ReportedLanePnl {
+  ok?: boolean;
+  timeZone: 'Asia/Taipei';
+  closeDateTaipei: string;
+  accountingComplete: boolean;
+  incompleteRecords: number;
+  today: {
+    baskets: number;
+    dailyRange: number;
+    singleSymbol: number;
+    total: number;
+    closedCount: number;
+  };
+  allTime: {
+    baskets: number;
+    dailyRange: number;
+    singleSymbol: number;
+    total: number;
+    closedCount: number;
+  };
 }
 
 interface MainNeuralLane {
@@ -1272,9 +1296,9 @@ export default function TestnetExchangeDashboard() {
   const exchangeRefreshMs = isLivePage ? LIVE_EXCHANGE_REFRESH_MS : REFRESH_MS;
   const allocationLabel = isLivePage ? 'LIVE lane allocation' : 'Testnet lane allocation';
   const [account, setAccount] = useState<LiveAccount | null>(null);
-  // Daily Range owns its own persisted fill history in each runtime. The headline receives its
-  // close-date aggregate from that same report instead of repurposing the range/signal date.
-  const [dailyRangeHeadline, setDailyRangeHeadline] = useState<DailyRangeHeadlineSummary | null>(null);
+  // The headline is a single API read model: all three books are classified by their actual
+  // exit timestamp in Taipei, so it cannot mix incompatible calendar definitions.
+  const [reportedLanePnl, setReportedLanePnl] = useState<ReportedLanePnl | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const [laneSeries, setLaneSeries] = useState<LanePerformanceSeries | null>(null);
   const [mfeRolloutSeries, setMfeRolloutSeries] = useState<LanePerformanceSeries | null>(null);
@@ -1580,21 +1604,24 @@ export default function TestnetExchangeDashboard() {
       const seriesParams = new URLSearchParams({
         view: performanceView,
         regime: performanceRegime,
+        timeZone: 'Asia/Taipei',
       });
       if (anchor) seriesParams.set('anchor', anchor);
       const mfeRolloutParams = new URLSearchParams(seriesParams);
       mfeRolloutParams.set('cohort', 'testnet_mfe_giveback_xrp_wld');
-      const [nextStatus, nextAccount, nextLaneSeries, nextMfeRolloutSeries] = await Promise.all([
+      const [nextStatus, nextAccount, nextLaneSeries, nextMfeRolloutSeries, nextReportedLanePnl] = await Promise.all([
         fetchJson<LiveStatus>(`${pageApiPrefix}/live/status`),
         fetchJson<LiveAccount>(`${pageApiPrefix}/live/account`),
         fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${seriesParams.toString()}`),
         fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${mfeRolloutParams.toString()}`),
+        fetchJson<ReportedLanePnl>(`${pageApiPrefix}/live/reported-lane-pnl`),
       ]);
       if (seq !== exchangeLoadSeqRef.current) return; // a newer call already superseded this one
       setStatus(nextStatus);
       setAccount(nextAccount);
       setLaneSeries(nextLaneSeries);
       setMfeRolloutSeries(nextMfeRolloutSeries);
+      setReportedLanePnl(nextReportedLanePnl);
       setError(null);
       liveRateLimitUntilRef.current = 0;
       setLastLoadedAt(new Date().toISOString());
@@ -1998,10 +2025,11 @@ export default function TestnetExchangeDashboard() {
   const healthTone = status?.armed ? 'tone-healthy' : status?.health?.lastTickError ? 'tone-warning' : 'tone-measure';
   const totalSourceEntries = account?.positions.reduce((sum, position) => sum + position.sourceOrderCount, 0) ?? 0;
   const regimeOptions = laneSeries?.regimeOptions ?? FALLBACK_REGIME_OPTIONS;
-  // Testnet is currently scoped to cross-sectional work plus the explicitly approved
-  // XRP/WLD CG_MFE_GIVEBACK rollout. Keep the live page's full history, while the testnet
-  // performance timeline shows the cross-sectional variants and this one approved CG lane.
-  const isTestnetTimelineLane = (laneId: string) => laneId.startsWith('CROSS_SECTIONAL_');
+  // The timeline is intentionally limited to the operator's two displayed books: hedge baskets
+  // and Daily Range.  Daily Range has its own executor ledger, so it must be selected explicitly
+  // instead of being lost when this view filters engine-only lanes.
+  const isDisplayedTimelineLane = (laneId: string) =>
+    laneId.startsWith('CROSS_SECTIONAL_') || laneId === 'DAILY_4H_RANGE_ACCEPTANCE';
   // 2026-08-18: dropped the `!isLivePage &&`. The section that renders this chart is already shown
   // on /live (`isLivePage || showTestnetLaneResearch`), so gating the DATA here left live with a
   // permanently empty chart. laneSeries is fetched on both pages; mfeRolloutSeries is testnet-only
@@ -2010,7 +2038,7 @@ export default function TestnetExchangeDashboard() {
     ? {
       ...laneSeries,
       lanes: [
-        ...laneSeries.lanes.filter((lane) => isTestnetTimelineLane(lane.laneId)),
+        ...laneSeries.lanes.filter((lane) => isDisplayedTimelineLane(lane.laneId)),
         ...(mfeRolloutSeries?.lanes ?? []).map((lane) => ({
           ...lane,
           laneId: mfeRolloutSeries?.cohort?.label ?? 'CG_MFE_GIVEBACK — XRP/WLD rollout',
@@ -2213,72 +2241,49 @@ export default function TestnetExchangeDashboard() {
               .filter((p) => isDailyRangePosition(p.laneIds))
               .reduce((s, p) => s + (p.dailyRangeUnrealizedPnl ?? p.unrealizedPnl), 0);
             const unattributedUnreal = unattributedExchangePositions.reduce((s, p) => s + p.unrealizedPnl, 0);
+            // The headline deliberately uses the same ownership buckets printed below it.  The
+            // exchange total is still fetched for reconciliation, but a microscopic rounding
+            // delta must not make the visual breakdown add up to a different number.
+            const ownedUnreal = dirUnreal + baskUnreal + dailyRangeUnreal + singleSymbolUnreal + unattributedUnreal;
             return (
               <>
-                <strong className={tone(account?.unrealizedPnl)}>{signed(account?.unrealizedPnl)}</strong>
-                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · daily range {signed(dailyRangeUnreal)} · single-symbol {signed(singleSymbolUnreal)} · exchange tak terikat {signed(unattributedUnreal)} · {account ? `${account.openPositionCount} pos` : 'loading'}</small>
+                <strong className={tone(account ? ownedUnreal : undefined)}>{signed(account ? ownedUnreal : undefined)}</strong>
+                <small>
+                  directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · daily range {signed(dailyRangeUnreal)} · single-symbol {signed(singleSymbolUnreal)}
+                  {unattributedExchangePositions.length > 0 ? <> · exchange tak terikat {signed(unattributedUnreal)}</> : null}
+                  {' · '}{account ? `${account.openPositionCount} pos` : 'loading'}
+                </small>
               </>
             );
           })()}
         </div>
         <div>
-          <span>Realized P&amp;L (reported lanes)</span>
-          {(() => {
-            // HEADLINE = reported lanes only. The mirror stays deliberately out (see below), while
-            // Daily Range now contributes from its ACTUAL exit-fill timestamp in Asia/Taipei — never
-            // from its dateUtc, which is the range/signal session and can be the prior calendar day.
-            // Basket and single-symbol daily aggregates retain their operational UTC definition.
-            // 2026-07-09: was CROSS_SECTIONAL_MARKET_NEUTRAL-only — the 2026-07-08 TREND/MIXED
-            // instances merge into their OWN closedLanes entries (see annotateCrossSectionalAccount),
-            // so a banked TREND/MIXED basket previously vanished from this all-time headline.
-            // 2026-07-11: was single-symbol-executor-blind too — a real +$1.39 BTC close via
-            // REGIME_COMPOSITE_CONFIRMATION_LONG (already correctly folded into account.closedLanes
-            // by annotateSingleSymbolAccount) never moved this headline because nothing here summed
-            // it. Operator caught it live ("kalo memang udah TP, kok all-time nya masih sama").
-            // singleSymbolExecutorRealizedPnlUsd is backend-computed (routes/live.ts's /api/live/account)
-            // over the live list of executors, so this never has to hardcode lane ids that drift.
-            // 2026-08-16 (operator decision, taken with the trade-off stated): the MIRROR lane is out
-            // of this card entirely. It is NOT decommissioned — newEntriesPaused is false and it can
-            // still open positions — so this card no longer reconciles with the exchange, and that is
-            // the accepted cost. Two things keep it from becoming a lie:
-            //   - the kill switch is untouched. status.totalRealizedPnlUsd still carries every mirror
-            //     close and still drives the daily-loss, consecutive-loss and drawdown trips, so what
-            //     is hidden here can never make the account less protected.
-            //   - the figure below is labelled by the lanes it COVERS, never as an account total. The
-            //     old "total" label would have been false the moment a lane left the sum.
-            // If the mirror lane is later disarmed, its history belongs in an audit section (the
-            // pattern annotateCrossSectionalAccount already uses), not silently deleted.
-            const basketsAllTime = ['CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS_SECTIONAL_TREND', 'CROSS_SECTIONAL_MIXED']
-              .reduce((sum, laneId) => sum + (account?.closedLanes?.find((l) => l.laneId === laneId)?.realizedPnlUsd ?? 0), 0);
-            const singleSymbolAllTime = account?.singleSymbolExecutorRealizedPnlUsd?.allTime;
-            const dailyRangeToday = dailyRangeHeadline?.todayNetPnlUsd;
-            const dailyRangeAllTime = dailyRangeHeadline?.allTimeNetPnlUsd;
-            const dailyRangeReady = dailyRangeHeadline != null;
-            const allTime = dailyRangeReady
-              ? basketsAllTime + (singleSymbolAllTime ?? 0) + (dailyRangeAllTime ?? 0)
-              : undefined;
-            // 2026-07-11: was FILTERED-only (xsecExec?.dailyRealizedUsd) — TREND/MIXED's own daily
-            // realized P&L never moved this "today" figure even though basketsAllTime above already
-            // correctly folds all 3 in via account.closedLanes.
-            const basketsToday = [xsecExec?.dailyRealizedUsd, xsecExecTrend?.dailyRealizedUsd, xsecExecMixed?.dailyRealizedUsd]
-              .reduce<number | undefined>((sum, v) => (v != null ? (sum ?? 0) + v : sum), undefined);
-            const singleSymbolToday = account?.singleSymbolExecutorRealizedPnlUsd?.today;
-            const today = dailyRangeReady && (basketsToday != null || singleSymbolToday != null || dailyRangeToday != null)
-              ? (basketsToday ?? 0) + (singleSymbolToday ?? 0) + (dailyRangeToday ?? 0)
-              : undefined;
-            return (
-              <>
-                <strong className={tone(today)}>{signed(today)}</strong>
-                <small>
-                  today — baskets {signed(basketsToday)} · daily range {dailyRangeReady ? signed(dailyRangeToday) : 'memuat…'} (close Taipei) · single-symbol {signed(singleSymbolToday)}
-                  <br />
-                  all-time — baskets {signed(basketsAllTime)} · daily range {dailyRangeReady ? signed(dailyRangeAllTime) : 'memuat…'} · single-symbol {signed(singleSymbolAllTime)} · jumlah {signed(allTime)}
-                  <br />
-                  <span style={{ opacity: 0.7 }}>mencakup basket + Daily Range + single-symbol; Daily Range hari ini = {dailyRangeHeadline?.closeDateTaipei ?? 'memuat'} berdasarkan exit fill Taipei — bukan total akun; kill-switch tetap memakai angka penuh seluruh lane</span>
-                </small>
-              </>
-            );
-          })()}
+          <span>Realized P&amp;L Today</span>
+          {reportedLanePnl?.accountingComplete ? (
+            <>
+              <strong className={tone(reportedLanePnl.today.total)}>{signed(reportedLanePnl.today.total)}</strong>
+              <small>
+                baskets {signed(reportedLanePnl.today.baskets)} · daily range {signed(reportedLanePnl.today.dailyRange)} · single-symbol {signed(reportedLanePnl.today.singleSymbol)}
+                {' · '}{reportedLanePnl.today.closedCount} close · Taipei {reportedLanePnl.closeDateTaipei}
+              </small>
+            </>
+          ) : (
+            <><strong className="tone-measure">Loading…</strong><small>menunggu closed-fill ledger lengkap</small></>
+          )}
+        </div>
+        <div>
+          <span>Realized P&amp;L All-Time</span>
+          {reportedLanePnl?.accountingComplete ? (
+            <>
+              <strong className={tone(reportedLanePnl.allTime.total)}>{signed(reportedLanePnl.allTime.total)}</strong>
+              <small>
+                baskets {signed(reportedLanePnl.allTime.baskets)} · daily range {signed(reportedLanePnl.allTime.dailyRange)} · single-symbol {signed(reportedLanePnl.allTime.singleSymbol)}
+                {' · '}{reportedLanePnl.allTime.closedCount} close
+              </small>
+            </>
+          ) : (
+            <><strong className="tone-measure">Loading…</strong><small>menunggu closed-fill ledger lengkap</small></>
+          )}
         </div>
         {/* NEW merged CORTEX tile (2026-07-23, testnet-only): the two CORTEX lines used to sit as
            extra <small> rows tucked under Realized P&L, easy to miss. Both numbers now share ONE
@@ -2325,7 +2330,10 @@ export default function TestnetExchangeDashboard() {
         <div>
           <span>Open positions</span>
           <strong><a href="#open-positions" style={{ color: 'inherit' }}>{openPositionsCount}</a></strong>
-          <small>directional + basket + single-symbol + exchange tak terikat</small>
+          <small>
+            directional + basket + daily range + single-symbol
+            {unattributedExchangePositions.length > 0 ? ' + exchange tak terikat' : ''}
+          </small>
         </div>
       </div>
 
@@ -2485,7 +2493,7 @@ export default function TestnetExchangeDashboard() {
           directional-regime, instrumentation, shadow reports: all 200 on 3103). pageApiPrefix makes
           it follow whichever page it is rendered on. */}
       <CrossSectionalReportCard apiPrefix={pageApiPrefix} />
-      <DailyRangeReportCard apiPrefix={pageApiPrefix} onHeadlineSummary={setDailyRangeHeadline} />
+      <DailyRangeReportCard apiPrefix={pageApiPrefix} />
       <ContinuationLifecycleCard apiPrefix={pageApiPrefix} />
 
       <main className="testnet-grid">
@@ -2502,8 +2510,10 @@ export default function TestnetExchangeDashboard() {
           <header><span>Open Positions</span><strong>{openPositionsCount} pos</strong></header>
           <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
             Directional (operator-controlled, engine mirror) + Basket (cross-sectional hedge, automatic exit only) +
-            Daily range (native SL / 2R TP, lane-managed) + Single-symbol (stop-protected, own exchange-side stop) + Exchange tak terikat in one table. Posisi tak terikat
-            tetap ditampilkan agar total exchange dan uPnL tidak terlihat bertentangan; dashboard tidak mengklaim pemiliknya dan tidak memberi tombol close.
+            Daily range (native SL / 2R TP, lane-managed) + Single-symbol (stop-protected, own exchange-side stop)
+            {unattributedExchangePositions.length > 0
+              ? <> + Exchange tak terikat in one table. Posisi tak terikat tetap ditampilkan agar total exchange dan uPnL tidak terlihat bertentangan; dashboard tidak mengklaim pemiliknya dan tidak memberi tombol close.</>
+              : <>. Semua posisi exchange saat ini memiliki pemilik lane yang terverifikasi.</>}
           </p>
           {closeResult && <p className={closeResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{closeResult.message}</p>}
           {copyResult && (
@@ -3319,7 +3329,7 @@ export default function TestnetExchangeDashboard() {
                     <td>{plain(lane.feesUsd, ' USDT')}</td>
                     <td>{lane.regimes.map((regime) => `${regime.bucket.toLowerCase()} ${regime.count}`).join(', ') || 'n/a'}</td>
                     <td>{lane.symbols.join(', ') || 'n/a'}</td>
-                    <td>{timeAgo(account?.closedLanes?.find((cl) => cl.laneId === lane.laneId)?.lastClosedAt)}</td>
+                    <td>{timeAgo(lane.lastClosedAt ?? account?.closedLanes?.find((cl) => cl.laneId === lane.laneId)?.lastClosedAt)}</td>
                   </tr>
                 ))}
               </tbody>

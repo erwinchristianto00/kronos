@@ -33,7 +33,11 @@ import {
 } from "../lib/cross-sectional-executor.js";
 import type { CrossSectionalAutoPool, CrossSectionalAutoPoolSnapshot } from "../lib/cross-sectional-auto-pool.js";
 import type { SymbolReliabilitySnapshot } from "../lib/cross-sectional-symbol-reliability.js";
-import { DAILY_RANGE_LANE_ID, type DailyRangeAcceptanceLane, type DailyRangeCanaryEvidence } from "../lib/daily-4h-range-acceptance-lane.js";
+import { DAILY_RANGE_LANE_ID, type DailyRangeAcceptanceLane, type DailyRangeCanaryEvidence, type DailyRangeTrade } from "../lib/daily-4h-range-acceptance-lane.js";
+import {
+  summarizeReportedLanePnl,
+  type ReportedLanePnlRecord,
+} from "../lib/reported-lane-pnl.js";
 import type { DailyRangeAutoPoolSnapshot } from "../lib/daily-range-auto-pool.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
 import {
@@ -688,6 +692,7 @@ export function mergeCrossSectionalIntoLaneSeries(
   let wins = 0;
   let losses = 0;
   let closedCount = 0;
+  let lastClosedAt: string | null = null;
   const symbols = new Set<string>();
   for (const basket of executor.getClosedBaskets()) {
     if (!basket.closedAt || basket.netPnlUsd === null || basket.accountingStatus === "ACCOUNTING_INCOMPLETE") continue;
@@ -712,6 +717,7 @@ export function mergeCrossSectionalIntoLaneSeries(
     closedCount += 1;
     if (basket.netPnlUsd > 0) wins += 1;
     if (basket.netPnlUsd < 0) losses += 1;
+    if (lastClosedAt === null || basket.closedAt > lastClosedAt) lastClosedAt = basket.closedAt;
     for (const leg of basket.legs) symbols.add(leg.symbol);
   }
   if (closedCount === 0) return report;
@@ -727,6 +733,7 @@ export function mergeCrossSectionalIntoLaneSeries(
     existing.losses += losses;
     existing.winRatePct = existing.closedCount > 0 ? (existing.wins / existing.closedCount) * 100 : null;
     existing.symbols = Array.from(new Set([...existing.symbols, ...symbols])).sort();
+    if (lastClosedAt && (!existing.lastClosedAt || lastClosedAt > existing.lastClosedAt)) existing.lastClosedAt = lastClosedAt;
     let cumulative = 0;
     for (const point of existing.points) {
       const add = perBucket.get(point.bucketStart);
@@ -755,6 +762,7 @@ export function mergeCrossSectionalIntoLaneSeries(
       losses,
       winRatePct: closedCount > 0 ? (wins / closedCount) * 100 : null,
       symbols: Array.from(symbols).sort(),
+      lastClosedAt,
       regimes: [],
       points,
     });
@@ -1142,6 +1150,7 @@ export function mergeSingleSymbolIntoLaneSeries(
   let wins = 0;
   let losses = 0;
   let closedCount = 0;
+  let lastClosedAt: string | null = null;
   const symbols = new Set<string>();
   for (const pos of executor.getClosedPositions()) {
     if (!pos.closedAt || pos.netPnlUsd === null) continue;
@@ -1175,6 +1184,7 @@ export function mergeSingleSymbolIntoLaneSeries(
     closedCount += 1;
     if (netUsd > 0) wins += 1;
     if (netUsd < 0) losses += 1;
+    if (lastClosedAt === null || pos.closedAt > lastClosedAt) lastClosedAt = pos.closedAt;
     symbols.add(pos.symbol);
   }
   if (closedCount === 0) return report;
@@ -1188,6 +1198,7 @@ export function mergeSingleSymbolIntoLaneSeries(
     existing.losses += losses;
     existing.winRatePct = existing.closedCount > 0 ? (existing.wins / existing.closedCount) * 100 : null;
     existing.symbols = Array.from(new Set([...existing.symbols, ...symbols])).sort();
+    if (lastClosedAt && (!existing.lastClosedAt || lastClosedAt > existing.lastClosedAt)) existing.lastClosedAt = lastClosedAt;
     let cumulative = 0;
     for (const point of existing.points) {
       const add = perBucket.get(point.bucketStart);
@@ -1216,6 +1227,104 @@ export function mergeSingleSymbolIntoLaneSeries(
       losses,
       winRatePct: closedCount > 0 ? (wins / closedCount) * 100 : null,
       symbols: Array.from(symbols).sort(),
+      lastClosedAt,
+      regimes: [],
+      points,
+    });
+  }
+  report.lanes.sort((left, right) => Math.abs(right.realizedPnlUsd) - Math.abs(left.realizedPnlUsd));
+  return report;
+}
+
+/**
+ * Daily Range has its own durable lane ledger rather than LiveExecutionEngine intents.  Merge its
+ * closed fills into the same calendar-bucket report so the performance timeline is an actual
+ * lane timeline, not a cross-sectional-only projection.  It has no regime label, so it is shown
+ * only in the unfiltered view (the same treatment as cross-sectional baskets).
+ */
+export function mergeDailyRangeIntoLaneSeries(
+  report: LiveLaneSeriesReport,
+  lane: DailyRangeAcceptanceLane | null,
+): LiveLaneSeriesReport {
+  if (!lane || report.regimeFilter !== "all") return report;
+  const sinceMs = new Date(report.since).getTime();
+  const untilMs = new Date(report.until).getTime();
+  const bucketStartsMs = report.bucketStarts.map((value) => new Date(value).getTime());
+  const perBucket = new Map<string, { realizedPnlUsd: number; closedCount: number; wins: number; losses: number }>();
+  let realizedPnlUsd = 0;
+  let feesUsd = 0;
+  let closedCount = 0;
+  let wins = 0;
+  let losses = 0;
+  let lastClosedAt: string | null = null;
+  const symbols = new Set<string>();
+
+  for (const trade of lane.history("trades", 10_000) as DailyRangeTrade[]) {
+    if (trade.status !== "CLOSED" || !trade.exitTimestamp || trade.netPnlUsd === null) continue;
+    const closedMs = new Date(trade.exitTimestamp).getTime();
+    if (!Number.isFinite(closedMs) || closedMs < sinceMs || closedMs >= untilMs) continue;
+    let bucketIdx = -1;
+    for (let index = 0; index < bucketStartsMs.length; index += 1) {
+      if (bucketStartsMs[index]! <= closedMs) bucketIdx = index;
+      else break;
+    }
+    if (bucketIdx < 0) continue;
+    const bucketStart = report.bucketStarts[bucketIdx]!;
+    const bucket = perBucket.get(bucketStart) ?? { realizedPnlUsd: 0, closedCount: 0, wins: 0, losses: 0 };
+    bucket.realizedPnlUsd += trade.netPnlUsd;
+    bucket.closedCount += 1;
+    if (trade.netPnlUsd > 0) bucket.wins += 1;
+    if (trade.netPnlUsd < 0) bucket.losses += 1;
+    perBucket.set(bucketStart, bucket);
+    realizedPnlUsd += trade.netPnlUsd;
+    feesUsd += trade.feesUsd ?? 0;
+    closedCount += 1;
+    if (trade.netPnlUsd > 0) wins += 1;
+    if (trade.netPnlUsd < 0) losses += 1;
+    if (lastClosedAt === null || trade.exitTimestamp > lastClosedAt) lastClosedAt = trade.exitTimestamp;
+    symbols.add(trade.symbol);
+  }
+  if (closedCount === 0) return report;
+
+  const existing = report.lanes.find((candidate) => candidate.laneId === DAILY_RANGE_LANE_ID);
+  if (existing) {
+    existing.realizedPnlUsd += realizedPnlUsd;
+    existing.feesUsd += feesUsd;
+    existing.closedCount += closedCount;
+    existing.wins += wins;
+    existing.losses += losses;
+    existing.winRatePct = existing.closedCount > 0 ? (existing.wins / existing.closedCount) * 100 : null;
+    existing.symbols = Array.from(new Set([...existing.symbols, ...symbols])).sort();
+    if (lastClosedAt && (!existing.lastClosedAt || lastClosedAt > existing.lastClosedAt)) existing.lastClosedAt = lastClosedAt;
+    let cumulative = 0;
+    for (const point of existing.points) {
+      const add = perBucket.get(point.bucketStart);
+      if (add) {
+        point.realizedPnlUsd += add.realizedPnlUsd;
+        point.closedCount += add.closedCount;
+        point.wins += add.wins;
+        point.losses += add.losses;
+      }
+      cumulative += point.realizedPnlUsd;
+      point.cumulativePnlUsd = cumulative;
+    }
+  } else {
+    let cumulative = 0;
+    const points = report.bucketStarts.map((bucketStart) => {
+      const bucket = perBucket.get(bucketStart) ?? { realizedPnlUsd: 0, closedCount: 0, wins: 0, losses: 0 };
+      cumulative += bucket.realizedPnlUsd;
+      return { bucketStart, ...bucket, cumulativePnlUsd: cumulative };
+    });
+    report.lanes.push({
+      laneId: DAILY_RANGE_LANE_ID,
+      realizedPnlUsd,
+      feesUsd,
+      closedCount,
+      wins,
+      losses,
+      winRatePct: closedCount > 0 ? (wins / closedCount) * 100 : null,
+      symbols: Array.from(symbols).sort(),
+      lastClosedAt,
       regimes: [],
       points,
     });
@@ -3906,6 +4015,64 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
     }
   });
 
+  /**
+   * One canonical read model for the dashboard headline.  Each book is read from its own durable
+   * closed-fill ledger, then all three are classified by the exact exit timestamp in Asia/Taipei.
+   * This avoids the old impossible-to-reconcile mix of UTC basket "today" and Taipei Daily Range
+   * "today".  It is presentation-only; no gate, risk rule, or stored accounting field reads it.
+   */
+  app.get("/api/live/reported-lane-pnl", async (_request, reply) => {
+    try {
+      const records: ReportedLanePnlRecord[] = [];
+      let incompleteRecords = 0;
+      for (const executor of allCrossSectionalExecutors()) {
+        for (const basket of executor.getClosedBaskets()) {
+          if (basket.accountingStatus === "ACCOUNTING_INCOMPLETE") continue;
+          if (!basket.closedAt || basket.netPnlUsd === null || !Number.isFinite(basket.netPnlUsd)) {
+            incompleteRecords += 1;
+            continue;
+          }
+          records.push({ category: "BASKETS", closedAt: basket.closedAt, netPnlUsd: basket.netPnlUsd });
+        }
+      }
+      const dailyRangeLane = opts.dailyRangeLane?.() ?? null;
+      if (dailyRangeLane) {
+        for (const trade of dailyRangeLane.history("trades", 10_000) as DailyRangeTrade[]) {
+          if (trade.status !== "CLOSED") continue;
+          if (!trade.exitTimestamp || trade.netPnlUsd === null || !Number.isFinite(trade.netPnlUsd)) {
+            incompleteRecords += 1;
+            continue;
+          }
+          records.push({ category: "DAILY_RANGE", closedAt: trade.exitTimestamp, netPnlUsd: trade.netPnlUsd });
+        }
+      }
+      for (const executor of allSingleSymbolExecutors()) {
+        for (const position of executor.getClosedPositions()) {
+          const netPnlUsd = fullyCostedNetPnlUsd(position);
+          if (!position.closedAt || netPnlUsd === null || !Number.isFinite(netPnlUsd)) {
+            incompleteRecords += 1;
+            continue;
+          }
+          records.push({ category: "SINGLE_SYMBOL", closedAt: position.closedAt, netPnlUsd });
+        }
+      }
+      const summary = summarizeReportedLanePnl(records);
+      if (!summary) {
+        reply.code(500);
+        return { ok: false, reason: "unable to resolve Taipei close date" };
+      }
+      return {
+        ok: true,
+        ...summary,
+        accountingComplete: incompleteRecords === 0,
+        incompleteRecords,
+      };
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, reason: err instanceof Error ? err.message : "reported lane P&L failed" };
+    }
+  });
+
   // Report-only: compares the engine's internal daily realized-P&L ledger against Binance's own
   // /fapi/v1/income for the same UTC day. See wallet-reconciliation.ts's module doc for the full
   // safety rationale — this endpoint only reads and reports; it never corrects anything.
@@ -4007,6 +4174,7 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
       view?: string;
       period?: string;
       anchor?: string;
+      timeZone?: string;
       regime?: string;
       cohort?: string;
     };
@@ -4019,6 +4187,7 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
         view: query.view,
         period: query.period,
         anchor: query.anchor,
+        timeZone: query.timeZone,
         regime: query.regime,
         ...(mfeRollout
           ? {
@@ -4035,6 +4204,7 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
         for (const executor of allSingleSymbolExecutors()) {
           series = mergeSingleSymbolIntoLaneSeries(series, executor);
         }
+        series = mergeDailyRangeIntoLaneSeries(series, opts.dailyRangeLane?.() ?? null);
       }
       // The chart is intentionally calendar-scoped: a basket closed on 13 Aug must not be
       // painted into the 14 Aug hourly curve just to make the current view non-zero. Surface the
