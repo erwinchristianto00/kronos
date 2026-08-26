@@ -3,9 +3,11 @@ import {
   CandlestickSeries,
   ColorType,
   createChart,
+  createSeriesMarkers,
   HistogramSeries,
   LineSeries,
   LineStyle,
+  type SeriesMarker,
   type UTCTimestamp,
 } from 'lightweight-charts';
 import { calculateEmaSeries, calculateStructuralTrendlines } from './openBasketChartOverlays';
@@ -106,6 +108,14 @@ type PriceLevel = {
   color: string;
 };
 
+/** A real execution marker, anchored to the completed candle that contains its fill timestamp. */
+type ExecutionMarker = {
+  at: string;
+  price: number;
+  side: 'LONG' | 'SHORT';
+  label: string;
+};
+
 type AcceptanceEvent = {
   at: number;
   side: 'LONG' | 'SHORT';
@@ -182,6 +192,31 @@ function currentAcceptance(candles: Candle[], high: number, low: number): 'LONG'
   return null;
 }
 
+/**
+ * Lightweight Charts markers must attach to an actual bar time.  Daily Range has an exact
+ * exchange fill timestamp, so bind it only to the completed 5m candle that contains that fill.
+ * Do not attach it to the nearest bar outside that window: a missing/not-yet-completed candle
+ * must result in no marker rather than a misleading visual entry.
+ */
+function entryMarkerForCompletedFiveMinuteCandle(
+  candles: Candle[],
+  marker: ExecutionMarker,
+): SeriesMarker<UTCTimestamp> | null {
+  const fillAt = Date.parse(marker.at);
+  if (!Number.isFinite(fillAt) || !(marker.price > 0)) return null;
+  const matchingCandle = candles.find((candle) => fillAt >= candle.openTime && fillAt < candle.openTime + 5 * 60_000);
+  if (!matchingCandle) return null;
+  return {
+    time: Math.floor(matchingCandle.openTime / 1000) as UTCTimestamp,
+    position: 'atPriceMiddle',
+    price: marker.price,
+    shape: 'circle',
+    size: 2,
+    color: marker.side === 'LONG' ? C.good : C.bad,
+    text: marker.label,
+  };
+}
+
 function CandlePane({
   title,
   candles,
@@ -191,6 +226,7 @@ function CandlePane({
   error,
   showMovingAverages = false,
   showStructuralTrendlines = false,
+  executionMarker,
   viewportKey,
   viewportStore,
 }: {
@@ -202,6 +238,8 @@ function CandlePane({
   error?: string | null;
   showMovingAverages?: boolean;
   showStructuralTrendlines?: boolean;
+  /** Only used by Daily Range's 5m panel, where the entry fill is persisted. */
+  executionMarker?: ExecutionMarker | null;
   /** Per leg/timeframe state survives the 30s completed-candle refresh. */
   viewportKey: string;
   viewportStore: MutableRefObject<Map<string, CandleViewport>>;
@@ -228,6 +266,10 @@ function CandlePane({
     candleSeries.setData(candles.map((candle) => ({
       time: toTime(candle.openTime), open: candle.open, high: candle.high, low: candle.low, close: candle.close,
     })));
+    if (executionMarker) {
+      const marker = entryMarkerForCompletedFiveMinuteCandle(candles, executionMarker);
+      if (marker) createSeriesMarkers(candleSeries, [marker]);
+    }
     const volumeSeries = chart.addSeries(HistogramSeries, {
       priceFormat: { type: 'volume' }, lastValueVisible: false, priceLineVisible: false,
     }, 1);
@@ -302,7 +344,7 @@ function CandlePane({
       window.removeEventListener('resize', resize);
       chart.remove();
     };
-  }, [candles, levels, showMovingAverages, showStructuralTrendlines, viewportKey, viewportStore]);
+  }, [candles, executionMarker, levels, showMovingAverages, showStructuralTrendlines, viewportKey, viewportStore]);
 
   return <div style={{ minWidth: 0, border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden', background: C.sub }}>
     <div style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}`, color: C.text, fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
@@ -435,6 +477,14 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     { price: reference.rangeLow, label: '4H range low · breakdown + acceptance short', color: C.bad },
     ...tradeLevels,
   ] : tradeLevels;
+  const dailyRangeEntryMarker: ExecutionMarker | null = isDailyRange && leg.openedAt && leg.entryPrice > 0
+    ? {
+      at: leg.openedAt,
+      price: leg.entryPrice,
+      side: leg.side,
+      label: `ENTRY ${leg.side}`,
+    }
+    : null;
   // A Daily Range trade cannot be accepted before its source 4h candle has closed.  Keep the
   // existing cross-sectional review's historical display semantics unchanged.
   const acceptanceCandles = reference && data
@@ -486,13 +536,14 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
           Range high <strong style={{ color: C.accent }}>{formatPrice(reference.rangeHigh)}</strong> · range low <strong style={{ color: C.good }}>{formatPrice(reference.rangeLow)}</strong>.
           Acceptance memakai <strong style={{ color: C.text }}>dua close 5m selesai berturut-turut</strong> di luar level tersebut.
           {' '}Garis putus-putus ini tetap horizontal karena ini harga high/low range 4H yang dibekukan untuk eksekusi.
+          {isDailyRange && <> Titik <strong style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>ENTRY {leg.side}</strong> di panel 5m adalah fill entry aktual pada waktu fill yang tersimpan.</>}
           {' '}Garis penuh oranye/biru di panel historis adalah resistance/support struktural: masing-masing menghubungkan dua pivot peak/trough selesai paling baru dan hanya untuk review visual.
           {' '}EMA20/EMA50 juga memakai completed candle saja; tidak mengubah formation, entry, sizing, atau exit.
         </> : <span>Level 4H UTC belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
       </div>
       <div className="candle-review-chart-stack">
         <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines viewportKey={`${leg.key}:historical:${historicalInterval}`} viewportStore={viewportStore} />
-        <CandlePane title={isDailyRange ? '5m · EMA20/EMA50 + breakout / breakdown + acceptance + native bracket' : '5m · EMA20/EMA50 + breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages viewportKey={`${leg.key}:5m`} viewportStore={viewportStore} />
+        <CandlePane title={isDailyRange ? '5m · EMA20/EMA50 + breakout / breakdown + acceptance + native bracket' : '5m · EMA20/EMA50 + breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages executionMarker={dailyRangeEntryMarker} viewportKey={`${leg.key}:5m`} viewportStore={viewportStore} />
       </div>
       {reference && <div style={{ padding: '0 12px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55 }}>
         Status acceptance sekarang: <strong style={{ color: latestAcceptance === 'LONG' ? C.good : latestAcceptance === 'SHORT' ? C.bad : C.text }}>{latestAcceptance ? `${latestAcceptance} confirmed` : 'belum ada dua close 5m berturut-turut'}</strong>.
