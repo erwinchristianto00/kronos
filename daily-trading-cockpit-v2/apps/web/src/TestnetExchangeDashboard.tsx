@@ -4,7 +4,7 @@ import './neural-mindmap.css';
 // table/accordion primitives also used by the Research dashboard's InnovationLanesCard.
 import { Disclosure, LaneMaturityTable, laneEdgeBadge, type LaneMaturityRow } from './LaneMaturityTable';
 import CrossSectionalReportCard from './CrossSectionalReportCard';
-import DailyRangeReportCard from './DailyRangeReportCard';
+import DailyRangeReportCard, { type DailyRangeHeadlineSummary } from './DailyRangeReportCard';
 import ContinuationLifecycleCard from './ContinuationLifecycleCard';
 
 const REFRESH_MS = 5_000;
@@ -1272,6 +1272,9 @@ export default function TestnetExchangeDashboard() {
   const exchangeRefreshMs = isLivePage ? LIVE_EXCHANGE_REFRESH_MS : REFRESH_MS;
   const allocationLabel = isLivePage ? 'LIVE lane allocation' : 'Testnet lane allocation';
   const [account, setAccount] = useState<LiveAccount | null>(null);
+  // Daily Range owns its own persisted fill history in each runtime. The headline receives its
+  // close-date aggregate from that same report instead of repurposing the range/signal date.
+  const [dailyRangeHeadline, setDailyRangeHeadline] = useState<DailyRangeHeadlineSummary | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const [laneSeries, setLaneSeries] = useState<LanePerformanceSeries | null>(null);
   const [mfeRolloutSeries, setMfeRolloutSeries] = useState<LanePerformanceSeries | null>(null);
@@ -2219,12 +2222,12 @@ export default function TestnetExchangeDashboard() {
           })()}
         </div>
         <div>
-          <span>Realized P&amp;L (today)</span>
+          <span>Realized P&amp;L (reported lanes)</span>
           {(() => {
-            // HEADLINE = HARI INI (UTC): mirror today + baskets today + single-symbol today. The
-            // lifetime numbers stay visible but clearly labeled all-time — the old headline summed
-            // lifetime mirror (which still carries the pre-fix churn-era losses) with baskets and
-            // read like a current loss ("kayanya kebawa data lama" — it wasn't stale, just mislabeled).
+            // HEADLINE = reported lanes only. The mirror stays deliberately out (see below), while
+            // Daily Range now contributes from its ACTUAL exit-fill timestamp in Asia/Taipei — never
+            // from its dateUtc, which is the range/signal session and can be the prior calendar day.
+            // Basket and single-symbol daily aggregates retain their operational UTC definition.
             // 2026-07-09: was CROSS_SECTIONAL_MARKET_NEUTRAL-only — the 2026-07-08 TREND/MIXED
             // instances merge into their OWN closedLanes entries (see annotateCrossSectionalAccount),
             // so a banked TREND/MIXED basket previously vanished from this all-time headline.
@@ -2248,25 +2251,30 @@ export default function TestnetExchangeDashboard() {
             const basketsAllTime = ['CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS_SECTIONAL_TREND', 'CROSS_SECTIONAL_MIXED']
               .reduce((sum, laneId) => sum + (account?.closedLanes?.find((l) => l.laneId === laneId)?.realizedPnlUsd ?? 0), 0);
             const singleSymbolAllTime = account?.singleSymbolExecutorRealizedPnlUsd?.allTime;
-            const allTime = basketsAllTime + (singleSymbolAllTime ?? 0);
+            const dailyRangeToday = dailyRangeHeadline?.todayNetPnlUsd;
+            const dailyRangeAllTime = dailyRangeHeadline?.allTimeNetPnlUsd;
+            const dailyRangeReady = dailyRangeHeadline != null;
+            const allTime = dailyRangeReady
+              ? basketsAllTime + (singleSymbolAllTime ?? 0) + (dailyRangeAllTime ?? 0)
+              : undefined;
             // 2026-07-11: was FILTERED-only (xsecExec?.dailyRealizedUsd) — TREND/MIXED's own daily
             // realized P&L never moved this "today" figure even though basketsAllTime above already
             // correctly folds all 3 in via account.closedLanes.
             const basketsToday = [xsecExec?.dailyRealizedUsd, xsecExecTrend?.dailyRealizedUsd, xsecExecMixed?.dailyRealizedUsd]
               .reduce<number | undefined>((sum, v) => (v != null ? (sum ?? 0) + v : sum), undefined);
             const singleSymbolToday = account?.singleSymbolExecutorRealizedPnlUsd?.today;
-            const today = basketsToday != null || singleSymbolToday != null
-              ? (basketsToday ?? 0) + (singleSymbolToday ?? 0)
+            const today = dailyRangeReady && (basketsToday != null || singleSymbolToday != null || dailyRangeToday != null)
+              ? (basketsToday ?? 0) + (singleSymbolToday ?? 0) + (dailyRangeToday ?? 0)
               : undefined;
             return (
               <>
                 <strong className={tone(today)}>{signed(today)}</strong>
                 <small>
-                  today — baskets {signed(basketsToday)} · single-symbol {signed(singleSymbolToday)}
+                  today — baskets {signed(basketsToday)} · daily range {dailyRangeReady ? signed(dailyRangeToday) : 'memuat…'} (close Taipei) · single-symbol {signed(singleSymbolToday)}
                   <br />
-                  all-time — baskets {signed(basketsAllTime)} · single-symbol {signed(singleSymbolAllTime)} · jumlah {signed(allTime)}
+                  all-time — baskets {signed(basketsAllTime)} · daily range {dailyRangeReady ? signed(dailyRangeAllTime) : 'memuat…'} · single-symbol {signed(singleSymbolAllTime)} · jumlah {signed(allTime)}
                   <br />
-                  <span style={{ opacity: 0.7 }}>mencakup 2 lane ini saja — bukan total akun; kill-switch tetap memakai angka penuh seluruh lane</span>
+                  <span style={{ opacity: 0.7 }}>mencakup basket + Daily Range + single-symbol; Daily Range hari ini = {dailyRangeHeadline?.closeDateTaipei ?? 'memuat'} berdasarkan exit fill Taipei — bukan total akun; kill-switch tetap memakai angka penuh seluruh lane</span>
                 </small>
               </>
             );
@@ -2477,7 +2485,7 @@ export default function TestnetExchangeDashboard() {
           directional-regime, instrumentation, shadow reports: all 200 on 3103). pageApiPrefix makes
           it follow whichever page it is rendered on. */}
       <CrossSectionalReportCard apiPrefix={pageApiPrefix} />
-      {!isLivePage && <DailyRangeReportCard apiPrefix={pageApiPrefix} />}
+      <DailyRangeReportCard apiPrefix={pageApiPrefix} onHeadlineSummary={setDailyRangeHeadline} />
       <ContinuationLifecycleCard apiPrefix={pageApiPrefix} />
 
       <main className="testnet-grid">

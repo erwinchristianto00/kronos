@@ -391,6 +391,7 @@ import {
 import { DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES } from "../lib/dynamic-mom36-continuation-runtime.js";
 import { isDynamicMom36ContinuationStrategy } from "../lib/dynamic-mom36-shock-strategy.js";
 import type { CrossSectionalAutoPool } from "../lib/cross-sectional-auto-pool.js";
+import { startCrossSectionalAutoPoolHeartbeat } from "../lib/cross-sectional-auto-pool-heartbeat.js";
 import { spotSymbolForCandles, buildWinnersCounterfactualReport } from "../lib/cross-sectional-winners-counterfactual.js";
 import { buildRegimeAxisTimeline } from "../lib/regime-axis-timeline.js";
 import { buildTpSweepReport } from "../lib/cross-sectional-tp-sweep.js";
@@ -544,11 +545,17 @@ export async function registerShadowRoutes(
       sizeMultiplier: Number.isFinite(multiplier) && multiplier > 0 ? multiplier : 1,
     };
   };
-  // Public metadata only: it cannot create, change, or close a basket. Priming at process start
-  // ensures the first formation after a deploy does not sit on a static fallback waiting for cadence.
-  const initialAutoPoolInput = autoPoolInput();
-  if (initialAutoPoolInput && opts.crossSectionalAutoPool) {
-    void opts.crossSectionalAutoPool.refreshIfDue(initialAutoPoolInput).catch(() => undefined);
+  // Public metadata only: it cannot create, change, or close a basket.  This must not depend on
+  // a dashboard/brief request: a quiet UI must not freeze the C1/C2 pool past its own cadence.
+  if (opts.crossSectionalAutoPool && autoPoolInput()) {
+    const stopAutoPoolHeartbeat = startCrossSectionalAutoPoolHeartbeat(
+      opts.crossSectionalAutoPool,
+      autoPoolInput,
+      { onError: (error) => console.error("[cross-sectional-auto-pool] REFRESH_FAILED", error) },
+    );
+    app.addHook("onClose", () => {
+      stopAutoPoolHeartbeat();
+    });
   }
   if (opts.notificationService) {
     opts.notificationService.setSnapshotProvider(() => {

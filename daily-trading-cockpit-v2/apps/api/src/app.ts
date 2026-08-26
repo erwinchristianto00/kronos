@@ -24,7 +24,7 @@ import { registerOutcomesRoutes } from "./routes/outcomes.js";
 import { registerScanRoute } from "./routes/scan.js";
 import { registerShadowRoutes } from "./routes/shadow.js";
 import { registerTradingAssistantRoutes } from "./routes/trading-assistant.js";
-import { BinanceFuturesPrivateClient, DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS, type BinanceFuturesRateLimitStatus } from "./lib/binance-futures-private.js";
+import { BinanceFuturesPrivateClient } from "./lib/binance-futures-private.js";
 import { FuturesMarketReferenceCache } from "./lib/futures-market-reference-cache.js";
 import {
   FuturesReferenceHealthTracker,
@@ -55,6 +55,7 @@ import {
   DailyRangeAcceptanceLane,
   DailyRangeLaneStore,
 } from "./lib/daily-4h-range-acceptance-lane.js";
+import { parseDailyRangeMainnetControls } from "./lib/daily-range-mainnet-policy.js";
 import {
   DailyRangeAutoPool,
   type DailyRangeAutoPoolSnapshot,
@@ -1066,9 +1067,6 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // Declared here (assigned below) so the shadow routes can READ the live engine's in-memory
   // status (sync getStatus, no I/O) for the order-reconciliation readiness gate, via a lazy getter.
   let liveEngine: LiveExecutionEngine | null = null;
-  // Same lazy-getter pattern as liveEngine: routes can expose bounded private-transport evidence
-  // without constructing another client or causing an additional Binance request.
-  let binanceTransportStatusGetter: (() => BinanceFuturesRateLimitStatus) | null = null;
   // Declared here (assigned inside the four-brain `if (!isTest)` block below, from that block's OWN
   // local `const`s — see the "Ref" suffix) so the shadow routes' /api/shadow/four-brain handler can
   // READ the live metrics aggregator + recent-decisions ring buffer via a lazy getter — same threading
@@ -1101,8 +1099,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // the four-brain path never mutates it.
   let liveExecutionStore: LiveExecutionStore | null = null;
   let crossSectionalExecutor: CrossSectionalExecutor | null = null;
-  // The daily range lane is deliberately nullable everywhere except the
-  // testnet-only construction below.  No live process can construct it.
+  // The Daily Range lane remains nullable for non-execution processes. A
+  // mainnet execution process may construct it only in observation mode until
+  // the lane's independent real-money policy explicitly permits more.
   let dailyRangeLane: DailyRangeAcceptanceLane | null = null;
   // The Daily Range pool is a separate C1-C6 universe. Keeping its snapshot behind a getter lets
   // the Testnet status route expose exactly what was eligible without giving Live any construction
@@ -1346,22 +1345,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   const fourBrainOutcomeDataDirRuntime = fourBrainTestnetFocusEnabled ? "data/four-brain-testnet-focus" : "data";
   fourBrainExactFillCohortSinceMs = resolveFourBrainExactFillCohortSinceMs();
   if (liveConfig.enabled && liveConfig.configErrors.length === 0 && liveConfig.env) {
-    const configuredSignedReadIntervalMs = Number(process.env.LIVE_BINANCE_SIGNED_READ_MIN_INTERVAL_MS ?? "");
-    const signedReadMinIntervalMs = Number.isFinite(configuredSignedReadIntervalMs) &&
-      configuredSignedReadIntervalMs >= 0 && configuredSignedReadIntervalMs <= 60_000
-      ? Math.floor(configuredSignedReadIntervalMs)
-      : liveConfig.env === "testnet"
-        ? DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS
-        : 0;
     const liveClient = new BinanceFuturesPrivateClient({
       apiKey: liveConfig.apiKey,
       apiSecret: liveConfig.apiSecret,
       env: liveConfig.env,
       fetchImpl: options.fetchImpl,
-      signedReadMinIntervalMs,
     });
-    binanceTransportStatusGetter = () => liveClient.getRateLimitStatus();
-    console.log(`[binance-transport] env=${liveConfig.env} signedReadMinIntervalMs=${signedReadMinIntervalMs}`);
     // RECORDING-ONLY (2026-07-27). Keep the existing SPOT mid as the entry-quality gate input, while
     // prewarming an independent book reference from the SAME USD-M testnet/mainnet base used for
     // execution. The execution-book fetch runs in parallel and is capped at 750ms; failure/timeout
@@ -1599,44 +1588,62 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       timelineExitGate: (symbol: string, direction: "LONG" | "SHORT") =>
         singleSymbolPriceTimeline?.exitGate(symbol, direction) ?? Promise.resolve({ shouldExit: false, reason: null }),
     };
-    // Completely isolated, Testnet-only lane. It has no mainnet switch: the
-    // construction condition itself is the live boundary. Its C1/C2 membership
-    // pool is deliberately disjoint from the cross-sectional candidate universe:
-    // the durable lease below remains a safety backstop, not a normal basket blocker.
-    // It starts DISARMED; its scheduler only reconciles/records until a passing
-    // exchange canary is persisted and an operator arms this lane through its
-    // own endpoint.
-    if (!isTest && liveConfig.env === "testnet") {
+    // Daily Range has its own C1-C6 membership contract and durable symbol
+    // leases. Testnet remains unchanged. Mainnet constructs an isolated,
+    // DISARMED observation lane whose class-level policy rejects every order
+    // until all dedicated real-money controls are explicitly enabled.
+    if (!isTest && (liveConfig.env === "testnet" || liveConfig.env === "mainnet")) {
+      const dailyRangeMainnetControls = liveConfig.env === "mainnet"
+        ? parseDailyRangeMainnetControls(process.env)
+        : undefined;
+      const dailyRangeStateFile = liveConfig.env === "mainnet"
+        ? "daily-4h-range-acceptance-2r-v1-mainnet.json"
+        : "daily-4h-range-acceptance-2r-v1.json";
+      const dailyRangePoolFile = liveConfig.env === "mainnet"
+        ? "daily-range-auto-pool-mainnet.json"
+        : "daily-range-auto-pool.json";
       const dailyRangePoolInput = () => resolveDailyRangeAutoPoolInput(
         CROSS_SECTIONAL_UNIVERSE,
         dailyRangeForeignStrategySymbols(),
       );
       const dailyRangeAutoPool = new DailyRangeAutoPool({
         dataDir: "data",
-        fileName: "daily-range-auto-pool.json",
+        fileName: dailyRangePoolFile,
         fetchImpl: options.fetchImpl,
-        // Mainnet public data supplies liquidity, spread, and history. C1 also proves this
-        // exact symbol exists on the Testnet venue where the Daily lane submits orders.
-        venueSymbols: async () => new Set((await liveClient.getExchangeFilters()).keys()),
       });
       const currentDailyRangePool = () => dailyRangeAutoPool.getSnapshot(dailyRangePoolInput());
       dailyRangeAutoPoolSnapshot = () => currentDailyRangePool();
       const dailyRangeUniverse = () => {
-        const pool = currentDailyRangePool();
+        const input = dailyRangePoolInput();
+        const pool = dailyRangeAutoPool.getSnapshot(input);
         return {
           symbols: pool.activeSymbols,
           source: "DAILY_RANGE_AUTO_POOL_V2:" + pool.state,
+          poolEvidence: dailyRangeAutoPool.getEvidence(input, pool),
         };
       };
       dailyRangeLane = new DailyRangeAcceptanceLane({
         client: liveClient,
-        store: new DailyRangeLaneStore("data"),
+        store: new DailyRangeLaneStore("data", dailyRangeStateFile),
         getUniverse: dailyRangeUniverse,
         // The daily lane has its own disjoint catalog and therefore must not inherit a
         // cross-sectional short blocklist that was designed for different symbols/risk.
         getShortBlocklist: () => new Set<string>(),
         entryClaims: singleSymbolEntryClaims,
-        environment: "testnet",
+        environment: liveConfig.env,
+        mainnetControls: dailyRangeMainnetControls,
+        entryGate: () => {
+          if (liveConfig.env !== "mainnet") return { allowed: true, reason: null };
+          const engine = liveEngine;
+          if (!engine) return { allowed: false, reason: "mainnet account safety engine is unavailable" };
+          return {
+            allowed: engine.canOpenNewAccountEntries(),
+            reason: engine.newAccountEntryBlockReason(),
+          };
+        },
+        onTradeClosed: liveConfig.env === "mainnet"
+          ? (netPnlUsd) => liveEngine?.recordExternalConsecutiveLossOutcome(netPnlUsd)
+          : undefined,
       });
       const tickDailyRangeLane = (): void => {
         void dailyRangeAutoPool.refreshIfDue(dailyRangePoolInput())
@@ -1646,8 +1653,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       setTimeout(tickDailyRangeLane, 20_000);
       setInterval(tickDailyRangeLane, 30_000);
       console.log(
-        "[daily-range-lane] READY environment=testnet version=" + DAILY_RANGE_LANE_ID +
-        " control=DISARMED pool=DAILY_RANGE_AUTO_POOL_V2 candidates=ALL_USDM_PERPETUAL",
+        "[daily-range-lane] READY environment=" + liveConfig.env + " version=" + DAILY_RANGE_LANE_ID +
+        " control=DISARMED pool=DAILY_RANGE_AUTO_POOL_V2 candidates=ALL_USDM_PERPETUAL" +
+        (liveConfig.env === "mainnet" ? " mode=OBSERVE_ONLY_UNTIL_EXPLICIT_ARM" : ""),
       );
     }
     // Shared account-exposure coordinator (account-exposure-coordinator.ts) — the reserve-then-
@@ -1821,21 +1829,29 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // allSingleSymbolLaneExecutors() closures above instead of its own duplicated literal array.
       externalManagedNetQty: () => {
         const net = computeExternalManagedNetQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors());
-        // Testnet-only daily-range ownership must also be visible to the legacy
-        // mirror's reconciliation. Otherwise it would label the lane's exact
-        // exchange position an orphan; Live never receives this extra claim.
-        if (liveConfig.env === "testnet") {
-          for (const [symbol, qty] of dailyRangeLane?.managedNetQty() ?? []) {
-            net.set(symbol, (net.get(symbol) ?? 0) + qty);
-          }
+        // A Daily Range trade has an exact exchange-native bracket on a one-way
+        // account. Its durable claim must be visible in both runtimes or the
+        // legacy mirror can label it an orphan / net against it.
+        for (const [symbol, qty] of dailyRangeLane?.managedNetQty() ?? []) {
+          net.set(symbol, (net.get(symbol) ?? 0) + qty);
         }
         return net;
       },
       // 2026-08-17 maker-entry disarm fix: resting post-only entry orders are not yet legs, so the
       // net claim above cannot see them — reconcile() needs them as a separate tolerance band.
-      externalPendingEntryQty: () =>
-        computeExternalPendingEntryQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
-      ...(liveConfig.env === "testnet" ? {
+      externalPendingEntryQty: () => {
+        const pending = computeExternalPendingEntryQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors());
+        // A normal Daily Range entry and DRCANARY both persist their bounded
+        // requested quantity before a MARKET POST. They are not yet a durable
+        // net claim, but reconcile may observe a partial/full fill before the
+        // lane adopts it. Merge only into the tolerance band, never into the
+        // managed-net map used by lifecycle/close calculations.
+        for (const [symbol, qty] of dailyRangeLane?.pendingEntryNetQty() ?? []) {
+          pending.set(symbol, (pending.get(symbol) ?? 0) + qty);
+        }
+        return pending;
+      },
+      ...(dailyRangeLane ? {
         externalEntryBlockReason: (symbol: string) => {
           const lease = dailyRangeLane?.isSymbolLeased(symbol);
           return lease ? `daily range lane lease ${lease.tradeId} (${lease.status})` : null;
@@ -1845,8 +1861,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // account-wide kill-switch (killSwitchTrip) can finally see real losses/gains from these lanes
       // instead of only its own mirror/directional-slot ledger — see live-executor-wiring.ts's
       // sumExternalRealizedPnlUsd doc comment.
-      getExternalRealizedPnlUsd: () =>
-        sumExternalRealizedPnlUsd(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
+      getExternalRealizedPnlUsd: () => {
+        const external = sumExternalRealizedPnlUsd(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors());
+        // Testnet's current lane accounting is intentionally untouched. Once
+        // promoted, mainnet Daily Range is part of the same account-wide daily
+        // loss/drawdown safety total as every other independently-owned lane.
+        const daily = liveConfig.env === "mainnet" ? dailyRangeLane?.realizedPnlSummary() : null;
+        return {
+          today: external.today + (daily?.today ?? 0),
+          allTime: external.allTime + (daily?.allTime ?? 0),
+        };
+      },
       // 2026-07-12 kill-switch RESPONSE fix: when the account-wide breaker trips, close the OTHER
       // 11 executors' positions too — via each executor's OWN orderly close (reduce-only,
       // netting-aware), never a blanket symbol flatten (2026-07-07 netting-blind-closes rule).
@@ -1867,6 +1892,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
             await exec.closeAllPositionsOrderly(killReason);
           } catch (error) {
             console.error(`[app] kill-switch single-symbol close failed: ${(error as Error).message}`);
+          }
+        }
+        if (liveConfig.env === "mainnet" && dailyRangeLane) {
+          try {
+            const result = await dailyRangeLane.closeAllTradesOrderly(killReason);
+            if (result.failed > 0) {
+              console.error(`[app] kill-switch Daily Range close incomplete: ${result.failed} trade(s) unresolved`);
+            }
+          } catch (error) {
+            console.error(`[app] kill-switch Daily Range close failed: ${(error as Error).message}`);
           }
         }
       },
@@ -2528,7 +2563,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           (crossSectionalTrendExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalMixedExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
         sharedGetPositions,
-        ...(liveConfig.env === "testnet" ? {
+        ...(dailyRangeLane ? {
           isSymbolEntryBlocked: (symbol: string) => {
             const lease = dailyRangeLane?.isSymbolLeased(symbol);
             return lease ? `daily range lane lease ${lease.tradeId} (${lease.status})` : null;
@@ -2614,7 +2649,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           (crossSectionalExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalMixedExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
         sharedGetPositions,
-        ...(liveConfig.env === "testnet" ? {
+        ...(dailyRangeLane ? {
           isSymbolEntryBlocked: (symbol: string) => {
             const lease = dailyRangeLane?.isSymbolLeased(symbol);
             return lease ? `daily range lane lease ${lease.tradeId} (${lease.status})` : null;
@@ -2664,7 +2699,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           (crossSectionalExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalTrendExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
         sharedGetPositions,
-        ...(liveConfig.env === "testnet" ? {
+        ...(dailyRangeLane ? {
           isSymbolEntryBlocked: (symbol: string) => {
             const lease = dailyRangeLane?.isSymbolLeased(symbol);
             return lease ? `daily range lane lease ${lease.tradeId} (${lease.status})` : null;
@@ -3357,7 +3392,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
               .filter((candidate): candidate is CrossSectionalExecutor => candidate !== null && candidate !== executor)
               .reduce((sum, candidate) => sum + candidate.getDailyRealizedUsd(nowIso), 0),
           sharedGetPositions,
-          ...(liveConfig.env === "testnet" ? {
+          ...(dailyRangeLane ? {
             isSymbolEntryBlocked: (symbol: string) => {
               const lease = dailyRangeLane?.isSymbolLeased(symbol);
               return lease ? `daily range lane lease ${lease.tradeId} (${lease.status})` : null;
@@ -4855,7 +4890,6 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     unifiedProposalStore: () => unifiedProposalStore,
     singleSymbolPriceTimeline: () => singleSymbolPriceTimeline,
     marketCandles: (symbol, interval, limit) => binanceClient.getFuturesCandles(symbol, interval, limit),
-    binanceTransportStatus: () => binanceTransportStatusGetter?.() ?? null,
     futuresReferenceHealth: () => futuresReferenceHealth?.snapshot() ?? null,
     probeFuturesReferenceHealth: (symbols) =>
       probeFuturesReferenceHealth ? probeFuturesReferenceHealth(symbols) : Promise.resolve(null),

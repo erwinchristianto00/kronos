@@ -28,6 +28,7 @@ import {
   type DailyRangeSignal,
   type DailyRangeSymbolState,
 } from "../src/lib/daily-4h-range-acceptance-lane.js";
+import type { DailyRangeMainnetControls } from "../src/lib/daily-range-mainnet-policy.js";
 
 const DAY = Date.UTC(2026, 7, 26);
 const AT_0410 = DAY + 4 * 3_600_000 + 10 * 60_000;
@@ -175,6 +176,41 @@ function makeLane(client: FakeDailyClient, nowRef: { value: number }, universe =
     getShortBlocklist: () => new Set<string>(),
     entryClaims: claim,
     environment: "testnet",
+    nowMs: () => nowRef.value,
+    confirmRetryMs: 0,
+  });
+  return { lane, store, dir };
+}
+
+function mainnetControls(overrides: Partial<DailyRangeMainnetControls> = {}): DailyRangeMainnetControls {
+  return {
+    executionEnabled: true,
+    confirmed: true,
+    canaryEnabled: true,
+    armEnabled: true,
+    maxOpenTrades: 1,
+    maxGrossNotionalUsd: 25,
+    ...overrides,
+  };
+}
+
+function makeMainnetLane(
+  client: FakeDailyClient,
+  nowRef: { value: number },
+  controls?: DailyRangeMainnetControls,
+  entryGate = () => ({ allowed: true, reason: null }),
+) {
+  const dir = dataDir();
+  const store = new DailyRangeLaneStore(dir, "state.json", nowRef.value);
+  const lane = new DailyRangeAcceptanceLane({
+    client,
+    store,
+    getUniverse: () => ({ symbols, source: "TEST" }),
+    getShortBlocklist: () => new Set<string>(),
+    entryClaims: { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+    environment: "mainnet",
+    mainnetControls: controls,
+    entryGate,
     nowMs: () => nowRef.value,
     confirmRetryMs: 0,
   });
@@ -336,11 +372,9 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     const trade = store.getState().trades[0]!;
     expect(trade.status).toBe("OPEN");
     trade.lastReconcileError = "account reconciliation unavailable: rate limited (HTTP 418)";
-    store.getState().runtime.reconciliationError = "rate limited (HTTP 418)";
     await (lane as unknown as { reconcileOpenTrades(): Promise<void> }).reconcileOpenTrades();
 
     expect(trade.lastReconcileError).toBeNull();
-    expect(store.getState().runtime.reconciliationError).toBeNull();
     expect(lane.getOpenPositionClaims()).toEqual([expect.objectContaining({
       laneId: "DAILY_4H_RANGE_ACCEPTANCE",
       tradeId: trade.tradeId,
@@ -399,6 +433,47 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect(evidence.orphanPosition).toBe(false);
     expect(evidence.orphanOrders).toBe(0);
     expect(client.cancelledAlgos).toHaveLength(2);
+  });
+
+  it("keeps a mainnet lane structurally unable to arm, canary, or submit with no dedicated controls", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeMainnetLane(client, now);
+    expect(lane.arm()).toMatchObject({ ok: false, mode: "DISARMED" });
+    await expect(lane.runCanary()).rejects.toThrow("mainnet execution is disabled");
+
+    // A stale/hand-edited persisted ARMED state cannot bypass the class-level
+    // policy. This models the exact failure mode a deployment guard must stop.
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value);
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    expect(row.reason).toBe("MAINNET_EXECUTION_DISABLED");
+    expect(client.placed).toHaveLength(0);
+  });
+
+  it("enforces mainnet account gate and atomic open-trade/notional caps before every entry", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const denied = makeMainnetLane(client, now, mainnetControls(), () => ({ allowed: false, reason: "account kill switch" }));
+    denied.store.arm(new Date(now.value).toISOString());
+    const deniedSignal = signal("AAAUSDT", now.value);
+    denied.store.getState().signals.push(deniedSignal);
+    await (denied.lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(deniedSignal);
+    expect(deniedSignal.reason).toBe("ACCOUNT_ENTRY_BLOCKED");
+    expect(client.placed).toHaveLength(0);
+
+    const capped = makeMainnetLane(client, now, mainnetControls());
+    capped.store.arm(new Date(now.value).toISOString());
+    const first = signal("BBBUSDT", now.value);
+    const second = signal("CCCUSDT", now.value);
+    capped.store.getState().signals.push(first, second);
+    await Promise.all([first, second].map((row) =>
+      (capped.lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row),
+    ));
+    expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(1);
+    expect(capped.store.getState().trades.filter((trade) => trade.status === "OPEN")).toHaveLength(1);
+    expect(["MAX_OPEN_TRADES_REACHED", "MAX_GROSS_NOTIONAL_REACHED"]).toContain(second.reason);
   });
 
   it("persists watermarks/locks across a restart and does not duplicate a prior C1/C2 run", async () => {

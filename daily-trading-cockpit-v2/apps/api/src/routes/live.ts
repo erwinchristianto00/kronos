@@ -17,7 +17,7 @@ import { buildInstrumentationReport } from "../lib/instrumentation-report.js";
 import { rejectedBasketLogPath } from "../lib/rejected-basket-recorder.js";
 import type { FastifyInstance } from "fastify";
 
-import { BinanceFuturesPrivateError, withBinanceTransportSource, type BinanceFuturesRateLimitStatus } from "../lib/binance-futures-private.js";
+import { BinanceFuturesPrivateError } from "../lib/binance-futures-private.js";
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
 import { fullyCostedNetPnlUsd, fullyCostedFeeUsd } from "../lib/fully-costed-net-pnl.js";
 import { poolReconciliationPlan } from "../lib/symbol-pool-reconciliation.js";
@@ -33,7 +33,7 @@ import {
 } from "../lib/cross-sectional-executor.js";
 import type { CrossSectionalAutoPool, CrossSectionalAutoPoolSnapshot } from "../lib/cross-sectional-auto-pool.js";
 import type { SymbolReliabilitySnapshot } from "../lib/cross-sectional-symbol-reliability.js";
-import { DAILY_RANGE_LANE_ID, type DailyRangeAcceptanceLane } from "../lib/daily-4h-range-acceptance-lane.js";
+import { DAILY_RANGE_LANE_ID, type DailyRangeAcceptanceLane, type DailyRangeCanaryEvidence } from "../lib/daily-4h-range-acceptance-lane.js";
 import type { DailyRangeAutoPoolSnapshot } from "../lib/daily-range-auto-pool.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
 import {
@@ -237,24 +237,7 @@ export function scheduledOpenBasketDeadline(
 }
 
 const DASHBOARD_ACCOUNT_CACHE_TTL_MS = 15_000;
-const TESTNET_DASHBOARD_ACCOUNT_CACHE_TTL_MS = 30_000;
 const DASHBOARD_ACCOUNT_RATE_LIMIT_BACKOFF_MS = 60_000;
-
-/**
- * The dashboard is observability-only. Testnet's private REST path repeatedly hit 418 when a 15s
- * account snapshot ran beside active reconciliation loops, so retain a fresh-enough 30s view there
- * while keeping Live's existing 15s display cadence unchanged. A bounded env override is provided
- * for an incident response, but cannot accidentally turn this into a sub-second poller.
- */
-export function resolveDashboardAccountCacheTtlMs(env: NodeJS.ProcessEnv = process.env): number {
-  const configured = Number(env.LIVE_DASHBOARD_ACCOUNT_CACHE_TTL_MS ?? "");
-  if (Number.isFinite(configured) && configured >= 5_000 && configured <= 5 * 60_000) {
-    return Math.floor(configured);
-  }
-  return env.LIVE_BINANCE_ENV === "testnet"
-    ? TESTNET_DASHBOARD_ACCOUNT_CACHE_TTL_MS
-    : DASHBOARD_ACCOUNT_CACHE_TTL_MS;
-}
 
 /**
  * Account data is observability-only here.  Never feed this cache into entry, exit, reconciliation,
@@ -316,7 +299,7 @@ function createDashboardAccountSnapshotReader(
   } = {},
 ): () => Promise<DashboardAccountSnapshot> {
   const nowMs = options.nowMs ?? (() => Date.now());
-  const cacheTtlMs = options.cacheTtlMs ?? resolveDashboardAccountCacheTtlMs();
+  const cacheTtlMs = options.cacheTtlMs ?? DASHBOARD_ACCOUNT_CACHE_TTL_MS;
   const rateLimitBackoffMs = options.rateLimitBackoffMs ?? DASHBOARD_ACCOUNT_RATE_LIMIT_BACKOFF_MS;
   let cache: { snapshot: LiveAccountSnapshot; fetchedAtMs: number } | null = null;
   let retryAfterMs = 0;
@@ -340,7 +323,7 @@ function createDashboardAccountSnapshotReader(
     };
   };
 
-  return async (): Promise<DashboardAccountSnapshot> => withBinanceTransportSource("dashboard.account", async () => {
+  return async (): Promise<DashboardAccountSnapshot> => {
     const now = nowMs();
     if (cache && now - cache.fetchedAtMs < cacheTtlMs) {
       return cached("USD_M_PRIVATE_CACHE", false);
@@ -377,7 +360,7 @@ function createDashboardAccountSnapshotReader(
       }
     })();
     return inFlight;
-  });
+  };
 }
 
 /** The account route adds report-only executor attribution. Keep that mutation out of the shared
@@ -1311,9 +1294,9 @@ export async function registerLiveRoutes(
   opts: {
     configErrors?: string[];
     crossSectionalExecutor?: () => CrossSectionalExecutor | null;
-    /** Isolated, structurally Testnet-only daily 4h range acceptance lane. */
+    /** Isolated Daily 4h range acceptance lane; Mainnet is fail-closed by its own policy. */
     dailyRangeLane?: () => DailyRangeAcceptanceLane | null;
-    /** C1-C6 pool evidence for the isolated Testnet Daily Range lane. */
+    /** C1-C6 pool evidence for the isolated Daily Range lane. */
     dailyRangeAutoPoolSnapshot?: () => DailyRangeAutoPoolSnapshot | null;
     /** Same durable C1/C2 pool consumed by Dynamic formation; status only on this route. */
     crossSectionalAutoPool?: () => CrossSectionalAutoPool | null;
@@ -1353,11 +1336,9 @@ export async function registerLiveRoutes(
     openBasketChartNowMs?: () => number;
     /** Read-only USD-M sizing-reference diagnostics. Never reaches any order route. */
     futuresReferenceHealth?: () => FuturesReferenceHealthSnapshot | null;
-    /** Read-only private-transport telemetry. The route never makes a Binance request itself. */
-    binanceTransportStatus?: () => BinanceFuturesRateLimitStatus | null;
     /** Optional, bounded public-USD-M refresh for a diagnostic watch list. */
     probeFuturesReferenceHealth?: (symbols: string[]) => Promise<FuturesReferenceHealthSnapshot | null>;
-    /** Test seam only. Production uses a 30s Testnet / 15s Live shared read and a 60s HTTP-418 cooldown. */
+    /** Test seam only. Production uses a 15s shared read and a 60s HTTP-418 cooldown. */
     dashboardAccountSnapshot?: {
       nowMs?: () => number;
       cacheTtlMs?: number;
@@ -1443,18 +1424,6 @@ export async function registerLiveRoutes(
       unifiedOrchestrator: opts.unifiedOrchestrator?.()?.getStatus() ?? null,
       unifiedProposalSource: opts.unifiedProposalStore?.()?.getStatus() ?? null,
     };
-  });
-
-  // This intentionally returns the client-owned evidence as-is and does no network I/O.  It lets
-  // an operator distinguish an active cooldown from an old failure, and identify the bounded
-  // caller/endpoint/weight history without ever exposing signed URLs, API keys, or signatures.
-  app.get("/api/live/binance-transport", async (request, reply) => {
-    const status = opts.binanceTransportStatus?.() ?? null;
-    if (!status) {
-      reply.code(503);
-      return { available: false, reason: "private Binance transport is unavailable because execution runtime is disabled" };
-    }
-    return { available: true, ...status };
   });
 
   app.get("/api/live/futures-reference-health", async (request, reply) => {
@@ -2146,7 +2115,7 @@ export async function registerLiveRoutes(
     };
   });
 
-  // ── Daily 4h range-acceptance lane (Testnet-only, isolated from MOM36) ────
+  // ── Daily 4h range-acceptance lane (isolated from MOM36) ──────────────────
   // Read-only chart feed for a specific durable Daily Range trade.  Unlike the
   // generic basket review route, this intentionally takes the persisted range
   // from the trade, so an open trade keeps the exact 00:00-04:00 UTC reference
@@ -2155,7 +2124,7 @@ export async function registerLiveRoutes(
     const lane = opts.dailyRangeLane?.() ?? null;
     if (!lane) {
       reply.code(503);
-      return { ok: false, reason: "daily range lane is unavailable outside Testnet" };
+      return { ok: false, reason: "daily range lane is unavailable in this runtime" };
     }
     const query = (request.query ?? {}) as { tradeId?: unknown };
     const tradeId = typeof query.tradeId === "string" ? query.tradeId.trim() : "";
@@ -2217,7 +2186,7 @@ export async function registerLiveRoutes(
   app.get("/api/live/daily-range-lane/status", async () => {
     const lane = opts.dailyRangeLane?.() ?? null;
     if (!lane) {
-      return { enabled: false, reason: "daily range lane is available only in the Testnet runtime" };
+      return { enabled: false, reason: "daily range lane is unavailable in this runtime" };
     }
     return {
       enabled: true,
@@ -2230,13 +2199,13 @@ export async function registerLiveRoutes(
     const lane = opts.dailyRangeLane?.() ?? null;
     if (!lane) {
       reply.code(503);
-      return { ok: false, reason: "daily range lane is unavailable outside Testnet" };
+      return { ok: false, reason: "daily range lane is unavailable in this runtime" };
     }
     const query = (request.query ?? {}) as { kind?: string; limit?: string | number };
     const kind = query.kind;
-    if (kind !== "levels" && kind !== "signals" && kind !== "trades") {
+    if (kind !== "levels" && kind !== "signals" && kind !== "trades" && kind !== "cohorts" && kind !== "pool-evidence") {
       reply.code(400);
-      return { ok: false, reason: "kind must be levels, signals, or trades" };
+      return { ok: false, reason: "kind must be levels, signals, trades, cohorts, or pool-evidence" };
     }
     const parsedLimit = typeof query.limit === "number" ? query.limit : Number.parseInt(query.limit ?? "500", 10);
     return { ok: true, kind, rows: lane.history(kind, Number.isFinite(parsedLimit) ? parsedLimit : 500) };
@@ -2246,13 +2215,13 @@ export async function registerLiveRoutes(
     const lane = opts.dailyRangeLane?.() ?? null;
     if (!lane) {
       reply.code(503);
-      return { ok: false, reason: "daily range lane is unavailable outside Testnet" };
+      return { ok: false, reason: "daily range lane is unavailable in this runtime" };
     }
     const params = request.params as { kind?: string };
     const kind = params.kind;
-    if (kind !== "levels" && kind !== "signals" && kind !== "trades") {
+    if (kind !== "levels" && kind !== "signals" && kind !== "trades" && kind !== "cohorts" && kind !== "pool-evidence") {
       reply.code(400);
-      return { ok: false, reason: "kind must be levels, signals, or trades" };
+      return { ok: false, reason: "kind must be levels, signals, trades, cohorts, or pool-evidence" };
     }
     const query = (request.query ?? {}) as { format?: string };
     if (query.format === "csv") {
@@ -2263,34 +2232,44 @@ export async function registerLiveRoutes(
   });
 
   app.post("/api/live/daily-range-lane/canary", async (request, reply) => {
-    if (!isLoopbackAddress(request.ip) || process.env.LIVE_BINANCE_ENV !== "testnet") {
+    const runtime = process.env.LIVE_BINANCE_ENV;
+    if (!isLoopbackAddress(request.ip) || (runtime !== "testnet" && runtime !== "mainnet")) {
       reply.code(403);
-      return { ok: false, reason: "Testnet loopback caller required" };
+      return { ok: false, reason: "local execution-runtime caller required" };
     }
     const body = (request.body ?? {}) as { confirm?: string };
-    if (body.confirm !== "RUN_DAILY_RANGE_CANARY") {
+    const expectedConfirm = runtime === "mainnet" ? "RUN_DAILY_RANGE_MAINNET_CANARY" : "RUN_DAILY_RANGE_CANARY";
+    if (body.confirm !== expectedConfirm) {
       reply.code(400);
-      return { ok: false, reason: 'canary requires body {"confirm":"RUN_DAILY_RANGE_CANARY"}' };
+      return { ok: false, reason: `canary requires body {"confirm":"${expectedConfirm}"}` };
     }
     const lane = opts.dailyRangeLane?.() ?? null;
     if (!lane) {
       reply.code(503);
       return { ok: false, reason: "daily range lane is unavailable" };
     }
-    const evidence = await lane.runCanary();
+    let evidence: DailyRangeCanaryEvidence;
+    try {
+      evidence = await lane.runCanary();
+    } catch (error) {
+      reply.code(409);
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
     if (evidence.status !== "PASSED") reply.code(409);
     return { ok: evidence.status === "PASSED", evidence };
   });
 
   app.post("/api/live/daily-range-lane/arm", async (request, reply) => {
-    if (!isLoopbackAddress(request.ip) || process.env.LIVE_BINANCE_ENV !== "testnet") {
+    const runtime = process.env.LIVE_BINANCE_ENV;
+    if (!isLoopbackAddress(request.ip) || (runtime !== "testnet" && runtime !== "mainnet")) {
       reply.code(403);
-      return { ok: false, reason: "Testnet loopback caller required" };
+      return { ok: false, reason: "local execution-runtime caller required" };
     }
     const body = (request.body ?? {}) as { confirm?: string };
-    if (body.confirm !== "ARM_DAILY_RANGE_LANE") {
+    const expectedConfirm = runtime === "mainnet" ? "ARM_DAILY_RANGE_MAINNET_LANE" : "ARM_DAILY_RANGE_LANE";
+    if (body.confirm !== expectedConfirm) {
       reply.code(400);
-      return { ok: false, reason: 'arm requires body {"confirm":"ARM_DAILY_RANGE_LANE"}' };
+      return { ok: false, reason: `arm requires body {"confirm":"${expectedConfirm}"}` };
     }
     const lane = opts.dailyRangeLane?.() ?? null;
     if (!lane) {
@@ -2303,14 +2282,16 @@ export async function registerLiveRoutes(
   });
 
   app.post("/api/live/daily-range-lane/disarm", async (request, reply) => {
-    if (!isLoopbackAddress(request.ip) || process.env.LIVE_BINANCE_ENV !== "testnet") {
+    const runtime = process.env.LIVE_BINANCE_ENV;
+    if (!isLoopbackAddress(request.ip) || (runtime !== "testnet" && runtime !== "mainnet")) {
       reply.code(403);
-      return { ok: false, reason: "Testnet loopback caller required" };
+      return { ok: false, reason: "local execution-runtime caller required" };
     }
     const body = (request.body ?? {}) as { confirm?: string; reason?: string };
-    if (body.confirm !== "DISARM_DAILY_RANGE_LANE") {
+    const expectedConfirm = runtime === "mainnet" ? "DISARM_DAILY_RANGE_MAINNET_LANE" : "DISARM_DAILY_RANGE_LANE";
+    if (body.confirm !== expectedConfirm) {
       reply.code(400);
-      return { ok: false, reason: 'disarm requires body {"confirm":"DISARM_DAILY_RANGE_LANE"}' };
+      return { ok: false, reason: `disarm requires body {"confirm":"${expectedConfirm}"}` };
     }
     const lane = opts.dailyRangeLane?.() ?? null;
     if (!lane) {
@@ -2321,14 +2302,16 @@ export async function registerLiveRoutes(
   });
 
   app.post("/api/live/daily-range-lane/close", async (request, reply) => {
-    if (!isLoopbackAddress(request.ip) || process.env.LIVE_BINANCE_ENV !== "testnet") {
+    const runtime = process.env.LIVE_BINANCE_ENV;
+    if (!isLoopbackAddress(request.ip) || (runtime !== "testnet" && runtime !== "mainnet")) {
       reply.code(403);
-      return { ok: false, reason: "Testnet loopback caller required" };
+      return { ok: false, reason: "local execution-runtime caller required" };
     }
     const body = (request.body ?? {}) as { confirm?: string; tradeId?: string };
-    if (body.confirm !== "CLOSE_DAILY_RANGE_TRADE" || typeof body.tradeId !== "string" || !body.tradeId.trim()) {
+    const expectedConfirm = runtime === "mainnet" ? "CLOSE_DAILY_RANGE_MAINNET_TRADE" : "CLOSE_DAILY_RANGE_TRADE";
+    if (body.confirm !== expectedConfirm || typeof body.tradeId !== "string" || !body.tradeId.trim()) {
       reply.code(400);
-      return { ok: false, reason: 'close requires body {"confirm":"CLOSE_DAILY_RANGE_TRADE","tradeId":"..."}' };
+      return { ok: false, reason: `close requires body {"confirm":"${expectedConfirm}","tradeId":"..."}` };
     }
     const lane = opts.dailyRangeLane?.() ?? null;
     if (!lane) {

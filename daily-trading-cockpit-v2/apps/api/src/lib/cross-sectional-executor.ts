@@ -48,7 +48,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, resolve } from "node:path";
 
 import type { ExposureReserveCampaignCap, ExposureReserveRequest, ExposureReserveResult } from "./account-exposure-coordinator.js";
-import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, withBinanceTransportSource, type BinanceFuturesPrivateClient, type FillPriceResolution, type FuturesOrder, type FuturesSymbolFilters } from "./binance-futures-private.js";
+import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, type BinanceFuturesPrivateClient, type FillPriceResolution, type FuturesOrder, type FuturesSymbolFilters } from "./binance-futures-private.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
 import {
@@ -3615,10 +3615,6 @@ export class CrossSectionalExecutor {
 
   /** Single-flight tick: bank early winners, close due baskets, then consider opening a new one. */
   async tick(): Promise<void> {
-    return withBinanceTransportSource(`cross-sectional.${this.laneId}`, () => this.runTick());
-  }
-
-  private async runTick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     this.dynamicV3CloseAttemptedThisTick.clear();

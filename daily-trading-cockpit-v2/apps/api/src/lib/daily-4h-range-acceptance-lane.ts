@@ -1,5 +1,5 @@
 /**
- * DAILY 4H RANGE ACCEPTANCE — testnet-only experimental lane.
+ * DAILY 4H RANGE ACCEPTANCE — isolated 4h acceptance lane.
  *
  * This module intentionally has no dependency on MOM36, the regime controller, a
  * continuation model, or the Dynamic basket admission path.  It owns its own
@@ -15,7 +15,6 @@ import { dirname, resolve } from "node:path";
 
 import {
   BinanceFuturesPrivateError,
-  withBinanceTransportSource,
   type BinanceFuturesPrivateClient,
   type FuturesAlgoOrder,
   type FuturesIncomeEntry,
@@ -25,9 +24,13 @@ import {
   type FuturesSymbolFilters,
   type FuturesUserTrade,
 } from "./binance-futures-private.js";
+import type { DailyRangePoolEvidence, DailyRangePoolSymbolAudit } from "./daily-range-auto-pool.js";
+import type { DailyRangeMainnetControls } from "./daily-range-mainnet-policy.js";
 
 export const DAILY_RANGE_LANE_ID = "DAILY_4H_RANGE_ACCEPTANCE";
 export const DAILY_RANGE_STRATEGY_VERSION = "daily-4h-range-acceptance-2r-v1";
+/** Existing selector behavior, named so research never mistakes loop order for an alpha model. */
+export const DAILY_RANGE_SELECTOR_POLICY_VERSION = "BASELINE_LEXICAL_SEQUENCE_V1";
 export const DAILY_RANGE_TRADE_NOTIONAL_USD = 25;
 export const DAILY_RANGE_LEVERAGE = 1;
 export const DAILY_RANGE_RR = 2;
@@ -39,6 +42,7 @@ const EPSILON = 1e-9;
 const MAX_FRESH_SIGNAL_AGE_MS = 95_000;
 const CONFIRM_RETRIES = 4;
 const DEFAULT_CONFIRM_RETRY_MS = 350;
+const MAX_SIGNAL_COHORTS = 20_000;
 
 export type DailyRangeDirection = "LONG" | "SHORT";
 export type DailyRangeControlMode = "DISARMED" | "ARMED";
@@ -66,7 +70,11 @@ export type DailyRangeSignalReason =
   | "INSUFFICIENT_MARGIN"
   | "MISSED_SIGNAL_RECOVERY"
   | "LANE_DISARMED"
-  | "ENTRY_IN_FLIGHT";
+  | "ENTRY_IN_FLIGHT"
+  | "MAINNET_EXECUTION_DISABLED"
+  | "ACCOUNT_ENTRY_BLOCKED"
+  | "MAX_OPEN_TRADES_REACHED"
+  | "MAX_GROSS_NOTIONAL_REACHED";
 
 export interface DailyRangeCandle {
   openTime: number;
@@ -104,6 +112,8 @@ export interface DailyRangeDayState {
   initializedAt: string;
   universeSymbols: string[];
   universeSource: string;
+  /** Immutable C1-C6 evidence at the moment the UTC universe was frozen. */
+  poolEvidence?: DailyRangePoolEvidence | null;
   levels: Record<string, DailyRangeLevel>;
   invalidReferenceSymbols: Array<{ symbol: string; reason: string }>;
   symbolStates: Record<string, DailyRangeSymbolState>;
@@ -127,6 +137,49 @@ export interface DailyRangeSignal {
   entryAttemptedAt: string | null;
   tradeId: string | null;
 }
+
+export interface DailyRangeSignalCohortCandidate {
+  signalId: string;
+  symbol: string;
+  direction: DailyRangeDirection;
+  /** Exact order handed to the unchanged baseline entry loop for this scheduler tick. */
+  executionSequence: number;
+  cohortSequence: number;
+  rangeHigh: number;
+  rangeLow: number;
+  rangeWidth: number;
+  rangeWidthPct: number | null;
+  confirmationClose: number;
+  /** Distance past the range boundary at C2 close; positive means it qualified. */
+  breakoutDistancePrice: number;
+  /** Same distance normalized by that symbol's frozen 4h range width. */
+  breakoutDistanceOfRange: number | null;
+  /** Immutable day-level C1-C6 evidence for this candidate, if capture completed. */
+  poolAudit: DailyRangePoolSymbolAudit | null;
+  /** Filled only from the existing signal outcome; no extra execution decision is made here. */
+  decision: {
+    entryEligible: boolean;
+    reason: DailyRangeSignalReason | null;
+    tradeId: string | null;
+    entryAttemptedAt: string | null;
+  } | null;
+}
+
+/** Candidates that competed in one completed 5m bar.  This is observation-only. */
+export interface DailyRangeSignalCohort {
+  cohortId: string;
+  strategyVersion: typeof DAILY_RANGE_STRATEGY_VERSION;
+  laneId: typeof DAILY_RANGE_LANE_ID;
+  selectorPolicyVersion: typeof DAILY_RANGE_SELECTOR_POLICY_VERSION;
+  dateUtc: string;
+  signalTimestamp: string;
+  signalTimestampMs: number;
+  observedAt: string;
+  finalizedAt: string | null;
+  candidates: DailyRangeSignalCohortCandidate[];
+}
+
+export type DailyRangeHistoryKind = "levels" | "signals" | "trades" | "cohorts" | "pool-evidence";
 
 export interface DailyRangeTrade {
   tradeId: string;
@@ -217,6 +270,8 @@ export interface DailyRangeCanaryEvidence {
   side: "BUY";
   intendedNotionalUsd: number;
   leverage: number;
+  /** Exact rounded quantity reserved before the canary MARKET POST. Optional for pre-v2 evidence. */
+  requestedQty?: number | null;
   entryOrderId: string | null;
   entryClientOrderId: string | null;
   entryFillPrice: number | null;
@@ -252,6 +307,7 @@ interface DailyRangePersistedState {
   };
   days: Record<string, DailyRangeDayState>;
   signals: DailyRangeSignal[];
+  signalCohorts: DailyRangeSignalCohort[];
   trades: DailyRangeTrade[];
   canaries: DailyRangeCanaryEvidence[];
   runtime: DailyRangeRuntimeState;
@@ -304,12 +360,49 @@ function blankSymbolState(lastProcessedBarOpenTime: number | null): DailyRangeSy
   };
 }
 
+function clonePoolAudit(audit: DailyRangePoolSymbolAudit): DailyRangePoolSymbolAudit {
+  return { ...audit, failures: [...audit.failures] };
+}
+
+/** The pool keeps rolling evidence; a Daily day must own a detached copy. */
+function clonePoolEvidence(evidence: DailyRangePoolEvidence | null | undefined): DailyRangePoolEvidence | null {
+  if (!evidence) return null;
+  return {
+    ...evidence,
+    activeSymbols: [...evidence.activeSymbols],
+    thresholds: { ...evidence.thresholds },
+    reconciliation: evidence.reconciliation
+      ? {
+        ...evidence.reconciliation,
+        adds: [...evidence.reconciliation.adds],
+        drops: [...evidence.reconciliation.drops],
+        rejectionCounts: { ...evidence.reconciliation.rejectionCounts },
+        crossSectionalExcluded: [...evidence.reconciliation.crossSectionalExcluded],
+        strategyOwnedExcluded: [...evidence.reconciliation.strategyOwnedExcluded],
+      }
+      : null,
+    auditBySymbol: Object.fromEntries(Object.entries(evidence.auditBySymbol)
+      .map(([symbol, audit]) => [symbol, clonePoolAudit(audit)])),
+    missingAuditSymbols: [...evidence.missingAuditSymbols],
+  };
+}
+
+function cloneCohortPoolAudit(day: DailyRangeDayState, symbol: string): DailyRangePoolSymbolAudit | null {
+  const audit = day.poolEvidence?.auditBySymbol[normalizeSymbol(symbol)] ?? null;
+  return audit ? clonePoolAudit(audit) : null;
+}
+
+function signalCohortId(dateUtc: string, signalTimestampMs: number): string {
+  return `drra-cohort-${dateUtc}-${signalTimestampMs}`;
+}
+
 function emptyState(nowMs: number): DailyRangePersistedState {
   return {
     version: 1,
     control: { mode: "DISARMED", armedAt: null, disarmedAt: iso(nowMs), disarmReason: "initial state" },
     days: {},
     signals: [],
+    signalCohorts: [],
     trades: [],
     canaries: [],
     runtime: {
@@ -355,6 +448,7 @@ export class DailyRangeLaneStore {
         },
         days: parsed.days as Record<string, DailyRangeDayState>,
         signals: parsed.signals as DailyRangeSignal[],
+        signalCohorts: Array.isArray(parsed.signalCohorts) ? parsed.signalCohorts as DailyRangeSignalCohort[] : [],
         trades: parsed.trades as DailyRangeTrade[],
         canaries: Array.isArray(parsed.canaries) ? parsed.canaries as DailyRangeCanaryEvidence[] : [],
         runtime: {
@@ -439,11 +533,19 @@ export type DailyRangeExecClient = Pick<
 export interface DailyRangeUniverseSnapshot {
   symbols: string[];
   source: string;
+  /** Optional so legacy/test fixtures remain valid; production supplies it from the auto-pool. */
+  poolEvidence?: DailyRangePoolEvidence | null;
 }
 
 export interface DailyRangeEntryClaims {
   tryClaimEntrySymbol: (symbol: string, owner: string) => boolean;
   releaseEntrySymbol: (symbol: string, owner: string) => void;
+}
+
+/** Account-level safety gate, deliberately independent from Daily Range's signal logic. */
+export interface DailyRangeEntryGateDecision {
+  allowed: boolean;
+  reason: string | null;
 }
 
 export interface DailyRangeAcceptanceLaneOptions {
@@ -454,6 +556,12 @@ export interface DailyRangeAcceptanceLaneOptions {
   getShortBlocklist: () => ReadonlySet<string>;
   entryClaims: DailyRangeEntryClaims;
   environment: "testnet" | "mainnet";
+  /** Omitted means Mainnet is observation-only and structurally cannot enter. */
+  mainnetControls?: DailyRangeMainnetControls;
+  /** Mainnet account-health / kill-switch gate. It cannot relax lane-local controls. */
+  entryGate?: () => DailyRangeEntryGateDecision;
+  /** Best-effort notification after one real, settled lane close. */
+  onTradeClosed?: (netPnlUsd: number) => void;
   nowMs?: () => number;
   confirmRetryMs?: number;
 }
@@ -597,6 +705,9 @@ export class DailyRangeAcceptanceLane {
   private readonly getShortBlocklist: () => ReadonlySet<string>;
   private readonly entryClaims: DailyRangeEntryClaims;
   private readonly environment: "testnet" | "mainnet";
+  private readonly mainnetControls: DailyRangeMainnetControls | null;
+  private readonly entryGate: () => DailyRangeEntryGateDecision;
+  private readonly onTradeClosed: ((netPnlUsd: number) => void) | null;
   private readonly nowMs: () => number;
   private readonly confirmRetryMs: number;
   private ticking = false;
@@ -610,6 +721,9 @@ export class DailyRangeAcceptanceLane {
     this.getShortBlocklist = opts.getShortBlocklist;
     this.entryClaims = opts.entryClaims;
     this.environment = opts.environment;
+    this.mainnetControls = opts.mainnetControls ?? null;
+    this.entryGate = opts.entryGate ?? (() => ({ allowed: true, reason: null }));
+    this.onTradeClosed = opts.onTradeClosed ?? null;
     this.nowMs = opts.nowMs ?? (() => Date.now());
     this.confirmRetryMs = opts.confirmRetryMs ?? DEFAULT_CONFIRM_RETRY_MS;
   }
@@ -661,19 +775,96 @@ export class DailyRangeAcceptanceLane {
   }
 
   /**
-   * Signed quantities the isolated lane owns (or has durably submitted). app.ts
-   * supplies this to the legacy mirror's reconciliation only on Testnet, so it
-   * never mistakes this lane's exchange position for an orphan or nets it away.
+   * Signed quantities with a confirmed Daily Range ownership record. app.ts
+   * supplies them to the account engine's reconciliation in both runtimes, so
+   * a protected Daily Range position is not mistaken for an orphan or netted
+   * away by a different executor.
    */
   managedNetQty(): Map<string, number> {
     const net = new Map<string, number>();
     for (const trade of this.store.getState().trades) {
       if (isTerminalTradeStatus(trade.status)) continue;
-      const qty = trade.entryQty ?? trade.requestedQty;
+      // Before a market order is fully adopted, only a bounded pending claim is
+      // safe: a terminal partial fill may be anywhere between zero and the
+      // requested quantity. See pendingEntryNetQty() below.
+      if (trade.status === "ENTRY_SUBMITTING" || trade.status === "ENTRY_RECONCILING") continue;
+      const qty = trade.entryQty;
       if (!finitePositive(qty)) continue;
       net.set(trade.symbol, (net.get(trade.symbol) ?? 0) + directionSign(trade.direction) * qty);
     }
     return net;
+  }
+
+  /**
+   * Bounded, not-yet-adopted Daily Range entry quantities.  The account engine
+   * uses this only as a reconciliation tolerance band: it can explain a
+   * partial/full fill up to the exact requested amount, never a larger or
+   * opposite-side position.  This covers both a normal durable entry and the
+   * deliberately separate DRCANARY lifecycle.
+   */
+  pendingEntryNetQty(): Map<string, number> {
+    const pending = new Map<string, number>();
+    const add = (symbol: string, qty: number, sign: number): void => {
+      if (!finitePositive(qty)) return;
+      pending.set(symbol, (pending.get(symbol) ?? 0) + sign * qty);
+    };
+    for (const trade of this.store.getState().trades) {
+      if (trade.status !== "ENTRY_SUBMITTING" && trade.status !== "ENTRY_RECONCILING") continue;
+      add(trade.symbol, trade.requestedQty ?? 0, directionSign(trade.direction));
+    }
+    for (const canary of this.store.getState().canaries) {
+      if (canary.status !== "RUNNING" || !canary.symbol) continue;
+      // The controlled canary is deliberately long-only. Keeping this explicit
+      // makes a future canary-side expansion require an intentional review.
+      add(canary.symbol, canary.requestedQty ?? 0, canary.side === "BUY" ? 1 : -1);
+    }
+    return pending;
+  }
+
+  /**
+   * Realized Daily Range P&L for account-level safety aggregation.  It uses the
+   * actual exit timestamp (UTC), not the date of the 00:00–04:00 range, so a
+   * trade that closes after midnight cannot be counted in the wrong loss day.
+   */
+  realizedPnlSummary(dayUtc = utcDate(this.nowMs())): { today: number; allTime: number } {
+    const settled = this.store.getState().trades.filter((trade) =>
+      isTerminalTradeStatus(trade.status) && Number.isFinite(trade.netPnlUsd),
+    );
+    return {
+      today: settled
+        .filter((trade) => trade.exitTimestamp?.startsWith(dayUtc))
+        .reduce((sum, trade) => sum + (trade.netPnlUsd ?? 0), 0),
+      allTime: settled.reduce((sum, trade) => sum + (trade.netPnlUsd ?? 0), 0),
+    };
+  }
+
+  private mainnetControlBlockReason(action: "canary" | "arm" | "entry"): string | null {
+    if (this.environment !== "mainnet") return null;
+    const controls = this.mainnetControls;
+    if (!controls?.executionEnabled) return "Daily Range mainnet execution is disabled";
+    if (!controls.confirmed) return "Daily Range mainnet confirmation is missing";
+    if (controls.maxOpenTrades < 1) return "Daily Range mainnet max-open-trades cap is not positive";
+    if (controls.maxGrossNotionalUsd + EPSILON < DAILY_RANGE_TRADE_NOTIONAL_USD) {
+      return `Daily Range mainnet gross-notional cap is below ${DAILY_RANGE_TRADE_NOTIONAL_USD} USDT`;
+    }
+    if (action === "canary" && !controls.canaryEnabled) return "Daily Range mainnet canary is disabled";
+    if ((action === "arm" || action === "entry") && !controls.armEnabled) return "Daily Range mainnet arm is disabled";
+    return null;
+  }
+
+  private entryLimitReason(): Extract<DailyRangeSignalReason, "MAX_OPEN_TRADES_REACHED" | "MAX_GROSS_NOTIONAL_REACHED"> | null {
+    if (this.environment !== "mainnet") return null;
+    const controls = this.mainnetControls;
+    if (!controls) return "MAX_OPEN_TRADES_REACHED";
+    const activeTrades = this.store.getState().trades.filter((trade) => !isTerminalTradeStatus(trade.status));
+    if (activeTrades.length >= controls.maxOpenTrades) return "MAX_OPEN_TRADES_REACHED";
+    // Every pending/filled trade reserves the full intended 25 USDT before its
+    // market POST.  That makes the gross cap atomic even when several C2 signals
+    // arrive in the same scheduler tick; actual fill drift can only be observed,
+    // never used to squeeze in an extra order.
+    const reservedGrossUsd = (activeTrades.length + 1) * DAILY_RANGE_TRADE_NOTIONAL_USD;
+    if (reservedGrossUsd > controls.maxGrossNotionalUsd + EPSILON) return "MAX_GROSS_NOTIONAL_REACHED";
+    return null;
   }
 
   getStatus(): Record<string, unknown> {
@@ -703,9 +894,18 @@ export class DailyRangeAcceptanceLane {
         /** Immutable source captured at the UTC-day boundary; lets operators verify pool isolation. */
         dailyUniverseSource: day?.universeSource ?? null,
         dailyUniverseSymbols: day?.universeSymbols ?? [],
+        poolEvidence: day?.poolEvidence ? {
+          schemaVersion: day.poolEvidence.schemaVersion,
+          poolVersion: day.poolEvidence.poolVersion,
+          state: day.poolEvidence.state,
+          capturedAt: day.poolEvidence.capturedAt,
+          auditedSymbols: Object.keys(day.poolEvidence.auditBySymbol).length,
+          missingAuditSymbols: day.poolEvidence.missingAuditSymbols,
+        } : null,
         monitoringSymbols: Object.keys(day?.levels ?? {}).length,
         invalidReferenceSymbols: day?.invalidReferenceSymbols ?? [],
         signals: signalsToday.length,
+        signalCohorts: state.signalCohorts.filter((cohort) => cohort.dateUtc === date).length,
         executedTrades: tradesToday.filter((trade) => trade.entryOrderId !== null).length,
         closedTrades: tradesToday.filter((trade) => trade.status === "CLOSED").length,
       },
@@ -713,6 +913,15 @@ export class DailyRangeAcceptanceLane {
       openTrades,
       totalHistoricalTrades: state.trades.filter((trade) => trade.entryOrderId !== null).length,
       performance,
+      mainnetControls: this.environment === "mainnet" ? {
+        executionEnabled: this.mainnetControls?.executionEnabled ?? false,
+        confirmed: this.mainnetControls?.confirmed ?? false,
+        canaryEnabled: this.mainnetControls?.canaryEnabled ?? false,
+        armEnabled: this.mainnetControls?.armEnabled ?? false,
+        maxOpenTrades: this.mainnetControls?.maxOpenTrades ?? 0,
+        maxGrossNotionalUsd: this.mainnetControls?.maxGrossNotionalUsd ?? 0,
+        entryBlockReason: this.mainnetControlBlockReason("entry"),
+      } : null,
       lastCanary: state.canaries.at(-1) ?? null,
     };
   }
@@ -729,7 +938,7 @@ export class DailyRangeAcceptanceLane {
     } : null;
   }
 
-  history(kind: "levels" | "signals" | "trades", limit = 500): unknown[] {
+  history(kind: DailyRangeHistoryKind, limit = 500): unknown[] {
     const bounded = Math.max(1, Math.min(10_000, Math.floor(limit)));
     const state = this.store.getState();
     if (kind === "levels") {
@@ -738,11 +947,28 @@ export class DailyRangeAcceptanceLane {
         .sort((a, b) => b.fourHourOpenTime - a.fourHourOpenTime || a.symbol.localeCompare(b.symbol))
         .slice(0, bounded);
     }
+    if (kind === "pool-evidence") {
+      return Object.values(state.days)
+        .flatMap((day) => day.poolEvidence ? [{
+          dateUtc: day.dateUtc,
+          frozenAt: day.initializedAt,
+          universeSource: day.universeSource,
+          universeSymbols: [...day.universeSymbols],
+          evidence: clonePoolEvidence(day.poolEvidence),
+        }] : [])
+        .sort((a, b) => b.dateUtc.localeCompare(a.dateUtc))
+        .slice(0, bounded);
+    }
+    if (kind === "cohorts") {
+      return [...state.signalCohorts]
+        .sort((a, b) => b.signalTimestampMs - a.signalTimestampMs || b.cohortId.localeCompare(a.cohortId))
+        .slice(0, bounded);
+    }
     const rows = kind === "signals" ? state.signals : state.trades;
     return [...rows].slice(-bounded).reverse();
   }
 
-  exportCsv(kind: "levels" | "signals" | "trades"): string {
+  exportCsv(kind: DailyRangeHistoryKind): string {
     const rows = this.history(kind, 10_000) as Array<Record<string, unknown>>;
     if (rows.length === 0) return "";
     const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))];
@@ -812,15 +1038,16 @@ export class DailyRangeAcceptanceLane {
     };
   }
 
-  /** Testnet-only manual kill switch. Existing exchange-native brackets are left intact. */
+  /** Manual lane kill switch. Existing exchange-native brackets are left intact. */
   disarm(reason = "manual lane disarm"): { ok: boolean; mode: DailyRangeControlMode } {
     this.store.disarm(iso(this.nowMs()), reason);
     return { ok: true, mode: "DISARMED" };
   }
 
   arm(): { ok: boolean; reason: string | null; mode: DailyRangeControlMode } {
-    if (this.environment !== "testnet") {
-      return { ok: false, reason: "daily range lane is structurally testnet-only", mode: "DISARMED" };
+    const mainnetBlock = this.mainnetControlBlockReason("arm");
+    if (mainnetBlock) {
+      return { ok: false, reason: mainnetBlock, mode: "DISARMED" };
     }
     const lastCanary = this.store.getState().canaries.at(-1);
     if (!lastCanary || lastCanary.status !== "PASSED") {
@@ -829,8 +1056,38 @@ export class DailyRangeAcceptanceLane {
     if (!this.startupReconciled) {
       return { ok: false, reason: "exchange/account reconciliation is not complete", mode: "DISARMED" };
     }
+    this.resetTodayDetectionAtArm();
     this.store.arm(iso(this.nowMs()));
     return { ok: true, reason: null, mode: "ARMED" };
+  }
+
+  /**
+   * A manual re-arm is a fresh observation boundary, not permission to replay
+   * candles completed while the lane was DISARMED.  Resetting both the
+   * watermark and the C1/C2 state prevents a pre-arm C1 from combining with a
+   * post-arm C2, or a fully missed C1/C2 pair from being entered late.
+   */
+  private resetTodayDetectionAtArm(): void {
+    const now = this.nowMs();
+    const state = this.store.getState();
+    const day = state.days[utcDate(now)];
+    const latestCompletedOpen = lastClosedFiveMinuteOpenTime(now);
+    if (!day || latestCompletedOpen === null) return;
+
+    for (const symbol of Object.keys(day.levels)) {
+      const symbolState = day.symbolStates[symbol] ?? blankSymbolState(latestCompletedOpen);
+      symbolState.lastProcessedBarOpenTime = Math.max(symbolState.lastProcessedBarOpenTime ?? latestCompletedOpen, latestCompletedOpen);
+      symbolState.previousClosedCandle = null;
+      symbolState.longCount = 0;
+      symbolState.shortCount = 0;
+      symbolState.longLocked = false;
+      symbolState.shortLocked = false;
+      day.symbolStates[symbol] = symbolState;
+    }
+    state.runtime.lastProcessedMarketBarOpenTime = Math.max(
+      state.runtime.lastProcessedMarketBarOpenTime ?? latestCompletedOpen,
+      latestCompletedOpen,
+    );
   }
 
   /**
@@ -839,10 +1096,6 @@ export class DailyRangeAcceptanceLane {
    * once for every completed 5m candle.
    */
   async tick(): Promise<void> {
-    return withBinanceTransportSource("daily-range.tick", () => this.runTick());
-  }
-
-  private async runTick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     const startedAt = this.nowMs();
@@ -851,6 +1104,9 @@ export class DailyRangeAcceptanceLane {
     try {
       if (!this.startupReconciled) await this.reconcileOnStartup();
       await this.reconcileOpenTrades();
+      // If a process ended between the order attempt and the passive cohort
+      // snapshot, recover the outcome from the durable signal record only.
+      this.syncSignalCohortDecisions();
       await this.ensureTodayRange();
       if (state.control.mode !== "ARMED") {
         state.runtime.lastError = null;
@@ -880,11 +1136,10 @@ export class DailyRangeAcceptanceLane {
   }
 
   private async reconcileOnStartup(): Promise<void> {
-    if (this.environment !== "testnet") throw new Error("daily range lane refuses non-testnet runtime");
     const state = this.store.getState();
     try {
       const hedge = await this.client.isHedgeMode();
-      if (hedge) throw new Error("P0: testnet account is in hedge mode; daily lane requires verified one-way semantics");
+      if (hedge) throw new Error("P0: account is in hedge mode; daily lane requires verified one-way semantics");
       await this.reconcilePendingEntries();
       await this.reconcileOpenTrades();
       this.startupReconciled = true;
@@ -963,13 +1218,14 @@ export class DailyRangeAcceptanceLane {
       initializedAt: iso(this.nowMs()),
       universeSymbols: symbols,
       universeSource: snapshot.source,
+      poolEvidence: clonePoolEvidence(snapshot.poolEvidence),
       levels,
       invalidReferenceSymbols,
       symbolStates,
     };
     this.store.save();
     console.log(
-      `[daily-range-lane] DAILY_RANGE_INITIALIZED date=${date} universe=${symbols.length} valid=${Object.keys(levels).length} invalid=${invalidReferenceSymbols.length} source=${snapshot.source}`,
+      `[daily-range-lane] DAILY_RANGE_INITIALIZED date=${date} universe=${symbols.length} valid=${Object.keys(levels).length} invalid=${invalidReferenceSymbols.length} source=${snapshot.source} poolEvidence=${snapshot.poolEvidence ? "CAPTURED" : "UNAVAILABLE"}`,
     );
   }
 
@@ -1020,7 +1276,15 @@ export class DailyRangeAcceptanceLane {
     }
     state.runtime.lastProcessedMarketBarOpenTime = latestCompletedOpen;
     this.store.save();
-    await Promise.all(actions.map((signal) => this.executeFreshSignal(signal)));
+    const cohortIds = this.captureSignalCohorts(day, actions);
+    try {
+      await Promise.all(actions.map((signal) => this.executeFreshSignal(signal)));
+    } finally {
+      // A persistence or exchange error must not fabricate an outcome.  This
+      // refresh only copies the existing signal decision into the cohort and
+      // leaves unresolved candidates explicitly null for the next tick.
+      this.syncSignalCohortDecisions(cohortIds);
+    }
   }
 
   private applyCandle(
@@ -1101,6 +1365,109 @@ export class DailyRangeAcceptanceLane {
     state.signals.push(signal);
     console.log(`[daily-range-lane] ACCEPTANCE_${direction}_CONFIRMED symbol=${signal.symbol} signal=${signal.signalId}`);
     return signal;
+  }
+
+  /**
+   * Captures the candidate set before the unchanged entry loop runs.  The data
+   * is intentionally descriptive: no score, no sort, and no veto is read by
+   * executeFreshSignal().
+   */
+  private captureSignalCohorts(day: DailyRangeDayState, actions: readonly DailyRangeSignal[]): string[] {
+    if (actions.length === 0) return [];
+    const state = this.store.getState();
+    const known = new Set(state.signalCohorts.map((cohort) => cohort.cohortId));
+    const grouped = new Map<number, Array<{ signal: DailyRangeSignal; executionSequence: number }>>();
+    actions.forEach((signal, executionSequence) => {
+      const rows = grouped.get(signal.signalTimestampMs) ?? [];
+      rows.push({ signal, executionSequence });
+      grouped.set(signal.signalTimestampMs, rows);
+    });
+    const captured: string[] = [];
+    for (const [signalTimestampMs, rows] of grouped) {
+      const cohortId = signalCohortId(day.dateUtc, signalTimestampMs);
+      if (known.has(cohortId)) continue;
+      const candidates = rows.map(({ signal, executionSequence }, cohortSequence): DailyRangeSignalCohortCandidate => {
+        const rangeWidth = signal.rangeHigh - signal.rangeLow;
+        const boundary = signal.direction === "LONG" ? signal.rangeHigh : signal.rangeLow;
+        const breakoutDistancePrice = signal.direction === "LONG"
+          ? signal.confirmationBar2.close - boundary
+          : boundary - signal.confirmationBar2.close;
+        return {
+          signalId: signal.signalId,
+          symbol: signal.symbol,
+          direction: signal.direction,
+          executionSequence,
+          cohortSequence,
+          rangeHigh: signal.rangeHigh,
+          rangeLow: signal.rangeLow,
+          rangeWidth,
+          rangeWidthPct: signal.rangeLow > 0 ? rangeWidth / signal.rangeLow : null,
+          confirmationClose: signal.confirmationBar2.close,
+          breakoutDistancePrice,
+          breakoutDistanceOfRange: rangeWidth > EPSILON ? breakoutDistancePrice / rangeWidth : null,
+          poolAudit: cloneCohortPoolAudit(day, signal.symbol),
+          decision: null,
+        };
+      });
+      state.signalCohorts.push({
+        cohortId,
+        strategyVersion: DAILY_RANGE_STRATEGY_VERSION,
+        laneId: DAILY_RANGE_LANE_ID,
+        selectorPolicyVersion: DAILY_RANGE_SELECTOR_POLICY_VERSION,
+        dateUtc: day.dateUtc,
+        signalTimestamp: iso(signalTimestampMs),
+        signalTimestampMs,
+        observedAt: iso(this.nowMs()),
+        finalizedAt: null,
+        candidates,
+      });
+      captured.push(cohortId);
+    }
+    if (captured.length > 0) {
+      if (state.signalCohorts.length > MAX_SIGNAL_COHORTS) {
+        state.signalCohorts.splice(0, state.signalCohorts.length - MAX_SIGNAL_COHORTS);
+      }
+      this.store.save();
+    }
+    return captured;
+  }
+
+  /** Rejoins persisted signals after an entry attempt; safe to repeat after a restart. */
+  private syncSignalCohortDecisions(cohortIds?: readonly string[]): void {
+    const state = this.store.getState();
+    if (state.signalCohorts.length === 0) return;
+    const selected = cohortIds ? new Set(cohortIds) : null;
+    const signals = new Map(state.signals.map((signal) => [signal.signalId, signal]));
+    let changed = false;
+    for (const cohort of state.signalCohorts) {
+      if (selected && !selected.has(cohort.cohortId)) continue;
+      // A finalized cohort is immutable evidence.  Re-reading it every 30s
+      // would add avoidable work as the forward research sample grows.
+      if (cohort.finalizedAt !== null) continue;
+      let complete = true;
+      for (const candidate of cohort.candidates) {
+        const signal = signals.get(candidate.signalId);
+        const decision = signal && (signal.entryAttemptedAt !== null || signal.reason !== null || signal.tradeId !== null)
+          ? {
+            entryEligible: signal.entryEligible,
+            reason: signal.reason,
+            tradeId: signal.tradeId,
+            entryAttemptedAt: signal.entryAttemptedAt,
+          }
+          : null;
+        if (JSON.stringify(candidate.decision) !== JSON.stringify(decision)) {
+          candidate.decision = decision;
+          changed = true;
+        }
+        if (decision === null) complete = false;
+      }
+      const nextFinalizedAt = complete ? cohort.finalizedAt ?? iso(this.nowMs()) : null;
+      if (cohort.finalizedAt !== nextFinalizedAt) {
+        cohort.finalizedAt = nextFinalizedAt;
+        changed = true;
+      }
+    }
+    if (changed) this.store.save();
   }
 
   private markSignal(signal: DailyRangeSignal, input: { eligible: boolean; reason: DailyRangeSignalReason | null; tradeId?: string | null }): void {
@@ -1190,6 +1557,25 @@ export class DailyRangeAcceptanceLane {
     const now = this.nowMs();
     if (state.control.mode !== "ARMED") {
       this.markSignal(signal, { eligible: false, reason: "LANE_DISARMED" });
+      return;
+    }
+    if (this.mainnetControlBlockReason("entry")) {
+      this.markSignal(signal, { eligible: false, reason: "MAINNET_EXECUTION_DISABLED" });
+      return;
+    }
+    let accountGate: DailyRangeEntryGateDecision;
+    try {
+      accountGate = this.entryGate();
+    } catch (error) {
+      accountGate = { allowed: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+    if (!accountGate?.allowed) {
+      this.markSignal(signal, { eligible: false, reason: "ACCOUNT_ENTRY_BLOCKED" });
+      return;
+    }
+    const limitReason = this.entryLimitReason();
+    if (limitReason) {
+      this.markSignal(signal, { eligible: false, reason: limitReason });
       return;
     }
     if (!inDailyRangeEntryWindow(signal.signalTimestampMs)) {
@@ -1635,16 +2021,7 @@ export class DailyRangeAcceptanceLane {
     const active = this.store.getState().trades.filter((trade) =>
       ["PROTECTING", "OPEN", "EXIT_RECONCILING"].includes(trade.status),
     );
-    if (active.length === 0) {
-      // A prior transport failure is historical once there is no open lane exposure left to
-      // reconcile. Keeping it forever makes the status endpoint look exchange-broken after a
-      // successful close/restart even though there is no unresolved safety obligation.
-      if (this.store.getState().runtime.reconciliationError !== null) {
-        this.store.getState().runtime.reconciliationError = null;
-        this.store.save();
-      }
-      return;
-    }
+    if (active.length === 0) return;
     let positions: FuturesPosition[];
     let algos: FuturesAlgoOrder[];
     try {
@@ -1685,10 +2062,6 @@ export class DailyRangeAcceptanceLane {
         trade.status = "OPEN";
       }
     }
-    // This reaches only after the complete account snapshot and every active bracket have been
-    // verified. Clear the lane-level transport alarm here, rather than merely clearing each trade,
-    // so `/daily-range-lane/status` cannot keep reporting a stale HTTP 418 after recovery.
-    this.store.getState().runtime.reconciliationError = null;
     this.store.save();
   }
 
@@ -1822,6 +2195,14 @@ export class DailyRangeAcceptanceLane {
     trade.status = terminalStatus;
     trade.lastReconcileError = null;
     this.store.save();
+    if (Number.isFinite(trade.netPnlUsd)) {
+      try {
+        this.onTradeClosed?.(trade.netPnlUsd!);
+      } catch {
+        // Accounting/kill-switch telemetry must never turn a confirmed, settled
+        // lane close back into an error or duplicate its exchange handling.
+      }
+    }
   }
 
   /** Close exactly one owned daily-lane trade. It never touches a basket or another lane. */
@@ -1835,6 +2216,34 @@ export class DailyRangeAcceptanceLane {
       reason: trade.status === "CLOSED" ? null : trade.lastReconcileError ?? `close remains ${trade.status}`,
       netPnlUsd: trade.netPnlUsd,
     };
+  }
+
+  /**
+   * Account-kill counterpart to the other lane executors' orderly close methods.
+   * It disarms first, reconciles any uncertain entry once, then only sends an
+   * exact-quantity reduce-only exit for a position this lane can prove it owns.
+   */
+  async closeAllTradesOrderly(reason: string): Promise<{ closed: number; failed: number }> {
+    this.disarm(reason);
+    try {
+      await this.reconcilePendingEntries();
+    } catch {
+      // The per-trade loop below records unresolved pending entries as failures;
+      // never turn an account-wide kill into a blanket symbol flatten.
+    }
+    let closed = 0;
+    let failed = 0;
+    const candidates = this.store.getState().trades.filter((trade) => !isTerminalTradeStatus(trade.status));
+    for (const trade of candidates) {
+      if (!finitePositive(trade.entryQty)) {
+        failed += 1;
+        continue;
+      }
+      await this.emergencyFlatten(trade, "CLOSED", reason);
+      if (trade.status === "CLOSED") closed += 1;
+      else failed += 1;
+    }
+    return { closed, failed };
   }
 
   /**
@@ -1947,7 +2356,8 @@ export class DailyRangeAcceptanceLane {
 
   /** Controlled exchange canary.  It is deliberately separate from signal/trade history. */
   async runCanary(): Promise<DailyRangeCanaryEvidence> {
-    if (this.environment !== "testnet") throw new Error("DRCANARY refuses non-testnet runtime");
+    const mainnetBlock = this.mainnetControlBlockReason("canary");
+    if (mainnetBlock) throw new Error(mainnetBlock);
     if (this.store.getState().control.mode === "ARMED") throw new Error("disarm daily lane before running a canary");
     if (!this.startupReconciled) await this.reconcileOnStartup();
     await this.ensureTodayRange();
@@ -1960,6 +2370,7 @@ export class DailyRangeAcceptanceLane {
       side: "BUY",
       intendedNotionalUsd: DAILY_RANGE_TRADE_NOTIONAL_USD,
       leverage: DAILY_RANGE_LEVERAGE,
+      requestedQty: null,
       entryOrderId: null,
       entryClientOrderId: null,
       entryFillPrice: null,
@@ -1996,9 +2407,14 @@ export class DailyRangeAcceptanceLane {
       if (!filter || !finitePositive(reference)) throw new Error("canary symbol lacks a valid filter/ask");
       const qty = clampQty(DAILY_RANGE_TRADE_NOTIONAL_USD / reference, filter);
       if (!qty || qty * reference + EPSILON < filter.minNotional) throw new Error("canary 25 USDT quantity is not executable");
-      await this.client.setLeverage(symbol, DAILY_RANGE_LEVERAGE);
       const entryId = canaryClientId("E", symbol, now);
       evidence.entryClientOrderId = entryId;
+      // Persist the exact bounded claim BEFORE the private POST.  The shared
+      // account engine can then distinguish this controlled lifecycle from an
+      // orphan position if its reconciliation tick races the canary fill.
+      evidence.requestedQty = qty;
+      this.store.save();
+      await this.client.setLeverage(symbol, DAILY_RANGE_LEVERAGE);
       const entry = await this.submitCanaryMarketOrder({
         symbol,
         side: "BUY",

@@ -11,7 +11,7 @@
     "formation, sizing, risk, or exit behavior. This rollout intentionally has no such divergence.",
     "",
     "Apply or verify with deploy/apply-required-env.sh. Run --check after EVERY cutover.",
-    "Values here are per-lane policy, never secrets \u2014 API keys stay out of version control."
+    "Values here are per-lane policy, never secrets — API keys stay out of version control."
   ],
   "shared": {
     "CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS": {
@@ -80,7 +80,7 @@
     },
     "CROSS_SECTIONAL_SMART_FORMATION_RERANK": {
       "value": "0",
-      "why": "Smart Formation's utility re-ranking (fastSupport, adverseExtension, counter-axis, cluster penalty) OFF. Ablation over 12 block offsets across two years: full re-ranking +0.2227%/basket vs +0.2220% for plain MOM36 rank \u2014 0.0007pp, with identical PF, hit rate, quarterly stability and worst quarter. The hard cluster cap stays as a concentration guardrail; entry revalidation and ghost use the frozen selected-leg data without running utility rerank."
+      "why": "Smart Formation's utility re-ranking (fastSupport, adverseExtension, counter-axis, cluster penalty) OFF. Ablation over 12 block offsets across two years: full re-ranking +0.2227%/basket vs +0.2220% for plain MOM36 rank — 0.0007pp, with identical PF, hit rate, quarterly stability and worst quarter. The hard cluster cap stays as a concentration guardrail; entry revalidation and ghost use the frozen selected-leg data without running utility rerank."
     },
     "CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED": {
       "value": "1",
@@ -132,7 +132,7 @@
     },
     "CROSS_SECTIONAL_EXEC_TICK_MS": {
       "value": "60000",
-      "why": "Executor tick. Was a hardcoded 5 minutes, so a fresh signal waited ~150s on average before anything looked at it \u2014 measured end to end at 239.8s live / 229.9s testnet, almost all of it this interval. No gate is weakened by being asked sooner; the tick is idempotent and single-flighted. Bounded 15s-5m in code."
+      "why": "Executor tick. Was a hardcoded 5 minutes, so a fresh signal waited ~150s on average before anything looked at it — measured end to end at 239.8s live / 229.9s testnet, almost all of it this interval. No gate is weakened by being asked sooner; the tick is idempotent and single-flighted. Bounded 15s-5m in code."
     },
     "CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH": {
       "value": "0",
@@ -143,19 +143,19 @@
       "why": "The Dynamic policy freezes six equal $25 legs and has no confidence-sized learning tier. Keep the old traffic-light scaler OFF in both environments."
     },
     "CROSS_SECTIONAL_POLICY_VERSION": {
-      "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+      "value": "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
       "why": "Immutable policy identity for Dynamic MOM36 V5. It preserves continuation, score-gap, cluster cap, and SL/MFE exits, but uses a complete same-snapshot raw-V3 selection when strict SLOW_AND_FAST cannot fill all six legs. New evidence must never be mixed with V4."
     },
     "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-      "value": "2026-08-26T06:20:00Z",
+      "value": "2026-08-25T21:15:14Z",
       "why": "Forward-cohort boundary for Dynamic MOM36 V5. It is set at V5 cutover preparation and does not reclassify prior baskets."
     },
     "CROSS_SECTIONAL_STRATEGY_VERSION": {
-      "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+      "value": "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
       "why": "Selects the versioned Dynamic MOM36 continuation with strict SLOW_AND_FAST preferred first, exact complete raw-V3 fallback second, and the unchanged SL/MFE exit dispatcher for new baskets only."
     },
     "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
-      "value": "2026-08-26T06:20:00Z",
+      "value": "2026-08-25T21:15:14Z",
       "why": "Frozen strategy deployment timestamp captured in every new V5 basket fingerprint."
     },
     "CROSS_SECTIONAL_EXEC_VARIANT": {
@@ -207,7 +207,40 @@
     },
     "3103": {
       "role": "mainnet",
-      "extra": {}
+      "extra": {
+        "DAILY_RANGE_AUTO_POOL_ENABLED": {
+          "value": "1",
+          "why": "Prepare the Live Daily Range C1-C6 universe with the same public USD-M evidence contract as Testnet. Observation only; lane execution remains independently disabled below."
+        },
+        "DAILY_RANGE_AUTO_POOL_REFRESH_MS": {
+          "value": "300000",
+          "why": "Same five-minute membership refresh cadence as Testnet. It affects only a future UTC-day pool snapshot and cannot enter while the mainnet execution gate is off."
+        },
+        "DAILY_RANGE_MAINNET_EXECUTION_ENABLED": {
+          "value": "1",
+          "why": "Operator-authorized Live activation. This enables only the isolated Daily Range lane; every signal still requires the dedicated confirmation, arm, ownership, account-health, and cap guards."
+        },
+        "DAILY_RANGE_MAINNET_CONFIRM": {
+          "value": "I_UNDERSTAND_DAILY_RANGE_REAL_MONEY",
+          "why": "Dedicated real-money acknowledgement for the operator-authorized Daily Range activation, intentionally separate from LIVE_MAINNET_CONFIRM."
+        },
+        "DAILY_RANGE_MAINNET_CANARY_ENABLED": {
+          "value": "1",
+          "why": "Permit the required controlled 25-USDT Live canary. The lane cannot arm until its full entry, native-bracket, cancellation, flat-position, and zero-orphan lifecycle passes."
+        },
+        "DAILY_RANGE_MAINNET_ARM_ENABLED": {
+          "value": "1",
+          "why": "Permit arming only after the Live canary has passed. Entry still remains constrained by account health, the frozen range, and the explicit three-trade cap below."
+        },
+        "DAILY_RANGE_MAINNET_MAX_OPEN_TRADES": {
+          "value": "3",
+          "why": "Operator-authorized Live cap: at most three simultaneous Daily Range trades. Each trade remains the fixed 25-USDT, 1x allocation."
+        },
+        "DAILY_RANGE_MAINNET_MAX_GROSS_NOTIONAL_USD": {
+          "value": "75",
+          "why": "Operator-authorized aggregate cap: three fixed 25-USDT, 1x Daily Range allocations. The lane reserves the full amount before each entry."
+        }
+      }
     }
   }
 }

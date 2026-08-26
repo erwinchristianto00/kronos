@@ -172,7 +172,7 @@ describe("GET /api/live/open-basket-chart", () => {
     try {
       const response = await app.inject({ method: "GET", url: "/api/live/daily-range-lane/chart?tradeId=drra-opusdt-example" });
       expect(response.statusCode).toBe(503);
-      expect(response.json()).toMatchObject({ ok: false, reason: "daily range lane is unavailable outside Testnet" });
+      expect(response.json()).toMatchObject({ ok: false, reason: "daily range lane is unavailable in this runtime" });
     } finally {
       await app.close();
     }

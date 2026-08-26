@@ -2349,6 +2349,33 @@ i.health-diagnostic {
   font-size: 16px;
 }
 
+/* Candle review has dense inline level/indicator copy. The dashboard defaults
+   make every span and strong a heading block, which turns this copy into a
+   vertical stack and makes the chart context harder to read. */
+.candle-review-card span,
+.candle-review-card strong {
+  display: inline;
+  margin-top: 0;
+  color: inherit;
+  font: inherit;
+  text-transform: none;
+}
+
+.candle-review-card > header > div > span,
+.candle-review-card > header > span {
+  display: block;
+  color: #70858f;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.candle-review-card > header > div > strong {
+  display: block;
+  margin-top: 6px;
+  color: #e6f4ee;
+  font-size: 16px;
+}
+
 .cross-open-basket-table th,
 .cross-open-basket-table td {
   padding: 8px 10px;
@@ -2360,6 +2387,105 @@ i.health-diagnostic {
   color: #70858f;
   font: 700 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
   text-transform: uppercase;
+}
+
+/* Daily Range is one lane with real trade ownership. Present it as a concise
+   ledger rather than a wall of tiles, while retaining symbol -> candle review. */
+.daily-range-report-note {
+  padding: 9px 12px;
+  color: #7d97a3;
+  font-size: 11px;
+  line-height: 1.55;
+  border-bottom: 1px solid #20313a;
+  background: #0f1c23;
+}
+
+.daily-range-message {
+  padding: 12px;
+  color: #7d97a3;
+  font-size: 12px;
+}
+
+.daily-range-breakdown {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  color: #8da5ae;
+  font-size: 11px;
+  border-bottom: 1px solid #17272e;
+}
+
+.daily-range-breakdown span:last-child {
+  color: #6fb3d6;
+}
+
+.daily-range-table {
+  min-width: 1420px !important;
+}
+
+.daily-range-table th,
+.daily-range-table td {
+  padding: 9px 10px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.daily-range-table td small {
+  margin-left: 3px;
+  color: #718791;
+  font-size: 10px;
+}
+
+.daily-range-symbol-button {
+  padding: 0;
+  border: 0;
+  color: #dbe7ec;
+  background: transparent;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: rgba(111, 179, 214, 0.75);
+  text-underline-offset: 3px;
+}
+
+.daily-range-symbol-button[aria-pressed="true"] {
+  color: #6fb3d6;
+}
+
+.daily-range-state {
+  display: inline-flex !important;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 6px;
+  border: 1px solid #35505a;
+  border-radius: 999px;
+  color: #a9c2cb !important;
+  font: 700 9px/1 "IBM Plex Mono", "Cascadia Code", monospace !important;
+  letter-spacing: 0.02em;
+}
+
+.daily-range-state.is-tp {
+  border-color: rgba(70, 211, 154, 0.48);
+  color: #46d39a !important;
+}
+
+.daily-range-state.is-stop {
+  border-color: rgba(255, 107, 107, 0.48);
+  color: #ff8b8b !important;
+}
+
+.daily-range-action {
+  color: #6fb3d6 !important;
+  font-size: 10px !important;
+}
+
+.daily-range-reconcile {
+  display: block;
+  max-width: 190px;
+  margin: 4px 0 0 !important;
+  white-space: normal;
 }
 
 .testnet-kpis {

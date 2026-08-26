@@ -30,7 +30,6 @@ import {
   BinanceFuturesPrivateError,
   resolveConfirmedFillPrice,
   resolveLiveBinanceEnv,
-  withBinanceTransportSource,
   type BinanceFuturesPrivateClient,
   type FuturesIncomeEntry,
   type FuturesOrder,
@@ -2618,6 +2617,30 @@ export class LiveExecutionEngine {
     return this.entryGateDecision().reason;
   }
 
+  /**
+   * Account-safety-only entry gate for independent lanes.  It deliberately does
+   * not inherit the mirror/Dynamic strategy admission policy, but it still
+   * honours arm state, a latched kill, the operator drain, and transport
+   * cooldown.  Independent lanes use this only as an additional AND gate.
+   */
+  private accountEntryGateDecision(): LiveNewEntryGateDecision {
+    const st = this.store.getState();
+    if (!this.armed) return { allowed: false, reason: "engine is not ARMED" };
+    if (st.killedAt) return { allowed: false, reason: st.killReason ?? "kill switch latched" };
+    if (this.isNewEntryDrainActive()) {
+      return { allowed: false, reason: "new-entry drain is active (operator paused new entries)" };
+    }
+    return this.transportAvailabilityGate();
+  }
+
+  canOpenNewAccountEntries(): boolean {
+    return this.accountEntryGateDecision().allowed;
+  }
+
+  newAccountEntryBlockReason(): string | null {
+    return this.accountEntryGateDecision().reason;
+  }
+
   /** Same as canOpenNewEntries() but never delegates to the manual-directional bias gate — for
    *  baskets (e.g. CROSS_SECTIONAL_MARKET_NEUTRAL) whose own signal has no single-symbol
    *  directional bias to align with, so the manual selector's LONG/SHORT allocation is simply
@@ -3385,10 +3408,6 @@ export class LiveExecutionEngine {
   // ── tick orchestration ─────────────────────────────────────────────────────
 
   async tick(): Promise<void> {
-    return withBinanceTransportSource("live-engine.tick", () => this.runTick());
-  }
-
-  private async runTick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     this.lastTickError = null;

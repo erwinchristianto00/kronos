@@ -27,6 +27,10 @@ const C = {
 };
 
 const REFRESH_MS = 30_000;
+// Keep the two candle cards deliberately tall. Structural S/R, EMA20/EMA50 and the
+// 5m acceptance levels are otherwise visually compressed on a wide dashboard.
+const CANDLE_CHART_HEIGHT = 460;
+const VOLUME_PANE_HEIGHT = 84;
 const HISTORICAL_INTERVALS = [
   { value: '15m', label: '15m' },
   { value: '1h', label: '1H' },
@@ -203,7 +207,7 @@ function CandlePane({
     const toTime = (ms: number) => Math.floor(ms / 1000) as UTCTimestamp;
     const chart = createChart(node, {
       width: Math.max(1, node.clientWidth),
-      height: 300,
+      height: CANDLE_CHART_HEIGHT,
       layout: { background: { type: ColorType.Solid, color: '#071016' }, textColor: '#8fa5ae', fontFamily: 'IBM Plex Mono, Cascadia Code, monospace' },
       grid: { vertLines: { color: 'rgba(38, 61, 72, 0.45)' }, horzLines: { color: 'rgba(38, 61, 72, 0.45)' } },
       rightPriceScale: { borderColor: '#29414c' },
@@ -225,7 +229,7 @@ function CandlePane({
       value: candle.volume,
       color: candle.close >= candle.open ? 'rgba(92, 228, 166, 0.45)' : 'rgba(255, 119, 125, 0.42)',
     })));
-    chart.panes()[1]?.setHeight(62);
+    chart.panes()[1]?.setHeight(VOLUME_PANE_HEIGHT);
     for (const level of levels) {
       candleSeries.createPriceLine({
         price: level.price,
@@ -268,7 +272,7 @@ function CandlePane({
       }
     }
     chart.timeScale().fitContent();
-    const resize = () => chart.resize(Math.max(1, node.clientWidth), 300);
+    const resize = () => chart.resize(Math.max(1, node.clientWidth), CANDLE_CHART_HEIGHT);
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(resize);
     observer?.observe(node);
     window.addEventListener('resize', resize);
@@ -377,7 +381,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   }, [historicalEndpoint, historicalInterval, leg?.key]);
 
   if (!leg) {
-    return <section className="testnet-panel testnet-wide-panel" id="open-basket-review-chart">
+    return <section className="testnet-panel testnet-wide-panel candle-review-card" id="open-basket-review-chart">
       <header><div><span>Basket candle review</span><strong>Menunggu basket aktif</strong></div></header>
       <div style={{ padding: 12, color: C.dim, fontSize: 12 }}>Saat ada basket aktif, klik simbolnya di tabel untuk membuka candle 1D dan 5m. Tidak ada dropdown simbol.</div>
     </section>;
@@ -435,7 +439,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     </select>
   </label>;
 
-  return <section className="testnet-panel testnet-wide-panel" id={isDailyRange ? 'daily-range-review-chart' : 'open-basket-review-chart'}>
+  return <section className="testnet-panel testnet-wide-panel candle-review-card" id={isDailyRange ? 'daily-range-review-chart' : 'open-basket-review-chart'}>
     <header>
       <div>
         <span>{reviewTitle}</span>
