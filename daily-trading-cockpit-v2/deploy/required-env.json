@@ -143,20 +143,20 @@
       "why": "The Dynamic policy freezes six equal $25 legs and has no confidence-sized learning tier. Keep the old traffic-light scaler OFF in both environments."
     },
     "CROSS_SECTIONAL_POLICY_VERSION": {
-      "value": "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
-      "why": "Immutable policy identity for Dynamic MOM36 V5. It preserves continuation, score-gap, cluster cap, and SL/MFE exits, but uses a complete same-snapshot raw-V3 selection when strict SLOW_AND_FAST cannot fill all six legs. New evidence must never be mixed with V4."
+      "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+      "why": "Active TESTNET Dynamic MOM36 V5 identity. Preserve the already-running continuation, SLOW_AND_FAST preference/fallback, and SL/MFE policy across dashboard-only releases; new evidence must not be reclassified as V4."
     },
     "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-      "value": "2026-08-25T21:15:14Z",
-      "why": "Forward-cohort boundary for Dynamic MOM36 V5. It is set at V5 cutover preparation and does not reclassify prior baskets."
+      "value": "2026-08-26T06:20:00Z",
+      "why": "Active TESTNET V5 forward-cohort boundary. It is retained exactly during dashboard-only releases and does not reclassify prior baskets."
     },
     "CROSS_SECTIONAL_STRATEGY_VERSION": {
-      "value": "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
-      "why": "Selects the versioned Dynamic MOM36 continuation with strict SLOW_AND_FAST preferred first, exact complete raw-V3 fallback second, and the unchanged SL/MFE exit dispatcher for new baskets only."
+      "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+      "why": "Active TESTNET Dynamic MOM36 V5 implementation: continuation, MOM36 rank walk, SLOW_AND_FAST preference/fallback, and unchanged SL/MFE exit dispatcher for new baskets only."
     },
     "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
-      "value": "2026-08-25T21:15:14Z",
-      "why": "Frozen strategy deployment timestamp captured in every new V5 basket fingerprint."
+      "value": "2026-08-26T06:20:00Z",
+      "why": "Active TESTNET V5 deployment timestamp captured in every new basket fingerprint."
     },
     "CROSS_SECTIONAL_EXEC_VARIANT": {
       "value": "DYNAMIC_MOM36_SHOCK",
