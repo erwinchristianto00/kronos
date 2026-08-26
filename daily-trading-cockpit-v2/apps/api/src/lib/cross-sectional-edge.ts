@@ -1949,8 +1949,8 @@ export function filteredWeightingModel(env: NodeJS.ProcessEnv = process.env): Cr
 
 export function buildFilteredCrossSectionalBasket(
   scored: ScoredSymbol[],
-  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap" | "sideTrendAlignment"> &
-    Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap">>,
+  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
+    Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap" | "sideTrendAlignment">>,
 ): CrossSectionalObservation | null {
   const rerankEnabled = opts.smartFormation?.enabled === true || (
     opts.smartFormation === undefined && isCrossSectionalSmartFormationRerankEnabled()
@@ -1968,7 +1968,12 @@ export function buildFilteredCrossSectionalBasket(
     maxPerCluster: opts.maxPerCluster ?? CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER,
     weightingModel: opts.weightingModel ?? filteredWeightingModel(),
     formationMode,
-    sideTrendAlignment: crossSectionalFilteredSideTrendAlignment(),
+    // FILTERED callers retain the configured legacy eligibility by default.  Dynamic MOM36's
+    // balanced admission probe is the one deliberate override: V5 owns SLOW_AND_FAST while
+    // forming its final breadth basket, whereas this probe measures only score-gap, cluster, and
+    // liquidity geometry.  Applying the legacy 3L/3S alignment here would make a valid 0L6S or
+    // 6L0S breadth cycle fail before its Dynamic selector is evaluated.
+    sideTrendAlignment: opts.sideTrendAlignment ?? crossSectionalFilteredSideTrendAlignment(),
     smartFormation: opts.smartFormation ?? { enabled: formationMode === "SMART_FORMATION_RERANK" },
   });
 }
@@ -2793,6 +2798,10 @@ export async function runCrossSectionalCycle(opts: {
           shortK: CROSS_SECTIONAL_K,
           formationMode: "PLAIN_MOM36" as CrossSectionalFormationMode,
           smartFormation: { enabled: false },
+          // Dynamic V5 applies its own strict SLOW_AND_FAST preference/fallback during final
+          // formation.  This balanced 3L/3S probe must not reject a one-sided breadth regime
+          // merely because legacy LONG candidates are absent.
+          sideTrendAlignment: "OFF" as CrossSectionalSideTrendAlignment,
         }
       : buildOpts;
     const baselineGap = { value: null as CrossSectionalGapRejection | null };

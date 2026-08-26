@@ -110,6 +110,8 @@ export type CrossSectionalPolicyFingerprint = {
     formationMode: CrossSectionalFormationMode;
     smartFormationRerank: boolean;
     sideTrendAlignment: CrossSectionalSideTrendAlignment;
+    /** Eligibility used by the balanced score-gap / cluster admission probe. */
+    admissionProbeSideTrendAlignment?: CrossSectionalSideTrendAlignment;
     entryRevalidationEnabled: boolean;
     entryHealthBypassed: boolean;
   };
@@ -122,6 +124,8 @@ export type CrossSectionalEffectiveRuntime = {
   strategyVersion: string;
   formationMode: CrossSectionalFormationMode;
   sideTrendAlignment: CrossSectionalSideTrendAlignment;
+  /** Dynamic V5's admission probe must not inherit the legacy balanced-side eligibility gate. */
+  admissionProbeSideTrendAlignment: CrossSectionalSideTrendAlignment;
   adaptiveExitMode: CrossSectionalAdaptiveExitMode;
   entryRevalidation: boolean;
   executorTick: {
@@ -408,6 +412,7 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
       formationMode: dynamic ? "PLAIN_MOM36" : crossSectionalFormationMode(env),
       smartFormationRerank: dynamic ? false : isCrossSectionalSmartFormationRerankEnabled(env),
       sideTrendAlignment: dynamic ? "OFF" : crossSectionalFilteredSideTrendAlignment(env),
+      admissionProbeSideTrendAlignment: dynamic ? "OFF" : crossSectionalFilteredSideTrendAlignment(env),
       entryRevalidationEnabled: dynamic ? false : isCrossSectionalSmartBasketLifecycleEnabled(env),
       entryHealthBypassed: env.CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH === "1",
     },
@@ -469,6 +474,7 @@ export function effectiveCrossSectionalRuntime(
     strategyVersion: selection.strategyVersion,
     formationMode: dynamic ? "PLAIN_MOM36" : crossSectionalFormationMode(env),
     sideTrendAlignment: dynamic ? "OFF" : selection.sideTrendAlignment,
+    admissionProbeSideTrendAlignment: dynamic ? "OFF" : selection.sideTrendAlignment,
     adaptiveExitMode: dynamic ? "OFF" : crossSectionalAdaptiveExitMode(env),
     entryRevalidation: !dynamic && isCrossSectionalSmartBasketLifecycleEnabled(env),
     executorTick: {

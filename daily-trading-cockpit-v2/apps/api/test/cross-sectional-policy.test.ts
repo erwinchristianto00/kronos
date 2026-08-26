@@ -281,7 +281,12 @@ describe("cross-sectional effective runtime policy", () => {
         selectionMode: "DYNAMIC_MOM36_BREADTH",
         selectionState: "EFFECTIVE",
       },
-      formation: { weighting: "EQUAL_NOTIONAL", entryRevalidationEnabled: false },
+      formation: {
+        weighting: "EQUAL_NOTIONAL",
+        sideTrendAlignment: "OFF",
+        admissionProbeSideTrendAlignment: "OFF",
+        entryRevalidationEnabled: false,
+      },
       execution: {
         executionCapHours: 36,
         dynamicV3Exit: {
@@ -290,6 +295,10 @@ describe("cross-sectional effective runtime policy", () => {
           mfeGivebackFraction: 0.30,
         },
       },
+    });
+    expect(effectiveCrossSectionalRuntime(true, env)).toMatchObject({
+      sideTrendAlignment: "OFF",
+      admissionProbeSideTrendAlignment: "OFF",
     });
   });
 });

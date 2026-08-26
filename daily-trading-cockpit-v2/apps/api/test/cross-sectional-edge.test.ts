@@ -361,6 +361,40 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
       )!;
       expect(legacy.shortLeg.map((leg) => leg.symbol)).toEqual(["R6", "R5", "R4"]);
     });
+
+    it("lets Dynamic V5's balanced admission probe opt out without weakening normal SLOW_AND_FAST selection", () => {
+      const fallingBreadth: ScoredSymbol[] = [
+        { symbol: "F1", score: -0.10, price: 100, fastReturn: -0.01 },
+        { symbol: "F2", score: -0.12, price: 100, fastReturn: -0.01 },
+        { symbol: "F3", score: -0.14, price: 100, fastReturn: -0.01 },
+        { symbol: "F4", score: -0.16, price: 100, fastReturn: -0.01 },
+        { symbol: "F5", score: -0.18, price: 100, fastReturn: -0.01 },
+        { symbol: "F6", score: -0.20, price: 100, fastReturn: -0.01 },
+      ];
+      const allSymbols = new Set(fallingBreadth.map((row) => row.symbol));
+
+      withEnv({ CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "1" }, () => {
+        // The ordinary FILTERED path still fails closed: it has no aligned LONG candidates.
+        expect(buildFilteredCrossSectionalBasket(fallingBreadth, {
+          ...common,
+          longAllowlist: allSymbols,
+          shortAllowlist: allSymbols,
+        })).toBeNull();
+
+        // Dynamic V5 has already frozen its own SLOW_AND_FAST final selection. Its balanced
+        // probe therefore evaluates only score-gap/cluster/liquidity geometry and remains valid
+        // in an all-negative MOM36 breadth regime.
+        const probe = buildFilteredCrossSectionalBasket(fallingBreadth, {
+          ...common,
+          longAllowlist: allSymbols,
+          shortAllowlist: allSymbols,
+          sideTrendAlignment: "OFF",
+        })!;
+        expect(probe.longLeg.map((leg) => leg.symbol)).toEqual(["F1", "F2", "F3"]);
+        expect(probe.shortLeg.map((leg) => leg.symbol)).toEqual(["F6", "F5", "F4"]);
+        expect(probe.scoreGap).toBeGreaterThan(0);
+      });
+    });
   });
 
   it("[SMART BASKET V1] keeps the same FILTERED universe/K but prefers a close-ranked, confirmed normal-range leg over a stretched reversal", () => {

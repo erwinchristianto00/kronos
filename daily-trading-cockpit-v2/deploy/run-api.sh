@@ -21,6 +21,24 @@ case "$here" in
   /root/kronos-live-releases/*)    instance=3103 ;;
   /root/kronos-testnet-releases/*) instance=3102 ;;
 esac
+
+# Testnet positions are owned by the approved durable lane ledger, not by a
+# release archive.  Keep this stricter-than-generic fence from the incumbent
+# release: a merely valid but different symlink can still make every real
+# Testnet position look foreign to the new process.
+if [ "$instance" = "3102" ]; then
+    state_dir="$here/../apps/api/data"
+    canonical_testnet_state="${KRONOS_TESTNET_STATE_DIR:-/root/kronos-testnet-releases/128b09f/daily-trading-cockpit-v2/apps/api/data}"
+    state_target="$(readlink -f "$state_dir" 2>/dev/null || true)"
+    if [ ! -L "$state_dir" ] || [ "$state_target" != "$canonical_testnet_state" ] \
+       || [ ! -s "$state_target/cross-sectional-executor.json" ] \
+       || [ ! -s "$state_target/live-execution.json" ]; then
+      echo "!! TESTNET STATE GUARD — refusing to start without the approved shared position ledger."
+      echo "!! Expected: $canonical_testnet_state"
+      echo "!! Actual:   ${state_target:-not-a-symlink}"
+      exit 79
+    fi
+fi
 if [ -n "$instance" ]; then
     # Runtime state must be shared deliberately with the durable lane store. A source archive
     # contains historical data fixtures, so merely creating a link *inside* apps/api/data leaves
@@ -48,6 +66,13 @@ if [ -n "$instance" ]; then
         echo "!!  REQUIRED_ENV_CHECK=warn — starting despite the drift above."
       fi
     fi
+fi
+
+# Staged releases use this non-mutating path before PM2 replaces a healthy
+# process.  It validates the exact same state/env guards as a real start.
+if [ "${RUN_API_PRECHECK_ONLY:-0}" = "1" ]; then
+  echo "OK: API prestart checks passed for instance ${instance:-unscoped}."
+  exit 0
 fi
 
 cd "$here/../apps/api"

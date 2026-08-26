@@ -120,6 +120,73 @@ describe("Dynamic MOM36 production-cycle integration", () => {
     }
   });
 
+  it("admits an all-negative 0L6S V5 breadth cycle when the legacy balanced-side alignment is ON", async () => {
+    const overrides: Record<string, string> = {
+      CROSS_SECTIONAL_STRATEGY_VERSION: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5,
+      CROSS_SECTIONAL_INTERVAL: "1h",
+      CROSS_SECTIONAL_MOMENTUM_BARS: "36",
+      CROSS_SECTIONAL_HORIZON_BARS: "48",
+      CROSS_SECTIONAL_K: "3",
+      CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP: "0.058",
+      CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER: "2",
+      CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST: universe.join(","),
+      CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST: universe.join(","),
+      // This is the live setting. It must remain effective for normal FILTERED selection, but
+      // cannot be applied to Dynamic V5's balanced score-gap/cluster admission probe.
+      CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "1",
+      CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST: "",
+      CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "0",
+      CROSS_SECTIONAL_REGIME_SKEW_ENABLED: "0",
+      CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+      CROSS_SECTIONAL_STAND_DOWN_14D_PCT: "0",
+      CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR: "0",
+      CROSS_SECTIONAL_EDGE_DISABLED: "0",
+    };
+    const before = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+    try {
+      for (const [key, value] of Object.entries(overrides)) process.env[key] = value;
+      vi.resetModules();
+      const edge = await import("../src/lib/cross-sectional-edge.js");
+      const dir = mkdtempSync(join(tmpdir(), "dynamic-mom36-v5-0l6s-admission-"));
+      dirs.push(dir);
+      const returns: Record<string, number> = {
+        BTCUSDT: -0.05,
+        ETHUSDT: -0.08,
+        SOLUSDT: -0.11,
+        DOGEUSDT: -0.14,
+        LINKUSDT: -0.25,
+        FETUSDT: -0.30,
+        AAVEUSDT: -0.35,
+        WLDUSDT: -0.40,
+      };
+      const store = new edge.CrossSectionalStore(dir);
+      const result = await edge.runCrossSectionalCycle({
+        store,
+        universe,
+        now: cutoff + 5 * 60_000,
+        fetchCandles: async (symbol) => candlesFor(returns[symbol]!),
+      });
+
+      expect(result.openedDynamicMom36Shock).toBe(1);
+      const observation = store.all.find((row) => row.variant === "DYNAMIC_MOM36_SHOCK")!;
+      expect(observation.dynamicMom36).toMatchObject({
+        positiveCount: 0,
+        negativeCount: 8,
+        finalAllocation: { label: "0L6S" },
+        admission: { passed: true, scoreGapFloor: 0.058 },
+        noEntryReason: null,
+      });
+      expect(observation.dynamicMom36?.admission.scoreGap).toBeGreaterThanOrEqual(0.058);
+      expect(observation.longLeg).toHaveLength(0);
+      expect(observation.shortLeg).toHaveLength(6);
+    } finally {
+      for (const [key, value] of before) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("skips an isolated daily-range lease before V5 basket formation instead of reaching executor netting", async () => {
     const overrides: Record<string, string> = {
       CROSS_SECTIONAL_STRATEGY_VERSION: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5,
