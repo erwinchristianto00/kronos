@@ -208,6 +208,10 @@
     "3103": {
       "role": "mainnet",
       "extra": {
+        "KRONOS_RELEASE_SHA": {
+          "value": "80507ee62e120a76426fd4f968da9ccba8935c49",
+          "why": "Exact source identity for the Live-only Plain MOM36 policy fence. Every new basket fingerprint records this immutable commit, rather than inheriting the prior Dynamic release SHA."
+        },
         "CROSS_SECTIONAL_POLICY_VERSION": {
           "value": "plain-mom36-filtered-3l3s-slowfast-36h-usdm-v1",
           "why": "Live-only policy fence after the audited Dynamic MOM36 breadth drift. New LIVE evidence is a separate Plain MOM36 3L/3S cohort; Testnet remains unchanged on its existing V5 runtime."
