@@ -700,6 +700,18 @@ export class DailyRangeAcceptanceLane {
     };
   }
 
+  /** Read-only review accessor for a durable lane-owned trade.  The returned
+   * record is detached from store state so API/dashboard callers cannot alter
+   * entry, bracket, or reconciliation ownership by accident. */
+  findTrade(tradeId: string): DailyRangeTrade | null {
+    const trade = this.store.findTrade(tradeId);
+    return trade ? {
+      ...trade,
+      confirmationBar1: { ...trade.confirmationBar1 },
+      confirmationBar2: { ...trade.confirmationBar2 },
+    } : null;
+  }
+
   history(kind: "levels" | "signals" | "trades", limit = 500): unknown[] {
     const bounded = Math.max(1, Math.min(10_000, Math.floor(limit)));
     const state = this.store.getState();

@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import { describe, expect, it, vi } from "vitest";
+import type { DailyRangeAcceptanceLane } from "../src/lib/daily-4h-range-acceptance-lane.js";
 import { registerLiveRoutes } from "../src/routes/live.js";
 
 describe("GET /api/live/open-basket-chart", () => {
@@ -82,6 +83,70 @@ describe("GET /api/live/open-basket-chart", () => {
         },
         referenceReason: null,
       });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("uses the Daily Range trade's persisted 4h range instead of inferring a new calendar-day range", async () => {
+    const marketCandles = vi.fn(async (_symbol: string, interval: string) => {
+      if (interval === "1d") return [{
+        openTime: Date.UTC(2026, 7, 23, 0, 0, 0), open: 0.09, high: 0.13, low: 0.08, close: 0.103, volume: 700,
+      }];
+      if (interval === "5m") return [{
+        openTime: Date.UTC(2026, 7, 24, 4, 5, 0), open: 0.102, high: 0.104, low: 0.1, close: 0.101, volume: 12,
+      }];
+      return [];
+    });
+    const lane = {
+      findTrade: vi.fn((tradeId: string) => tradeId === "drra-opusdt-example" ? {
+        tradeId,
+        dateUtc: "2026-08-24",
+        symbol: "OPUSDT",
+        rangeHigh: 0.1102,
+        rangeLow: 0.0984,
+      } : null),
+    } as unknown as DailyRangeAcceptanceLane;
+    const app = Fastify();
+    await registerLiveRoutes(app, null, {
+      dailyRangeLane: () => lane,
+      marketCandles,
+      openBasketChartNowMs: () => Date.UTC(2026, 7, 26, 12, 0, 0),
+    });
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/live/daily-range-lane/chart?tradeId=drra-opusdt-example" });
+      expect(response.statusCode).toBe(200);
+      expect(marketCandles).toHaveBeenCalledWith("OPUSDT", "1d", 120);
+      expect(marketCandles).toHaveBeenCalledWith("OPUSDT", "5m", 576);
+      expect(marketCandles).not.toHaveBeenCalledWith("OPUSDT", "4h", 18);
+      expect(response.json()).toMatchObject({
+        ok: true,
+        chartKind: "DAILY_RANGE_TRADE",
+        tradeId: "drra-opusdt-example",
+        symbol: "OPUSDT",
+        completedOnly: true,
+        reference4h: {
+          dateUtc: "2026-08-24",
+          fourHourOpenTime: Date.UTC(2026, 7, 24, 0, 0, 0),
+          fourHourCloseTime: Date.UTC(2026, 7, 24, 4, 0, 0),
+          rangeHigh: 0.1102,
+          rangeLow: 0.0984,
+          source: "TRADE_PERSISTED",
+        },
+        referenceReason: null,
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("does not expose a Daily Range chart outside the isolated lane", async () => {
+    const app = Fastify();
+    await registerLiveRoutes(app, null, { marketCandles: vi.fn(async () => []) });
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/live/daily-range-lane/chart?tradeId=drra-opusdt-example" });
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toMatchObject({ ok: false, reason: "daily range lane is unavailable outside Testnet" });
     } finally {
       await app.close();
     }

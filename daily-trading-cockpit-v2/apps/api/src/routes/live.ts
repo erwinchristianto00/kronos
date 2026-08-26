@@ -144,6 +144,16 @@ function previousUtcDayStartMs(nowMs: number): number {
   return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 0, 0, 0, 0);
 }
 
+/** Parse only a canonical persisted UTC trade date.  A Daily Range chart must
+ * never substitute today's/yesterday's range when its original reference is
+ * missing or malformed. */
+function utcDateStartMs(dateUtc: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateUtc)) return null;
+  const value = Date.parse(`${dateUtc}T00:00:00.000Z`);
+  if (!Number.isFinite(value)) return null;
+  return new Date(value).toISOString().slice(0, 10) === dateUtc ? value : null;
+}
+
 /** Canonical choices for the operator allocation selector. Keep this server-owned so newly
  * wired executors do not disappear just because a frontend fallback list was not updated. */
 const OPERATOR_ALLOCATION_LANE_IDS = [
@@ -2101,6 +2111,73 @@ export async function registerLiveRoutes(
   });
 
   // ── Daily 4h range-acceptance lane (Testnet-only, isolated from MOM36) ────
+  // Read-only chart feed for a specific durable Daily Range trade.  Unlike the
+  // generic basket review route, this intentionally takes the persisted range
+  // from the trade, so an open trade keeps the exact 00:00-04:00 UTC reference
+  // it was created with even after the calendar day changes.
+  app.get("/api/live/daily-range-lane/chart", async (request, reply) => {
+    const lane = opts.dailyRangeLane?.() ?? null;
+    if (!lane) {
+      reply.code(503);
+      return { ok: false, reason: "daily range lane is unavailable outside Testnet" };
+    }
+    const query = (request.query ?? {}) as { tradeId?: unknown };
+    const tradeId = typeof query.tradeId === "string" ? query.tradeId.trim() : "";
+    if (!tradeId || tradeId.length > 160) {
+      reply.code(400);
+      return { ok: false, reason: "valid daily range tradeId is required" };
+    }
+    const trade = lane.findTrade(tradeId);
+    if (!trade) {
+      reply.code(404);
+      return { ok: false, reason: "daily range trade not found" };
+    }
+    if (!validOpenBasketChartSymbol(trade.symbol)) {
+      reply.code(422);
+      return { ok: false, reason: "daily range trade has an invalid USD-M symbol" };
+    }
+
+    const referenceStartMs = utcDateStartMs(trade.dateUtc);
+    const referenceValid = referenceStartMs !== null
+      && Number.isFinite(trade.rangeHigh)
+      && Number.isFinite(trade.rangeLow)
+      && trade.rangeHigh > trade.rangeLow;
+    try {
+      const [dailyCandles, fiveMinuteCandles] = await Promise.all([
+        readOpenBasketChartCandles(trade.symbol, "1d"),
+        readOpenBasketChartCandles(trade.symbol, "5m"),
+      ]);
+      return {
+        ok: true,
+        chartKind: "DAILY_RANGE_TRADE" as const,
+        tradeId: trade.tradeId,
+        symbol: trade.symbol,
+        source: "BINANCE_USDM_PUBLIC" as const,
+        completedOnly: true,
+        asOf: new Date(openBasketChartNowMs()).toISOString(),
+        daily: { interval: "1d" as const, candles: cleanOpenBasketChartCandles(dailyCandles) },
+        fiveMinute: { interval: "5m" as const, candles: cleanOpenBasketChartCandles(fiveMinuteCandles) },
+        reference4h: referenceValid
+          ? {
+            dateUtc: trade.dateUtc,
+            fourHourOpenTime: referenceStartMs,
+            fourHourCloseTime: referenceStartMs + FOUR_HOURS_MS,
+            rangeHigh: trade.rangeHigh,
+            rangeLow: trade.rangeLow,
+            source: "TRADE_PERSISTED" as const,
+          }
+          : null,
+        referenceReason: referenceValid ? null : "trade's persisted 00:00-04:00 UTC range is missing or invalid",
+      };
+    } catch (error) {
+      reply.code(503);
+      return {
+        ok: false,
+        reason: error instanceof Error ? error.message : "public USD-M candle source unavailable",
+      };
+    }
+  });
+
   app.get("/api/live/daily-range-lane/status", async () => {
     const lane = opts.dailyRangeLane?.() ?? null;
     if (!lane) {

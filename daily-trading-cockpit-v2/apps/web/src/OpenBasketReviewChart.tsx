@@ -33,6 +33,11 @@ export type OpenBasketReviewLeg = {
   entryPrice: number;
   markPrice: number | null;
   grossUnrealizedUsd: number | null;
+  /** Daily Range supplies an exact trade-scoped feed rather than the generic prior-day reference. */
+  chartEndpoint?: string;
+  reviewKind?: 'cross-sectional' | 'daily-range';
+  stopPrice?: number | null;
+  takeProfitPrice?: number | null;
 };
 
 type Candle = {
@@ -44,6 +49,15 @@ type Candle = {
   volume: number;
 };
 
+type ChartReference = {
+  dateUtc: string;
+  fourHourOpenTime: number;
+  fourHourCloseTime: number;
+  rangeHigh: number;
+  rangeLow: number;
+  source?: 'TRADE_PERSISTED';
+};
+
 type ChartResponse = {
   ok: boolean;
   symbol: string;
@@ -52,13 +66,8 @@ type ChartResponse = {
   asOf: string;
   daily: { interval: '1d'; candles: Candle[] };
   fiveMinute: { interval: '5m'; candles: Candle[] };
-  previousUtcReference4h: {
-    dateUtc: string;
-    fourHourOpenTime: number;
-    fourHourCloseTime: number;
-    rangeHigh: number;
-    rangeLow: number;
-  } | null;
+  previousUtcReference4h?: ChartReference | null;
+  reference4h?: ChartReference | null;
   referenceReason: string | null;
   reason?: string;
 };
@@ -215,6 +224,9 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   const [data, setData] = useState<ChartResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const chartEndpoint = leg
+    ? leg.chartEndpoint ?? `${apiPrefix}/live/open-basket-chart?symbol=${encodeURIComponent(leg.symbol)}`
+    : null;
 
   useEffect(() => {
     if (!leg) {
@@ -227,7 +239,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     const load = async () => {
       setLoading(true);
       try {
-        const response = await fetch(`${apiPrefix}/live/open-basket-chart?symbol=${encodeURIComponent(leg.symbol)}`, { cache: 'no-store' });
+        const response = await fetch(chartEndpoint!, { cache: 'no-store' });
         const body = await response.json() as ChartResponse;
         if (!response.ok || body.ok !== true || !Array.isArray(body.daily?.candles) || !Array.isArray(body.fiveMinute?.candles)) {
           throw new Error(body.reason ?? `candle request failed (${response.status})`);
@@ -248,7 +260,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [apiPrefix, leg?.key, leg?.symbol]);
+  }, [chartEndpoint, leg?.key]);
 
   if (!leg) {
     return <section className="testnet-panel testnet-wide-panel" id="open-basket-review-chart">
@@ -257,46 +269,70 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     </section>;
   }
 
-  const reference = data?.previousUtcReference4h ?? null;
+  const isDailyRange = leg.reviewKind === 'daily-range';
+  const reference = data?.reference4h ?? data?.previousUtcReference4h ?? null;
+  const tradeLevels: PriceLevel[] = isDailyRange ? [
+    { price: leg.entryPrice, label: 'Entry', color: C.measure },
+    ...(leg.stopPrice != null && Number.isFinite(leg.stopPrice)
+      ? [{ price: leg.stopPrice, label: 'Native SL', color: C.bad }]
+      : []),
+    ...(leg.takeProfitPrice != null && Number.isFinite(leg.takeProfitPrice)
+      ? [{ price: leg.takeProfitPrice, label: 'Native 2R TP', color: C.good }]
+      : []),
+  ] : [];
   const dailyLevels: PriceLevel[] = reference ? [
     { price: reference.rangeHigh, label: 'Resistance', color: C.accent },
     { price: reference.rangeLow, label: 'Support', color: C.good },
-  ] : [];
+    ...tradeLevels,
+  ] : tradeLevels;
   const fiveMinuteLevels: PriceLevel[] = reference ? [
     { price: reference.rangeHigh, label: 'Breakout + acceptance long', color: C.accent },
     { price: reference.rangeLow, label: 'Breakdown + acceptance short', color: C.bad },
-  ] : [];
-  const acceptanceEvents = reference && data ? findAcceptanceEvents(data.fiveMinute.candles, reference.rangeHigh, reference.rangeLow) : [];
-  const latestAcceptance = reference && data ? currentAcceptance(data.fiveMinute.candles, reference.rangeHigh, reference.rangeLow) : null;
+    ...tradeLevels,
+  ] : tradeLevels;
+  // A Daily Range trade cannot be accepted before its source 4h candle has closed.  Keep the
+  // existing cross-sectional review's historical display semantics unchanged.
+  const acceptanceCandles = reference && data
+    ? isDailyRange
+      ? data.fiveMinute.candles.filter((candle) => candle.openTime >= reference.fourHourCloseTime)
+      : data.fiveMinute.candles
+    : [];
+  const acceptanceEvents = reference ? findAcceptanceEvents(acceptanceCandles, reference.rangeHigh, reference.rangeLow) : [];
+  const latestAcceptance = reference ? currentAcceptance(acceptanceCandles, reference.rangeHigh, reference.rangeLow) : null;
   const latestLongAcceptance = acceptanceEvents.filter((event) => event.side === 'LONG').at(-1);
   const latestShortAcceptance = acceptanceEvents.filter((event) => event.side === 'SHORT').at(-1);
+  const reviewTitle = isDailyRange ? 'Daily Range 4H candle review · klik trade' : 'Basket candle review · klik leg di tabel';
+  const ownerNoun = isDailyRange ? 'trade' : 'basket';
 
-  return <section className="testnet-panel testnet-wide-panel" id="open-basket-review-chart">
+  return <section className="testnet-panel testnet-wide-panel" id={isDailyRange ? 'daily-range-review-chart' : 'open-basket-review-chart'}>
     <header>
       <div>
-        <span>Basket candle review · klik leg di tabel</span>
+        <span>{reviewTitle}</span>
         <strong style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.symbol} · {leg.side}</strong>
       </div>
       <span style={{ color: C.dim, fontSize: 11 }}>{loading ? 'memperbarui completed candles…' : data?.asOf ? `as of ${formatTaipei(data.asOf)} Taipei` : 'memuat…'}</span>
     </header>
     <div style={{ padding: '8px 12px', display: 'flex', gap: 14, flexWrap: 'wrap', color: C.dim, fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
-      <span>basket <strong style={{ color: C.text }}>{leg.basketId}</strong></span>
+      <span>{ownerNoun} <strong style={{ color: C.text }}>{leg.basketId}</strong></span>
       <span>entry {formatPrice(leg.entryPrice)}</span>
       <span>mark {formatPrice(leg.markPrice)}</span>
-      <span style={{ color: leg.grossUnrealizedUsd == null ? C.dim : leg.grossUnrealizedUsd >= 0 ? C.good : C.bad }}>leg P&amp;L {formatMoney(leg.grossUnrealizedUsd)}</span>
+      <span style={{ color: leg.grossUnrealizedUsd == null ? C.dim : leg.grossUnrealizedUsd >= 0 ? C.good : C.bad }}>{isDailyRange ? 'gross mark P&L' : 'leg P&L'} {formatMoney(leg.grossUnrealizedUsd)}</span>
+      {isDailyRange && <span>native SL {formatPrice(leg.stopPrice)} · TP 2R {formatPrice(leg.takeProfitPrice)}</span>}
       <span>open {formatTaipei(leg.openedAt)} Taipei</span>
     </div>
     {error ? <div style={{ padding: 12, color: C.bad, fontSize: 12 }}>Candle chart unavailable: {error}</div> : <>
       <div style={{ padding: '9px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55, borderBottom: `1px solid ${C.border}` }}>
         {reference ? <>
-          Referensi: candle 4H <strong style={{ color: C.text }}>{reference.dateUtc} 00:00–04:00 UTC</strong> (hari kalender sebelum hari ini UTC).
+          {isDailyRange
+            ? <>Referensi eksekusi: candle 4H <strong style={{ color: C.text }}>{reference.dateUtc} 00:00–04:00 UTC</strong> yang dibekukan saat trade dibuat.</>
+            : <>Referensi: candle 4H <strong style={{ color: C.text }}>{reference.dateUtc} 00:00–04:00 UTC</strong> (hari kalender sebelum hari ini UTC).</>}
           Resistance <strong style={{ color: C.accent }}>{formatPrice(reference.rangeHigh)}</strong> · support <strong style={{ color: C.good }}>{formatPrice(reference.rangeLow)}</strong>.
           Acceptance memakai <strong style={{ color: C.text }}>dua close 5m selesai berturut-turut</strong> di luar level tersebut.
         </> : <span>Level 4H UTC belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
       </div>
       <div style={{ padding: 12, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 12 }}>
-        <CandlePane title="1D · historical candles + resistance / support" candles={data?.daily.candles ?? []} levels={dailyLevels} ariaLabel={`${leg.symbol} 1d candle chart`} />
-        <CandlePane title="5m · breakout / breakdown + acceptance threshold" candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} />
+        <CandlePane title={isDailyRange ? '1D · historical candles + range / trade levels' : '1D · historical candles + resistance / support'} candles={data?.daily.candles ?? []} levels={dailyLevels} ariaLabel={`${leg.symbol} 1d candle chart`} />
+        <CandlePane title={isDailyRange ? '5m · breakout / breakdown + acceptance + native bracket' : '5m · breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} />
       </div>
       {reference && <div style={{ padding: '0 12px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55 }}>
         Status acceptance sekarang: <strong style={{ color: latestAcceptance === 'LONG' ? C.good : latestAcceptance === 'SHORT' ? C.bad : C.text }}>{latestAcceptance ? `${latestAcceptance} confirmed` : 'belum ada dua close 5m berturut-turut'}</strong>.

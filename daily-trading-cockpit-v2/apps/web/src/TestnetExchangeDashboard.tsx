@@ -4,6 +4,7 @@ import './neural-mindmap.css';
 // table/accordion primitives also used by the Research dashboard's InnovationLanesCard.
 import { Disclosure, LaneMaturityTable, laneEdgeBadge, type LaneMaturityRow } from './LaneMaturityTable';
 import CrossSectionalReportCard from './CrossSectionalReportCard';
+import DailyRangeReportCard from './DailyRangeReportCard';
 import ContinuationLifecycleCard from './ContinuationLifecycleCard';
 
 const REFRESH_MS = 5_000;
@@ -2476,6 +2477,7 @@ export default function TestnetExchangeDashboard() {
           directional-regime, instrumentation, shadow reports: all 200 on 3103). pageApiPrefix makes
           it follow whichever page it is rendered on. */}
       <CrossSectionalReportCard apiPrefix={pageApiPrefix} />
+      {!isLivePage && <DailyRangeReportCard apiPrefix={pageApiPrefix} />}
       <ContinuationLifecycleCard apiPrefix={pageApiPrefix} />
 
       <main className="testnet-grid">
