@@ -142,7 +142,13 @@ describe("private Binance transport telemetry route", () => {
       retryAt: null,
       lastHttpStatus: 418,
       lastFailure: "rate limited (HTTP 418)",
-      readBudget: { signedReadMinIntervalMs: 4_000, queuedReads: 0, nextEligibleAt: null },
+      readBudget: {
+        signedReadMinIntervalMs: 4_000,
+        publicKlineMinIntervalMs: 750,
+        queuedReads: 0,
+        nextEligibleAt: null,
+        nextPublicKlineEligibleAt: null,
+      },
       recentRequests: [{
         at: "2026-08-26T07:00:00.000Z", source: "cross-sectional.CROSS_SECTIONAL_MARKET_NEUTRAL",
         method: "GET", path: "/fapi/v2/positionRisk", signed: true, outcome: "OK", httpStatus: 200,
@@ -158,7 +164,7 @@ describe("private Binance transport telemetry route", () => {
     expect(response.json()).toMatchObject({
       available: true,
       coolingDown: false,
-      readBudget: { signedReadMinIntervalMs: 4_000 },
+      readBudget: { signedReadMinIntervalMs: 4_000, publicKlineMinIntervalMs: 750 },
       recentRequests: [expect.objectContaining({
         source: "cross-sectional.CROSS_SECTIONAL_MARKET_NEUTRAL",
         path: "/fapi/v2/positionRisk",

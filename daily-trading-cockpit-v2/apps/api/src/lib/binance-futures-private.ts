@@ -76,11 +76,18 @@ const HTTP_429_FALLBACK_COOLDOWN_MS = 5_000;
 /**
  * Testnet has a materially tighter and less predictable REST envelope than mainnet.  The active
  * account has several independent reconciliation loops, so merely serialising reads still lets a
- * steady 15s dashboard refresh + lane ticks accumulate into an IP ban.  This is intentionally a
- * minimum spacing between SIGNED reads only: public market-data remains unaffected and
- * risk-reducing POST/DELETE requests bypass it entirely.
+ * steady 15s dashboard refresh + lane ticks accumulate into an IP ban.  Signed account reads and
+ * high-fan-out public Kline scans have separate budgets; ordinary public quotes remain unaffected
+ * and risk-reducing POST/DELETE requests bypass both budgets entirely.
  */
 export const DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS = 4_000;
+/**
+ * A Daily Range catch-up reads one 5m Kline range per monitored symbol.  Testnet has returned
+ * HTTP 418 after a fast serial 20-symbol scan even though signed reads were already paced.  Keep
+ * these heavier public reads at a conservative, independently observable cadence.  Twenty symbols
+ * finish in about fifteen seconds, comfortably inside the lane's 30-second scheduler interval.
+ */
+export const DEFAULT_TESTNET_PUBLIC_KLINE_MIN_INTERVAL_MS = 750;
 const DEFAULT_MAX_RECENT_TRANSPORT_EVENTS = 40;
 
 /**
@@ -99,6 +106,24 @@ export function resolveSignedReadMinIntervalMs(
     }
   }
   return env === "testnet" ? DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS : 0;
+}
+
+/**
+ * Keep an omitted/blank Testnet setting fail-safe.  Explicit zero remains an intentional opt-out
+ * for a caller that has a verified external public-data budget, while mainnet behavior is unchanged.
+ */
+export function resolvePublicKlineMinIntervalMs(
+  env: LiveBinanceEnv,
+  configuredRaw: string | undefined,
+): number {
+  const value = configuredRaw?.trim();
+  if (value) {
+    const configured = Number(value);
+    if (Number.isFinite(configured) && configured >= 0 && configured <= 60_000) {
+      return Math.floor(configured);
+    }
+  }
+  return env === "testnet" ? DEFAULT_TESTNET_PUBLIC_KLINE_MIN_INTERVAL_MS : 0;
 }
 // Re-fetch exchange filters (tickSize/stepSize/minQty/minNotional) periodically instead of caching
 // them for the process lifetime. Binance occasionally updates a symbol's LOT_SIZE/PRICE_FILTER/
@@ -516,6 +541,8 @@ export interface BinanceFuturesPrivateClientOptions {
    * conservative value on Testnet; leave 0 for callers that deliberately own an external budget.
    */
   signedReadMinIntervalMs?: number;
+  /** Global minimum spacing for public USD-M Kline reads. Testnet uses a safe default. */
+  publicKlineMinIntervalMs?: number;
   /** Test hook for deterministic budget waits. */
   sleep?: (ms: number) => Promise<void>;
   /** Bounded diagnostic history. Never contains API keys, signatures, or query parameters. */
@@ -538,8 +565,10 @@ export interface BinanceFuturesRateLimitStatus {
   lastFailure: string | null;
   readBudget: {
     signedReadMinIntervalMs: number;
+    publicKlineMinIntervalMs: number;
     queuedReads: number;
     nextEligibleAt: string | null;
+    nextPublicKlineEligibleAt: string | null;
   };
   recentRequests: BinanceFuturesTransportEvent[];
 }
@@ -561,6 +590,8 @@ export interface BinanceFuturesTransportEvent {
   usedWeight1mDelta: number | null;
   retryAt: string | null;
 }
+
+type ReadBudgetKind = "none" | "signed" | "public-kline";
 
 /**
  * Annotates outbound Binance work with a high-level owner (dashboard, lifecycle, lane, etc.).
@@ -609,6 +640,7 @@ export class BinanceFuturesPrivateClient {
   private readonly nowMs: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly signedReadMinIntervalMs: number;
+  private readonly publicKlineMinIntervalMs: number;
   private readonly maxRecentTransportEvents: number;
   readonly env: LiveBinanceEnv;
 
@@ -623,6 +655,8 @@ export class BinanceFuturesPrivateClient {
   private transportTail: Promise<void> = Promise.resolve();
   /** Next reserved dispatch time for authenticated GETs sharing this account-level transport. */
   private nextSignedReadAtMs = 0;
+  /** Next reserved dispatch time for public Kline scans sharing this same transport. */
+  private nextPublicKlineAtMs = 0;
   private queuedReads = 0;
   /**
    * Public time synchronisation can carry a venue weight header too, but is not
@@ -643,6 +677,7 @@ export class BinanceFuturesPrivateClient {
     this.nowMs = options.nowMs ?? (() => Date.now());
     this.sleep = options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     this.signedReadMinIntervalMs = Math.max(0, Math.floor(options.signedReadMinIntervalMs ?? 0));
+    this.publicKlineMinIntervalMs = Math.max(0, Math.floor(options.publicKlineMinIntervalMs ?? 0));
     this.maxRecentTransportEvents = Math.max(1, Math.floor(options.maxRecentTransportEvents ?? DEFAULT_MAX_RECENT_TRANSPORT_EVENTS));
   }
 
@@ -655,7 +690,7 @@ export class BinanceFuturesPrivateClient {
     if (method === "GET") {
       return this.withTransportSlot(
         (readBudgetWaitMs) => this.dispatchRawRequest(method, url, signed, readBudgetWaitMs),
-        signed,
+        signed ? "signed" : "none",
       );
     }
     this.assertRateLimitCircuitClosed();
@@ -670,7 +705,7 @@ export class BinanceFuturesPrivateClient {
   private async dispatchSignedRead(buildUrl: () => string): Promise<unknown> {
     return this.withTransportSlot(
       (readBudgetWaitMs) => this.dispatchRawRequest("GET", buildUrl(), true, readBudgetWaitMs),
-      true,
+      "signed",
     );
   }
 
@@ -682,7 +717,7 @@ export class BinanceFuturesPrivateClient {
    */
   private async withTransportSlot<T>(
     operation: (readBudgetWaitMs: number) => Promise<T>,
-    signed: boolean,
+    budget: ReadBudgetKind,
   ): Promise<T> {
     this.queuedReads += 1;
     const previous = this.transportTail;
@@ -693,7 +728,12 @@ export class BinanceFuturesPrivateClient {
     await previous;
     try {
       this.assertRateLimitCircuitClosed();
-      const readBudgetWaitMs = signed ? await this.waitForSignedReadBudget() : 0;
+      const readBudgetWaitMs =
+        budget === "signed"
+          ? await this.waitForSignedReadBudget()
+          : budget === "public-kline"
+            ? await this.waitForPublicKlineBudget()
+            : 0;
       return await operation(readBudgetWaitMs);
     } finally {
       this.queuedReads = Math.max(0, this.queuedReads - 1);
@@ -712,6 +752,16 @@ export class BinanceFuturesPrivateClient {
     const scheduledAt = Math.max(now, this.nextSignedReadAtMs);
     const waitMs = Math.max(0, scheduledAt - now);
     this.nextSignedReadAtMs = scheduledAt + this.signedReadMinIntervalMs;
+    if (waitMs > 0) await this.sleep(waitMs);
+    return waitMs;
+  }
+
+  private async waitForPublicKlineBudget(): Promise<number> {
+    if (this.publicKlineMinIntervalMs <= 0) return 0;
+    const now = this.nowMs();
+    const scheduledAt = Math.max(now, this.nextPublicKlineAtMs);
+    const waitMs = Math.max(0, scheduledAt - now);
+    this.nextPublicKlineAtMs = scheduledAt + this.publicKlineMinIntervalMs;
     if (waitMs > 0) await this.sleep(waitMs);
     return waitMs;
   }
@@ -885,8 +935,12 @@ export class BinanceFuturesPrivateClient {
   }
 
   /** GETs retry on transient failures; mutations never do. */
-  private async requestPublic(path: string, params: Record<string, string | number | boolean | undefined> = {}): Promise<unknown> {
-    return (await this.requestPublicWithTiming(path, params)).value;
+  private async requestPublic(
+    path: string,
+    params: Record<string, string | number | boolean | undefined> = {},
+    budget: ReadBudgetKind = "none",
+  ): Promise<unknown> {
+    return (await this.requestPublicWithTiming(path, params, budget)).value;
   }
 
   /**
@@ -897,6 +951,7 @@ export class BinanceFuturesPrivateClient {
   private async requestPublicWithTiming(
     path: string,
     params: Record<string, string | number | boolean | undefined> = {},
+    budget: ReadBudgetKind = "none",
   ): Promise<{ value: unknown; dispatchedAtMs: number; completedAtMs: number }> {
     const qs = buildQueryString(params);
     const url = `${this.baseUrl}${path}${qs ? `?${qs}` : ""}`;
@@ -907,7 +962,7 @@ export class BinanceFuturesPrivateClient {
           const dispatchedAtMs = this.nowMs();
           const value = await this.dispatchRawRequest("GET", url, false, readBudgetWaitMs);
           return { value, dispatchedAtMs, completedAtMs: this.nowMs() };
-        }, false);
+        }, budget);
       } catch (error) {
         lastError = error;
         if (!shouldRetryGet(error) || attempt === GET_MAX_RETRIES) throw error;
@@ -1018,8 +1073,10 @@ export class BinanceFuturesPrivateClient {
       lastFailure: this.lastRateLimitFailure,
       readBudget: {
         signedReadMinIntervalMs: this.signedReadMinIntervalMs,
+        publicKlineMinIntervalMs: this.publicKlineMinIntervalMs,
         queuedReads: this.queuedReads,
         nextEligibleAt: this.nextSignedReadAtMs > now ? new Date(this.nextSignedReadAtMs).toISOString() : null,
+        nextPublicKlineEligibleAt: this.nextPublicKlineAtMs > now ? new Date(this.nextPublicKlineAtMs).toISOString() : null,
       },
       recentRequests: this.recentTransportEvents.map((event) => ({ ...event })),
     };
@@ -1101,7 +1158,7 @@ export class BinanceFuturesPrivateClient {
       startTime: opts.startTime,
       endTime: opts.endTime,
       limit: opts.limit,
-    });
+    }, "public-kline");
     if (!Array.isArray(parsed)) {
       throw new BinanceFuturesPrivateError("invalid_response", `klines response missing for ${symbol}/${interval}`);
     }

@@ -6,6 +6,7 @@ import {
   buildQueryString,
   resolveLiveBinanceBaseUrl,
   resolveLiveBinanceEnv,
+  resolvePublicKlineMinIntervalMs,
   resolveSignedReadMinIntervalMs,
   signQueryString,
   withBinanceTransportSource,
@@ -38,13 +39,19 @@ describe("binance-futures-private signing", () => {
     expect(resolveLiveBinanceBaseUrl("mainnet")).toContain("fapi.binance.com");
   });
 
-  it("keeps the protective Testnet signed-read budget when the optional env is missing or blank", () => {
+  it("keeps the protective Testnet read budgets when optional env values are missing or blank", () => {
     expect(resolveSignedReadMinIntervalMs("testnet", undefined)).toBe(4_000);
     expect(resolveSignedReadMinIntervalMs("testnet", "")).toBe(4_000);
     expect(resolveSignedReadMinIntervalMs("testnet", "  ")).toBe(4_000);
     expect(resolveSignedReadMinIntervalMs("testnet", "1500")).toBe(1_500);
     expect(resolveSignedReadMinIntervalMs("testnet", "0")).toBe(0);
     expect(resolveSignedReadMinIntervalMs("mainnet", undefined)).toBe(0);
+    expect(resolvePublicKlineMinIntervalMs("testnet", undefined)).toBe(750);
+    expect(resolvePublicKlineMinIntervalMs("testnet", "")).toBe(750);
+    expect(resolvePublicKlineMinIntervalMs("testnet", "  ")).toBe(750);
+    expect(resolvePublicKlineMinIntervalMs("testnet", "1250")).toBe(1_250);
+    expect(resolvePublicKlineMinIntervalMs("testnet", "0")).toBe(0);
+    expect(resolvePublicKlineMinIntervalMs("mainnet", undefined)).toBe(0);
   });
 
   it("reads the public book ticker from the same selected execution base", async () => {
@@ -267,6 +274,58 @@ describe("binance-futures-private signing", () => {
         usedWeight1mDelta: 4,
         readBudgetWaitMs: 6_000,
       }),
+    ]);
+  });
+
+  it("paces Testnet public Kline scans without delaying ordinary public quote reads", async () => {
+    let nowMs = 1_700_000_000_000;
+    const waits: number[] = [];
+    const dispatches: Array<{ path: string; at: number }> = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      if (value.includes("/fapi/v1/klines")) {
+        dispatches.push({ path: "/fapi/v1/klines", at: nowMs });
+        return new Response(JSON.stringify([[
+          1_700_000_000_000, "100", "103", "99", "102", "12.5", 1_700_000_299_999,
+        ]]), { status: 200 });
+      }
+      if (value.includes("/fapi/v1/ticker/bookTicker")) {
+        dispatches.push({ path: "/fapi/v1/ticker/bookTicker", at: nowMs });
+        return new Response(JSON.stringify({ bidPrice: "100", askPrice: "101", bidQty: "1", askQty: "1" }), { status: 200 });
+      }
+      throw new Error(`unexpected URL ${value}`);
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "testnet",
+      fetchImpl,
+      nowMs: () => nowMs,
+      publicKlineMinIntervalMs: 750,
+      sleep: async (ms) => { waits.push(ms); nowMs += ms; },
+    });
+
+    await client.getKlines("SOLUSDT", "5m", { limit: 1 });
+    await client.getBookTicker("SOLUSDT");
+    await client.getKlines("BTCUSDT", "5m", { limit: 1 });
+
+    expect(dispatches).toEqual([
+      { path: "/fapi/v1/klines", at: 1_700_000_000_000 },
+      { path: "/fapi/v1/ticker/bookTicker", at: 1_700_000_000_000 },
+      { path: "/fapi/v1/klines", at: 1_700_000_000_750 },
+    ]);
+    expect(waits).toEqual([750]);
+    expect(client.getRateLimitStatus()).toMatchObject({
+      coolingDown: false,
+      readBudget: {
+        publicKlineMinIntervalMs: 750,
+        nextPublicKlineEligibleAt: new Date(1_700_000_001_500).toISOString(),
+      },
+    });
+    const klines = client.getRateLimitStatus().recentRequests.filter((event) => event.path === "/fapi/v1/klines");
+    expect(klines).toEqual([
+      expect.objectContaining({ readBudgetWaitMs: 0, outcome: "OK" }),
+      expect.objectContaining({ readBudgetWaitMs: 750, outcome: "OK" }),
     ]);
   });
 

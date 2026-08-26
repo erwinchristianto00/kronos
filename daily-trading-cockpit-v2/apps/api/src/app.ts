@@ -24,7 +24,12 @@ import { registerOutcomesRoutes } from "./routes/outcomes.js";
 import { registerScanRoute } from "./routes/scan.js";
 import { registerShadowRoutes } from "./routes/shadow.js";
 import { registerTradingAssistantRoutes } from "./routes/trading-assistant.js";
-import { BinanceFuturesPrivateClient, resolveSignedReadMinIntervalMs, type BinanceFuturesRateLimitStatus } from "./lib/binance-futures-private.js";
+import {
+  BinanceFuturesPrivateClient,
+  resolvePublicKlineMinIntervalMs,
+  resolveSignedReadMinIntervalMs,
+  type BinanceFuturesRateLimitStatus,
+} from "./lib/binance-futures-private.js";
 import { FuturesMarketReferenceCache } from "./lib/futures-market-reference-cache.js";
 import {
   FuturesReferenceHealthTracker,
@@ -1350,15 +1355,23 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       liveConfig.env,
       process.env.LIVE_BINANCE_SIGNED_READ_MIN_INTERVAL_MS,
     );
+    const publicKlineMinIntervalMs = resolvePublicKlineMinIntervalMs(
+      liveConfig.env,
+      process.env.LIVE_BINANCE_PUBLIC_KLINE_MIN_INTERVAL_MS,
+    );
     const liveClient = new BinanceFuturesPrivateClient({
       apiKey: liveConfig.apiKey,
       apiSecret: liveConfig.apiSecret,
       env: liveConfig.env,
       fetchImpl: options.fetchImpl,
       signedReadMinIntervalMs,
+      publicKlineMinIntervalMs,
     });
     binanceTransportStatusGetter = () => liveClient.getRateLimitStatus();
-    console.log(`[binance-transport] env=${liveConfig.env} signedReadMinIntervalMs=${signedReadMinIntervalMs}`);
+    console.log(
+      `[binance-transport] env=${liveConfig.env} signedReadMinIntervalMs=${signedReadMinIntervalMs} ` +
+      `publicKlineMinIntervalMs=${publicKlineMinIntervalMs}`,
+    );
     // RECORDING-ONLY (2026-07-27). Keep the existing SPOT mid as the entry-quality gate input, while
     // prewarming an independent book reference from the SAME USD-M testnet/mainnet base used for
     // execution. The execution-book fetch runs in parallel and is capped at 750ms; failure/timeout
