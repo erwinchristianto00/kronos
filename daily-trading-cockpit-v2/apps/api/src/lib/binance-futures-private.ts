@@ -539,7 +539,7 @@ export interface BinanceFuturesTransportEvent {
   readBudgetWaitMs: number;
   /** Binance's cumulative one-minute weight header, when the venue supplies it. */
   usedWeight1m: number | null;
-  /** Delta from the preceding observed cumulative header, when comparable. */
+  /** Delta from the preceding signed-request cumulative header, when comparable. */
   usedWeight1mDelta: number | null;
   retryAt: string | null;
 }
@@ -606,7 +606,11 @@ export class BinanceFuturesPrivateClient {
   /** Next reserved dispatch time for authenticated GETs sharing this account-level transport. */
   private nextSignedReadAtMs = 0;
   private queuedReads = 0;
-  private lastObservedUsedWeight1m: number | null = null;
+  /**
+   * Public time synchronisation can carry a venue weight header too, but is not
+   * part of the signed-read budget this telemetry is meant to measure.
+   */
+  private lastObservedSignedUsedWeight1m: number | null = null;
   private readonly recentTransportEvents: BinanceFuturesTransportEvent[] = [];
   private rateLimitCooldownUntilMs = 0;
   private lastRateLimitHttpStatus: 418 | 429 | null = null;
@@ -807,10 +811,13 @@ export class BinanceFuturesPrivateClient {
     error: BinanceFuturesPrivateError | null;
   }): void {
     const usedWeight1m = this.readUsedWeight1m(input.response);
-    const usedWeight1mDelta = usedWeight1m !== null && this.lastObservedUsedWeight1m !== null && usedWeight1m >= this.lastObservedUsedWeight1m
-      ? usedWeight1m - this.lastObservedUsedWeight1m
+    const usedWeight1mDelta = input.signed
+      && usedWeight1m !== null
+      && this.lastObservedSignedUsedWeight1m !== null
+      && usedWeight1m >= this.lastObservedSignedUsedWeight1m
+      ? usedWeight1m - this.lastObservedSignedUsedWeight1m
       : null;
-    if (usedWeight1m !== null) this.lastObservedUsedWeight1m = usedWeight1m;
+    if (input.signed && usedWeight1m !== null) this.lastObservedSignedUsedWeight1m = usedWeight1m;
     const error = input.error;
     const outcome: BinanceFuturesTransportEvent["outcome"] = error === null
       ? "OK"
