@@ -293,12 +293,12 @@
           "why": "Same five-minute membership refresh cadence as Testnet. It affects only a future UTC-day pool snapshot and cannot enter while the mainnet execution gate is off."
         },
         "DAILY_RANGE_NEW_ENTRY_MODE": {
-          "value": "PAUSED_SELECTION_FIX",
-          "why": "Incident containment: Live Daily Range may reconcile existing positions and collect complete candidate batches, but cannot send a new entry until the independent selector promotion gate has passed."
+          "value": "ENABLED",
+          "why": "Operator-authorized baseline activation after the batch allocator and native-exit reconciliation fixes. New Live entries remain capped at three 25-USDT / 1x trades and use no unvalidated alpha selector."
         },
         "DAILY_RANGE_ALLOCATOR": {
-          "value": "PAUSED",
-          "why": "Live rejects the retired loop-order allocator and every unvalidated selector. This is independent of arm/disarm so a shadow collection lane can be armed safely without entry authority."
+          "value": "SEEDED_RANDOM_BASELINE",
+          "why": "Operator-authorized neutral Live allocator. The deterministic seed removes lexical loop-order authority while keeping SELECTOR = SHADOW; it does not claim alpha."
         },
         "DAILY_RANGE_MAINNET_EXECUTION_ENABLED": {
           "value": "1",
