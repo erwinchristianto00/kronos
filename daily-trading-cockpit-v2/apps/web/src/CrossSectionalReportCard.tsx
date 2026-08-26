@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
+import OpenBasketReviewChart, { type OpenBasketReviewLeg } from './OpenBasketReviewChart';
 
 const C = {
   card: '#14222a',
@@ -163,6 +164,21 @@ type OpenBasketUnrealized = {
   unrealizedAfterEstimatedCloseCostUsd: number | null;
   unrealizedExtrema: UnrealizedExtrema | null;
 };
+
+function openBasketReviewLeg(basket: OpenBasketUnrealized, leg: OpenBasketUnrealized['legs'][number]): OpenBasketReviewLeg {
+  return {
+    key: `${basket.basketId}:${leg.side}:${leg.symbol}`,
+    basketId: basket.basketId,
+    signal: basket.signal,
+    variant: basket.variant,
+    symbol: leg.symbol,
+    side: leg.side,
+    openedAt: basket.openedAt,
+    entryPrice: leg.entryPrice,
+    markPrice: leg.markPrice,
+    grossUnrealizedUsd: leg.grossUnrealizedUsd,
+  };
+}
 type CrossSectionalPnl = {
   openBasketCount: number;
   openLegCount: number;
@@ -669,7 +685,15 @@ function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: strin
   </details>;
 }
 
-function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized }) {
+function OpenBasketUnrealizedBlock({
+  basket,
+  selectedLegKey,
+  onSelectLeg,
+}: {
+  basket: OpenBasketUnrealized;
+  selectedLegKey: string | null;
+  onSelectLeg: (leg: OpenBasketReviewLeg) => void;
+}) {
   const long = basket.legs.filter((leg) => leg.side === 'LONG').map((leg) => leg.symbol);
   const short = basket.legs.filter((leg) => leg.side === 'SHORT').map((leg) => leg.symbol);
   const scheduledCloseAtMs = typeof basket.scheduledCloseAtMs === 'number' && Number.isFinite(basket.scheduledCloseAtMs)
@@ -707,6 +731,7 @@ function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized })
     <div style={{ padding: '8px 12px 4px', display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12 }}>
       <span style={{ color: C.good }}>Long: {long.join(', ')}</span>
       <span style={{ color: C.bad }}>Short: {short.join(', ')}</span>
+      <span style={{ color: C.measure }}>Klik simbol di tabel untuk melihat candle</span>
     </div>
     <ExtremaStrip capitalUsd={basketNotionalUsd(basket.legs)} rows={summary} />
     {!extrema && <small style={{ display: 'block', padding: '6px 10px', color: C.dim }}>ATH/ATL mulai direkam sejak report ini aktif.</small>}
@@ -717,9 +742,18 @@ function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized })
         </tr></thead>
         <tbody>{basket.legs.map((leg) => {
           const path = leg.unrealizedExtrema;
-          return <tr key={`${basket.basketId}-${leg.symbol}-${leg.side}`} style={{ borderTop: `1px solid ${C.border}` }}>
+          const reviewLeg = openBasketReviewLeg(basket, leg);
+          const selected = reviewLeg.key === selectedLegKey;
+          return <tr key={`${basket.basketId}-${leg.symbol}-${leg.side}`} style={{ borderTop: `1px solid ${C.border}`, background: selected ? '#19313a' : undefined }}>
             <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>
-              {leg.symbol}{' '}<LiquidityBadge liq={leg.entryLiquidity} compact />
+              <button
+                type="button"
+                onClick={() => onSelectLeg(reviewLeg)}
+                style={{ color: selected ? C.accent : C.text, background: 'transparent', border: 0, padding: 0, font: 'inherit', fontWeight: 700, cursor: 'pointer', textDecoration: 'underline', textUnderlineOffset: 3 }}
+                title={`Buka candle ${leg.symbol}`}
+              >
+                {leg.symbol}
+              </button>{' '}<LiquidityBadge liq={leg.entryLiquidity} compact />
             </td>
             <td style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</td>
             <td>{price(leg.entryPrice)}</td>
@@ -928,6 +962,7 @@ function NextSignalNote({ apiPrefix }: { apiPrefix: string }) {
 function OpenCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
   const [data, setData] = useState<ClosedResponse | null>(null);
   const [error, setError] = useState(false);
+  const [selectedLegKey, setSelectedLegKey] = useState<string | null>(null);
   async function load() {
     try {
       const response = await fetch(`${apiPrefix}/live/cross-sectional-closed-baskets`, { cache: 'no-store' });
@@ -938,6 +973,12 @@ function OpenCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
   }
   useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 15_000); return () => window.clearInterval(timer); }, [apiPrefix]);
   const openBaskets = data?.openBaskets ?? [];
+  const reviewLegs = openBaskets.flatMap((basket) => basket.legs.map((leg) => openBasketReviewLeg(basket, leg)));
+  const reviewLegKeys = reviewLegs.map((leg) => leg.key).join('|');
+  const selectedLeg = reviewLegs.find((leg) => leg.key === selectedLegKey) ?? reviewLegs[0] ?? null;
+  useEffect(() => {
+    if (selectedLegKey !== selectedLeg?.key) setSelectedLegKey(selectedLeg?.key ?? null);
+  }, [reviewLegKeys, selectedLegKey, selectedLeg?.key]);
   return <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-open-report">
     <header><div><span>Open cross-basket · unrealized P&amp;L path</span><strong>{openBaskets.length} open basket{openBaskets.length === 1 ? '' : 's'}</strong></div><span className="tone-measure">grouped per basket · live marks</span></header>
     <NextSignalNote apiPrefix={apiPrefix} />
@@ -948,9 +989,10 @@ function OpenCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
       </div>
       <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>{data.crossSectionalPnl.openLegCount} leg aktif · {data.crossSectionalPnl.slippageCaveat}</div>
       {openBaskets.length ? <div style={{ padding: '0 12px 12px' }}>
-        {openBaskets.map((basket) => <OpenBasketUnrealizedBlock key={basket.basketId} basket={basket} />)}
+        {openBaskets.map((basket) => <OpenBasketUnrealizedBlock key={basket.basketId} basket={basket} selectedLegKey={selectedLeg?.key ?? null} onSelectLeg={(leg) => setSelectedLegKey(leg.key)} />)}
       </div> : <div style={{ padding: 12, color: C.dim }}>Tidak ada basket aktif.</div>}
     </> : <div style={{ padding: 12, color: C.dim }}>Loading open basket…</div>}
+    <OpenBasketReviewChart apiPrefix={apiPrefix} leg={selectedLeg} />
   </section>;
 }
 

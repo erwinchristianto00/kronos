@@ -2038,6 +2038,15 @@ export default function TestnetExchangeDashboard() {
   const foundationPositions = allPositions.filter(
     (p) => !isSingleSymbolExecutorPosition(p.laneIds) && ((p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol))),
   );
+  // The account headline is exchange truth, so it includes every non-zero USD-M position.  The
+  // old table only rendered positions claimed by a Kronos intent/basket/single-symbol lane; an
+  // operator-created or otherwise unclaimed exchange position therefore moved the headline uPnL
+  // while the table claimed there were zero positions.  Keep it explicitly separate: this is a
+  // reporting/reconciliation state, never a new engine book and never a permission to close it.
+  const trackedAccountPositions = new Set([...directionalPositions, ...foundationPositions]);
+  const unattributedExchangePositions = allPositions.filter((p) =>
+    !trackedAccountPositions.has(p) && !isSingleSymbolExecutorPosition(p.laneIds),
+  );
   // 2026-07-23 fix (adversarial review finding, HIGH-adjacent): folding Intent State into the
   // directional rows means an intent is only ever shown attached to a MATCHING Binance position.
   // An intent whose symbol has no matching position yet (transient mirror/exchange desync — the
@@ -2045,9 +2054,10 @@ export default function TestnetExchangeDashboard() {
   // its own row in the old separate Mirror Intents table. Surface that gap explicitly instead of
   // letting the merged table look clean while a real open intent sits unresolved and unseen.
   const orphanIntents = (status?.openIntents ?? []).filter((i) => !allPositions.some((p) => p.symbol === i.symbol));
-  // NEW derived display value (2026-07-23, no new fetch): sum of open positions across all 3
-  // real-money books, surfaced as a single zero-click KPI that deep-links to the merged table.
-  const openPositionsCount = directionalPositions.length + foundationPositions.length + singleSymbolLanePositions.length;
+  // Sum every position the dashboard can prove is open: the three engine-owned books plus an
+  // explicit exchange-unattributed bucket.  This must reconcile to the account count rather than
+  // hiding a position merely because no executor currently claims it.
+  const openPositionsCount = directionalPositions.length + foundationPositions.length + singleSymbolLanePositions.length + unattributedExchangePositions.length;
   // 2026-07-11: the 3 CrossSectionalExecutor instances each have independent halted/error/
   // openBaskets/staleSince state — surface all 3, not just FILTERED, so a stuck TREND or MIXED
   // instance is visible instead of silently invisible. (Unchanged data, just one combined list
@@ -2181,10 +2191,11 @@ export default function TestnetExchangeDashboard() {
             const singleSymbolUnreal = ps
               .filter((p) => isSingleSymbolExecutorPosition(p.laneIds))
               .reduce((s, p) => s + (p.basketUnrealizedPnl ?? 0), 0);
+            const unattributedUnreal = unattributedExchangePositions.reduce((s, p) => s + p.unrealizedPnl, 0);
             return (
               <>
                 <strong className={tone(account?.unrealizedPnl)}>{signed(account?.unrealizedPnl)}</strong>
-                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · single-symbol {signed(singleSymbolUnreal)} · {account ? `${account.openPositionCount} pos` : 'loading'}</small>
+                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · single-symbol {signed(singleSymbolUnreal)} · exchange tak terikat {signed(unattributedUnreal)} · {account ? `${account.openPositionCount} pos` : 'loading'}</small>
               </>
             );
           })()}
@@ -2288,7 +2299,7 @@ export default function TestnetExchangeDashboard() {
         <div>
           <span>Open positions</span>
           <strong><a href="#open-positions" style={{ color: 'inherit' }}>{openPositionsCount}</a></strong>
-          <small>directional + basket + single-symbol</small>
+          <small>directional + basket + single-symbol + exchange tak terikat</small>
         </div>
       </div>
 
@@ -2464,8 +2475,8 @@ export default function TestnetExchangeDashboard() {
           <header><span>Open Positions</span><strong>{openPositionsCount} pos</strong></header>
           <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
             Directional (operator-controlled, engine mirror) + Basket (cross-sectional hedge, automatic exit only) +
-            Single-symbol (stop-protected, own exchange-side stop) in one table. Not every column applies to every
-            book — blank cells are expected, not missing data.
+            Single-symbol (stop-protected, own exchange-side stop) + Exchange tak terikat in one table. Posisi tak terikat
+            tetap ditampilkan agar total exchange dan uPnL tidak terlihat bertentangan; dashboard tidak mengklaim pemiliknya dan tidak memberi tombol close.
           </p>
           {closeResult && <p className={closeResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{closeResult.message}</p>}
           {copyResult && (
@@ -2516,6 +2527,13 @@ export default function TestnetExchangeDashboard() {
           {singleSymbolPositionsStaleSince && (
             <p className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
               ⚠ single-symbol fetch gagal sejak {timeAgo(singleSymbolPositionsStaleSince)} — baris single-symbol di bawah bisa basi.
+            </p>
+          )}
+          {unattributedExchangePositions.length > 0 && (
+            <p className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
+              ⚠ {unattributedExchangePositions.length} posisi exchange tidak terikat ke intent/basket/lane Kronos: {' '}
+              {unattributedExchangePositions.map((p) => `${p.symbol} ${p.direction}`).join(', ')}. uPnL akun memang memasukkannya;
+              posisi ini bukan basket aktif dan dashboard tidak akan menutupnya.
             </p>
           )}
           {orphanIntents.length > 0 && (
@@ -2629,8 +2647,8 @@ export default function TestnetExchangeDashboard() {
                 </tr>
               </thead>
               <tbody>
-                {directionalPositions.length === 0 && foundationPositions.length === 0 && singleSymbolLanePositions.length === 0 ? (
-                  <tr><td colSpan={20}>No open positions across any book.</td></tr>
+                {directionalPositions.length === 0 && foundationPositions.length === 0 && singleSymbolLanePositions.length === 0 && unattributedExchangePositions.length === 0 ? (
+                  <tr><td colSpan={20}>No open positions on the exchange.</td></tr>
                 ) : (
                   <>
                     {directionalPositions.map((p) => {
@@ -2759,6 +2777,33 @@ export default function TestnetExchangeDashboard() {
                           </td>
                           <td>—</td>
                           <td className="tone-measure" title="Menutup satu leg basket akan membuat sisa basket jadi taruhan directional telanjang — tidak ada Close now di sini, sama seperti sebelumnya.">auto-exit only</td>
+                        </tr>
+                      );
+                    })}
+                    {unattributedExchangePositions.map((p) => {
+                      const afterCost = p.unrealizedAfterEstimatedCloseCostUsd ?? (p.unrealizedPnl - (p.estimatedCloseCostUsd ?? 0));
+                      return (
+                        <tr key={`exchange-unattributed-${p.symbol}`} style={{ background: 'rgba(240, 181, 75, 0.07)' }}>
+                          <td>Exchange tak terikat</td>
+                          <td>{p.symbol}</td>
+                          <td className={p.direction === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{p.direction}</td>
+                          <td>{Number(Math.abs(p.quantity).toFixed(8))}</td>
+                          <td>{price(p.entryPrice)}</td>
+                          <td>{price(p.markPrice)}</td>
+                          <td>—</td>
+                          <td>—</td>
+                          <td className="tone-critical">{price(p.liquidationPrice)}</td>
+                          <td>—</td>
+                          <td>—</td>
+                          <td>tidak ada basket/lane yang mengklaim</td>
+                          <td className={tone(p.unrealizedPnl)}>{signed(p.unrealizedPnl)}</td>
+                          <td className={tone(afterCost)}>{signed(afterCost)}</td>
+                          <td>{p.leverage}x</td>
+                          <td>—</td>
+                          <td>{p.laneIds.length > 0 ? p.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
+                          <td>—</td>
+                          <td>—</td>
+                          <td className="tone-measure" title="Tidak ada ownership Kronos yang terbukti; dashboard tidak menawarkan aksi untuk posisi ini.">no action</td>
                         </tr>
                       );
                     })}

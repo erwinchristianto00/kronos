@@ -94,11 +94,18 @@ const PROFIT_CORE_SHORT_TRAIL_LANE_ID = "PROFIT_CORE_SHORT_TRAIL";
 // The served dashboard asks only for these operator review windows.  Bounding both interval and
 // count keeps a chart refresh from becoming an arbitrary market-data proxy.
 const OPEN_BASKET_CHART_LIMITS = {
-  "15m": 192, // 48h: 36h basket plus entry context
-  "1h": 168,  // seven days
-  "4h": 120,  // twenty days
+  // The two views actually rendered in the dashboard.  They deliberately retain
+  // enough completed history to review the path rather than only the latest bar.
+  "5m": 576,  // 48h
+  "1d": 120,  // 120 completed daily candles
+  // Kept for the older read-only chart clients and for the prior-UTC-day range
+  // reference that the new 5m view draws.
+  "15m": 192,
+  "1h": 168,
+  "4h": 18,   // 72h: safely contains the prior UTC 00:00-04:00 bar
 } as const;
 type OpenBasketChartInterval = keyof typeof OPEN_BASKET_CHART_LIMITS;
+const FOUR_HOURS_MS = 4 * 60 * 60_000;
 
 function isOpenBasketChartInterval(value: unknown): value is OpenBasketChartInterval {
   return typeof value === "string" && Object.hasOwn(OPEN_BASKET_CHART_LIMITS, value);
@@ -106,6 +113,35 @@ function isOpenBasketChartInterval(value: unknown): value is OpenBasketChartInte
 
 function validOpenBasketChartSymbol(value: unknown): value is string {
   return typeof value === "string" && /^[A-Z0-9]{4,30}$/.test(value);
+}
+
+type OpenBasketChartCandle = Pick<Candle, "openTime" | "open" | "high" | "low" | "close" | "volume">;
+
+function cleanOpenBasketChartCandles(candles: readonly Candle[]): OpenBasketChartCandle[] {
+  return candles
+    .filter((candle) =>
+      Number.isFinite(candle.openTime) &&
+      Number.isFinite(candle.open) &&
+      Number.isFinite(candle.high) &&
+      Number.isFinite(candle.low) &&
+      Number.isFinite(candle.close) &&
+      Number.isFinite(candle.volume) &&
+      candle.openTime > 0 && candle.open > 0 && candle.high > 0 && candle.low > 0 && candle.close > 0 && candle.volume >= 0,
+    )
+    .map((candle) => ({
+      openTime: candle.openTime,
+      open: candle.open,
+      high: candle.high,
+      low: candle.low,
+      close: candle.close,
+      volume: candle.volume,
+    }))
+    .sort((a, b) => a.openTime - b.openTime);
+}
+
+function previousUtcDayStartMs(nowMs: number): number {
+  const now = new Date(nowMs);
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 0, 0, 0, 0);
 }
 
 /** Canonical choices for the operator allocation selector. Keep this server-owned so newly
@@ -1216,6 +1252,8 @@ export async function registerLiveRoutes(
     singleSymbolPriceTimeline?: () => SingleSymbolPriceTimelineService | null;
     /** Bounded completed public USD-M candles for the read-only open-basket chart. */
     marketCandles?: (symbol: string, interval: OpenBasketChartInterval, limit: number) => Promise<Candle[]>;
+    /** Test seam only. Production uses the current UTC clock to choose yesterday's 00:00 4h bar. */
+    openBasketChartNowMs?: () => number;
     /** Read-only USD-M sizing-reference diagnostics. Never reaches any order route. */
     futuresReferenceHealth?: () => FuturesReferenceHealthSnapshot | null;
     /** Optional, bounded public-USD-M refresh for a diagnostic watch list. */
@@ -1245,6 +1283,7 @@ export async function registerLiveRoutes(
     ? createDashboardAccountSnapshotReader(engine, opts.dashboardAccountSnapshot)
     : null;
   const openBasketChartCache = new Map<string, { cachedAtMs: number; candles: Candle[] }>();
+  const openBasketChartNowMs = (): number => opts.openBasketChartNowMs?.() ?? Date.now();
   const readOpenBasketChartCandles = async (
     symbol: string,
     interval: OpenBasketChartInterval,
@@ -1252,7 +1291,7 @@ export async function registerLiveRoutes(
     const source = opts.marketCandles;
     if (!source) throw new Error("public USD-M candle source unavailable");
     const key = `${symbol}:${interval}`;
-    const nowMs = Date.now();
+    const nowMs = openBasketChartNowMs();
     const cached = openBasketChartCache.get(key);
     if (cached && nowMs - cached.cachedAtMs < 30_000) return cached.candles;
     const candles = await source(symbol, interval, OPEN_BASKET_CHART_LIMITS[interval]);
@@ -1357,6 +1396,11 @@ export async function registerLiveRoutes(
 
   // Read-only chart feed for the currently served Open Basket panel.  It uses public USD-M
   // candles only; no order client, account state, or forming candle can reach this route.
+  //
+  // Without `interval`, this is the dashboard bundle: completed 1d + 5m candles, plus the
+  // PREVIOUS UTC calendar day's exact 00:00-04:00 4h range.  That range is display-only and is
+  // intentionally separate from any current-day trading lane's reference range.  With `interval`,
+  // retain the older single-series contract for existing read-only clients.
   app.get("/api/live/open-basket-chart", async (request, reply) => {
     const query = request.query as { symbol?: unknown; interval?: unknown };
     const symbol = typeof query.symbol === "string" ? query.symbol.trim().toUpperCase() : "";
@@ -1364,37 +1408,52 @@ export async function registerLiveRoutes(
       reply.code(400);
       return { ok: false, reason: "valid USD-M symbol is required" };
     }
-    if (!isOpenBasketChartInterval(query.interval)) {
+    if (query.interval !== undefined && !isOpenBasketChartInterval(query.interval)) {
       reply.code(400);
-      return { ok: false, reason: "interval must be one of 15m, 1h, 4h" };
+      return { ok: false, reason: "interval must be one of 5m, 15m, 1h, 4h, 1d" };
     }
     try {
-      const candles = await readOpenBasketChartCandles(symbol, query.interval);
-      const clean = candles
-        .filter((candle) =>
-          Number.isFinite(candle.openTime) &&
-          Number.isFinite(candle.open) &&
-          Number.isFinite(candle.high) &&
-          Number.isFinite(candle.low) &&
-          Number.isFinite(candle.close) &&
-          Number.isFinite(candle.volume),
-        )
-        .map((candle) => ({
-          openTime: candle.openTime,
-          open: candle.open,
-          high: candle.high,
-          low: candle.low,
-          close: candle.close,
-          volume: candle.volume,
-        }));
+      if (isOpenBasketChartInterval(query.interval)) {
+        const candles = cleanOpenBasketChartCandles(await readOpenBasketChartCandles(symbol, query.interval));
+        return {
+          ok: true,
+          symbol,
+          interval: query.interval,
+          source: "BINANCE_USDM_PUBLIC" as const,
+          completedOnly: true,
+          asOf: new Date(openBasketChartNowMs()).toISOString(),
+          candles,
+        };
+      }
+
+      const nowMs = openBasketChartNowMs();
+      const previousDayStartMs = previousUtcDayStartMs(nowMs);
+      const [dailyCandles, fiveMinuteCandles, fourHourCandles] = await Promise.all([
+        readOpenBasketChartCandles(symbol, "1d"),
+        readOpenBasketChartCandles(symbol, "5m"),
+        readOpenBasketChartCandles(symbol, "4h"),
+      ]);
+      const reference = cleanOpenBasketChartCandles(fourHourCandles)
+        .find((candle) => candle.openTime === previousDayStartMs) ?? null;
+      const referenceValid = reference !== null && reference.high > reference.low;
       return {
         ok: true,
         symbol,
-        interval: query.interval,
         source: "BINANCE_USDM_PUBLIC" as const,
         completedOnly: true,
-        asOf: new Date().toISOString(),
-        candles: clean,
+        asOf: new Date(nowMs).toISOString(),
+        daily: { interval: "1d" as const, candles: cleanOpenBasketChartCandles(dailyCandles) },
+        fiveMinute: { interval: "5m" as const, candles: cleanOpenBasketChartCandles(fiveMinuteCandles) },
+        previousUtcReference4h: referenceValid
+          ? {
+            dateUtc: new Date(previousDayStartMs).toISOString().slice(0, 10),
+            fourHourOpenTime: previousDayStartMs,
+            fourHourCloseTime: previousDayStartMs + FOUR_HOURS_MS,
+            rangeHigh: reference.high,
+            rangeLow: reference.low,
+          }
+          : null,
+        referenceReason: referenceValid ? null : `missing or invalid completed 4h candle at ${new Date(previousDayStartMs).toISOString()}`,
       };
     } catch (error) {
       reply.code(503);
