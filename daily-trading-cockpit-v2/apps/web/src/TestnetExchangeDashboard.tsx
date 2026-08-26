@@ -285,6 +285,15 @@ interface LiveAccount {
     basketQty?: number | null;
     basketUnrealizedPnl?: number | null;
     singleSymbolStopPrice?: number | null;
+    dailyRangeTradeId?: string | null;
+    dailyRangeQty?: number | null;
+    dailyRangeEntryPrice?: number | null;
+    dailyRangeUnrealizedPnl?: number | null;
+    dailyRangeStopPrice?: number | null;
+    dailyRangeTakeProfitPrice?: number | null;
+    dailyRangeOpenedAt?: string | null;
+    dailyRangeStatus?: string | null;
+    dailyRangeLastReconcileError?: string | null;
   }>;
   lanes: Array<{
     laneId: string;
@@ -424,6 +433,7 @@ function timeAgo(iso: string | null | undefined): string {
 }
 
 function compactLane(laneId: string): string {
+  if (laneId === 'DAILY_4H_RANGE_ACCEPTANCE') return 'DAILY RANGE 4H';
   return laneId.replace(/^CG_VARIANT_MATRIX:/, '').replace(/^CG_LONG_VARIANT_MATRIX:/, '');
 }
 
@@ -2027,6 +2037,7 @@ export default function TestnetExchangeDashboard() {
     laneIds.includes('REGIME_COMPOSITE_CONFIRMATION_LONG') ||
     laneIds.includes('PANIC_WASHOUT_RECLAIM_LONG') ||
     laneIds.some((id) => id.startsWith('COMPOSITE_ESTIMATOR_BIDI_'));
+  const isDailyRangePosition = (laneIds: string[]) => laneIds.includes('DAILY_4H_RANGE_ACCEPTANCE');
 
   // 2026-07-23 dashboard consolidation: split (2026-07-07/08 operator asks) the directional slot
   // vs the cross-sectional foundation the exact same way the old separate tables did — lifted up
@@ -2036,14 +2047,17 @@ export default function TestnetExchangeDashboard() {
   const allPositions = account?.positions ?? [];
   const directionalPositions = allPositions.filter((p) => intentBySymbol.has(p.symbol));
   const foundationPositions = allPositions.filter(
-    (p) => !isSingleSymbolExecutorPosition(p.laneIds) && ((p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol))),
+    (p) => !isDailyRangePosition(p.laneIds) && !isSingleSymbolExecutorPosition(p.laneIds) && ((p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol))),
+  );
+  const dailyRangePositions = allPositions.filter((p) =>
+    isDailyRangePosition(p.laneIds) && !intentBySymbol.has(p.symbol),
   );
   // The account headline is exchange truth, so it includes every non-zero USD-M position.  The
   // old table only rendered positions claimed by a Kronos intent/basket/single-symbol lane; an
   // operator-created or otherwise unclaimed exchange position therefore moved the headline uPnL
   // while the table claimed there were zero positions.  Keep it explicitly separate: this is a
   // reporting/reconciliation state, never a new engine book and never a permission to close it.
-  const trackedAccountPositions = new Set([...directionalPositions, ...foundationPositions]);
+  const trackedAccountPositions = new Set([...directionalPositions, ...foundationPositions, ...dailyRangePositions]);
   const unattributedExchangePositions = allPositions.filter((p) =>
     !trackedAccountPositions.has(p) && !isSingleSymbolExecutorPosition(p.laneIds),
   );
@@ -2057,7 +2071,7 @@ export default function TestnetExchangeDashboard() {
   // Sum every position the dashboard can prove is open: the three engine-owned books plus an
   // explicit exchange-unattributed bucket.  This must reconcile to the account count rather than
   // hiding a position merely because no executor currently claims it.
-  const openPositionsCount = directionalPositions.length + foundationPositions.length + singleSymbolLanePositions.length + unattributedExchangePositions.length;
+  const openPositionsCount = directionalPositions.length + foundationPositions.length + dailyRangePositions.length + singleSymbolLanePositions.length + unattributedExchangePositions.length;
   // 2026-07-11: the 3 CrossSectionalExecutor instances each have independent halted/error/
   // openBaskets/staleSince state — surface all 3, not just FILTERED, so a stuck TREND or MIXED
   // instance is visible instead of silently invisible. (Unchanged data, just one combined list
@@ -2186,16 +2200,19 @@ export default function TestnetExchangeDashboard() {
             const ps = account?.positions ?? [];
             const dirUnreal = ps.reduce((s, p) => s + (p.intentUnrealizedPnl ?? 0), 0);
             const baskUnreal = ps
-              .filter((p) => !isSingleSymbolExecutorPosition(p.laneIds))
+              .filter((p) => !isDailyRangePosition(p.laneIds) && !isSingleSymbolExecutorPosition(p.laneIds))
               .reduce((s, p) => s + (p.basketUnrealizedPnl ?? 0), 0);
             const singleSymbolUnreal = ps
               .filter((p) => isSingleSymbolExecutorPosition(p.laneIds))
               .reduce((s, p) => s + (p.basketUnrealizedPnl ?? 0), 0);
+            const dailyRangeUnreal = ps
+              .filter((p) => isDailyRangePosition(p.laneIds))
+              .reduce((s, p) => s + (p.dailyRangeUnrealizedPnl ?? p.unrealizedPnl), 0);
             const unattributedUnreal = unattributedExchangePositions.reduce((s, p) => s + p.unrealizedPnl, 0);
             return (
               <>
                 <strong className={tone(account?.unrealizedPnl)}>{signed(account?.unrealizedPnl)}</strong>
-                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · single-symbol {signed(singleSymbolUnreal)} · exchange tak terikat {signed(unattributedUnreal)} · {account ? `${account.openPositionCount} pos` : 'loading'}</small>
+                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · daily range {signed(dailyRangeUnreal)} · single-symbol {signed(singleSymbolUnreal)} · exchange tak terikat {signed(unattributedUnreal)} · {account ? `${account.openPositionCount} pos` : 'loading'}</small>
               </>
             );
           })()}
@@ -2475,7 +2492,7 @@ export default function TestnetExchangeDashboard() {
           <header><span>Open Positions</span><strong>{openPositionsCount} pos</strong></header>
           <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
             Directional (operator-controlled, engine mirror) + Basket (cross-sectional hedge, automatic exit only) +
-            Single-symbol (stop-protected, own exchange-side stop) + Exchange tak terikat in one table. Posisi tak terikat
+            Daily range (native SL / 2R TP, lane-managed) + Single-symbol (stop-protected, own exchange-side stop) + Exchange tak terikat in one table. Posisi tak terikat
             tetap ditampilkan agar total exchange dan uPnL tidak terlihat bertentangan; dashboard tidak mengklaim pemiliknya dan tidak memberi tombol close.
           </p>
           {closeResult && <p className={closeResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{closeResult.message}</p>}
@@ -2647,7 +2664,7 @@ export default function TestnetExchangeDashboard() {
                 </tr>
               </thead>
               <tbody>
-                {directionalPositions.length === 0 && foundationPositions.length === 0 && singleSymbolLanePositions.length === 0 && unattributedExchangePositions.length === 0 ? (
+                {directionalPositions.length === 0 && foundationPositions.length === 0 && dailyRangePositions.length === 0 && singleSymbolLanePositions.length === 0 && unattributedExchangePositions.length === 0 ? (
                   <tr><td colSpan={20}>No open positions on the exchange.</td></tr>
                 ) : (
                   <>
@@ -2777,6 +2794,45 @@ export default function TestnetExchangeDashboard() {
                           </td>
                           <td>—</td>
                           <td className="tone-measure" title="Menutup satu leg basket akan membuat sisa basket jadi taruhan directional telanjang — tidak ada Close now di sini, sama seperti sebelumnya.">auto-exit only</td>
+                        </tr>
+                      );
+                    })}
+                    {dailyRangePositions.map((p) => {
+                      const qty = Math.abs(p.dailyRangeQty ?? p.quantity);
+                      const side = p.dailyRangeQty != null ? (p.dailyRangeQty >= 0 ? 'LONG' : 'SHORT') : p.direction;
+                      const entry = p.dailyRangeEntryPrice ?? p.entryPrice;
+                      const stop = p.dailyRangeStopPrice ?? null;
+                      const target = p.dailyRangeTakeProfitPrice ?? null;
+                      const risk = stop != null ? Math.abs(entry - stop) : 0;
+                      const dirSign = side === 'LONG' ? 1 : -1;
+                      const currentR = p.markPrice != null && risk > 0 ? ((p.markPrice - entry) / risk) * dirSign : null;
+                      const targetGap = target != null && p.markPrice != null && p.markPrice > 0
+                        ? ((target - p.markPrice) / p.markPrice) * dirSign * 100
+                        : null;
+                      const unreal = p.dailyRangeUnrealizedPnl ?? p.unrealizedPnl;
+                      const afterCost = unreal - (p.estimatedCloseCostUsd ?? 0);
+                      return (
+                        <tr key={`daily-range-${p.dailyRangeTradeId ?? p.symbol}`} style={{ background: 'rgba(95, 208, 168, 0.055)' }}>
+                          <td>Daily range</td>
+                          <td>{p.symbol}</td>
+                          <td className={side === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{side}</td>
+                          <td>{Number(qty.toFixed(8))}</td>
+                          <td>{price(entry)}</td>
+                          <td>{price(p.markPrice)}</td>
+                          <td>{target == null ? 'native 2R pending' : price(target)}</td>
+                          <td className={tone(targetGap)}>{percent(targetGap)}</td>
+                          <td className="tone-critical">{price(p.liquidationPrice)}</td>
+                          <td>{price(stop)}</td>
+                          <td className={tone(currentR ?? 0)}>{currentR == null ? '—' : `${currentR.toFixed(2)}R`}</td>
+                          <td>native SL / 2R TP</td>
+                          <td className={tone(unreal)}>{signed(unreal)}</td>
+                          <td className={tone(afterCost)}>{signed(afterCost)}</td>
+                          <td>{p.leverage}x</td>
+                          <td>{p.sourceOrderCount}</td>
+                          <td>{compactLane('DAILY_4H_RANGE_ACCEPTANCE')}</td>
+                          <td>{p.dailyRangeOpenedAt ? taipeiDateTime(p.dailyRangeOpenedAt) ?? '—' : '—'}</td>
+                          <td>{p.dailyRangeStatus ?? '—'}{p.dailyRangeLastReconcileError ? <small className="tone-warning" style={{ display: 'block' }}>reconcile: {p.dailyRangeLastReconcileError}</small> : null}</td>
+                          <td className="tone-measure" title="Milik lane daily-range dengan native stop dan target 2R. Penutupan harus melalui lifecycle lane, bukan close net position generik.">lane-managed</td>
                         </tr>
                       );
                     })}

@@ -189,6 +189,25 @@ export interface DailyRangeTrade {
   lastReconcileError: string | null;
 }
 
+/**
+ * The only account-level claim this isolated lane is allowed to publish.  It
+ * exists for reconciliation/reporting; it never carries permission for another
+ * component to amend, close, or resize the trade.
+ */
+export interface DailyRangeOpenPositionClaim {
+  laneId: typeof DAILY_RANGE_LANE_ID;
+  tradeId: string;
+  symbol: string;
+  direction: DailyRangeDirection;
+  qty: number;
+  entryPrice: number;
+  openedAt: string;
+  status: Extract<DailyRangeTradeStatus, "PROTECTING" | "OPEN" | "EXIT_RECONCILING">;
+  stopPrice: number | null;
+  takeProfitPrice: number | null;
+  lastReconcileError: string | null;
+}
+
 export interface DailyRangeCanaryEvidence {
   canaryId: string;
   at: string;
@@ -597,6 +616,34 @@ export class DailyRangeAcceptanceLane {
   isSymbolLeased(symbol: string): { tradeId: string; direction: DailyRangeDirection; status: DailyRangeTradeStatus } | null {
     const trade = this.store.hasActiveSymbolLease(symbol);
     return trade ? { tradeId: trade.tradeId, direction: trade.direction, status: trade.status } : null;
+  }
+
+  /**
+   * Report exact filled, still-open daily-range ownership to the shared account
+   * view. Pending submissions deliberately do not appear here: before a fill is
+   * proven, presenting requested quantity as an exchange position would invent
+   * attribution. The lane's own startup reconciliation remains responsible for
+   * those pending states.
+  */
+  getOpenPositionClaims(): DailyRangeOpenPositionClaim[] {
+    return this.store.getState().trades.flatMap((trade) => {
+      const status = trade.status;
+      if (status !== "PROTECTING" && status !== "OPEN" && status !== "EXIT_RECONCILING") return [];
+      if (!finitePositive(trade.entryQty) || !finitePositive(trade.entryFillPrice)) return [];
+      return [{
+        laneId: DAILY_RANGE_LANE_ID,
+        tradeId: trade.tradeId,
+        symbol: trade.symbol,
+        direction: trade.direction,
+        qty: trade.entryQty,
+        entryPrice: trade.entryFillPrice,
+        openedAt: trade.entryFilledAt ?? trade.entrySubmittedAt,
+        status,
+        stopPrice: trade.stopPrice,
+        takeProfitPrice: trade.takeProfitPrice,
+        lastReconcileError: trade.lastReconcileError,
+      }];
+    });
   }
 
   /**
@@ -1588,9 +1635,12 @@ export class DailyRangeAcceptanceLane {
         await this.emergencyFlatten(trade, "ENTRY_ABORT_PROTECTION_FAILED", "missing exchange-native bracket while position open");
         continue;
       }
+      // A past transport failure must not remain attached to a healthy, freshly
+      // verified trade. Leaving it here made the status endpoint report a stale
+      // 418 even after a later reconciliation had proved both native brackets.
+      trade.lastReconcileError = null;
       if (trade.status === "PROTECTING") {
         trade.status = "OPEN";
-        trade.lastReconcileError = null;
       }
     }
     this.store.save();

@@ -2979,6 +2979,18 @@ export class LiveExecutionEngine {
        *  field rather than reusing targetTpPrice so the dashboard can render it honestly instead of
        *  as a fabricated "TP target" (2026-07-09 audit finding). */
       singleSymbolStopPrice: number | null;
+      /** Isolated daily 4h range-acceptance share. Filled only by the report-only
+       * route annotation after an exact side/quantity reconciliation against the
+       * lane's durable claim; never inferred from an exchange symbol alone. */
+      dailyRangeTradeId: string | null;
+      dailyRangeQty: number | null;
+      dailyRangeEntryPrice: number | null;
+      dailyRangeUnrealizedPnl: number | null;
+      dailyRangeStopPrice: number | null;
+      dailyRangeTakeProfitPrice: number | null;
+      dailyRangeOpenedAt: string | null;
+      dailyRangeStatus: string | null;
+      dailyRangeLastReconcileError: string | null;
     }>;
     lanes: Array<{
       laneId: string;
@@ -3080,6 +3092,15 @@ export class LiveExecutionEngine {
         basketQty: null,
         basketUnrealizedPnl: null,
         singleSymbolStopPrice: null,
+        dailyRangeTradeId: null,
+        dailyRangeQty: null,
+        dailyRangeEntryPrice: null,
+        dailyRangeUnrealizedPnl: null,
+        dailyRangeStopPrice: null,
+        dailyRangeTakeProfitPrice: null,
+        dailyRangeOpenedAt: null,
+        dailyRangeStatus: null,
+        dailyRangeLastReconcileError: null,
       };
     });
     const unrealizedPnl = positions.reduce((sum, position) => sum + position.unRealizedProfit, 0);

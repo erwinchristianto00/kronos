@@ -324,6 +324,40 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect(client.algoPlaced.every((order) => order.quantity === 0.125)).toBe(true);
   });
 
+  it("publishes only proven open ownership and clears a stale reconciliation alarm after brackets verify", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeLane(client, now);
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value, "SHORT");
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+
+    const trade = store.getState().trades[0]!;
+    expect(trade.status).toBe("OPEN");
+    trade.lastReconcileError = "account reconciliation unavailable: rate limited (HTTP 418)";
+    await (lane as unknown as { reconcileOpenTrades(): Promise<void> }).reconcileOpenTrades();
+
+    expect(trade.lastReconcileError).toBeNull();
+    expect(lane.getOpenPositionClaims()).toEqual([expect.objectContaining({
+      laneId: "DAILY_4H_RANGE_ACCEPTANCE",
+      tradeId: trade.tradeId,
+      symbol: "AAAUSDT",
+      direction: "SHORT",
+      qty: trade.entryQty,
+      entryPrice: trade.entryFillPrice,
+      status: "OPEN",
+      stopPrice: trade.stopPrice,
+      takeProfitPrice: trade.takeProfitPrice,
+      lastReconcileError: null,
+    })]);
+
+    // A submitted/reconciling entry is deliberately not attributed until an exact
+    // fill and still-open position are both proven.
+    trade.status = "ENTRY_RECONCILING";
+    expect(lane.getOpenPositionClaims()).toEqual([]);
+  });
+
   it("records actual fills, fees, entry/exit slippage, and cancels both owned siblings on a controlled lane close", async () => {
     const now = { value: AT_0410 };
     const client = new FakeDailyClient();

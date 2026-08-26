@@ -5,6 +5,7 @@ import { registerLiveRoutes } from "../src/routes/live.js";
 import type { LiveExecutionEngine } from "../src/lib/live-execution-engine.js";
 import { BinanceFuturesPrivateError } from "../src/lib/binance-futures-private.js";
 import type { CrossSectionalExecutor, ExecutorBasket } from "../src/lib/cross-sectional-executor.js";
+import type { DailyRangeAcceptanceLane, DailyRangeOpenPositionClaim } from "../src/lib/daily-4h-range-acceptance-lane.js";
 import type { SingleSymbolLaneExecutor, SingleSymbolPosition } from "../src/lib/single-symbol-lane-executor.js";
 import type { SymbolReliabilitySnapshot } from "../src/lib/cross-sectional-symbol-reliability.js";
 
@@ -32,7 +33,10 @@ function fakeAccountSnapshot(): Awaited<ReturnType<LiveExecutionEngine["getAccou
         estimatedCloseCostUsd: 0, unrealizedAfterEstimatedCloseCostUsd: 0, leverage: 3,
         sourceOrderCount: 0, laneIds: [] as string[], intentDirection: null, intentQty: null,
         intentEntryPrice: null, intentUnrealizedPnl: null, basketQty: null, basketUnrealizedPnl: null,
-        singleSymbolStopPrice: null,
+        singleSymbolStopPrice: null, dailyRangeTradeId: null, dailyRangeQty: null,
+        dailyRangeEntryPrice: null, dailyRangeUnrealizedPnl: null, dailyRangeStopPrice: null,
+        dailyRangeTakeProfitPrice: null, dailyRangeOpenedAt: null, dailyRangeStatus: null,
+        dailyRangeLastReconcileError: null,
       },
       {
         symbol: "BUSDT", direction: "SHORT", quantity: 5, entryPrice: 1, markPrice: 1,
@@ -40,7 +44,10 @@ function fakeAccountSnapshot(): Awaited<ReturnType<LiveExecutionEngine["getAccou
         estimatedCloseCostUsd: 0, unrealizedAfterEstimatedCloseCostUsd: 0, leverage: 3,
         sourceOrderCount: 0, laneIds: [] as string[], intentDirection: null, intentQty: null,
         intentEntryPrice: null, intentUnrealizedPnl: null, basketQty: null, basketUnrealizedPnl: null,
-        singleSymbolStopPrice: null,
+        singleSymbolStopPrice: null, dailyRangeTradeId: null, dailyRangeQty: null,
+        dailyRangeEntryPrice: null, dailyRangeUnrealizedPnl: null, dailyRangeStopPrice: null,
+        dailyRangeTakeProfitPrice: null, dailyRangeOpenedAt: null, dailyRangeStatus: null,
+        dailyRangeLastReconcileError: null,
       },
     ],
     lanes: [],
@@ -87,6 +94,28 @@ function fakeSingleSymbolExecutor(laneId: string, symbol: string): SingleSymbolL
     getClosedSummary: () => ({ closedCount: 0, wins: 0, losses: 0, realizedPnlUsd: 0, feesUsd: 0, symbols: [], lastClosedAt: null }),
     getClosedPositions: () => [],
   } as unknown as SingleSymbolLaneExecutor;
+}
+
+function fakeDailyRangeLane(claims: DailyRangeOpenPositionClaim[]): DailyRangeAcceptanceLane {
+  return { getOpenPositionClaims: () => claims } as unknown as DailyRangeAcceptanceLane;
+}
+
+function fakeDailyRangeAccountSnapshot(): Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>> {
+  const snapshot = fakeAccountSnapshot();
+  snapshot.openPositionCount = 2;
+  snapshot.positions = [
+    {
+      ...snapshot.positions[0]!,
+      symbol: "OPUSDT", direction: "SHORT", quantity: 242.2,
+      entryPrice: 0.1032, markPrice: 0.103, unrealizedPnl: 0.04844,
+    },
+    {
+      ...snapshot.positions[1]!,
+      symbol: "ADAUSDT", direction: "SHORT", quantity: 116,
+      entryPrice: 0.2154, markPrice: 0.21194, unrealizedPnl: 0.40136,
+    },
+  ];
+  return snapshot;
 }
 
 let app: FastifyInstance | null = null;
@@ -162,6 +191,51 @@ describe("registerLiveRoutes — /api/live/account wires ALL 5 executor instance
     expect(res.statusCode).toBe(200);
     const row = res.json().positions.find((p: { symbol: string }) => p.symbol === "AUSDT");
     expect(row.laneIds).toEqual(["CROSS_SECTIONAL_MARKET_NEUTRAL"]);
+  });
+
+  it("attributes only an exact, durable daily-range position claim and leaves a quantity mismatch visible as unclaimed", async () => {
+    const claims: DailyRangeOpenPositionClaim[] = [
+      {
+        laneId: "DAILY_4H_RANGE_ACCEPTANCE", tradeId: "drra-op", symbol: "OPUSDT", direction: "SHORT",
+        qty: 242.2, entryPrice: 0.1032, openedAt: "2026-08-25T16:45:49.991Z", status: "OPEN",
+        stopPrice: 0.1072, takeProfitPrice: 0.0952, lastReconcileError: null,
+      },
+      {
+        // Same symbol and side are insufficient. A partial/foreign net quantity
+        // must remain an alarm rather than being silently claimed by this lane.
+        laneId: "DAILY_4H_RANGE_ACCEPTANCE", tradeId: "drra-ada-mismatch", symbol: "ADAUSDT", direction: "SHORT",
+        qty: 115.9, entryPrice: 0.2154, openedAt: "2026-08-25T16:45:49.043Z", status: "OPEN",
+        stopPrice: 0.221, takeProfitPrice: 0.2042, lastReconcileError: null,
+      },
+    ];
+    const fakeEngine = {
+      getAccountSnapshot: async () => fakeDailyRangeAccountSnapshot(),
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+    } as unknown as LiveExecutionEngine;
+    app = Fastify();
+    await registerLiveRoutes(app, fakeEngine, { dailyRangeLane: () => fakeDailyRangeLane(claims) });
+    await app.ready();
+
+    const response = await app.inject({ method: "GET", url: "/api/live/account" });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    const op = body.positions.find((row: { symbol: string }) => row.symbol === "OPUSDT");
+    const ada = body.positions.find((row: { symbol: string }) => row.symbol === "ADAUSDT");
+    expect(op).toMatchObject({
+      laneIds: ["DAILY_4H_RANGE_ACCEPTANCE"],
+      sourceOrderCount: 1,
+      dailyRangeTradeId: "drra-op",
+      dailyRangeQty: -242.2,
+      dailyRangeEntryPrice: 0.1032,
+      dailyRangeStopPrice: 0.1072,
+      dailyRangeTakeProfitPrice: 0.0952,
+    });
+    expect(op.dailyRangeUnrealizedPnl).toBeCloseTo(0.04844, 8);
+    expect(ada.laneIds).toEqual([]);
+    expect(ada.dailyRangeTradeId).toBeNull();
+    expect(body.lanes).toContainEqual(expect.objectContaining({
+      laneId: "DAILY_4H_RANGE_ACCEPTANCE", sourceOrderCount: 1, symbols: ["OPUSDT"],
+    }));
   });
 });
 

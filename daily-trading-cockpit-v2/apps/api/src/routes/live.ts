@@ -33,7 +33,7 @@ import {
 } from "../lib/cross-sectional-executor.js";
 import type { CrossSectionalAutoPool, CrossSectionalAutoPoolSnapshot } from "../lib/cross-sectional-auto-pool.js";
 import type { SymbolReliabilitySnapshot } from "../lib/cross-sectional-symbol-reliability.js";
-import type { DailyRangeAcceptanceLane } from "../lib/daily-4h-range-acceptance-lane.js";
+import { DAILY_RANGE_LANE_ID, type DailyRangeAcceptanceLane } from "../lib/daily-4h-range-acceptance-lane.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
 import {
   CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
@@ -1036,6 +1036,71 @@ export function annotateSingleSymbolAccount(
     } else {
       snapshot.lanes.push({
         laneId,
+        sourceOrderCount: laneRow.sourceOrderCount,
+        symbols: Array.from(laneRow.symbols).sort(),
+        notionalUsd: laneRow.notionalUsd,
+        unrealizedPnl: laneRow.unrealizedPnl,
+      });
+      snapshot.lanes.sort((left, right) => left.laneId.localeCompare(right.laneId));
+    }
+  }
+  return snapshot;
+}
+
+/**
+ * Daily-range trades do not pass through LiveExecutionEngine intents or a
+ * SingleSymbolLaneExecutor. Their ownership is nonetheless durable and exact:
+ * accept it only when the exchange row has the same symbol, side, and quantity.
+ * A mismatch intentionally remains unattributed so the existing fail-closed
+ * reconciliation alarm stays visible instead of relabelling foreign exposure.
+ */
+export function annotateDailyRangeAccount(
+  snapshot: LiveAccountSnapshot,
+  lane: DailyRangeAcceptanceLane | null,
+): LiveAccountSnapshot {
+  if (!lane) return snapshot;
+  const claims = lane.getOpenPositionClaims();
+  if (claims.length === 0) return snapshot;
+
+  const laneRow = { laneId: DAILY_RANGE_LANE_ID, sourceOrderCount: 0, symbols: new Set<string>(), notionalUsd: 0, unrealizedPnl: 0 };
+  for (const claim of claims) {
+    const row = snapshot.positions.find((position) => position.symbol === claim.symbol);
+    if (!row || row.direction !== claim.direction) continue;
+    const quantityTolerance = Math.max(1e-9, claim.qty * 1e-6);
+    if (Math.abs(row.quantity - claim.qty) > quantityTolerance) continue;
+
+    row.sourceOrderCount += 1;
+    if (!row.laneIds.includes(DAILY_RANGE_LANE_ID)) row.laneIds.push(DAILY_RANGE_LANE_ID);
+    const direction = claim.direction === "LONG" ? 1 : -1;
+    const unrealized = row.markPrice !== null
+      ? (row.markPrice - claim.entryPrice) * claim.qty * direction
+      : null;
+    row.dailyRangeTradeId = claim.tradeId;
+    row.dailyRangeQty = claim.qty * direction;
+    row.dailyRangeEntryPrice = claim.entryPrice;
+    row.dailyRangeUnrealizedPnl = unrealized;
+    row.dailyRangeStopPrice = claim.stopPrice;
+    row.dailyRangeTakeProfitPrice = claim.takeProfitPrice;
+    row.dailyRangeOpenedAt = claim.openedAt;
+    row.dailyRangeStatus = claim.status;
+    row.dailyRangeLastReconcileError = claim.lastReconcileError;
+
+    laneRow.sourceOrderCount += 1;
+    laneRow.symbols.add(claim.symbol);
+    laneRow.notionalUsd += Math.abs(claim.qty * claim.entryPrice);
+    laneRow.unrealizedPnl += unrealized ?? row.unrealizedPnl;
+  }
+
+  if (laneRow.sourceOrderCount > 0) {
+    const existing = snapshot.lanes.find((row) => row.laneId === DAILY_RANGE_LANE_ID);
+    if (existing) {
+      existing.sourceOrderCount += laneRow.sourceOrderCount;
+      existing.symbols = Array.from(new Set([...existing.symbols, ...laneRow.symbols])).sort();
+      existing.notionalUsd += laneRow.notionalUsd;
+      existing.unrealizedPnl += laneRow.unrealizedPnl;
+    } else {
+      snapshot.lanes.push({
+        laneId: DAILY_RANGE_LANE_ID,
         sourceOrderCount: laneRow.sourceOrderCount,
         symbols: Array.from(laneRow.symbols).sort(),
         notionalUsd: laneRow.notionalUsd,
@@ -3703,6 +3768,7 @@ ${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca —
       for (const executor of allSingleSymbolExecutors()) {
         snapshot = annotateSingleSymbolAccount(snapshot, executor);
       }
+      snapshot = annotateDailyRangeAccount(snapshot, opts.dailyRangeLane?.() ?? null);
       // 2026-07-11: the dashboard's headline "Realized P&L (today/all-time)" summed only the
       // mirror ledger (status.totalRealizedPnlUsd) and the 3 cross-sectional lane ids — every
       // SingleSymbolLaneExecutor's real realized P&L (already correctly folded into closedLanes
