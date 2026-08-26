@@ -10,7 +10,7 @@
  * open the same symbol while this lane's reduce-only bracket is live.
  */
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import {
@@ -25,12 +25,20 @@ import {
   type FuturesUserTrade,
 } from "./binance-futures-private.js";
 import type { DailyRangePoolEvidence, DailyRangePoolSymbolAudit } from "./daily-range-auto-pool.js";
-import type { DailyRangeMainnetControls } from "./daily-range-mainnet-policy.js";
+import {
+  DAILY_RANGE_TESTNET_MAX_OPEN_TRADES_DEFAULT,
+  type DailyRangeMainnetControls,
+} from "./daily-range-mainnet-policy.js";
+import {
+  allocateDailyRangeBatch,
+  type DailyRangeAllocatorMode,
+  type DailyRangeAllocationSkipReason,
+} from "./daily-range-selector.js";
 
 export const DAILY_RANGE_LANE_ID = "DAILY_4H_RANGE_ACCEPTANCE";
 export const DAILY_RANGE_STRATEGY_VERSION = "daily-4h-range-acceptance-2r-v1";
-/** Existing selector behavior, named so research never mistakes loop order for an alpha model. */
-export const DAILY_RANGE_SELECTOR_POLICY_VERSION = "BASELINE_LEXICAL_SEQUENCE_V1";
+/** No model has allocation authority. New data is collected under this immutable policy label. */
+export const DAILY_RANGE_SELECTOR_POLICY_VERSION = "DAILY_RANGE_BATCH_SELECTOR_SHADOW_V1";
 export const DAILY_RANGE_TRADE_NOTIONAL_USD = 25;
 export const DAILY_RANGE_LEVERAGE = 1;
 export const DAILY_RANGE_RR = 2;
@@ -43,6 +51,11 @@ const MAX_FRESH_SIGNAL_AGE_MS = 95_000;
 const CONFIRM_RETRIES = 4;
 const DEFAULT_CONFIRM_RETRY_MS = 350;
 const MAX_SIGNAL_COHORTS = 20_000;
+const MAX_COUNTERFACTUAL_MATURATION_PER_TICK = 50;
+const ALLOCATOR_LOCK_STALE_MS = 10 * 60_000;
+const RESEARCH_ENTRY_FEE_BPS = 4;
+const RESEARCH_EXIT_FEE_BPS = 4;
+const RESEARCH_SLIPPAGE_BPS = 0;
 
 export type DailyRangeDirection = "LONG" | "SHORT";
 export type DailyRangeControlMode = "DISARMED" | "ARMED";
@@ -74,7 +87,14 @@ export type DailyRangeSignalReason =
   | "MAINNET_EXECUTION_DISABLED"
   | "ACCOUNT_ENTRY_BLOCKED"
   | "MAX_OPEN_TRADES_REACHED"
-  | "MAX_GROSS_NOTIONAL_REACHED";
+  | "MAX_GROSS_NOTIONAL_REACHED"
+  | "NO_AVAILABLE_SLOT"
+  | "SKIP_CAP_LOWER_RANK"
+  | "STRATEGY_SYMBOL_CONFLICT"
+  | "SPREAD_HARD_REJECT"
+  | "SELECTOR_NOT_READY"
+  | "LIVE_NEW_ENTRY_PAUSED"
+  | "SELECTED_EXECUTION_FAILED";
 
 export interface DailyRangeCandle {
   openTime: number;
@@ -83,6 +103,7 @@ export interface DailyRangeCandle {
   high: number;
   low: number;
   close: number;
+  volume: number;
 }
 
 export interface DailyRangeLevel {
@@ -136,6 +157,141 @@ export interface DailyRangeSignal {
   reason: DailyRangeSignalReason | null;
   entryAttemptedAt: string | null;
   tradeId: string | null;
+  /** Fields below were added with the batch/PIT allocator and are optional for legacy rows. */
+  signalBatchTimestamp?: string;
+  eligibleSince?: string;
+  poolVersion?: number | null;
+  universePolicyId?: string | null;
+  selectorMode?: DailyRangeAllocatorMode;
+  selectorId?: string | null;
+  selectorScore?: number | null;
+  selectorRank?: number | null;
+  actuallySelected?: boolean;
+  actuallyExecuted?: boolean;
+  research?: DailyRangeSignalResearchRecord | null;
+}
+
+export type DailyRangePitQuality = "FULL_PIT" | "PARTIAL_RECONSTRUCTION" | "UNAVAILABLE";
+export type DailyRangeCounterfactualStatus = "PENDING" | "MATURE_TP" | "MATURE_SL" | "OUTCOME_AMBIGUOUS";
+
+/** Detached execution-quality read captured when the signal batch is finalized. */
+export interface DailyRangeSignalMarketQualitySnapshot {
+  capturedAt: string;
+  poolCapturedAt: string | null;
+  /**
+   * FULL_PIT requires a frozen pool read and an exchange BBO timestamp at or
+   * before C2 close.  A REST BBO read after the close is useful diagnostics,
+   * but is deliberately not promoted into a causal feature sample.
+   */
+  pitQuality: DailyRangePitQuality;
+  bookSnapshotQuality: "STRICT_AT_OR_BEFORE_SIGNAL" | "NEAR_SIGNAL_AFTER_CLOSE" | "UNAVAILABLE";
+  bookObservedAt: string | null;
+  bookSourceTime: number | null;
+  bestBid: number | null;
+  bestAsk: number | null;
+  quoteVolume24hUsd: number | null;
+  medianSpreadBps: number | null;
+  currentSpreadBps: number | null;
+  fiveMinuteData: "OK" | "MISSING" | "STALE" | "GAPPED" | null;
+  fourHourData: "OK" | "MISSING" | "STALE" | "GAPPED" | null;
+  listedDays: number | null;
+  c1Pass: boolean | null;
+  c2Pass: boolean | null;
+  c3Pass: boolean | null;
+  c4Pass: boolean | null;
+  c5Pass: boolean | null;
+  c6Pass: boolean | null;
+  poolAudit: DailyRangePoolSymbolAudit | null;
+}
+
+/** Small, interpretable, no-lookahead feature record. It is data collection only. */
+export interface DailyRangeSignalFeatureSnapshot {
+  schemaVersion: 1;
+  capturedAt: string;
+  sourceBarCloseTime: number;
+  pitQuality: DailyRangePitQuality;
+  breakout: {
+    boundary: number;
+    c1ExtensionPrice: number;
+    c2ExtensionPrice: number;
+    c1ExtensionOfRange: number | null;
+    c2ExtensionOfRange: number | null;
+    c2ExtensionOfAtr: number | null;
+    c2ExtensionPct: number | null;
+    atr14: number | null;
+    realizedVolatility: number | null;
+  };
+  relativeVolume: {
+    confirmation1: number | null;
+    confirmation2: number | null;
+    c1Vs12: number | null;
+    c1Vs24: number | null;
+    c1Vs36: number | null;
+    c2Vs12: number | null;
+    c2Vs24: number | null;
+    c2Vs36: number | null;
+    combinedVs12: number | null;
+    combinedVs24: number | null;
+    combinedVs36: number | null;
+  };
+  trend: {
+    return1h: number | null;
+    return4h: number | null;
+    sideAlignedReturn1h: number | null;
+    sideAlignedReturn4h: number | null;
+    sideAligned1h: boolean | null;
+    sideAligned4h: boolean | null;
+  };
+  rangeQuality: {
+    rangeWidthOfPrice: number | null;
+    rangeWidthOfAtr: number | null;
+    referenceBodyOfRange: number | null;
+    upperWickPct: number | null;
+    lowerWickPct: number | null;
+    referenceVolume: number | null;
+    referenceVolumeVsRecent: number | null;
+  };
+  marketRegime: {
+    btcReturn1h: number | null;
+    btcReturn4h: number | null;
+    ethReturn1h: number | null;
+    ethReturn4h: number | null;
+    btcSideAligned1h: boolean | null;
+    btcSideAligned4h: boolean | null;
+    universePositive1hPct: number | null;
+    universeNegative1hPct: number | null;
+  };
+}
+
+/** Research-only mirror of the incumbent entry/SL/2R semantics; never sends an order. */
+export interface DailyRangeCounterfactualOutcome {
+  status: DailyRangeCounterfactualStatus;
+  entryConvention: "C2_CLOSE_PIT_CANONICAL_V1";
+  entryPrice: number;
+  structuralStop: number;
+  takeProfit: number;
+  tickSize: number | null;
+  quantity: number | null;
+  modeledEntryFeeBps: number;
+  modeledExitFeeBps: number;
+  modeledSlippageBps: number;
+  startedAt: string;
+  lastCheckedBarOpenTime: number | null;
+  maturedAt: string | null;
+  grossR: number | null;
+  netModeledR: number | null;
+  grossPnlUsd: number | null;
+  netModeledPnlUsd: number | null;
+  mfePct: number | null;
+  maePct: number | null;
+  holdingDurationMs: number | null;
+  ambiguityReason: string | null;
+}
+
+export interface DailyRangeSignalResearchRecord {
+  marketQuality: DailyRangeSignalMarketQualitySnapshot | null;
+  features: DailyRangeSignalFeatureSnapshot | null;
+  counterfactual: DailyRangeCounterfactualOutcome | null;
 }
 
 export interface DailyRangeSignalCohortCandidate {
@@ -156,6 +312,17 @@ export interface DailyRangeSignalCohortCandidate {
   breakoutDistanceOfRange: number | null;
   /** Immutable day-level C1-C6 evidence for this candidate, if capture completed. */
   poolAudit: DailyRangePoolSymbolAudit | null;
+  marketQuality?: DailyRangeSignalMarketQualitySnapshot | null;
+  features?: DailyRangeSignalFeatureSnapshot | null;
+  counterfactual?: DailyRangeCounterfactualOutcome | null;
+  selectorMode?: DailyRangeAllocatorMode;
+  selectorId?: string | null;
+  selectorScore?: number | null;
+  selectorRank?: number | null;
+  tieBreakHash?: string | null;
+  actuallySelected?: boolean;
+  actuallyExecuted?: boolean;
+  skipReason?: DailyRangeSignalReason | null;
   /** Filled only from the existing signal outcome; no extra execution decision is made here. */
   decision: {
     entryEligible: boolean;
@@ -170,16 +337,32 @@ export interface DailyRangeSignalCohort {
   cohortId: string;
   strategyVersion: typeof DAILY_RANGE_STRATEGY_VERSION;
   laneId: typeof DAILY_RANGE_LANE_ID;
-  selectorPolicyVersion: typeof DAILY_RANGE_SELECTOR_POLICY_VERSION;
+  selectorPolicyVersion: string;
   dateUtc: string;
   signalTimestamp: string;
   signalTimestampMs: number;
   observedAt: string;
   finalizedAt: string | null;
   candidates: DailyRangeSignalCohortCandidate[];
+  /** Absent on passive pre-fix cohorts; they are never retroactively allocated. */
+  allocation?: {
+    allocatorMode: DailyRangeAllocatorMode;
+    selectorStatus: "SHADOW" | "VALIDATED" | "NOT_READY";
+    selectorId: string | null;
+    availableSlots: number | null;
+    pendingReservationsAtBatch: number;
+    candidateCount: number;
+    longCandidateCount: number;
+    shortCandidateCount: number;
+    oversubscriptionRatio: number | null;
+    batchComplete: boolean;
+    selectedSignalIds: string[];
+    finalizedAt: string | null;
+    allocationError: string | null;
+  };
 }
 
-export type DailyRangeHistoryKind = "levels" | "signals" | "trades" | "cohorts" | "pool-evidence";
+export type DailyRangeHistoryKind = "levels" | "signals" | "trades" | "cohorts" | "batches" | "pool-evidence";
 
 export interface DailyRangeTrade {
   tradeId: string;
@@ -311,6 +494,11 @@ interface DailyRangePersistedState {
   trades: DailyRangeTrade[];
   canaries: DailyRangeCanaryEvidence[];
   runtime: DailyRangeRuntimeState;
+}
+
+interface DailyRangeAllocatorLock {
+  readonly ownerId: string;
+  release(): void;
 }
 
 function iso(ms: number): string {
@@ -482,6 +670,63 @@ export class DailyRangeLaneStore {
     renameSync(tmp, this.file);
   }
 
+  /**
+   * One allocator authority for the shared per-environment state file.  The
+   * normal PM2 topology is one process, but this lock makes an accidental second
+   * process fail closed before it can reserve the same portfolio slot.  A dead
+   * owner can be recovered only after a conservative stale period.
+   */
+  tryAcquireAllocatorLock(nowMs: number): DailyRangeAllocatorLock | null {
+    const path = `${this.file}.allocator.lock`;
+    const ownerId = randomUUID();
+    const attempt = (): DailyRangeAllocatorLock | null => {
+      try {
+        const fd = openSync(path, "wx", 0o640);
+        try {
+          writeFileSync(fd, JSON.stringify({ ownerId, pid: process.pid, acquiredAtMs: nowMs }), "utf8");
+        } finally {
+          closeSync(fd);
+        }
+        return {
+          ownerId,
+          release: () => {
+            try {
+              const current = JSON.parse(readFileSync(path, "utf8")) as { ownerId?: string };
+              if (current.ownerId === ownerId) unlinkSync(path);
+            } catch {
+              // A restart or already-released lock is safe: never unlink an unknown owner.
+            }
+          },
+        };
+      } catch {
+        return null;
+      }
+    };
+    const acquired = attempt();
+    if (acquired) return acquired;
+    try {
+      const prior = JSON.parse(readFileSync(path, "utf8")) as { pid?: number; acquiredAtMs?: number };
+      const pid = Number(prior.pid);
+      const acquiredAtMs = Number(prior.acquiredAtMs);
+      let alive = false;
+      if (Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, 0);
+          alive = true;
+        } catch (error) {
+          alive = (error as NodeJS.ErrnoException).code === "EPERM";
+        }
+      }
+      if (!alive && Number.isFinite(acquiredAtMs) && nowMs - acquiredAtMs >= ALLOCATOR_LOCK_STALE_MS) {
+        renameSync(path, `${path}.stale-${nowMs}`);
+        return attempt();
+      }
+    } catch {
+      // Unknown lock provenance is not safe to remove. The caller will retry on a later tick.
+    }
+    return null;
+  }
+
   arm(at: string): void {
     this.state.control = { mode: "ARMED", armedAt: at, disarmedAt: null, disarmReason: null };
     this.save();
@@ -553,15 +798,29 @@ export interface DailyRangeAcceptanceLaneOptions {
   store: DailyRangeLaneStore;
   /** Current durable C1/C2 pool. It is copied once into each UTC day record. */
   getUniverse: () => DailyRangeUniverseSnapshot;
+  /**
+   * Latest C1-C6 evidence used for the live, same-batch preflight only.  It is
+   * never substituted for the frozen day evidence in research features.
+   */
+  getSignalPoolEvidence?: (symbols: readonly string[]) => DailyRangePoolEvidence | null;
   getShortBlocklist: () => ReadonlySet<string>;
   entryClaims: DailyRangeEntryClaims;
   environment: "testnet" | "mainnet";
   /** Omitted means Mainnet is observation-only and structurally cannot enter. */
   mainnetControls?: DailyRangeMainnetControls;
+  /**
+   * Testnet executes the neutral baseline under the same finite portfolio cap
+   * as the Live strategy. Mainnet always uses its dedicated controls instead.
+   */
+  testnetMaxOpenTrades?: number;
   /** Mainnet account-health / kill-switch gate. It cannot relax lane-local controls. */
   entryGate?: () => DailyRangeEntryGateDecision;
   /** Best-effort notification after one real, settled lane close. */
   onTradeClosed?: (netPnlUsd: number) => void;
+  /** PAUSED is the Mainnet-safe default; Testnet defaults to neutral seeded random. */
+  allocatorMode?: DailyRangeAllocatorMode;
+  /** Null until a separately promoted model artifact exists. */
+  selectorId?: string | null;
   nowMs?: () => number;
   confirmRetryMs?: number;
 }
@@ -635,7 +894,104 @@ function asDailyCandle(value: FuturesKline): DailyRangeCandle {
     high: value.high,
     low: value.low,
     close: value.close,
+    volume: value.volume,
   };
+}
+
+function finiteNumber(value: number | null | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function medianNumber(values: readonly number[]): number | null {
+  const sorted = values.filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+  if (sorted.length === 0) return null;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[middle] ?? null
+    : ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2;
+}
+
+function ratio(numerator: number | null, denominator: number | null): number | null {
+  return finiteNumber(numerator) && finiteNumber(denominator) && Math.abs(denominator) > EPSILON
+    ? numerator / denominator
+    : null;
+}
+
+function returnOverBars(candles: readonly DailyRangeCandle[], bars: number): number | null {
+  const rows = candles.slice(-(bars + 1));
+  if (rows.length !== bars + 1 || !contiguousFiveMinuteBars(rows)) return null;
+  const last = rows.at(-1);
+  const prior = rows[0];
+  return last && prior && finitePositive(last.close) && finitePositive(prior.close)
+    ? last.close / prior.close - 1
+    : null;
+}
+
+/** Never bridge a public-data gap when deriving a causal feature. */
+function contiguousFiveMinuteBars(rows: readonly DailyRangeCandle[]): boolean {
+  return rows.length > 0 && rows.every((row, index) =>
+    index === 0 || row.openTime === (rows[index - 1]?.openTime ?? row.openTime) + FIVE_MIN_MS,
+  );
+}
+
+function atr(candles: readonly DailyRangeCandle[], period = 14): number | null {
+  if (candles.length < period + 1) return null;
+  const rows = candles.slice(-(period + 1));
+  if (!contiguousFiveMinuteBars(rows)) return null;
+  const ranges: number[] = [];
+  for (let index = 1; index < rows.length; index++) {
+    const row = rows[index]!;
+    const priorClose = rows[index - 1]!.close;
+    ranges.push(Math.max(row.high - row.low, Math.abs(row.high - priorClose), Math.abs(row.low - priorClose)));
+  }
+  return ranges.length === period ? ranges.reduce((sum, value) => sum + value, 0) / ranges.length : null;
+}
+
+function realizedVolatility(candles: readonly DailyRangeCandle[], period = 24): number | null {
+  if (candles.length < period + 1) return null;
+  const rows = candles.slice(-(period + 1));
+  if (!contiguousFiveMinuteBars(rows)) return null;
+  const returns: number[] = [];
+  for (let index = 1; index < rows.length; index++) {
+    const prior = rows[index - 1]!.close;
+    const current = rows[index]!.close;
+    if (!finitePositive(prior) || !finitePositive(current)) return null;
+    returns.push(Math.log(current / prior));
+  }
+  if (returns.length !== period) return null;
+  return Math.sqrt(returns.reduce((sum, value) => sum + value * value, 0) / returns.length);
+}
+
+function relativeVolumeFor(
+  candles: readonly DailyRangeCandle[],
+  targetOpenTime: number,
+  lookback: number,
+): number | null {
+  const index = candles.findIndex((row) => row.openTime === targetOpenTime);
+  if (index < lookback) return null;
+  const target = candles[index];
+  const rows = candles.slice(index - lookback, index + 1);
+  if (!contiguousFiveMinuteBars(rows)) return null;
+  const baseline = medianNumber(rows.slice(0, -1).map((row) => row.volume));
+  return target ? ratio(target.volume, baseline) : null;
+}
+
+function sideAligned(value: number | null, direction: DailyRangeDirection): boolean | null {
+  return value === null ? null : direction === "LONG" ? value > 0 : value < 0;
+}
+
+function sideAlignedReturn(value: number | null, direction: DailyRangeDirection): number | null {
+  return value === null ? null : direction === "LONG" ? value : -value;
+}
+
+function spreadBps(book: { bid: number | null; ask: number | null }): number | null {
+  if (!finitePositive(book.bid) || !finitePositive(book.ask)) return null;
+  const mid = (book.bid + book.ask) / 2;
+  return mid > EPSILON ? (book.ask - book.bid) / mid * 10_000 : null;
+}
+
+function cPass(audit: DailyRangePoolSymbolAudit | null, prefix: string): boolean | null {
+  return audit ? !audit.failures.some((failure) => failure.startsWith(prefix)) : null;
 }
 
 function safeCsvCell(value: unknown): string {
@@ -702,12 +1058,16 @@ export class DailyRangeAcceptanceLane {
   private readonly client: DailyRangeExecClient;
   private readonly store: DailyRangeLaneStore;
   private readonly getUniverse: () => DailyRangeUniverseSnapshot;
+  private readonly getSignalPoolEvidence: (symbols: readonly string[]) => DailyRangePoolEvidence | null;
   private readonly getShortBlocklist: () => ReadonlySet<string>;
   private readonly entryClaims: DailyRangeEntryClaims;
   private readonly environment: "testnet" | "mainnet";
   private readonly mainnetControls: DailyRangeMainnetControls | null;
+  private readonly testnetMaxOpenTrades: number;
   private readonly entryGate: () => DailyRangeEntryGateDecision;
   private readonly onTradeClosed: ((netPnlUsd: number) => void) | null;
+  private readonly allocatorMode: DailyRangeAllocatorMode;
+  private readonly selectorId: string | null;
   private readonly nowMs: () => number;
   private readonly confirmRetryMs: number;
   private ticking = false;
@@ -718,12 +1078,20 @@ export class DailyRangeAcceptanceLane {
     this.client = opts.client;
     this.store = opts.store;
     this.getUniverse = opts.getUniverse;
+    this.getSignalPoolEvidence = opts.getSignalPoolEvidence ?? (() => null);
     this.getShortBlocklist = opts.getShortBlocklist;
     this.entryClaims = opts.entryClaims;
     this.environment = opts.environment;
     this.mainnetControls = opts.mainnetControls ?? null;
+    const testnetCap = Math.floor(opts.testnetMaxOpenTrades ?? DAILY_RANGE_TESTNET_MAX_OPEN_TRADES_DEFAULT);
+    this.testnetMaxOpenTrades = Number.isFinite(testnetCap) && testnetCap >= 1
+      ? testnetCap
+      : DAILY_RANGE_TESTNET_MAX_OPEN_TRADES_DEFAULT;
     this.entryGate = opts.entryGate ?? (() => ({ allowed: true, reason: null }));
     this.onTradeClosed = opts.onTradeClosed ?? null;
+    this.allocatorMode = opts.allocatorMode
+      ?? (opts.environment === "mainnet" ? opts.mainnetControls?.allocatorMode ?? "PAUSED" : "SEEDED_RANDOM_BASELINE");
+    this.selectorId = opts.selectorId ?? null;
     this.nowMs = opts.nowMs ?? (() => Date.now());
     this.confirmRetryMs = opts.confirmRetryMs ?? DEFAULT_CONFIRM_RETRY_MS;
   }
@@ -849,15 +1217,35 @@ export class DailyRangeAcceptanceLane {
     }
     if (action === "canary" && !controls.canaryEnabled) return "Daily Range mainnet canary is disabled";
     if ((action === "arm" || action === "entry") && !controls.armEnabled) return "Daily Range mainnet arm is disabled";
+    if (action === "entry" && controls.newEntryMode === "PAUSED_SELECTION_FIX") {
+      return "Daily Range new entries are paused for selection-fix validation";
+    }
     return null;
   }
 
+  private selectorStatus(): "SHADOW" | "VALIDATED" | "NOT_READY" {
+    if (this.allocatorMode === "VALIDATED_SELECTOR" && this.selectorId) return "VALIDATED";
+    if (this.allocatorMode === "SHADOW_SELECTOR" || this.allocatorMode === "SEEDED_RANDOM_BASELINE") return "SHADOW";
+    return "NOT_READY";
+  }
+
+  /** A manually enabled Live baseline must never look like an alpha promotion. */
+  private operatorSelectorStatus(): "SHADOW" | "VALIDATED" | "NOT_READY" | "NO_VALIDATED_ALPHA_SELECTOR" {
+    if (this.environment === "mainnet" && this.allocatorMode === "SEEDED_RANDOM_BASELINE") {
+      return "NO_VALIDATED_ALPHA_SELECTOR";
+    }
+    return this.selectorStatus();
+  }
+
   private entryLimitReason(): Extract<DailyRangeSignalReason, "MAX_OPEN_TRADES_REACHED" | "MAX_GROSS_NOTIONAL_REACHED"> | null {
+    const activeTrades = this.store.getState().trades.filter((trade) => !isTerminalTradeStatus(trade.status));
+    const maxOpenTrades = this.environment === "mainnet"
+      ? this.mainnetControls?.maxOpenTrades ?? 0
+      : this.testnetMaxOpenTrades;
+    if (activeTrades.length >= maxOpenTrades) return "MAX_OPEN_TRADES_REACHED";
     if (this.environment !== "mainnet") return null;
     const controls = this.mainnetControls;
     if (!controls) return "MAX_OPEN_TRADES_REACHED";
-    const activeTrades = this.store.getState().trades.filter((trade) => !isTerminalTradeStatus(trade.status));
-    if (activeTrades.length >= controls.maxOpenTrades) return "MAX_OPEN_TRADES_REACHED";
     // Every pending/filled trade reserves the full intended 25 USDT before its
     // market POST.  That makes the gross cap atomic even when several C2 signals
     // arrive in the same scheduler tick; actual fill drift can only be observed,
@@ -876,6 +1264,24 @@ export class DailyRangeAcceptanceLane {
     const signalsToday = state.signals.filter((signal) => signal.dateUtc === date);
     const tradesToday = state.trades.filter((trade) => trade.dateUtc === date);
     const openTrades = state.trades.filter((trade) => !isTerminalTradeStatus(trade.status));
+    const capacity = this.allocationCapacity();
+    const batches = state.signalCohorts.filter((batch) => batch.allocation);
+    const lastBatch = [...batches]
+      .sort((a, b) => b.signalTimestampMs - a.signalTimestampMs || b.cohortId.localeCompare(a.cohortId))[0] ?? null;
+    const researchSignals = state.signals.filter((signal) => signal.research?.counterfactual !== null && signal.research?.counterfactual !== undefined);
+    const counterfactuals = researchSignals.map((signal) => signal.research?.counterfactual!).filter(Boolean);
+    const mainnetPausedForSelection = this.environment === "mainnet" && (
+      this.mainnetControls?.newEntryMode === "PAUSED_SELECTION_FIX"
+      || state.control.disarmReason?.startsWith("SELECTION_FIX_PENDING_VALIDATION") === true
+    );
+    const entryControlReason = this.mainnetControlBlockReason("entry");
+    const newEntriesEnabled = state.control.mode === "ARMED" && this.allocatorMode !== "PAUSED" && entryControlReason === null;
+    const newEntryReason = !newEntriesEnabled
+      ? mainnetPausedForSelection ? "SELECTION_FIX_PENDING_VALIDATION"
+        : this.allocatorMode === "PAUSED" ? "ALLOCATOR_PAUSED"
+          : state.control.mode !== "ARMED" ? state.control.disarmReason ?? "LANE_DISARMED"
+            : entryControlReason
+      : null;
     return {
       ok: true,
       environment: this.environment,
@@ -920,8 +1326,40 @@ export class DailyRangeAcceptanceLane {
         armEnabled: this.mainnetControls?.armEnabled ?? false,
         maxOpenTrades: this.mainnetControls?.maxOpenTrades ?? 0,
         maxGrossNotionalUsd: this.mainnetControls?.maxGrossNotionalUsd ?? 0,
+        newEntryMode: this.mainnetControls?.newEntryMode ?? "PAUSED_SELECTION_FIX",
+        allocatorMode: this.mainnetControls?.allocatorMode ?? "PAUSED",
         entryBlockReason: this.mainnetControlBlockReason("entry"),
       } : null,
+      allocatorMode: this.allocatorMode,
+      newEntriesEnabled,
+      newEntryReason,
+      selectorStatus: this.operatorSelectorStatus(),
+      selectorId: this.selectorId,
+      availableSlots: capacity.displaySlots,
+      maxDailyPositions: capacity.maxOpenTrades,
+      openDailyPositions: openTrades.filter((trade) => ["PROTECTING", "OPEN", "EXIT_RECONCILING"].includes(trade.status)).length,
+      pendingReservations: capacity.pendingReservations,
+      lastCompletedBatch: lastBatch ? {
+        cohortId: lastBatch.cohortId,
+        timestamp: lastBatch.signalTimestamp,
+        finalizedAt: lastBatch.allocation?.finalizedAt ?? null,
+        complete: lastBatch.allocation?.batchComplete ?? false,
+      } : null,
+      lastBatchCandidateCount: lastBatch?.allocation?.candidateCount ?? 0,
+      lastBatchSelectedCount: lastBatch?.allocation?.selectedSignalIds.length ?? 0,
+      dataHealth: {
+        candidateSignalsCollected: state.signals.filter((signal) => signal.signalBatchTimestamp !== undefined).length,
+        maturedSignals: counterfactuals.filter((outcome) => outcome.status === "MATURE_TP" || outcome.status === "MATURE_SL").length,
+        pendingSignals: counterfactuals.filter((outcome) => outcome.status === "PENDING").length,
+        ambiguousSignals: counterfactuals.filter((outcome) => outcome.status === "OUTCOME_AMBIGUOUS").length,
+        oversubscribedBatches: batches.filter((batch) => {
+          const slots = batch.allocation?.availableSlots;
+          return slots !== null && slots !== undefined && batch.candidates.length > slots;
+        }).length,
+        fullPITSignals: state.signals.filter((signal) => signal.research?.marketQuality?.pitQuality === "FULL_PIT" && signal.research.features?.pitQuality === "FULL_PIT").length,
+        partialReconstructedSignals: state.signals.filter((signal) => signal.research?.marketQuality?.pitQuality === "PARTIAL_RECONSTRUCTION" || signal.research?.features?.pitQuality === "PARTIAL_RECONSTRUCTION").length,
+        lastSignalTimestamp: state.signals.at(-1)?.signalTimestamp ?? null,
+      },
       lastCanary: state.canaries.at(-1) ?? null,
     };
   }
@@ -959,7 +1397,7 @@ export class DailyRangeAcceptanceLane {
         .sort((a, b) => b.dateUtc.localeCompare(a.dateUtc))
         .slice(0, bounded);
     }
-    if (kind === "cohorts") {
+    if (kind === "cohorts" || kind === "batches") {
       return [...state.signalCohorts]
         .sort((a, b) => b.signalTimestampMs - a.signalTimestampMs || b.cohortId.localeCompare(a.cohortId))
         .slice(0, bounded);
@@ -1104,6 +1542,9 @@ export class DailyRangeAcceptanceLane {
     try {
       if (!this.startupReconciled) await this.reconcileOnStartup();
       await this.reconcileOpenTrades();
+      // Research labels mature independently from entry mode. A paused/disarmed
+      // lane must never abandon already-recorded counterfactual outcomes.
+      await this.matureCounterfactualOutcomes();
       // If a process ended between the order attempt and the passive cohort
       // snapshot, recover the outcome from the durable signal record only.
       this.syncSignalCohortDecisions();
@@ -1276,15 +1717,21 @@ export class DailyRangeAcceptanceLane {
     }
     state.runtime.lastProcessedMarketBarOpenTime = latestCompletedOpen;
     this.store.save();
-    const cohortIds = this.captureSignalCohorts(day, actions);
-    try {
-      await Promise.all(actions.map((signal) => this.executeFreshSignal(signal)));
-    } finally {
-      // A persistence or exchange error must not fabricate an outcome.  This
-      // refresh only copies the existing signal decision into the cohort and
-      // leaves unresolved candidates explicitly null for the next tick.
-      this.syncSignalCohortDecisions(cohortIds);
-    }
+    // Phase A is complete: every symbol's closed candles have been evaluated and
+    // all newly valid signals are durable.  No order may be placed above this
+    // line.  The finalizer below groups by canonical C2 close timestamp and
+    // reserves the complete selected batch before any exchange POST.
+    this.captureSignalBatches(day, actions);
+    // Capture the non-reconstructable BBO immediately after every symbol has
+    // finished C2 evaluation and before batch allocation can submit an order.
+    // A REST quote whose source time is after C2 remains explicitly partial;
+    // preserving it now is still materially more faithful than reading a later
+    // rolling quote after entry/finalization.
+    await this.captureSignalTimeMarketQuality(day, actions);
+    await this.finalizePendingSignalBatches(day);
+    await this.capturePendingResearchSnapshots(day);
+    await this.matureCounterfactualOutcomes();
+    this.syncSignalCohortDecisions();
   }
 
   private applyCandle(
@@ -1361,89 +1808,409 @@ export class DailyRangeAcceptanceLane {
       reason: bar1 === null ? "STALE_DATA" : null,
       entryAttemptedAt: null,
       tradeId: null,
+      signalBatchTimestamp: iso(confirmationBar2.closeTime + 1),
+      eligibleSince: iso(confirmationBar2.closeTime + 1),
+      poolVersion: day.poolEvidence?.poolVersion ?? null,
+      universePolicyId: day.universeSource,
+      selectorMode: this.allocatorMode,
+      selectorId: this.selectorId,
+      selectorScore: null,
+      selectorRank: null,
+      actuallySelected: false,
+      actuallyExecuted: false,
+      research: { marketQuality: null, features: null, counterfactual: null },
     };
     state.signals.push(signal);
     console.log(`[daily-range-lane] ACCEPTANCE_${direction}_CONFIRMED symbol=${signal.symbol} signal=${signal.signalId}`);
     return signal;
   }
 
+  private candidateFromSignal(
+    day: DailyRangeDayState,
+    signal: DailyRangeSignal,
+    executionSequence: number,
+    cohortSequence: number,
+  ): DailyRangeSignalCohortCandidate {
+    const rangeWidth = signal.rangeHigh - signal.rangeLow;
+    const boundary = signal.direction === "LONG" ? signal.rangeHigh : signal.rangeLow;
+    const breakoutDistancePrice = signal.direction === "LONG"
+      ? signal.confirmationBar2.close - boundary
+      : boundary - signal.confirmationBar2.close;
+    return {
+      signalId: signal.signalId,
+      symbol: signal.symbol,
+      direction: signal.direction,
+      executionSequence,
+      cohortSequence,
+      rangeHigh: signal.rangeHigh,
+      rangeLow: signal.rangeLow,
+      rangeWidth,
+      rangeWidthPct: signal.rangeLow > 0 ? rangeWidth / signal.rangeLow : null,
+      confirmationClose: signal.confirmationBar2.close,
+      breakoutDistancePrice,
+      breakoutDistanceOfRange: rangeWidth > EPSILON ? breakoutDistancePrice / rangeWidth : null,
+      poolAudit: cloneCohortPoolAudit(day, signal.symbol),
+      marketQuality: signal.research?.marketQuality ?? null,
+      features: signal.research?.features ?? null,
+      counterfactual: signal.research?.counterfactual ?? null,
+      selectorMode: signal.selectorMode ?? this.allocatorMode,
+      selectorId: signal.selectorId ?? this.selectorId,
+      selectorScore: signal.selectorScore ?? null,
+      selectorRank: signal.selectorRank ?? null,
+      tieBreakHash: null,
+      actuallySelected: signal.actuallySelected ?? false,
+      actuallyExecuted: signal.actuallyExecuted ?? false,
+      skipReason: signal.reason,
+      decision: null,
+    };
+  }
+
   /**
-   * Captures the candidate set before the unchanged entry loop runs.  The data
-   * is intentionally descriptive: no score, no sort, and no veto is read by
-   * executeFreshSignal().
+   * Persist every acceptance signal first.  A delayed/missing symbol may add a
+   * candidate to an existing timestamp later, so an incomplete batch is merged
+   * rather than prematurely finalized.
    */
-  private captureSignalCohorts(day: DailyRangeDayState, actions: readonly DailyRangeSignal[]): string[] {
-    if (actions.length === 0) return [];
+  private captureSignalBatches(day: DailyRangeDayState, actions: readonly DailyRangeSignal[]): void {
+    if (actions.length === 0) return;
     const state = this.store.getState();
-    const known = new Set(state.signalCohorts.map((cohort) => cohort.cohortId));
+    const byId = new Map(state.signalCohorts.map((cohort) => [cohort.cohortId, cohort]));
     const grouped = new Map<number, Array<{ signal: DailyRangeSignal; executionSequence: number }>>();
     actions.forEach((signal, executionSequence) => {
       const rows = grouped.get(signal.signalTimestampMs) ?? [];
       rows.push({ signal, executionSequence });
       grouped.set(signal.signalTimestampMs, rows);
     });
-    const captured: string[] = [];
+    let changed = false;
     for (const [signalTimestampMs, rows] of grouped) {
       const cohortId = signalCohortId(day.dateUtc, signalTimestampMs);
-      if (known.has(cohortId)) continue;
-      const candidates = rows.map(({ signal, executionSequence }, cohortSequence): DailyRangeSignalCohortCandidate => {
-        const rangeWidth = signal.rangeHigh - signal.rangeLow;
-        const boundary = signal.direction === "LONG" ? signal.rangeHigh : signal.rangeLow;
-        const breakoutDistancePrice = signal.direction === "LONG"
-          ? signal.confirmationBar2.close - boundary
-          : boundary - signal.confirmationBar2.close;
-        return {
-          signalId: signal.signalId,
-          symbol: signal.symbol,
-          direction: signal.direction,
-          executionSequence,
-          cohortSequence,
-          rangeHigh: signal.rangeHigh,
-          rangeLow: signal.rangeLow,
-          rangeWidth,
-          rangeWidthPct: signal.rangeLow > 0 ? rangeWidth / signal.rangeLow : null,
-          confirmationClose: signal.confirmationBar2.close,
-          breakoutDistancePrice,
-          breakoutDistanceOfRange: rangeWidth > EPSILON ? breakoutDistancePrice / rangeWidth : null,
-          poolAudit: cloneCohortPoolAudit(day, signal.symbol),
-          decision: null,
+      let cohort = byId.get(cohortId);
+      if (!cohort) {
+        cohort = {
+          cohortId,
+          strategyVersion: DAILY_RANGE_STRATEGY_VERSION,
+          laneId: DAILY_RANGE_LANE_ID,
+          selectorPolicyVersion: DAILY_RANGE_SELECTOR_POLICY_VERSION,
+          dateUtc: day.dateUtc,
+          signalTimestamp: iso(signalTimestampMs),
+          signalTimestampMs,
+          observedAt: iso(this.nowMs()),
+          finalizedAt: null,
+          candidates: [],
+          allocation: {
+            allocatorMode: this.allocatorMode,
+            selectorStatus: this.selectorStatus(),
+            selectorId: this.selectorId,
+            availableSlots: null,
+            pendingReservationsAtBatch: 0,
+            candidateCount: 0,
+            longCandidateCount: 0,
+            shortCandidateCount: 0,
+            oversubscriptionRatio: null,
+            batchComplete: false,
+            selectedSignalIds: [],
+            finalizedAt: null,
+            allocationError: null,
+          },
         };
-      });
-      state.signalCohorts.push({
-        cohortId,
-        strategyVersion: DAILY_RANGE_STRATEGY_VERSION,
-        laneId: DAILY_RANGE_LANE_ID,
-        selectorPolicyVersion: DAILY_RANGE_SELECTOR_POLICY_VERSION,
-        dateUtc: day.dateUtc,
-        signalTimestamp: iso(signalTimestampMs),
-        signalTimestampMs,
-        observedAt: iso(this.nowMs()),
-        finalizedAt: null,
-        candidates,
-      });
-      captured.push(cohortId);
-    }
-    if (captured.length > 0) {
-      if (state.signalCohorts.length > MAX_SIGNAL_COHORTS) {
-        state.signalCohorts.splice(0, state.signalCohorts.length - MAX_SIGNAL_COHORTS);
+        state.signalCohorts.push(cohort);
+        byId.set(cohortId, cohort);
+        changed = true;
       }
-      this.store.save();
+      // Passive legacy cohorts remain immutable evidence and cannot be upgraded
+      // into an allocation authority after a restart.
+      if (!cohort.allocation) continue;
+      const knownSignals = new Set(cohort.candidates.map((candidate) => candidate.signalId));
+      for (const { signal, executionSequence } of rows) {
+        if (knownSignals.has(signal.signalId)) continue;
+        cohort.candidates.push(this.candidateFromSignal(day, signal, executionSequence, cohort.candidates.length));
+        knownSignals.add(signal.signalId);
+        changed = true;
+      }
+      this.refreshBatchCounts(cohort);
     }
-    return captured;
+    if (!changed) return;
+    if (state.signalCohorts.length > MAX_SIGNAL_COHORTS) {
+      state.signalCohorts.splice(0, state.signalCohorts.length - MAX_SIGNAL_COHORTS);
+    }
+    this.store.save();
   }
 
-  /** Rejoins persisted signals after an entry attempt; safe to repeat after a restart. */
-  private syncSignalCohortDecisions(cohortIds?: readonly string[]): void {
+  private refreshBatchCounts(cohort: DailyRangeSignalCohort): void {
+    if (!cohort.allocation) return;
+    cohort.allocation.candidateCount = cohort.candidates.length;
+    cohort.allocation.longCandidateCount = cohort.candidates.filter((candidate) => candidate.direction === "LONG").length;
+    cohort.allocation.shortCandidateCount = cohort.candidates.length - cohort.allocation.longCandidateCount;
+  }
+
+  /**
+   * Freeze the mutable market-quality facts as close as the public BBO API can
+   * observe them. This runs after the whole candle batch is known but before
+   * allocation/entry. It never retries or overwrites a saved record: a failed
+   * contemporaneous read is honest UNAVAILABLE evidence, not a reason to copy
+   * a later quote into the old signal.
+   */
+  private async captureSignalTimeMarketQuality(
+    day: DailyRangeDayState,
+    signals: readonly DailyRangeSignal[],
+  ): Promise<void> {
+    const missing = signals.filter((signal) => !this.researchFor(signal).marketQuality);
+    if (missing.length === 0) return;
+    await Promise.all(missing.map(async (signal) => {
+      const research = this.researchFor(signal);
+      if (research.marketQuality) return;
+      const poolAudit = cloneCohortPoolAudit(day, signal.symbol);
+      let bestBid: number | null = null;
+      let bestAsk: number | null = null;
+      let currentSpreadBps: number | null = null;
+      let bookSourceTime: number | null = null;
+      let bookObservedAt: string | null = null;
+      try {
+        const book = await this.client.getBookTicker(signal.symbol);
+        bestBid = book.bid;
+        bestAsk = book.ask;
+        bookSourceTime = book.time;
+        bookObservedAt = iso(this.nowMs());
+        currentSpreadBps = spreadBps(book);
+      } catch {
+        // Preserve a concrete absence at signal time; a later successful BBO
+        // must not be written backward into this candidate.
+      }
+      const poolCapturedAtMs = toMs(day.poolEvidence?.capturedAt ?? null);
+      const frozenPoolIsCausal = poolAudit !== null
+        && poolCapturedAtMs !== null
+        && poolCapturedAtMs <= signal.signalTimestampMs;
+      const strictBookIsCausal = bookSourceTime !== null && bookSourceTime <= signal.signalTimestampMs;
+      const bookSnapshotQuality = bookObservedAt === null
+        ? "UNAVAILABLE" as const
+        : strictBookIsCausal ? "STRICT_AT_OR_BEFORE_SIGNAL" as const : "NEAR_SIGNAL_AFTER_CLOSE" as const;
+      research.marketQuality = {
+        capturedAt: iso(this.nowMs()),
+        poolCapturedAt: day.poolEvidence?.capturedAt ?? null,
+        pitQuality: frozenPoolIsCausal && strictBookIsCausal
+          ? "FULL_PIT"
+          : poolAudit && bookObservedAt !== null ? "PARTIAL_RECONSTRUCTION" : "UNAVAILABLE",
+        bookSnapshotQuality,
+        bookObservedAt,
+        bookSourceTime,
+        bestBid,
+        bestAsk,
+        quoteVolume24hUsd: poolAudit?.quoteVolume24hUsd ?? null,
+        medianSpreadBps: poolAudit?.medianSpreadBps ?? null,
+        currentSpreadBps,
+        fiveMinuteData: poolAudit?.fiveMinuteData ?? null,
+        fourHourData: poolAudit?.fourHourData ?? null,
+        listedDays: poolAudit?.listedDays ?? null,
+        c1Pass: cPass(poolAudit, "C1_"),
+        c2Pass: cPass(poolAudit, "C2_"),
+        c3Pass: cPass(poolAudit, "C3_"),
+        c4Pass: cPass(poolAudit, "C4_"),
+        c5Pass: cPass(poolAudit, "C5_"),
+        c6Pass: cPass(poolAudit, "C6_"),
+        poolAudit: poolAudit ? clonePoolAudit(poolAudit) : null,
+      };
+    }));
+    this.store.save();
+  }
+
+  private batchIsComplete(day: DailyRangeDayState, cohort: DailyRangeSignalCohort): boolean {
+    const candleOpenTime = cohort.signalTimestampMs - 1 - FIVE_MIN_MS;
+    return Object.keys(day.levels).every((symbol) => (day.symbolStates[symbol]?.lastProcessedBarOpenTime ?? -1) >= candleOpenTime);
+  }
+
+  private allocationCapacity(): { slots: number; displaySlots: number; pendingReservations: number; maxOpenTrades: number } {
+    const active = this.store.getState().trades.filter((trade) => !isTerminalTradeStatus(trade.status));
+    const pendingReservations = active.filter((trade) => trade.status === "ENTRY_SUBMITTING" || trade.status === "ENTRY_RECONCILING").length;
+    const controls = this.mainnetControls;
+    const maxOpenTrades = this.environment === "mainnet"
+      ? controls?.maxOpenTrades ?? 0
+      : this.testnetMaxOpenTrades;
+    const byCount = Math.max(0, maxOpenTrades - active.length);
+    const byGross = this.environment === "mainnet"
+      ? Math.max(0, Math.floor(((controls?.maxGrossNotionalUsd ?? 0) - active.length * DAILY_RANGE_TRADE_NOTIONAL_USD + EPSILON) / DAILY_RANGE_TRADE_NOTIONAL_USD))
+      : Number.POSITIVE_INFINITY;
+    const slots = Math.min(byCount, byGross);
+    return { slots, displaySlots: slots, pendingReservations, maxOpenTrades };
+  }
+
+  private batchCandidateBlockReason(signal: DailyRangeSignal): DailyRangeSignalReason | null {
+    const state = this.store.getState();
+    if (state.control.mode !== "ARMED") return "LANE_DISARMED";
+    const mainnetBlock = this.mainnetControlBlockReason("entry");
+    if (mainnetBlock) {
+      return this.mainnetControls?.newEntryMode === "PAUSED_SELECTION_FIX"
+        ? "LIVE_NEW_ENTRY_PAUSED"
+        : "MAINNET_EXECUTION_DISABLED";
+    }
+    let accountGate: DailyRangeEntryGateDecision;
+    try {
+      accountGate = this.entryGate();
+    } catch (error) {
+      accountGate = { allowed: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+    if (!accountGate.allowed) return "ACCOUNT_ENTRY_BLOCKED";
+    if (!inDailyRangeEntryWindow(signal.signalTimestampMs)) return "OUTSIDE_ENTRY_WINDOW";
+    if (this.nowMs() - signal.signalTimestampMs > MAX_FRESH_SIGNAL_AGE_MS) return "MISSED_SIGNAL_RECOVERY";
+    if (!signal.confirmationBar1 || signal.reason === "STALE_DATA") return "STALE_DATA";
+    if (signal.direction === "SHORT" && this.getShortBlocklist().has(signal.symbol)) return "SHORT_BLOCKED";
+    if (this.store.hasActiveSymbolLease(signal.symbol)) return "LANE_POSITION_ALREADY_OPEN";
+    return null;
+  }
+
+  private async batchExchangeBlockReason(signal: DailyRangeSignal): Promise<DailyRangeSignalReason | null> {
+    try {
+      const account = await this.readSymbolAccount(signal.symbol);
+      return this.foreignAccountReason(signal.symbol, account) ? "STRATEGY_SYMBOL_CONFLICT" : null;
+    } catch {
+      return "ACCOUNT_STATE_UNKNOWN";
+    }
+  }
+
+  private async finalizePendingSignalBatches(day: DailyRangeDayState): Promise<void> {
+    const batches = this.store.getState().signalCohorts
+      .filter((cohort) => cohort.dateUtc === day.dateUtc && cohort.allocation && cohort.allocation.finalizedAt === null)
+      .sort((a, b) => a.signalTimestampMs - b.signalTimestampMs || a.cohortId.localeCompare(b.cohortId));
+    for (const batch of batches) {
+      if (!this.batchIsComplete(day, batch)) continue;
+      await this.finalizeSignalBatch(batch);
+    }
+  }
+
+  private async finalizeSignalBatch(batch: DailyRangeSignalCohort): Promise<void> {
+    const allocation = batch.allocation;
+    if (!allocation || allocation.finalizedAt !== null) return;
+    const lock = this.store.tryAcquireAllocatorLock(this.nowMs());
+    if (!lock) {
+      allocation.allocationError = "ALLOCATOR_AUTHORITY_BUSY";
+      this.store.save();
+      return;
+    }
+    const reservations: Array<{ signal: DailyRangeSignal; trade: DailyRangeTrade }> = [];
+    try {
+      const signals = new Map(this.store.getState().signals.map((signal) => [signal.signalId, signal]));
+      const signalPoolEvidence = clonePoolEvidence(this.getSignalPoolEvidence(
+        [...new Set(batch.candidates.map((candidate) => candidate.symbol))],
+      ));
+      const preflight = await Promise.all(batch.candidates.map(async (candidate) => {
+        const signal = signals.get(candidate.signalId) ?? null;
+        if (!signal) return { candidate, signal, block: "STALE_DATA" as DailyRangeSignalReason };
+        const normalBlock = this.batchCandidateBlockReason(signal);
+        if (normalBlock) return { candidate, signal, block: normalBlock };
+        const poolAudit = signalPoolEvidence?.auditBySymbol[signal.symbol] ?? null;
+        if (poolAudit?.failures.includes("C3_HARD_SPREAD")) {
+          return { candidate, signal, block: "SPREAD_HARD_REJECT" as DailyRangeSignalReason };
+        }
+        return { candidate, signal, block: await this.batchExchangeBlockReason(signal) };
+      }));
+      const eligible: DailyRangeSignal[] = [];
+      for (const { signal, block } of preflight) {
+        if (!signal) continue;
+        if (block) {
+          signal.actuallySelected = false;
+          signal.actuallyExecuted = false;
+          this.markSignal(signal, { eligible: false, reason: block });
+          continue;
+        }
+        eligible.push(signal);
+      }
+      const capacity = this.allocationCapacity();
+      allocation.selectorStatus = this.selectorStatus();
+      allocation.availableSlots = capacity.displaySlots;
+      allocation.pendingReservationsAtBatch = capacity.pendingReservations;
+      allocation.batchComplete = true;
+      allocation.oversubscriptionRatio = capacity.displaySlots !== null && capacity.displaySlots > 0
+        ? eligible.length / capacity.displaySlots
+        : capacity.displaySlots === 0 && eligible.length > 0 ? Number.POSITIVE_INFINITY : null;
+
+      const result = allocateDailyRangeBatch({
+        mode: this.allocatorMode,
+        strategyVersion: DAILY_RANGE_STRATEGY_VERSION,
+        batchTimestampMs: batch.signalTimestampMs,
+        environment: this.environment,
+        availableSlots: capacity.slots,
+        candidates: eligible.map((signal) => ({
+          signalId: signal.signalId,
+          symbol: signal.symbol,
+          legacySequence: batch.candidates.find((candidate) => candidate.signalId === signal.signalId)?.executionSequence ?? Number.MAX_SAFE_INTEGER,
+          selectorScore: this.selectorId ? signal.selectorScore ?? null : null,
+        })),
+      });
+      const decisions = new Map(result.decisions.map((decision) => [decision.signalId, decision]));
+      allocation.selectedSignalIds = result.decisions.filter((decision) => decision.selected).map((decision) => decision.signalId);
+      for (const signal of eligible) {
+        const decision = decisions.get(signal.signalId);
+        if (!decision) continue;
+        const candidate = batch.candidates.find((row) => row.signalId === signal.signalId);
+        if (candidate) {
+          candidate.tieBreakHash = decision.tieBreakHash;
+          candidate.selectorMode = this.allocatorMode;
+          candidate.selectorId = this.selectorId;
+          candidate.selectorScore = decision.selectorScore;
+          candidate.selectorRank = decision.selectorRank;
+          candidate.actuallySelected = decision.selected;
+          candidate.skipReason = decision.skipReason as DailyRangeSignalReason | null;
+        }
+        signal.selectorMode = this.allocatorMode;
+        signal.selectorId = this.selectorId;
+        signal.selectorScore = decision.selectorScore;
+        signal.selectorRank = decision.selectorRank;
+        signal.actuallySelected = decision.selected;
+        signal.actuallyExecuted = false;
+        if (!decision.selected) {
+          this.markSignal(signal, { eligible: false, reason: decision.skipReason as DailyRangeSignalReason });
+          continue;
+        }
+        const trade = this.createPendingTrade(signal, { persist: false });
+        if (!trade) {
+          this.markSignal(signal, { eligible: false, reason: "SELECTED_EXECUTION_FAILED" });
+          continue;
+        }
+        reservations.push({ signal, trade });
+      }
+      allocation.finalizedAt = iso(this.nowMs());
+      allocation.allocationError = null;
+      // This is the allocation commit point: every selected slot is persisted
+      // together before the first MARKET POST.  A crash before this write has no
+      // reservation; a crash after it has the complete deterministic batch.
+      this.store.save();
+    } finally {
+      lock.release();
+    }
+    // A selected order failure intentionally leaves its slot unused.  Lower rank
+    // candidates are never promoted after a delay because that would corrupt
+    // same-batch attribution.
+    await Promise.all(reservations.map(({ signal, trade }) => this.executeReservedSignal(signal, trade)));
+    this.syncSignalCohortDecisions();
+  }
+
+  private async executeReservedSignal(signal: DailyRangeSignal, trade: DailyRangeTrade): Promise<void> {
+    if (!this.entryClaims.tryClaimEntrySymbol(signal.symbol, DAILY_RANGE_LANE_ID)) {
+      this.abortTrade(trade, "ENTRY_ABORT_SYMBOL_IN_FLIGHT", "shared in-flight symbol claim is held by another lane");
+      this.markSignal(signal, { eligible: false, reason: "SELECTED_EXECUTION_FAILED", tradeId: trade.tradeId });
+      return;
+    }
+    try {
+      await this.submitTradeEntry(trade, signal);
+      signal.actuallyExecuted = trade.entryOrderId !== null;
+      if (isTerminalTradeStatus(trade.status) && trade.status !== "CLOSED") {
+        this.markSignal(signal, { eligible: false, reason: "SELECTED_EXECUTION_FAILED", tradeId: trade.tradeId });
+      } else {
+        this.store.save();
+      }
+    } catch (error) {
+      this.abortTrade(trade, "ENTRY_ABORT_EXECUTION_FAILED", error instanceof Error ? error.message : String(error));
+      this.markSignal(signal, { eligible: false, reason: "SELECTED_EXECUTION_FAILED", tradeId: trade.tradeId });
+    } finally {
+      this.entryClaims.releaseEntrySymbol(signal.symbol, DAILY_RANGE_LANE_ID);
+    }
+  }
+
+  /** Rejoins persisted decisions/research after allocation, safe across restarts. */
+  private syncSignalCohortDecisions(): void {
     const state = this.store.getState();
     if (state.signalCohorts.length === 0) return;
-    const selected = cohortIds ? new Set(cohortIds) : null;
     const signals = new Map(state.signals.map((signal) => [signal.signalId, signal]));
     let changed = false;
     for (const cohort of state.signalCohorts) {
-      if (selected && !selected.has(cohort.cohortId)) continue;
-      // A finalized cohort is immutable evidence.  Re-reading it every 30s
-      // would add avoidable work as the forward research sample grows.
-      if (cohort.finalizedAt !== null) continue;
       let complete = true;
       for (const candidate of cohort.candidates) {
         const signal = signals.get(candidate.signalId);
@@ -1455,8 +2222,44 @@ export class DailyRangeAcceptanceLane {
             entryAttemptedAt: signal.entryAttemptedAt,
           }
           : null;
+        const next = signal ? {
+          marketQuality: signal.research?.marketQuality ?? null,
+          features: signal.research?.features ?? null,
+          counterfactual: signal.research?.counterfactual ?? null,
+          selectorMode: signal.selectorMode ?? candidate.selectorMode,
+          selectorId: signal.selectorId ?? candidate.selectorId ?? null,
+          selectorScore: signal.selectorScore ?? null,
+          selectorRank: signal.selectorRank ?? null,
+          actuallySelected: signal.actuallySelected ?? false,
+          actuallyExecuted: signal.actuallyExecuted ?? false,
+          skipReason: signal.reason,
+        } : null;
         if (JSON.stringify(candidate.decision) !== JSON.stringify(decision)) {
           candidate.decision = decision;
+          changed = true;
+        }
+        if (next && JSON.stringify({
+          marketQuality: candidate.marketQuality ?? null,
+          features: candidate.features ?? null,
+          counterfactual: candidate.counterfactual ?? null,
+          selectorMode: candidate.selectorMode,
+          selectorId: candidate.selectorId ?? null,
+          selectorScore: candidate.selectorScore ?? null,
+          selectorRank: candidate.selectorRank ?? null,
+          actuallySelected: candidate.actuallySelected ?? false,
+          actuallyExecuted: candidate.actuallyExecuted ?? false,
+          skipReason: candidate.skipReason ?? null,
+        }) !== JSON.stringify(next)) {
+          candidate.marketQuality = next.marketQuality;
+          candidate.features = next.features;
+          candidate.counterfactual = next.counterfactual;
+          candidate.selectorMode = next.selectorMode;
+          candidate.selectorId = next.selectorId;
+          candidate.selectorScore = next.selectorScore;
+          candidate.selectorRank = next.selectorRank;
+          candidate.actuallySelected = next.actuallySelected;
+          candidate.actuallyExecuted = next.actuallyExecuted;
+          candidate.skipReason = next.skipReason;
           changed = true;
         }
         if (decision === null) complete = false;
@@ -1470,6 +2273,340 @@ export class DailyRangeAcceptanceLane {
     if (changed) this.store.save();
   }
 
+  private researchFor(signal: DailyRangeSignal): DailyRangeSignalResearchRecord {
+    if (!signal.research) signal.research = { marketQuality: null, features: null, counterfactual: null };
+    return signal.research;
+  }
+
+  private async capturePendingResearchSnapshots(day: DailyRangeDayState): Promise<void> {
+    const batches = this.store.getState().signalCohorts
+      .filter((batch) => batch.dateUtc === day.dateUtc && batch.allocation?.batchComplete)
+      .sort((a, b) => a.signalTimestampMs - b.signalTimestampMs || a.cohortId.localeCompare(b.cohortId));
+    for (const batch of batches) {
+      const signals = batch.candidates
+        .map((candidate) => this.store.findSignal(candidate.signalId))
+        .filter((signal): signal is DailyRangeSignal => signal !== null);
+      if (signals.length === 0) continue;
+      // Recovery path only: normal forward flow captured this before allocation.
+      await this.captureSignalTimeMarketQuality(day, signals);
+      const needsCapture = signals.some((signal) => {
+        const research = signal.research;
+        return !research?.marketQuality || !research.features || !research.counterfactual;
+      });
+      if (!needsCapture) continue;
+
+      const candleEnd = batch.signalTimestampMs - 1;
+      const candleStart = candleEnd - 60 * FIVE_MIN_MS;
+      const universeSymbols = Object.keys(day.levels);
+      const histories = new Map<string, DailyRangeCandle[]>();
+      await Promise.all(universeSymbols.map(async (symbol) => {
+        try {
+          const rows = await this.client.getKlines(symbol, "5m", { startTime: candleStart, endTime: candleEnd, limit: 100 });
+          histories.set(symbol, rows.map(asDailyCandle).filter((row) => row.closeTime <= candleEnd).sort((a, b) => a.openTime - b.openTime));
+        } catch {
+          histories.set(symbol, []);
+        }
+      }));
+      const [btcCandles, ethCandles, filters] = await Promise.all([
+        this.readResearchCandles("BTCUSDT", candleStart, candleEnd),
+        this.readResearchCandles("ETHUSDT", candleStart, candleEnd),
+        this.readResearchFilters(),
+      ]);
+      const oneHourReturns = [...histories.values()].map((candles) => returnOverBars(candles, 12)).filter(finiteNumber);
+      const universePositive1hPct = oneHourReturns.length > 0
+        ? oneHourReturns.filter((value) => value > 0).length / oneHourReturns.length
+        : null;
+      const universeNegative1hPct = oneHourReturns.length > 0
+        ? oneHourReturns.filter((value) => value < 0).length / oneHourReturns.length
+        : null;
+
+      await Promise.all(signals.map(async (signal) => {
+        const research = this.researchFor(signal);
+        if (!research.features) {
+          const reference = await this.readReferenceFourHour(signal, day);
+          research.features = this.buildFeatureSnapshot({
+            signal,
+            candles: histories.get(signal.symbol) ?? [],
+            reference,
+            btcCandles,
+            ethCandles,
+            universePositive1hPct,
+            universeNegative1hPct,
+          });
+        }
+        if (!research.counterfactual) {
+          research.counterfactual = this.initializeCounterfactual(signal, filters?.get(signal.symbol) ?? null);
+        }
+      }));
+      this.store.save();
+    }
+    this.syncSignalCohortDecisions();
+  }
+
+  private async readResearchCandles(symbol: string, startTime: number, endTime: number): Promise<DailyRangeCandle[]> {
+    try {
+      const rows = await this.client.getKlines(symbol, "5m", { startTime, endTime, limit: 100 });
+      return rows.map(asDailyCandle).filter((row) => row.closeTime <= endTime).sort((a, b) => a.openTime - b.openTime);
+    } catch {
+      return [];
+    }
+  }
+
+  private async readResearchFilters(): Promise<Map<string, FuturesSymbolFilters> | null> {
+    try {
+      return await this.client.getExchangeFilters();
+    } catch {
+      return null;
+    }
+  }
+
+  private async readReferenceFourHour(signal: DailyRangeSignal, day: DailyRangeDayState): Promise<DailyRangeCandle[]> {
+    const level = day.levels[signal.symbol];
+    if (!level) return [];
+    try {
+      const rows = await this.client.getKlines(signal.symbol, "4h", {
+        startTime: level.fourHourOpenTime - 7 * FOUR_HOURS_MS,
+        endTime: level.fourHourCloseTime - 1,
+        limit: 8,
+      });
+      return rows.map(asDailyCandle).filter((row) => row.closeTime <= level.fourHourCloseTime - 1).sort((a, b) => a.openTime - b.openTime);
+    } catch {
+      return [];
+    }
+  }
+
+  private buildFeatureSnapshot(input: {
+    signal: DailyRangeSignal;
+    candles: DailyRangeCandle[];
+    reference: DailyRangeCandle[];
+    btcCandles: DailyRangeCandle[];
+    ethCandles: DailyRangeCandle[];
+    universePositive1hPct: number | null;
+    universeNegative1hPct: number | null;
+  }): DailyRangeSignalFeatureSnapshot {
+    const { signal, candles, reference } = input;
+    const rangeWidth = signal.rangeHigh - signal.rangeLow;
+    const boundary = signal.direction === "LONG" ? signal.rangeHigh : signal.rangeLow;
+    const extension = (candle: DailyRangeCandle): number => signal.direction === "LONG"
+      ? candle.close - boundary
+      : boundary - candle.close;
+    const c1ExtensionPrice = extension(signal.confirmationBar1 ?? signal.confirmationBar2);
+    const c2ExtensionPrice = extension(signal.confirmationBar2);
+    const atr14 = atr(candles, 14);
+    const c1Baseline = (lookback: number): number | null => {
+      const index = candles.findIndex((row) => row.openTime === (signal.confirmationBar1?.openTime ?? -1));
+      const rows = index >= lookback ? candles.slice(index - lookback, index + 1) : [];
+      return contiguousFiveMinuteBars(rows) ? medianNumber(rows.slice(0, -1).map((row) => row.volume)) : null;
+    };
+    const combinedRelative = (lookback: number): number | null => {
+      const baseline = c1Baseline(lookback);
+      const c1 = signal.confirmationBar1?.volume ?? null;
+      return c1 === null ? null : ratio(c1 + signal.confirmationBar2.volume, baseline === null ? null : 2 * baseline);
+    };
+    const referenceCandle = reference.find((row) => row.openTime === utcDayStartMs(signal.signalTimestampMs)) ?? null;
+    const referenceRange = referenceCandle ? referenceCandle.high - referenceCandle.low : null;
+    const referenceBody = referenceCandle && referenceRange && referenceRange > EPSILON
+      ? Math.abs(referenceCandle.close - referenceCandle.open) / referenceRange
+      : null;
+    const upperWick = referenceCandle && referenceRange && referenceRange > EPSILON
+      ? (referenceCandle.high - Math.max(referenceCandle.open, referenceCandle.close)) / referenceRange
+      : null;
+    const lowerWick = referenceCandle && referenceRange && referenceRange > EPSILON
+      ? (Math.min(referenceCandle.open, referenceCandle.close) - referenceCandle.low) / referenceRange
+      : null;
+    const referenceIndex = referenceCandle ? reference.findIndex((row) => row.openTime === referenceCandle.openTime) : -1;
+    const priorReferenceMedian = referenceIndex >= 3
+      ? medianNumber(reference.slice(Math.max(0, referenceIndex - 6), referenceIndex).map((row) => row.volume))
+      : null;
+    const return1h = returnOverBars(candles, 12);
+    const return4h = returnOverBars(candles, 48);
+    const btcReturn1h = returnOverBars(input.btcCandles, 12);
+    const btcReturn4h = returnOverBars(input.btcCandles, 48);
+    const ownHistory = candles.filter((row) => row.openTime <= signal.confirmationBar2.openTime);
+    const btcHistory = input.btcCandles.filter((row) => row.openTime <= signal.confirmationBar2.openTime);
+    const ethHistory = input.ethCandles.filter((row) => row.openTime <= signal.confirmationBar2.openTime);
+    const hasFullOwnHistory = ownHistory.at(-1)?.openTime === signal.confirmationBar2.openTime
+      && contiguousFiveMinuteBars(ownHistory.slice(-49));
+    const hasFullBtcHistory = btcHistory.at(-1)?.openTime === signal.confirmationBar2.openTime
+      && contiguousFiveMinuteBars(btcHistory.slice(-49));
+    const hasFullEthHistory = ethHistory.at(-1)?.openTime === signal.confirmationBar2.openTime
+      && contiguousFiveMinuteBars(ethHistory.slice(-49));
+    return {
+      schemaVersion: 1,
+      capturedAt: iso(this.nowMs()),
+      sourceBarCloseTime: signal.confirmationBar2.closeTime,
+      pitQuality: hasFullOwnHistory && hasFullBtcHistory && hasFullEthHistory ? "FULL_PIT" : "UNAVAILABLE",
+      breakout: {
+        boundary,
+        c1ExtensionPrice,
+        c2ExtensionPrice,
+        c1ExtensionOfRange: rangeWidth > EPSILON ? c1ExtensionPrice / rangeWidth : null,
+        c2ExtensionOfRange: rangeWidth > EPSILON ? c2ExtensionPrice / rangeWidth : null,
+        c2ExtensionOfAtr: ratio(c2ExtensionPrice, atr14),
+        c2ExtensionPct: ratio(c2ExtensionPrice, signal.confirmationBar2.close),
+        atr14,
+        realizedVolatility: realizedVolatility(candles, 24),
+      },
+      relativeVolume: {
+        confirmation1: signal.confirmationBar1?.volume ?? null,
+        confirmation2: signal.confirmationBar2.volume,
+        c1Vs12: signal.confirmationBar1 ? relativeVolumeFor(candles, signal.confirmationBar1.openTime, 12) : null,
+        c1Vs24: signal.confirmationBar1 ? relativeVolumeFor(candles, signal.confirmationBar1.openTime, 24) : null,
+        c1Vs36: signal.confirmationBar1 ? relativeVolumeFor(candles, signal.confirmationBar1.openTime, 36) : null,
+        c2Vs12: relativeVolumeFor(candles, signal.confirmationBar2.openTime, 12),
+        c2Vs24: relativeVolumeFor(candles, signal.confirmationBar2.openTime, 24),
+        c2Vs36: relativeVolumeFor(candles, signal.confirmationBar2.openTime, 36),
+        combinedVs12: combinedRelative(12),
+        combinedVs24: combinedRelative(24),
+        combinedVs36: combinedRelative(36),
+      },
+      trend: {
+        return1h,
+        return4h,
+        sideAlignedReturn1h: sideAlignedReturn(return1h, signal.direction),
+        sideAlignedReturn4h: sideAlignedReturn(return4h, signal.direction),
+        sideAligned1h: sideAligned(return1h, signal.direction),
+        sideAligned4h: sideAligned(return4h, signal.direction),
+      },
+      rangeQuality: {
+        rangeWidthOfPrice: ratio(rangeWidth, signal.confirmationBar2.close),
+        rangeWidthOfAtr: ratio(rangeWidth, atr14),
+        referenceBodyOfRange: referenceBody,
+        upperWickPct: upperWick,
+        lowerWickPct: lowerWick,
+        referenceVolume: referenceCandle?.volume ?? null,
+        referenceVolumeVsRecent: ratio(referenceCandle?.volume ?? null, priorReferenceMedian),
+      },
+      marketRegime: {
+        btcReturn1h,
+        btcReturn4h,
+        ethReturn1h: returnOverBars(input.ethCandles, 12),
+        ethReturn4h: returnOverBars(input.ethCandles, 48),
+        btcSideAligned1h: sideAligned(btcReturn1h, signal.direction),
+        btcSideAligned4h: sideAligned(btcReturn4h, signal.direction),
+        universePositive1hPct: input.universePositive1hPct,
+        universeNegative1hPct: input.universeNegative1hPct,
+      },
+    };
+  }
+
+  private initializeCounterfactual(signal: DailyRangeSignal, filter: FuturesSymbolFilters | null): DailyRangeCounterfactualOutcome {
+    const entryPrice = signal.confirmationBar2.close;
+    const structuralStop = structuralStopForAcceptance({
+      direction: signal.direction,
+      rangeHigh: signal.rangeHigh,
+      rangeLow: signal.rangeLow,
+      confirmationBar1: signal.confirmationBar1 ?? signal.confirmationBar2,
+      confirmationBar2: signal.confirmationBar2,
+    });
+    const rounded = filter ? roundDailyRangeBracket({
+      direction: signal.direction,
+      entry: entryPrice,
+      rawStop: structuralStop,
+      tickSize: filter.tickSize,
+    }) : null;
+    const risk = signal.direction === "LONG" ? entryPrice - (rounded?.stop ?? structuralStop) : (rounded?.stop ?? structuralStop) - entryPrice;
+    const takeProfit = rounded?.takeProfit ?? (signal.direction === "LONG"
+      ? entryPrice + DAILY_RANGE_RR * risk
+      : entryPrice - DAILY_RANGE_RR * risk);
+    const quantity = filter ? clampQty(DAILY_RANGE_TRADE_NOTIONAL_USD / entryPrice, filter) : null;
+    return {
+      status: "PENDING",
+      entryConvention: "C2_CLOSE_PIT_CANONICAL_V1",
+      entryPrice,
+      structuralStop: rounded?.stop ?? structuralStop,
+      takeProfit,
+      tickSize: filter?.tickSize ?? null,
+      quantity,
+      modeledEntryFeeBps: RESEARCH_ENTRY_FEE_BPS,
+      modeledExitFeeBps: RESEARCH_EXIT_FEE_BPS,
+      modeledSlippageBps: RESEARCH_SLIPPAGE_BPS,
+      startedAt: signal.signalTimestamp,
+      lastCheckedBarOpenTime: null,
+      maturedAt: null,
+      grossR: null,
+      netModeledR: null,
+      grossPnlUsd: null,
+      netModeledPnlUsd: null,
+      mfePct: null,
+      maePct: null,
+      holdingDurationMs: null,
+      ambiguityReason: null,
+    };
+  }
+
+  private async matureCounterfactualOutcomes(): Promise<void> {
+    const pending = this.store.getState().signals
+      .filter((signal) => signal.research?.counterfactual?.status === "PENDING")
+      .sort((a, b) => a.signalTimestampMs - b.signalTimestampMs)
+      .slice(0, MAX_COUNTERFACTUAL_MATURATION_PER_TICK);
+    if (pending.length === 0) return;
+    const now = this.nowMs();
+    const lastCompletedMinuteOpen = Math.floor(now / 60_000) * 60_000 - 60_000;
+    if (lastCompletedMinuteOpen < 0) return;
+    await Promise.all(pending.map(async (signal) => {
+      const outcome = signal.research?.counterfactual;
+      if (!outcome || outcome.status !== "PENDING") return;
+      try {
+        const startTime = outcome.lastCheckedBarOpenTime ?? signal.signalTimestampMs;
+        const rows = await this.client.getKlines(signal.symbol, "1m", {
+          startTime,
+          endTime: lastCompletedMinuteOpen + 60_000 - 1,
+          limit: 1_500,
+        });
+        const candles = rows.map(asDailyCandle).filter((row) => row.closeTime < now).sort((a, b) => a.openTime - b.openTime);
+        let mfe = outcome.mfePct ?? Number.NEGATIVE_INFINITY;
+        let mae = outcome.maePct ?? Number.POSITIVE_INFINITY;
+        for (const candle of candles) {
+          const favorable = signal.direction === "LONG"
+            ? (candle.high - outcome.entryPrice) / outcome.entryPrice
+            : (outcome.entryPrice - candle.low) / outcome.entryPrice;
+          const adverse = signal.direction === "LONG"
+            ? (candle.low - outcome.entryPrice) / outcome.entryPrice
+            : (outcome.entryPrice - candle.high) / outcome.entryPrice;
+          mfe = Math.max(mfe, favorable);
+          mae = Math.min(mae, adverse);
+          const tpHit = signal.direction === "LONG" ? candle.high >= outcome.takeProfit : candle.low <= outcome.takeProfit;
+          const slHit = signal.direction === "LONG" ? candle.low <= outcome.structuralStop : candle.high >= outcome.structuralStop;
+          if (!tpHit && !slHit) continue;
+          outcome.mfePct = Number.isFinite(mfe) ? mfe : null;
+          outcome.maePct = Number.isFinite(mae) ? mae : null;
+          outcome.maturedAt = iso(candle.closeTime + 1);
+          outcome.holdingDurationMs = Math.max(0, candle.closeTime + 1 - signal.signalTimestampMs);
+          if (tpHit && slHit) {
+            outcome.status = "OUTCOME_AMBIGUOUS";
+            outcome.ambiguityReason = "1m OHLC touched SL and TP in the same candle; sequence is not provable";
+            return;
+          }
+          const exitPrice = tpHit ? outcome.takeProfit : outcome.structuralStop;
+          const riskPrice = Math.abs(outcome.entryPrice - outcome.structuralStop);
+          const grossR = riskPrice > EPSILON
+            ? (signal.direction === "LONG" ? exitPrice - outcome.entryPrice : outcome.entryPrice - exitPrice) / riskPrice
+            : null;
+          outcome.status = tpHit ? "MATURE_TP" : "MATURE_SL";
+          outcome.grossR = grossR;
+          if (outcome.quantity !== null) {
+            const grossPnl = (signal.direction === "LONG" ? exitPrice - outcome.entryPrice : outcome.entryPrice - exitPrice) * outcome.quantity;
+            const fees = (outcome.entryPrice + exitPrice) * outcome.quantity * (outcome.modeledEntryFeeBps + outcome.modeledExitFeeBps) / 10_000;
+            outcome.grossPnlUsd = grossPnl;
+            outcome.netModeledPnlUsd = grossPnl - fees;
+            const riskUsd = riskPrice * outcome.quantity;
+            outcome.netModeledR = riskUsd > EPSILON ? (grossPnl - fees) / riskUsd : null;
+          }
+          return;
+        }
+        if (Number.isFinite(mfe)) outcome.mfePct = mfe;
+        if (Number.isFinite(mae)) outcome.maePct = mae;
+        const last = candles.at(-1);
+        if (last) outcome.lastCheckedBarOpenTime = last.openTime + 60_000;
+      } catch {
+        // A temporary public-data failure leaves PENDING intact; no future label is fabricated.
+      }
+    }));
+    this.store.save();
+    this.syncSignalCohortDecisions();
+  }
+
   private markSignal(signal: DailyRangeSignal, input: { eligible: boolean; reason: DailyRangeSignalReason | null; tradeId?: string | null }): void {
     signal.entryEligible = input.eligible;
     signal.reason = input.reason;
@@ -1478,7 +2615,7 @@ export class DailyRangeAcceptanceLane {
     this.store.save();
   }
 
-  private createPendingTrade(signal: DailyRangeSignal): DailyRangeTrade | null {
+  private createPendingTrade(signal: DailyRangeSignal, options: { persist?: boolean } = {}): DailyRangeTrade | null {
     if (!signal.confirmationBar1) return null;
     const tradeId = tradeIdFromSignal(signal);
     const rawStop = structuralStopForAcceptance({
@@ -1548,7 +2685,7 @@ export class DailyRangeAcceptanceLane {
     };
     this.store.getState().trades.push(trade);
     signal.tradeId = tradeId;
-    this.store.save(); // durable lease BEFORE a private order can be sent
+    if (options.persist !== false) this.store.save(); // durable lease BEFORE a private order can be sent
     return trade;
   }
 

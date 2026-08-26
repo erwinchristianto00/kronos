@@ -184,4 +184,24 @@ describe("DailyRangeAutoPool C1-C6", () => {
     expect(snapshot.activeSymbols).toEqual([]);
     expect(snapshot.lastError).toContain("public USD-M request failed");
   });
+
+  it("returns a detached compact proof for the exact effective Daily pool", async () => {
+    const symbols = Array.from({ length: 10 }, (_, index) => "EVID" + index + "USDT");
+    const dataDir = mkdtempSync(join(tmpdir(), "daily-range-auto-pool-evidence-"));
+    const subject = pool(dataDir, makeMarketFetch(symbols), () => NOW);
+    const input = resolveDailyRangeAutoPoolInput([symbols[0] as string], [symbols[1] as string]);
+    const snapshot = await subject.refreshIfDue(input);
+    const evidence = subject.getEvidence(input, snapshot);
+
+    expect(evidence.activeSymbols).toEqual(symbols.slice(2).sort());
+    expect(Object.keys(evidence.auditBySymbol)).toEqual(symbols.slice(2).sort());
+    expect(evidence.missingAuditSymbols).toEqual([]);
+    expect(evidence.auditBySymbol[symbols[2] as string]?.quoteVolume24hUsd).toBe(24_000_000);
+
+    evidence.activeSymbols.pop();
+    evidence.auditBySymbol[symbols[2] as string]!.failures.push("C2_LIQUIDITY");
+    const freshEvidence = subject.getEvidence(input, snapshot);
+    expect(freshEvidence.activeSymbols).toEqual(symbols.slice(2).sort());
+    expect(freshEvidence.auditBySymbol[symbols[2] as string]?.failures).toEqual([]);
+  });
 });

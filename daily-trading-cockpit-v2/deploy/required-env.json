@@ -202,6 +202,14 @@
         "DAILY_RANGE_AUTO_POOL_REFRESH_MS": {
           "value": "300000",
           "why": "Refresh the isolated Daily Range C1-C6 pool every five minutes so its required 5m/4h quality check is current. Existing daily trades retain their frozen day snapshot and exchange-side brackets."
+        },
+        "DAILY_RANGE_ALLOCATOR": {
+          "value": "SEEDED_RANDOM_BASELINE",
+          "why": "Testnet batch allocator is a deterministic neutral baseline. It breaks the old lexical loop-order authority without granting an unvalidated selector any alpha or sizing authority."
+        },
+        "DAILY_RANGE_TESTNET_MAX_OPEN_TRADES": {
+          "value": "3",
+          "why": "Testnet seeded-random execution uses the same finite three-position allocation cap as Live, so an oversubscribed batch is a real top-N decision rather than every candidate being entered."
         }
       }
     },
@@ -283,6 +291,14 @@
         "DAILY_RANGE_AUTO_POOL_REFRESH_MS": {
           "value": "300000",
           "why": "Same five-minute membership refresh cadence as Testnet. It affects only a future UTC-day pool snapshot and cannot enter while the mainnet execution gate is off."
+        },
+        "DAILY_RANGE_NEW_ENTRY_MODE": {
+          "value": "PAUSED_SELECTION_FIX",
+          "why": "Incident containment: Live Daily Range may reconcile existing positions and collect complete candidate batches, but cannot send a new entry until the independent selector promotion gate has passed."
+        },
+        "DAILY_RANGE_ALLOCATOR": {
+          "value": "PAUSED",
+          "why": "Live rejects the retired loop-order allocator and every unvalidated selector. This is independent of arm/disarm so a shadow collection lane can be armed safely without entry authority."
         },
         "DAILY_RANGE_MAINNET_EXECUTION_ENABLED": {
           "value": "1",

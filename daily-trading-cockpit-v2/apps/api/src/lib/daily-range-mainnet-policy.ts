@@ -1,3 +1,8 @@
+import {
+  parseDailyRangeAllocatorMode,
+  type DailyRangeAllocatorMode,
+} from "./daily-range-selector.js";
+
 /**
  * Explicit, fail-closed mainnet policy for the isolated Daily Range lane.
  *
@@ -7,6 +12,10 @@
  */
 
 export const DAILY_RANGE_MAINNET_CONFIRM_PHRASE = "I_UNDERSTAND_DAILY_RANGE_REAL_MONEY";
+/** Testnet must exercise the same scarce-slot allocation shape as the Live 3 × 25 USDT policy. */
+export const DAILY_RANGE_TESTNET_MAX_OPEN_TRADES_DEFAULT = 3;
+
+export type DailyRangeNewEntryMode = "ENABLED" | "PAUSED_SELECTION_FIX";
 
 export interface DailyRangeMainnetControls {
   executionEnabled: boolean;
@@ -15,6 +24,10 @@ export interface DailyRangeMainnetControls {
   armEnabled: boolean;
   maxOpenTrades: number;
   maxGrossNotionalUsd: number;
+  /** Independent from arm/disarm so protection and shadow collection can stay live. */
+  newEntryMode: DailyRangeNewEntryMode;
+  /** LOOP_ORDER_LEGACY is never accepted as an operational Mainnet mode. */
+  allocatorMode: DailyRangeAllocatorMode;
 }
 
 function nonNegativeInteger(raw: string | undefined): number {
@@ -27,6 +40,40 @@ function nonNegativeNumber(raw: string | undefined): number {
   return Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
+function newEntryMode(raw: string | undefined): DailyRangeNewEntryMode {
+  // After the selection incident, absence is deliberately a pause rather than a
+  // silent re-enable during a release/config migration.
+  return raw === "ENABLED" ? "ENABLED" : "PAUSED_SELECTION_FIX";
+}
+
+/**
+ * Testnet's neutral allocator is only a useful comparator when it receives the
+ * same finite portfolio decision as Live. An absent, zero, or malformed value
+ * therefore fails to the established three-trade strategy cap, never infinity.
+ */
+export function resolveDailyRangeTestnetMaxOpenTrades(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const configured = nonNegativeInteger(env.DAILY_RANGE_TESTNET_MAX_OPEN_TRADES);
+  return configured >= 1 ? configured : DAILY_RANGE_TESTNET_MAX_OPEN_TRADES_DEFAULT;
+}
+
+/**
+ * Testnet uses a neutral, deterministic baseline by default.  Mainnet inherits
+ * its separately fail-closed controls; no environment typo can enable alpha or
+ * the retired loop-order allocator.
+ */
+export function resolveDailyRangeRuntimeAllocatorMode(input: {
+  environment: "testnet" | "mainnet";
+  env?: NodeJS.ProcessEnv;
+  mainnetControls?: DailyRangeMainnetControls | null;
+}): DailyRangeAllocatorMode {
+  if (input.environment === "mainnet") return input.mainnetControls?.allocatorMode ?? "PAUSED";
+  const requested = parseDailyRangeAllocatorMode(input.env?.DAILY_RANGE_ALLOCATOR, "SEEDED_RANDOM_BASELINE");
+  // The legacy mode is retained only in pure replay/tests, never in a running lane.
+  return requested === "LOOP_ORDER_LEGACY" ? "PAUSED" : requested;
+}
+
 /**
  * All absent/malformed values resolve to a denial.  The caller still constructs
  * the lane in observation mode, but no entry, canary, or arm can occur.
@@ -34,6 +81,8 @@ function nonNegativeNumber(raw: string | undefined): number {
 export function parseDailyRangeMainnetControls(
   env: NodeJS.ProcessEnv = process.env,
 ): DailyRangeMainnetControls {
+  const parsedEntryMode = newEntryMode(env.DAILY_RANGE_NEW_ENTRY_MODE);
+  const requestedAllocator = parseDailyRangeAllocatorMode(env.DAILY_RANGE_ALLOCATOR, "PAUSED");
   return {
     executionEnabled: env.DAILY_RANGE_MAINNET_EXECUTION_ENABLED === "1",
     confirmed: env.DAILY_RANGE_MAINNET_CONFIRM === DAILY_RANGE_MAINNET_CONFIRM_PHRASE,
@@ -41,5 +90,9 @@ export function parseDailyRangeMainnetControls(
     armEnabled: env.DAILY_RANGE_MAINNET_ARM_ENABLED === "1",
     maxOpenTrades: nonNegativeInteger(env.DAILY_RANGE_MAINNET_MAX_OPEN_TRADES),
     maxGrossNotionalUsd: nonNegativeNumber(env.DAILY_RANGE_MAINNET_MAX_GROSS_NOTIONAL_USD),
+    newEntryMode: parsedEntryMode,
+    allocatorMode: parsedEntryMode === "PAUSED_SELECTION_FIX" || requestedAllocator === "LOOP_ORDER_LEGACY"
+      ? "PAUSED"
+      : requestedAllocator,
   };
 }

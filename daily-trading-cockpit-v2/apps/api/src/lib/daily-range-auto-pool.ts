@@ -386,7 +386,21 @@ export class DailyRangeAutoPool {
     input: DailyRangeAutoPoolInput,
     snapshot: DailyRangeAutoPoolSnapshot = this.getSnapshot(input),
   ): DailyRangePoolEvidence {
-    const activeSymbols = normalizeSymbols(snapshot.activeSymbols);
+    return this.getEvidenceForSymbols(input, snapshot.activeSymbols, snapshot);
+  }
+
+  /**
+   * Detached point-in-time audit for a signal batch.  Unlike getEvidence(), the
+   * requested symbols may have rolled out of the current active pool after the
+   * UTC-day freeze; their last observed C1-C6 facts are still copied explicitly
+   * rather than replaced with a later absence.
+   */
+  getEvidenceForSymbols(
+    input: DailyRangeAutoPoolInput,
+    symbols: readonly string[],
+    snapshot: DailyRangeAutoPoolSnapshot = this.getSnapshot(input),
+  ): DailyRangePoolEvidence {
+    const activeSymbols = normalizeSymbols(symbols);
     const auditBySymbol: Record<string, DailyRangePoolSymbolAudit> = {};
     const missingAuditSymbols: string[] = [];
     for (const symbol of activeSymbols) {

@@ -2203,9 +2203,9 @@ export async function registerLiveRoutes(
     }
     const query = (request.query ?? {}) as { kind?: string; limit?: string | number };
     const kind = query.kind;
-    if (kind !== "levels" && kind !== "signals" && kind !== "trades" && kind !== "cohorts" && kind !== "pool-evidence") {
+    if (kind !== "levels" && kind !== "signals" && kind !== "trades" && kind !== "cohorts" && kind !== "batches" && kind !== "pool-evidence") {
       reply.code(400);
-      return { ok: false, reason: "kind must be levels, signals, trades, cohorts, or pool-evidence" };
+      return { ok: false, reason: "kind must be levels, signals, trades, cohorts, batches, or pool-evidence" };
     }
     const parsedLimit = typeof query.limit === "number" ? query.limit : Number.parseInt(query.limit ?? "500", 10);
     return { ok: true, kind, rows: lane.history(kind, Number.isFinite(parsedLimit) ? parsedLimit : 500) };
@@ -2219,9 +2219,9 @@ export async function registerLiveRoutes(
     }
     const params = request.params as { kind?: string };
     const kind = params.kind;
-    if (kind !== "levels" && kind !== "signals" && kind !== "trades" && kind !== "cohorts" && kind !== "pool-evidence") {
+    if (kind !== "levels" && kind !== "signals" && kind !== "trades" && kind !== "cohorts" && kind !== "batches" && kind !== "pool-evidence") {
       reply.code(400);
-      return { ok: false, reason: "kind must be levels, signals, trades, cohorts, or pool-evidence" };
+      return { ok: false, reason: "kind must be levels, signals, trades, cohorts, batches, or pool-evidence" };
     }
     const query = (request.query ?? {}) as { format?: string };
     if (query.format === "csv") {

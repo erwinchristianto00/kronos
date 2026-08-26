@@ -3,17 +3,18 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type {
-  FuturesAlgoOrder,
-  FuturesExecutionBookTicker,
-  FuturesIncomeEntry,
-  FuturesKline,
-  FuturesOrder,
-  FuturesPosition,
-  FuturesSymbolFilters,
-  FuturesUserTrade,
-  PlaceAlgoOrderParams,
-  PlaceOrderParams,
+import {
+  BinanceFuturesPrivateError,
+  type FuturesAlgoOrder,
+  type FuturesExecutionBookTicker,
+  type FuturesIncomeEntry,
+  type FuturesKline,
+  type FuturesOrder,
+  type FuturesPosition,
+  type FuturesSymbolFilters,
+  type FuturesUserTrade,
+  type PlaceAlgoOrderParams,
+  type PlaceOrderParams,
 } from "../src/lib/binance-futures-private.js";
 import {
   DailyRangeAcceptanceLane,
@@ -22,12 +23,14 @@ import {
   roundDailyRangeBracket,
   structuralStopForAcceptance,
   type DailyRangeCandle,
+  type DailyRangeCanaryEvidence,
   type DailyRangeDayState,
   type DailyRangeExecClient,
   type DailyRangeLevel,
   type DailyRangeSignal,
   type DailyRangeSymbolState,
 } from "../src/lib/daily-4h-range-acceptance-lane.js";
+import type { DailyRangePoolEvidence } from "../src/lib/daily-range-auto-pool.js";
 import type { DailyRangeMainnetControls } from "../src/lib/daily-range-mainnet-policy.js";
 
 const DAY = Date.UTC(2026, 7, 26);
@@ -46,7 +49,7 @@ function dataDir(): string {
 }
 
 function candle(openTime: number, close: number, low = Math.min(close, 99), high = Math.max(close, 101)): DailyRangeCandle {
-  return { openTime, closeTime: openTime + 5 * 60_000 - 1, open: 100, high, low, close };
+  return { openTime, closeTime: openTime + 5 * 60_000 - 1, open: 100, high, low, close, volume: 1 };
 }
 
 function level(symbol = "AAAUSDT"): DailyRangeLevel {
@@ -73,6 +76,10 @@ class FakeDailyClient implements DailyRangeExecClient {
   readonly ordersByClientId = new Map<string, FuturesOrder>();
   readonly algos = new Map<string, FuturesAlgoOrder>();
   readonly fills: FuturesUserTrade[] = [];
+  readonly fiveMinuteReadSymbols = new Set<string>();
+  readonly entryCoverageSnapshots: string[][] = [];
+  beforeEntry: (() => void) | null = null;
+  failNextEntry = false;
   /** Simulates a terminal partial MARKET fill: safe handling must bracket the
    * actual quantity rather than treating the requested quantity as fact. */
   nextEntryPartialFill: { qty: number; status: "CANCELED" | "EXPIRED" } | null = null;
@@ -95,6 +102,7 @@ class FakeDailyClient implements DailyRangeExecClient {
     return { bid: 100, ask: 100, bidQty: 100, askQty: 100, time: this.now };
   }
   async getKlines(symbol: string, interval: "1m" | "5m" | "4h", opts: { startTime?: number; endTime?: number } = {}): Promise<FuturesKline[]> {
+    if (interval === "5m") this.fiveMinuteReadSymbols.add(symbol);
     return (this.klines.get(`${symbol}|${interval}`) ?? []).filter((row) =>
       (opts.startTime === undefined || row.openTime >= opts.startTime) && (opts.endTime === undefined || row.openTime <= opts.endTime),
     );
@@ -105,6 +113,14 @@ class FakeDailyClient implements DailyRangeExecClient {
     if (current) current.leverage = leverage;
   }
   async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
+    if (!params.reduceOnly) {
+      this.entryCoverageSnapshots.push([...this.fiveMinuteReadSymbols].sort());
+      this.beforeEntry?.();
+      if (this.failNextEntry) {
+        this.failNextEntry = false;
+        throw new BinanceFuturesPrivateError("binance_error", "synthetic selected-entry rejection");
+      }
+    }
     this.placed.push(params);
     const price = 100;
     const partial = !params.reduceOnly ? this.nextEntryPartialFill : null;
@@ -166,6 +182,16 @@ function referenceFourHour(): FuturesKline {
   return { openTime: DAY, closeTime: DAY + 4 * 3_600_000 - 1, open: 96, high: 100, low: 90, close: 95, volume: 1 };
 }
 
+function researchFiveMinuteHistory(c1Open: number, c2Open: number): FuturesKline[] {
+  const rows: FuturesKline[] = [];
+  for (let offset = 59; offset >= 0; offset--) {
+    const openTime = c2Open - offset * 5 * 60_000;
+    const close = openTime === c1Open ? 100 : openTime === c2Open ? 101 : 99;
+    rows.push(candle(openTime, close));
+  }
+  return rows;
+}
+
 function makeLane(client: FakeDailyClient, nowRef: { value: number }, universe = ["AAAUSDT"], claim = { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} }) {
   const dir = dataDir();
   const store = new DailyRangeLaneStore(dir, "state.json", nowRef.value);
@@ -190,7 +216,59 @@ function mainnetControls(overrides: Partial<DailyRangeMainnetControls> = {}): Da
     armEnabled: true,
     maxOpenTrades: 1,
     maxGrossNotionalUsd: 25,
+    newEntryMode: "ENABLED",
+    allocatorMode: "SEEDED_RANDOM_BASELINE",
     ...overrides,
+  };
+}
+
+function poolEvidence(universe: readonly string[]): DailyRangePoolEvidence {
+  return {
+    schemaVersion: 1,
+    poolVersion: 2,
+    state: "ACTIVE",
+    source: "BINANCE_USDM_MAINNET_PUBLIC",
+    capturedAt: new Date(AT_0410 - 60_000).toISOString(),
+    activeSymbols: [...universe],
+    thresholds: {
+      minNotionalUsd: 25,
+      maxMinQtyNotionalUsd: 25,
+      maxStepNotionalUsd: 2.5,
+      targetLiquidity24hUsd: 20_000_000,
+      liquidityEnter24hUsd: 22_000_000,
+      liquidityLeave24hUsd: 18_000_000,
+      liquidityHysteresisFraction: 0.1,
+      medianSpreadMaxBps: 5,
+      hardSpreadMaxBps: 10,
+      minListingDays: 60,
+      fiveMinuteFreshnessMs: 600_000,
+      fourHourFreshnessMs: 28_800_000,
+    },
+    reconciliation: {
+      changed: false,
+      adds: [...universe],
+      drops: [],
+      exchangePerpetualCandidates: universe.length,
+      eligibleCount: universe.length,
+      rejectionCounts: {},
+      crossSectionalExcluded: [],
+      strategyOwnedExcluded: [],
+    },
+    auditBySymbol: Object.fromEntries(universe.map((symbol) => [symbol, {
+      symbol,
+      eligible: true,
+      failures: [],
+      quoteVolume24hUsd: 50_000_000,
+      minNotionalUsd: 5,
+      minQtyNotionalUsd: 1,
+      stepNotionalUsd: 0.1,
+      listedDays: 365,
+      medianSpreadBps: 1.5,
+      maxObservedSpreadBps: 2,
+      fiveMinuteData: "OK" as const,
+      fourHourData: "OK" as const,
+    }])),
+    missingAuditSymbols: [],
   };
 }
 
@@ -199,17 +277,22 @@ function makeMainnetLane(
   nowRef: { value: number },
   controls?: DailyRangeMainnetControls,
   entryGate = () => ({ allowed: true, reason: null }),
+  universe = symbols,
+  evidence: DailyRangePoolEvidence | null = null,
+  signalEvidence: (() => DailyRangePoolEvidence | null) | undefined = undefined,
 ) {
   const dir = dataDir();
   const store = new DailyRangeLaneStore(dir, "state.json", nowRef.value);
   const lane = new DailyRangeAcceptanceLane({
     client,
     store,
-    getUniverse: () => ({ symbols, source: "TEST" }),
+    getUniverse: () => ({ symbols: universe, source: "TEST", poolEvidence: evidence }),
+    getSignalPoolEvidence: signalEvidence,
     getShortBlocklist: () => new Set<string>(),
     entryClaims: { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
     environment: "mainnet",
     mainnetControls: controls,
+    allocatorMode: controls?.allocatorMode ?? "PAUSED",
     entryGate,
     nowMs: () => nowRef.value,
     confirmRetryMs: 0,
@@ -226,6 +309,40 @@ function signal(symbol: string, at: number, direction: "LONG" | "SHORT" = "LONG"
     confirmationBar1: c1, confirmationBar2: c2, signalTimestamp: new Date(at - 1_000).toISOString(), signalTimestampMs: at - 1_000,
     entryEligible: false, reason: null, entryAttemptedAt: null, tradeId: null,
   };
+}
+
+async function runNaturalMainnetBatch(input: {
+  universe: string[];
+  controls?: DailyRangeMainnetControls;
+  evidence?: DailyRangePoolEvidence;
+  signalEvidence?: () => DailyRangePoolEvidence | null;
+}): Promise<{ client: FakeDailyClient; lane: DailyRangeAcceptanceLane; store: DailyRangeLaneStore; now: { value: number } }> {
+  const now = { value: AT_0410 };
+  const client = new FakeDailyClient();
+  const c1Open = DAY + 4 * 3_600_000 + 10 * 60_000;
+  const c2Open = DAY + 4 * 3_600_000 + 15 * 60_000;
+  const history = researchFiveMinuteHistory(c1Open, c2Open);
+  for (const symbol of input.universe) {
+    client.klines.set(`${symbol}|4h`, [referenceFourHour()]);
+    client.klines.set(`${symbol}|5m`, history);
+  }
+  client.klines.set("BTCUSDT|5m", history);
+  client.klines.set("ETHUSDT|5m", history);
+  const subject = makeMainnetLane(
+    client,
+    now,
+    input.controls ?? mainnetControls(),
+    () => ({ allowed: true, reason: null }),
+    input.universe,
+    input.evidence ?? poolEvidence(input.universe),
+    input.signalEvidence,
+  );
+  await subject.lane.tick();
+  subject.store.arm(new Date(now.value).toISOString());
+  now.value = DAY + 4 * 3_600_000 + 21 * 60_000;
+  client.now = now.value;
+  await subject.lane.tick();
+  return { client, lane: subject.lane, store: subject.store, now };
 }
 
 describe("daily-4h-range-acceptance-2r-v1", () => {
@@ -254,6 +371,49 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     client.now = now.value;
     await lane.tick();
     expect(store.getState().days["2026-08-27"]?.levels.AAAUSDT?.fourHourOpenTime).toBe(DAY + 24 * 3_600_000);
+  });
+
+  it("resets the acceptance state at re-arm and never enters a candle pair completed while disarmed", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    client.klines.set("AAAUSDT|4h", [referenceFourHour()]);
+    const c1 = candle(DAY + 4 * 3_600_000 + 10 * 60_000, 100);
+    const c2 = candle(DAY + 4 * 3_600_000 + 15 * 60_000, 101);
+    client.klines.set("AAAUSDT|5m", [c1, c2]);
+    const { lane, store } = makeLane(client, now);
+    await lane.tick(); // initializes while disarmed, with 04:05 as the watermark
+
+    // Model a C1 which had been observed before a later operator disarm.
+    const day = store.getState().days["2026-08-26"]!;
+    day.symbolStates.AAAUSDT = {
+      lastProcessedBarOpenTime: c1.openTime,
+      previousClosedCandle: c1,
+      longCount: 1,
+      shortCount: 0,
+      longLocked: false,
+      shortLocked: false,
+    };
+    store.disarm(new Date(now.value).toISOString(), "operator review");
+    store.getState().canaries.push({
+      canaryId: "DRCANARY-passed", at: new Date(now.value).toISOString(), status: "PASSED", symbol: "AAAUSDT", side: "BUY",
+      intendedNotionalUsd: 25, leverage: 1, requestedQty: 0.25,
+      entryOrderId: "1", entryClientOrderId: "DRCANARY-passed-E", entryFillPrice: 100, entryQty: 0.25,
+      stopAlgoOrderId: "2", takeProfitAlgoOrderId: "3", closeOrderId: "4",
+      positionVerified: true, bracketVerified: true, bracketCancelled: true, closeVerified: true,
+      orphanOrders: 0, orphanPosition: false, failure: null,
+    });
+
+    now.value = DAY + 4 * 3_600_000 + 21 * 60_000; // c2 completed while DISARMED
+    client.now = now.value;
+    expect(lane.arm()).toMatchObject({ ok: true, mode: "ARMED" });
+    await lane.tick();
+
+    const rearmed = store.getState().days["2026-08-26"]!.symbolStates.AAAUSDT!;
+    expect(rearmed.lastProcessedBarOpenTime).toBe(c2.openTime);
+    expect(rearmed.previousClosedCandle).toBeNull();
+    expect(rearmed.longCount).toBe(0);
+    expect(store.getState().signals).toHaveLength(0);
+    expect(client.placed).toHaveLength(0);
   });
 
   it("accepts equality, requires two consecutive closes, and resets each directional lock at the opposing boundary", () => {
@@ -324,7 +484,7 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect(client.placed).toHaveLength(0);
   });
 
-  it("opens ten distinct same-minute signals without a hidden lane-global trade cap", async () => {
+  it("enforces the same three-trade cap for Testnet baseline allocation", async () => {
     const now = { value: AT_0410 };
     const client = new FakeDailyClient();
     const claims = new Set<string>();
@@ -336,9 +496,11 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     const rows = symbols.map((symbol) => signal(symbol, now.value));
     store.getState().signals.push(...rows);
     await Promise.all(rows.map((row) => (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row)));
-    expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(10);
-    expect(store.getState().trades.filter((trade) => trade.status === "OPEN")).toHaveLength(10);
-    expect(client.algoPlaced).toHaveLength(20);
+    expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(3);
+    expect(store.getState().trades.filter((trade) => trade.status === "OPEN")).toHaveLength(3);
+    expect(client.algoPlaced).toHaveLength(6);
+    expect(rows.filter((row) => row.reason === "MAX_OPEN_TRADES_REACHED")).toHaveLength(7);
+    expect(lane.getStatus()).toMatchObject({ maxDailyPositions: 3, availableSlots: 0, openDailyPositions: 3 });
     expect(store.getState().trades.every((trade) => trade.entrySlippageBps === 0)).toBe(true);
   });
 
@@ -353,9 +515,16 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
     const trade = store.getState().trades[0]!;
     expect(trade.status).toBe("ENTRY_RECONCILING");
+    // Before adoption, the exchange may show any partial between 0 and the
+    // requested 0.25. It must be a bounded pending claim, not a false exact
+    // managed position that would make account reconciliation disarm.
+    expect(lane.managedNetQty().has("AAAUSDT")).toBe(false);
+    expect(lane.pendingEntryNetQty().get("AAAUSDT")).toBe(0.25);
     await (lane as unknown as { reconcilePendingEntries(): Promise<void> }).reconcilePendingEntries();
     expect(trade.status).toBe("OPEN");
     expect(trade.entryQty).toBe(0.125);
+    expect(lane.managedNetQty().get("AAAUSDT")).toBe(0.125);
+    expect(lane.pendingEntryNetQty().has("AAAUSDT")).toBe(false);
     expect(client.algoPlaced).toHaveLength(2);
     expect(client.algoPlaced.every((order) => order.quantity === 0.125)).toBe(true);
   });
@@ -432,7 +601,25 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect(evidence.closeVerified).toBe(true);
     expect(evidence.orphanPosition).toBe(false);
     expect(evidence.orphanOrders).toBe(0);
+    expect(evidence.requestedQty).toBe(0.25);
     expect(client.cancelledAlgos).toHaveLength(2);
+  });
+
+  it("publishes a bounded pending claim while a DRCANARY is in flight", () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeLane(client, now);
+    const canary: DailyRangeCanaryEvidence = {
+      canaryId: "DRCANARY-test", at: new Date(now.value).toISOString(), status: "RUNNING", symbol: "AAAUSDT", side: "BUY",
+      intendedNotionalUsd: 25, leverage: 1, requestedQty: 0.25,
+      entryOrderId: null, entryClientOrderId: "DRCANARY-test-E", entryFillPrice: null, entryQty: null,
+      stopAlgoOrderId: null, takeProfitAlgoOrderId: null, closeOrderId: null,
+      positionVerified: false, bracketVerified: false, bracketCancelled: false, closeVerified: false,
+      orphanOrders: null, orphanPosition: null, failure: null,
+    };
+    store.getState().canaries.push(canary);
+    expect(lane.managedNetQty().has("AAAUSDT")).toBe(false);
+    expect(lane.pendingEntryNetQty().get("AAAUSDT")).toBe(0.25);
   });
 
   it("keeps a mainnet lane structurally unable to arm, canary, or submit with no dedicated controls", async () => {
@@ -474,6 +661,321 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(1);
     expect(capped.store.getState().trades.filter((trade) => trade.status === "OPEN")).toHaveLength(1);
     expect(["MAX_OPEN_TRADES_REACHED", "MAX_GROSS_NOTIONAL_REACHED"]).toContain(second.reason);
+  });
+
+  it("persists frozen C1-C6 evidence and complete same-bar candidates before neutral allocation", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const universe = ["AAAUSDT", "BBBUSDT"];
+    const evidence = poolEvidence(universe);
+    for (const symbol of universe) {
+      client.klines.set(`${symbol}|4h`, [referenceFourHour()]);
+      client.klines.set(`${symbol}|5m`, [
+        candle(DAY + 4 * 3_600_000 + 10 * 60_000, 100),
+        candle(DAY + 4 * 3_600_000 + 15 * 60_000, 101),
+      ]);
+    }
+    const subject = makeMainnetLane(client, now, mainnetControls(), () => ({ allowed: true, reason: null }), universe, evidence);
+    await subject.lane.tick(); // freezes the range/pool proof while disarmed
+    expect(subject.store.getState().days["2026-08-26"]?.poolEvidence?.auditBySymbol.AAAUSDT?.quoteVolume24hUsd).toBe(50_000_000);
+    evidence.auditBySymbol.AAAUSDT!.quoteVolume24hUsd = 1; // later rolling mutation must not rewrite history
+    expect(subject.store.getState().days["2026-08-26"]?.poolEvidence?.auditBySymbol.AAAUSDT?.quoteVolume24hUsd).toBe(50_000_000);
+
+    subject.store.arm(new Date(now.value).toISOString());
+    now.value = DAY + 4 * 3_600_000 + 21 * 60_000;
+    client.now = now.value;
+    await subject.lane.tick();
+
+    const cohort = subject.store.getState().signalCohorts[0]!;
+    expect(cohort.selectorPolicyVersion).toBe("DAILY_RANGE_BATCH_SELECTOR_SHADOW_V1");
+    expect(cohort.candidates.map((candidate) => [candidate.symbol, candidate.executionSequence, candidate.cohortSequence]))
+      .toEqual([["AAAUSDT", 0, 0], ["BBBUSDT", 1, 1]]);
+    expect(cohort.candidates[0]?.breakoutDistanceOfRange).toBeCloseTo(0.1);
+    expect(cohort.candidates[0]?.poolAudit?.quoteVolume24hUsd).toBe(50_000_000);
+    expect(cohort.allocation).toMatchObject({ batchComplete: true, candidateCount: 2, availableSlots: 1 });
+    expect(cohort.candidates.filter((candidate) => candidate.actuallySelected)).toHaveLength(1);
+    expect(cohort.candidates.filter((candidate) => candidate.skipReason === "SKIP_CAP_LOWER_RANK")).toHaveLength(1);
+    expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(1);
+
+    const savedEvidence = subject.lane.history("pool-evidence") as Array<{ evidence: DailyRangePoolEvidence }>;
+    expect(savedEvidence[0]?.evidence.auditBySymbol.AAAUSDT?.quoteVolume24hUsd).toBe(50_000_000);
+  });
+
+  it("CONFIRMED_LOOP_ORDER_SELECTION_BIAS: the historical per-signal execution path chooses whichever row arrives first", async () => {
+    const runLegacy = async (order: string[]): Promise<string | undefined> => {
+      const now = { value: AT_0410 };
+      const client = new FakeDailyClient();
+      const subject = makeMainnetLane(client, now, mainnetControls(), () => ({ allowed: true, reason: null }), ["AAAUSDT", "BBBUSDT", "CCCUSDT"]);
+      subject.store.arm(new Date(now.value).toISOString());
+      const rows = order.map((symbol) => signal(symbol, now.value));
+      subject.store.getState().signals.push(...rows);
+      for (const row of rows) {
+        await (subject.lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+      }
+      return client.placed.find((orderRow) => !orderRow.reduceOnly)?.symbol;
+    };
+
+    await expect(runLegacy(["AAAUSDT", "BBBUSDT", "CCCUSDT"])).resolves.toBe("AAAUSDT");
+    await expect(runLegacy(["CCCUSDT", "BBBUSDT", "AAAUSDT"])).resolves.toBe("CCCUSDT");
+    await expect(runLegacy(["BBBUSDT", "AAAUSDT", "CCCUSDT"])).resolves.toBe("BBBUSDT");
+  });
+
+  it("makes natural same-candle allocation invariant to universe/input order", async () => {
+    const variants = [
+      ["AAAUSDT", "BBBUSDT", "CCCUSDT"],
+      ["CCCUSDT", "BBBUSDT", "AAAUSDT"],
+      ["BBBUSDT", "AAAUSDT", "CCCUSDT"],
+    ];
+    const selected = [] as string[];
+    for (const universe of variants) {
+      const subject = await runNaturalMainnetBatch({ universe });
+      const batch = subject.store.getState().signalCohorts.find((row) => row.allocation)?.allocation;
+      expect(batch?.batchComplete).toBe(true);
+      selected.push(batch?.selectedSignalIds[0] ?? "");
+    }
+    expect(new Set(selected).size).toBe(1);
+  });
+
+  it("labels an explicitly enabled Live seeded baseline as having no validated alpha selector", async () => {
+    const subject = await runNaturalMainnetBatch({ universe: ["AAAUSDT"] });
+    expect(subject.lane.getStatus()).toMatchObject({
+      allocatorMode: "SEEDED_RANDOM_BASELINE",
+      selectorStatus: "NO_VALIDATED_ALPHA_SELECTOR",
+    });
+  });
+
+  it("does not submit an order until every symbol in the same 5m batch has completed evaluation", async () => {
+    const universe = ["AAAUSDT", "BBBUSDT", "CCCUSDT"];
+    const subject = await runNaturalMainnetBatch({ universe });
+    expect(subject.client.entryCoverageSnapshots[0]).toEqual([...universe].sort());
+    expect(subject.client.placed.filter((order) => !order.reduceOnly)).toHaveLength(1);
+  });
+
+  it("reserves at most one slot for five simultaneous signals and never later enters a lower-ranked stale signal", async () => {
+    const universe = ["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"];
+    const subject = await runNaturalMainnetBatch({ universe });
+    const batch = subject.store.getState().signalCohorts.find((row) => row.allocation)!;
+    expect(batch.allocation?.selectedSignalIds).toHaveLength(1);
+    expect(subject.store.getState().trades.filter((trade) => !trade.status.startsWith("ENTRY_ABORT_") && trade.status !== "CLOSED")).toHaveLength(1);
+    expect(subject.client.placed.filter((order) => !order.reduceOnly)).toHaveLength(1);
+    expect(batch.candidates.filter((candidate) => candidate.skipReason === "SKIP_CAP_LOWER_RANK")).toHaveLength(4);
+
+    // Simulate a later native close. The already-ranked losers are terminal
+    // batch decisions, not a queue to be filled when a later slot opens.
+    const selectedTrade = subject.store.getState().trades[0]!;
+    selectedTrade.status = "CLOSED";
+    subject.now.value += 5 * 60_000;
+    subject.client.now = subject.now.value;
+    await subject.lane.tick();
+    expect(subject.client.placed.filter((order) => !order.reduceOnly)).toHaveLength(1);
+  });
+
+  it("uses a durable allocator lock to reject a second local authority", () => {
+    const dir = dataDir();
+    const first = new DailyRangeLaneStore(dir, "state.json", AT_0410);
+    const second = new DailyRangeLaneStore(dir, "state.json", AT_0410);
+    const lock = first.tryAcquireAllocatorLock(AT_0410);
+    expect(lock).not.toBeNull();
+    expect(second.tryAcquireAllocatorLock(AT_0410)).toBeNull();
+    lock?.release();
+    const recovered = second.tryAcquireAllocatorLock(AT_0410 + 1);
+    expect(recovered).not.toBeNull();
+    recovered?.release();
+  });
+
+  it("keeps an armed Mainnet lane collecting complete batches while only new entries are paused", async () => {
+    const controls = mainnetControls({ newEntryMode: "PAUSED_SELECTION_FIX", allocatorMode: "PAUSED" });
+    const subject = await runNaturalMainnetBatch({ universe: ["AAAUSDT", "BBBUSDT"], controls });
+    const batch = subject.store.getState().signalCohorts.find((row) => row.allocation)!;
+    expect(batch.allocation).toMatchObject({ batchComplete: true, selectedSignalIds: [] });
+    expect(batch.candidates.every((candidate) => candidate.skipReason === "LIVE_NEW_ENTRY_PAUSED")).toBe(true);
+    expect(subject.client.placed.filter((order) => !order.reduceOnly)).toHaveLength(0);
+    expect(subject.lane.getStatus()).toMatchObject({ newEntriesEnabled: false, newEntryReason: "SELECTION_FIX_PENDING_VALIDATION" });
+  });
+
+  it("keeps an existing owned position and both native brackets untouched across a paused Mainnet restart", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const dir = dataDir();
+    client.klines.set("AAAUSDT|4h", [referenceFourHour()]);
+    const firstStore = new DailyRangeLaneStore(dir, "state.json", now.value);
+    const testnet = new DailyRangeAcceptanceLane({
+      client,
+      store: firstStore,
+      getUniverse: () => ({ symbols: ["AAAUSDT"], source: "TEST" }),
+      getShortBlocklist: () => new Set<string>(),
+      entryClaims: { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+      environment: "testnet",
+      nowMs: () => now.value,
+      confirmRetryMs: 0,
+    });
+    firstStore.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value, "SHORT");
+    firstStore.getState().signals.push(row);
+    await (testnet as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    const before = firstStore.getState().trades[0]!;
+    const identity = {
+      qty: before.entryQty,
+      entry: before.entryFillPrice,
+      side: before.direction,
+      stop: before.stopAlgoOrderId,
+      takeProfit: before.takeProfitAlgoOrderId,
+      strategy: before.strategyVersion,
+    };
+    const orderCount = client.placed.length;
+    const restartStore = new DailyRangeLaneStore(dir, "state.json", now.value);
+    const pausedMainnet = new DailyRangeAcceptanceLane({
+      client,
+      store: restartStore,
+      getUniverse: () => ({ symbols: ["AAAUSDT"], source: "TEST" }),
+      getShortBlocklist: () => new Set<string>(),
+      entryClaims: { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+      environment: "mainnet",
+      mainnetControls: mainnetControls({ newEntryMode: "PAUSED_SELECTION_FIX", allocatorMode: "PAUSED" }),
+      allocatorMode: "PAUSED",
+      nowMs: () => now.value,
+      confirmRetryMs: 0,
+    });
+    await pausedMainnet.tick();
+
+    const after = restartStore.getState().trades[0]!;
+    expect({
+      qty: after.entryQty,
+      entry: after.entryFillPrice,
+      side: after.direction,
+      stop: after.stopAlgoOrderId,
+      takeProfit: after.takeProfitAlgoOrderId,
+      strategy: after.strategyVersion,
+    }).toEqual(identity);
+    expect(after.status).toBe("OPEN");
+    expect(client.cancelledAlgos).toHaveLength(0);
+    expect(client.placed).toHaveLength(orderCount);
+    expect(pausedMainnet.getStatus()).toMatchObject({ newEntriesEnabled: false, newEntryReason: "SELECTION_FIX_PENDING_VALIDATION" });
+  });
+
+  it("freezes the causal C1-C6 proof, records post-close BBO as partial, and never overwrites either", async () => {
+    const evidence = poolEvidence(["AAAUSDT", "BBBUSDT"]);
+    evidence.auditBySymbol.AAAUSDT!.quoteVolume24hUsd = 42_000_000;
+    const subject = await runNaturalMainnetBatch({
+      universe: ["AAAUSDT", "BBBUSDT"],
+      evidence,
+    });
+    const aaa = subject.store.getState().signals.find((row) => row.symbol === "AAAUSDT")!;
+    expect(aaa.research?.marketQuality).toMatchObject({
+      pitQuality: "PARTIAL_RECONSTRUCTION",
+      bookSnapshotQuality: "NEAR_SIGNAL_AFTER_CLOSE",
+      quoteVolume24hUsd: 42_000_000,
+      c1Pass: true,
+      c6Pass: true,
+    });
+    expect(aaa.research?.features).toMatchObject({
+      schemaVersion: 1,
+      pitQuality: "FULL_PIT",
+      breakout: expect.objectContaining({ c2ExtensionOfRange: expect.any(Number) }),
+      relativeVolume: expect.objectContaining({ confirmation2: 1 }),
+    });
+    expect(aaa.research?.counterfactual).toMatchObject({ status: "PENDING", entryConvention: "C2_CLOSE_PIT_CANONICAL_V1" });
+    evidence.auditBySymbol.AAAUSDT!.quoteVolume24hUsd = 1;
+    expect(aaa.research?.marketQuality?.quoteVolume24hUsd).toBe(42_000_000);
+  });
+
+  it("records every selected reservation before the first order POST and never promotes a lower-ranked failure", async () => {
+    const controls = mainnetControls({ maxOpenTrades: 2, maxGrossNotionalUsd: 50 });
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const universe = ["AAAUSDT", "BBBUSDT", "CCCUSDT"];
+    const c1Open = DAY + 4 * 3_600_000 + 10 * 60_000;
+    const c2Open = DAY + 4 * 3_600_000 + 15 * 60_000;
+    const history = researchFiveMinuteHistory(c1Open, c2Open);
+    for (const symbol of universe) {
+      client.klines.set(`${symbol}|4h`, [referenceFourHour()]);
+      client.klines.set(`${symbol}|5m`, history);
+    }
+    client.klines.set("BTCUSDT|5m", history);
+    client.klines.set("ETHUSDT|5m", history);
+    const subject = makeMainnetLane(client, now, controls, () => ({ allowed: true, reason: null }), universe, poolEvidence(universe));
+    await subject.lane.tick();
+    subject.store.arm(new Date(now.value).toISOString());
+    now.value = DAY + 4 * 3_600_000 + 21 * 60_000;
+    client.now = now.value;
+    let pendingReservationsAtFirstPost = 0;
+    client.beforeEntry = () => {
+      pendingReservationsAtFirstPost = subject.store.getState().trades
+        .filter((trade) => trade.status === "ENTRY_SUBMITTING").length;
+    };
+    client.failNextEntry = true;
+    await subject.lane.tick();
+
+    const batch = subject.store.getState().signalCohorts.find((row) => row.allocation)!;
+    expect(batch.allocation?.selectedSignalIds).toHaveLength(2);
+    expect(pendingReservationsAtFirstPost).toBe(2);
+    expect(batch.candidates.filter((candidate) => candidate.skipReason === "SKIP_CAP_LOWER_RANK")).toHaveLength(1);
+    const selected = batch.candidates.filter((candidate) => candidate.actuallySelected);
+    expect(selected.some((candidate) => candidate.skipReason === "SELECTED_EXECUTION_FAILED")).toBe(true);
+    expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(1);
+
+    now.value += 5 * 60_000;
+    client.now = now.value;
+    await subject.lane.tick();
+    expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(1);
+  });
+
+  it("marks foreign same-symbol account state explicitly before neutral selection", async () => {
+    const client = new FakeDailyClient();
+    client.positions.set("BBBUSDT", {
+      symbol: "BBBUSDT", positionAmt: 1, entryPrice: 100, markPrice: 100, liquidationPrice: 0,
+      unRealizedProfit: 0, leverage: 1, marginType: "CROSSED",
+    });
+    const now = { value: AT_0410 };
+    const universe = ["AAAUSDT", "BBBUSDT"];
+    const c1Open = DAY + 4 * 3_600_000 + 10 * 60_000;
+    const c2Open = DAY + 4 * 3_600_000 + 15 * 60_000;
+    const history = researchFiveMinuteHistory(c1Open, c2Open);
+    for (const symbol of universe) {
+      client.klines.set(`${symbol}|4h`, [referenceFourHour()]);
+      client.klines.set(`${symbol}|5m`, history);
+    }
+    client.klines.set("BTCUSDT|5m", history);
+    client.klines.set("ETHUSDT|5m", history);
+    const subject = makeMainnetLane(
+      client,
+      now,
+      mainnetControls({ maxOpenTrades: 2, maxGrossNotionalUsd: 50 }),
+      () => ({ allowed: true, reason: null }),
+      universe,
+      poolEvidence(universe),
+    );
+    await subject.lane.tick();
+    subject.store.arm(new Date(now.value).toISOString());
+    now.value = DAY + 4 * 3_600_000 + 21 * 60_000;
+    client.now = now.value;
+    await subject.lane.tick();
+
+    const blocked = subject.store.getState().signals.find((row) => row.symbol === "BBBUSDT");
+    expect(blocked).toMatchObject({ reason: "STRATEGY_SYMBOL_CONFLICT", actuallySelected: false });
+    expect(client.placed.filter((order) => !order.reduceOnly).map((order) => order.symbol)).toEqual(["AAAUSDT"]);
+  });
+
+  it("matures counterfactual labels with 1m data and marks same-candle dual barrier hits ambiguous", async () => {
+    const subject = await runNaturalMainnetBatch({ universe: ["AAAUSDT"] });
+    const signalRow = subject.store.getState().signals[0]!;
+    const minuteOpen = signalRow.signalTimestampMs;
+    subject.client.klines.set("AAAUSDT|1m", [{
+      openTime: minuteOpen,
+      closeTime: minuteOpen + 60_000 - 1,
+      open: 101,
+      high: 106,
+      low: 98,
+      close: 102,
+      volume: 10,
+    }]);
+    subject.now.value = minuteOpen + 2 * 60_000;
+    subject.client.now = subject.now.value;
+    await subject.lane.tick();
+    expect(signalRow.research?.counterfactual).toMatchObject({
+      status: "OUTCOME_AMBIGUOUS",
+      ambiguityReason: expect.stringContaining("same candle"),
+    });
   });
 
   it("persists watermarks/locks across a restart and does not duplicate a prior C1/C2 run", async () => {

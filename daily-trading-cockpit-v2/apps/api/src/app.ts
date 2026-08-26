@@ -55,7 +55,11 @@ import {
   DailyRangeAcceptanceLane,
   DailyRangeLaneStore,
 } from "./lib/daily-4h-range-acceptance-lane.js";
-import { parseDailyRangeMainnetControls } from "./lib/daily-range-mainnet-policy.js";
+import {
+  parseDailyRangeMainnetControls,
+  resolveDailyRangeRuntimeAllocatorMode,
+  resolveDailyRangeTestnetMaxOpenTrades,
+} from "./lib/daily-range-mainnet-policy.js";
 import {
   DailyRangeAutoPool,
   type DailyRangeAutoPoolSnapshot,
@@ -1661,16 +1665,30 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           poolEvidence: dailyRangeAutoPool.getEvidence(input, pool),
         };
       };
+      const dailyRangeSignalPoolEvidence = (symbols: readonly string[]) => {
+        const input = dailyRangePoolInput();
+        const pool = dailyRangeAutoPool.getSnapshot(input);
+        return dailyRangeAutoPool.getEvidenceForSymbols(input, symbols, pool);
+      };
       dailyRangeLane = new DailyRangeAcceptanceLane({
         client: liveClient,
         store: new DailyRangeLaneStore("data", dailyRangeStateFile),
         getUniverse: dailyRangeUniverse,
+        getSignalPoolEvidence: (symbols) => dailyRangeSignalPoolEvidence(symbols),
         // The daily lane has its own disjoint catalog and therefore must not inherit a
         // cross-sectional short blocklist that was designed for different symbols/risk.
         getShortBlocklist: () => new Set<string>(),
         entryClaims: singleSymbolEntryClaims,
         environment: liveConfig.env,
         mainnetControls: dailyRangeMainnetControls,
+        testnetMaxOpenTrades: liveConfig.env === "testnet"
+          ? resolveDailyRangeTestnetMaxOpenTrades(process.env)
+          : undefined,
+        allocatorMode: resolveDailyRangeRuntimeAllocatorMode({
+          environment: liveConfig.env,
+          env: process.env,
+          mainnetControls: dailyRangeMainnetControls,
+        }),
         entryGate: () => {
           if (liveConfig.env !== "mainnet") return { allowed: true, reason: null };
           const engine = liveEngine;
