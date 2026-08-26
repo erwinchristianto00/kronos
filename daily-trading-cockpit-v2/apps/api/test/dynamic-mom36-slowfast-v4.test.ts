@@ -7,12 +7,14 @@ import {
   evaluateDynamicMom36Formation,
 } from "../src/lib/cross-sectional-edge.js";
 import {
+  DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5,
   DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
   buildDynamicMom36Formation,
   isDynamicMom36SlowFastStrategy,
   selectDynamicMom36Legs,
   type DynamicMom36Allocation,
   type DynamicMom36RankedSymbol,
+  type DynamicMom36StrategyVersion,
   type FrozenContinuationOverlay,
 } from "../src/lib/dynamic-mom36-shock-strategy.js";
 import {
@@ -94,7 +96,11 @@ function continuation(decision: FrozenContinuationOverlay["decision"]): FrozenCo
   };
 }
 
-function evaluationInput(activeUniverse: DynamicMom36RankedSymbol[], admissionPassed = true) {
+function evaluationInput(
+  activeUniverse: DynamicMom36RankedSymbol[],
+  admissionPassed = true,
+  strategyVersion: DynamicMom36StrategyVersion = DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
+) {
   return {
     activeUniverse,
     now: new Date(CUT).toISOString(),
@@ -106,7 +112,7 @@ function evaluationInput(activeUniverse: DynamicMom36RankedSymbol[], admissionPa
     admissionScoreGap: 0.1,
     admissionScoreGapFloor: 0.058,
     admissionPassed,
-    strategyVersion: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
+    strategyVersion,
     continuationRuntime: null,
   } as const;
 }
@@ -198,6 +204,61 @@ describe("Dynamic MOM36 v4 — recovered legacy SLOW_AND_FAST", () => {
     });
   });
 
+  it("V5 uses the complete same-snapshot raw V3 selection only when strict SLOW_AND_FAST cannot fill all legs", () => {
+    const rows = [
+      row("SOL", 0.10, 0.01), row("SUI", 0.09, 0.01), row("DOGE", 0.08, -0.01),
+      row("XRP", 0.07, 0.01), row("BNB", 0.06, 0.01), row("ADA", 0.05, -0.01),
+      row("OP", 0.04, -0.01), row("SEI", -0.05, -0.01),
+    ];
+    const formation = buildDynamicMom36Formation({
+      activeUniverse: rows,
+      maxPerCluster: 0,
+      continuation: continuation("NO_EDGE"),
+      continuationOnly: true,
+      slowFastMode: "PREFER",
+    });
+    const evaluated = evaluateDynamicMom36Formation(
+      evaluationInput(rows, true, DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5),
+    );
+
+    expect(formation.slowFast).toMatchObject({ active: true, mode: "PREFER" });
+    expect(formation.slowFastStrictSelection).toMatchObject({
+      insufficientReason: "insufficient ranked execution-eligible symbols after current pool, blocklist, and cluster guards",
+    });
+    expect(formation.slowFastStrictSelection?.selectedLongs).toHaveLength(4);
+    expect(formation.rawV3Selection).toMatchObject({ insufficientReason: null, requiredLongs: 5, requiredShorts: 1 });
+    expect(formation.selectionSource).toBe("RAW_V3_FALLBACK");
+    expect(formation.selection.selectedLongs.map((candidate) => candidate.symbol)).toEqual(["SOL", "SUI", "DOGE", "XRP", "BNB"]);
+    expect(formation.selection.selectedShorts.map((candidate) => candidate.symbol)).toEqual(["SEI"]);
+    expect(evaluated.basket?.longLeg.map((leg) => leg.symbol)).toEqual(["SOL", "SUI", "DOGE", "XRP", "BNB"]);
+    expect(evaluated.snapshot).toMatchObject({
+      strategyVersion: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5,
+      selectionSource: "RAW_V3_FALLBACK",
+      slowFastStrictSelectedLongs: ["SOL", "SUI", "XRP", "BNB"],
+      slowFastStrictSelectionInsufficientReason: "insufficient ranked execution-eligible symbols after current pool, blocklist, and cluster guards",
+      noEntryReason: null,
+    });
+  });
+
+  it("V5 still rejects an incomplete raw V3 selection instead of making a partial basket", () => {
+    const rows = [
+      row("SOL", 0.10, 0.01), row("SUI", 0.09, 0.01), row("DOGE", 0.08, -0.01),
+      row("XRP", 0.07, 0.01),
+      row("BNB", 0.06, 0.01, { longEligible: false, longExecutionBlockReason: "EXECUTION_INELIGIBLE" }),
+      row("ADA", 0.05, -0.01, { longEligible: false, longExecutionBlockReason: "EXECUTION_INELIGIBLE" }),
+      row("OP", 0.04, -0.01, { longEligible: false, longExecutionBlockReason: "EXECUTION_INELIGIBLE" }),
+      row("SEI", -0.05, -0.01, { longEligible: false, longExecutionBlockReason: "EXECUTION_INELIGIBLE" }),
+    ];
+    const evaluated = evaluateDynamicMom36Formation(
+      evaluationInput(rows, true, DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5),
+    );
+
+    expect(evaluated.formation?.rawV3Selection.selectedLongs).toHaveLength(4);
+    expect(evaluated.formation?.selectionSource).toBe("RAW_V3");
+    expect(evaluated.basket).toBeNull();
+    expect(evaluated.noEntryReason).toContain("insufficient ranked execution-eligible symbols");
+  });
+
   it("preserves the short blocklist as an execution guard separate from alignment", () => {
     const selection = selectDynamicMom36Legs([
       row("SOL", 0.10, 0.01), row("SUI", 0.09, 0.01), row("DOGE", 0.08, 0.01), row("XRP", 0.07, 0.01),
@@ -271,6 +332,7 @@ describe("Dynamic MOM36 v4 — recovered legacy SLOW_AND_FAST", () => {
     expect(formation.finalAllocation).toMatchObject({ label: "5L1S" });
     expect(formation.slowFast).toEqual({
       active: true,
+      mode: "STRICT",
       policyId: DYNAMIC_MOM36_SLOW_FAST_POLICY_ID,
       implementationVersion: DYNAMIC_MOM36_SLOW_FAST_IMPLEMENTATION_VERSION,
       interval: "1h",
@@ -345,6 +407,9 @@ describe("Dynamic MOM36 v4 — recovered legacy SLOW_AND_FAST", () => {
     expect(isDynamicMom36SlowFastStrategy({
       CROSS_SECTIONAL_STRATEGY_VERSION: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
       CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "0",
+    } as NodeJS.ProcessEnv)).toBe(true);
+    expect(isDynamicMom36SlowFastStrategy({
+      CROSS_SECTIONAL_STRATEGY_VERSION: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5,
     } as NodeJS.ProcessEnv)).toBe(true);
   });
 });

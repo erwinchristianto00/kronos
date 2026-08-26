@@ -39,13 +39,13 @@ import {
   DYNAMIC_MOM36_SHOCK_VARIANT,
   buildDynamicMom36Formation,
   crossSectionalStrategyVersion,
+  dynamicMom36SlowFastMode,
   isDynamicMom36ContinuationStrategy,
   isDynamicMom36ContinuationVersion,
   isDynamicMom36ShockStrategy,
-  isDynamicMom36SlowFastStrategy,
-  isDynamicMom36SlowFastVersion,
   type DynamicMom36StrategyVersion,
   type DynamicMom36CandidateSelectionAudit,
+  type DynamicMom36SelectionSource,
   type DynamicMom36SlowFastPolicy,
   type FrozenContinuationOverlay,
   resolveFrozenRuntimeShockOverlay,
@@ -602,17 +602,17 @@ export interface DynamicMom36FormationSnapshot {
   shockState: DynamicMom36ShockState;
   shockReason: string | null;
   /**
-   * v3 formation-only V4 trajectory evidence.  Null for the retained v1 shock policy; unavailable
-   * V4 reads persist a NO_EDGE object rather than blocking the canonical MOM36 basket.
+   * Continuation trajectory evidence. Null for the retained v1 shock policy; unavailable V3+
+   * reads persist a NO_EDGE object rather than blocking the canonical MOM36 basket.
    */
   continuation: FrozenContinuationOverlay | null;
-  /** Null/disabled on retained v1/v3 observations; v4 freezes the exact recovered legacy policy. */
+  /** Null/disabled on retained v1/v3 observations; V4/V5 freeze the recovered legacy predicate and its mode. */
   slowFast?: DynamicMom36SlowFastPolicy;
   /** Base-only legs are retained even when the bounded shock overlay changes the final rung. */
   baseSelectedLongs: string[];
   baseSelectedShorts: string[];
   baseSelectionInsufficientReason: string | null;
-  /** Current v3 counterfactual after the V4 allocation but before per-leg SLOW_AND_FAST gating. */
+  /** Current V3 counterfactual after the frozen continuation allocation but before per-leg SLOW_AND_FAST gating. */
   rawV3SelectedLongs?: string[];
   rawV3SelectedShorts?: string[];
   rawV3SelectionInsufficientReason?: string | null;
@@ -620,11 +620,21 @@ export interface DynamicMom36FormationSnapshot {
     long: DynamicMom36CandidateSelectionAudit[];
     short: DynamicMom36CandidateSelectionAudit[];
   };
+  /** Strict V4/V5 attempt, retained even when V5 executes the complete raw-V3 fallback. */
+  slowFastStrictSelectedLongs?: string[];
+  slowFastStrictSelectedShorts?: string[];
+  slowFastStrictSelectionInsufficientReason?: string | null;
+  slowFastStrictCandidateAudit?: {
+    long: DynamicMom36CandidateSelectionAudit[];
+    short: DynamicMom36CandidateSelectionAudit[];
+  };
   finalAllocation: DynamicMom36Allocation;
+  /** Exact selector that supplied the recorded final legs. */
+  selectionSource?: DynamicMom36SelectionSource;
   selectedLongs: string[];
   selectedShorts: string[];
   blockedShortsSkipped: string[];
-  /** Full v4 (or raw for older versions) selection trail, including SLOW_FAST_* skip reasons. */
+  /** Full final selection trail, including SLOW_FAST_* skip reasons when strict selection supplied the legs. */
   selectionCandidateAudit?: {
     long: DynamicMom36CandidateSelectionAudit[];
     short: DynamicMom36CandidateSelectionAudit[];
@@ -1176,7 +1186,12 @@ function dynamicMom36Snapshot(
     rawV3SelectedShorts: formation.rawV3Selection.selectedShorts.map((row) => row.symbol),
     rawV3SelectionInsufficientReason: formation.rawV3Selection.insufficientReason,
     rawV3CandidateAudit: formation.rawV3Selection.candidateAudit,
+    slowFastStrictSelectedLongs: formation.slowFastStrictSelection?.selectedLongs.map((row) => row.symbol) ?? [],
+    slowFastStrictSelectedShorts: formation.slowFastStrictSelection?.selectedShorts.map((row) => row.symbol) ?? [],
+    slowFastStrictSelectionInsufficientReason: formation.slowFastStrictSelection?.insufficientReason ?? null,
+    slowFastStrictCandidateAudit: formation.slowFastStrictSelection?.candidateAudit,
     finalAllocation: formation.finalAllocation,
+    selectionSource: formation.selectionSource,
     selectedLongs: formation.selection.selectedLongs.map((row) => row.symbol),
     selectedShorts: formation.selection.selectedShorts.map((row) => row.symbol),
     blockedShortsSkipped: formation.selection.blockedShortsSkipped,
@@ -1198,7 +1213,7 @@ function dynamicMom36Snapshot(
   };
 }
 
-/** Defensive boundary for any caller of the pure evaluator: v4 may never trust a future bar. */
+/** Defensive boundary for any caller of the pure evaluator: V4/V5 may never trust a future bar. */
 function markSlowFastSourcesAtDecision(
   rows: readonly DynamicMom36RankedSymbol[],
   decisionInformationCutoffMs: number,
@@ -1237,7 +1252,8 @@ export function evaluateDynamicMom36Formation(input: DynamicMom36FormationInput)
   }
   const strategyVersion = input.strategyVersion ?? DYNAMIC_MOM36_SHOCK_36H_V1;
   const continuationStrategy = isDynamicMom36ContinuationVersion(strategyVersion);
-  const slowFastStrategy = isDynamicMom36SlowFastVersion(strategyVersion);
+  const slowFastMode = dynamicMom36SlowFastMode(strategyVersion);
+  const slowFastStrategy = slowFastMode !== "OFF";
   const formation = buildDynamicMom36Formation({
     activeUniverse: slowFastStrategy
       ? markSlowFastSourcesAtDecision(input.activeUniverse, input.decisionInformationCutoffMs)
@@ -1246,7 +1262,7 @@ export function evaluateDynamicMom36Formation(input: DynamicMom36FormationInput)
     shock: continuationStrategy ? undefined : resolveFrozenRuntimeShockOverlay(),
     continuationRuntime: continuationStrategy ? input.continuationRuntime ?? null : null,
     continuationOnly: continuationStrategy,
-    slowFastRequired: slowFastStrategy,
+    slowFastMode,
   });
   const noEntryReason = noEntryReasonForDynamicFormation(input, formation);
   const snapshot = dynamicMom36Snapshot(input, strategyVersion, formation, noEntryReason);
@@ -2299,7 +2315,7 @@ export async function runCrossSectionalCycle(opts: {
   const dynamicMom36Shock = isDynamicMom36ShockStrategy();
   const dynamicStrategyVersion = crossSectionalStrategyVersion();
   const dynamicMom36Continuation = isDynamicMom36ContinuationStrategy();
-  const dynamicMom36SlowFast = isDynamicMom36SlowFastStrategy();
+  const dynamicMom36SlowFastApplication = dynamicMom36SlowFastMode(dynamicStrategyVersion);
   const dynamicMom36ConfigValid = !dynamicMom36Shock || (
     CROSS_SECTIONAL_MOMENTUM_BARS === DYNAMIC_MOM36_LOOKBACK_BARS &&
     CROSS_SECTIONAL_INTERVAL === "1h"
@@ -2890,7 +2906,8 @@ export async function runCrossSectionalCycle(opts: {
       console.info(JSON.stringify({
         event: "dynamic_mom36_formation",
         strategyVersion: dynamicStrategyVersion,
-        slowFastRequired: dynamicMom36SlowFast,
+        slowFastRequired: dynamicMom36SlowFastApplication === "STRICT",
+        slowFastMode: dynamicMom36SlowFastApplication,
         admissionPass: snapshot?.admission.passed ?? false,
         admissionReason,
         activeUniverseSize: snapshot?.activeUniverse.length ?? dynamicBaseRows.length,
@@ -2911,6 +2928,10 @@ export async function runCrossSectionalCycle(opts: {
         rawV3SelectedLongs: snapshot?.rawV3SelectedLongs ?? [],
         rawV3SelectedShorts: snapshot?.rawV3SelectedShorts ?? [],
         rawV3SelectionInsufficientReason: snapshot?.rawV3SelectionInsufficientReason ?? null,
+        slowFastStrictSelectedLongs: snapshot?.slowFastStrictSelectedLongs ?? [],
+        slowFastStrictSelectedShorts: snapshot?.slowFastStrictSelectedShorts ?? [],
+        slowFastStrictSelectionInsufficientReason: snapshot?.slowFastStrictSelectionInsufficientReason ?? null,
+        selectionSource: snapshot?.selectionSource ?? null,
         finalAllocation: snapshot?.finalAllocation ?? null,
         requiredLongs: snapshot?.requiredLongs ?? null,
         requiredShorts: snapshot?.requiredShorts ?? null,

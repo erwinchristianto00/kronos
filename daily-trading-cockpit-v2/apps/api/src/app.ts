@@ -44,19 +44,19 @@ import {
 import { crossSectionalExecTickMs } from "./lib/cross-sectional-policy.js";
 import {
   buildCrossSectionalReport,
-  CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
   CROSS_SECTIONAL_FILTERED_SIGNAL,
   CROSS_SECTIONAL_UNIVERSE,
-  getCrossSectionalFilteredConfig,
   getCrossSectionalReportSinceMs,
   getCrossSectionalStore,
 } from "./lib/cross-sectional-edge.js";
 import { CrossSectionalAutoPool } from "./lib/cross-sectional-auto-pool.js";
 import {
   DAILY_RANGE_LANE_ID,
+  DAILY_RANGE_TRADE_NOTIONAL_USD,
   DailyRangeAcceptanceLane,
   DailyRangeLaneStore,
 } from "./lib/daily-4h-range-acceptance-lane.js";
+import { resolveDailyRangeAutoPoolInput } from "./lib/daily-range-auto-pool.js";
 import {
   DYNAMIC_MOM36_SHOCK_SIGNAL,
   DYNAMIC_MOM36_SHOCK_VARIANT,
@@ -1538,38 +1538,57 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         singleSymbolPriceTimeline?.exitGate(symbol, direction) ?? Promise.resolve({ shouldExit: false, reason: null }),
     };
     // Completely isolated, Testnet-only lane. It has no mainnet switch: the
-    // construction condition itself is the live boundary. It starts DISARMED;
-    // its scheduler only reconciles/records until a passing exchange canary is
-    // persisted and an operator arms this lane through its own endpoint.
+    // construction condition itself is the live boundary. Its C1/C2 membership
+    // pool is deliberately disjoint from the cross-sectional candidate universe:
+    // the durable lease below remains a safety backstop, not a normal basket blocker.
+    // It starts DISARMED; its scheduler only reconciles/records until a passing
+    // exchange canary is persisted and an operator arms this lane through its
+    // own endpoint.
     if (!isTest && liveConfig.env === "testnet") {
+      const dailyRangePoolInput = resolveDailyRangeAutoPoolInput(CROSS_SECTIONAL_UNIVERSE);
+      const dailyRangeAutoPool = new CrossSectionalAutoPool({
+        dataDir: "data",
+        fileName: "daily-range-auto-pool.json",
+        fetchImpl: options.fetchImpl,
+        enabledEnvKey: "DAILY_RANGE_AUTO_POOL_ENABLED",
+        refreshEveryMsEnvKey: "DAILY_RANGE_AUTO_POOL_REFRESH_MS",
+      });
       const dailyRangeUniverse = () => {
-        const configured = getCrossSectionalFilteredConfig();
-        const fallbackSymbols = [...new Set([...configured.longAllowlist, ...configured.shortAllowlist])];
-        const pool = crossSectionalAutoPool.getSnapshot({
-          candidateUniverse: CROSS_SECTIONAL_UNIVERSE,
-          fallbackSymbols,
-          baseLegUsd: 25,
+        const pool = dailyRangeAutoPool.getSnapshot({
+          ...dailyRangePoolInput,
+          baseLegUsd: DAILY_RANGE_TRADE_NOTIONAL_USD,
           sizeMultiplier: 1,
         });
         return {
           symbols: pool.activeSymbols,
-          source: `CROSS_SECTIONAL_AUTO_POOL:${pool.state}`,
+          source: `DAILY_RANGE_AUTO_POOL:${pool.state}`,
         };
       };
       dailyRangeLane = new DailyRangeAcceptanceLane({
         client: liveClient,
         store: new DailyRangeLaneStore("data"),
         getUniverse: dailyRangeUniverse,
-        getShortBlocklist: () => CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
+        // The daily lane has its own disjoint catalog and therefore must not inherit a
+        // cross-sectional short blocklist that was designed for different symbols/risk.
+        getShortBlocklist: () => new Set<string>(),
         entryClaims: singleSymbolEntryClaims,
         environment: "testnet",
       });
       const tickDailyRangeLane = (): void => {
-        void dailyRangeLane?.tick();
+        void dailyRangeAutoPool.refreshIfDue({
+          ...dailyRangePoolInput,
+          baseLegUsd: DAILY_RANGE_TRADE_NOTIONAL_USD,
+          sizeMultiplier: 1,
+        })
+          .then(() => dailyRangeLane?.tick())
+          .catch((error) => console.error("[daily-range-lane] AUTO_POOL_REFRESH_FAILED", error));
       };
       setTimeout(tickDailyRangeLane, 20_000);
       setInterval(tickDailyRangeLane, 30_000);
-      console.log(`[daily-range-lane] READY environment=testnet version=${DAILY_RANGE_LANE_ID} control=DISARMED`);
+      console.log(
+        `[daily-range-lane] READY environment=testnet version=${DAILY_RANGE_LANE_ID} ` +
+        `control=DISARMED pool=DAILY_RANGE_AUTO_POOL candidates=${dailyRangePoolInput.candidateUniverse.length}`,
+      );
     }
     // Shared account-exposure coordinator (account-exposure-coordinator.ts) — the reserve-then-
     // commit-then-release capacity ledger for EVERY SingleSymbolLaneExecutor/CrossSectionalExecutor

@@ -74,8 +74,8 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<{
   json(): Promise<unknown>;
 }>;
 
-function enabled(env: NodeJS.ProcessEnv): boolean {
-  return env.CROSS_SECTIONAL_AUTO_POOL_ENABLED === "1";
+function enabled(env: NodeJS.ProcessEnv, key: string): boolean {
+  return env[key] === "1";
 }
 
 function positiveMs(raw: string | undefined, fallback: number): number {
@@ -132,6 +132,8 @@ export class CrossSectionalAutoPool {
   private readonly fetchImpl: FetchLike;
   private readonly nowMs: () => number;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly enabledEnvKey: string;
+  private readonly refreshEveryMsEnvKey: string;
   private state: PersistedAutoPoolState;
   private inFlight: Promise<CrossSectionalAutoPoolSnapshot> | null = null;
 
@@ -141,17 +143,23 @@ export class CrossSectionalAutoPool {
     fetchImpl?: FetchLike;
     nowMs?: () => number;
     env?: NodeJS.ProcessEnv;
+    /** Allows an isolated lane to own its automation switch without sharing cross-basket state. */
+    enabledEnvKey?: string;
+    /** Allows an isolated lane to own its refresh cadence without sharing cross-basket state. */
+    refreshEveryMsEnvKey?: string;
   } = {}) {
     const dataDir = opts.dataDir ?? "data";
     this.file = resolve(dataDir, opts.fileName ?? "cross-sectional-auto-pool.json");
     this.fetchImpl = opts.fetchImpl ?? (fetch as unknown as FetchLike);
     this.nowMs = opts.nowMs ?? (() => Date.now());
     this.env = opts.env ?? process.env;
+    this.enabledEnvKey = opts.enabledEnvKey ?? "CROSS_SECTIONAL_AUTO_POOL_ENABLED";
+    this.refreshEveryMsEnvKey = opts.refreshEveryMsEnvKey ?? "CROSS_SECTIONAL_AUTO_POOL_REFRESH_MS";
     this.state = this.read();
   }
 
   refreshEveryMs(): number {
-    return positiveMs(this.env.CROSS_SECTIONAL_AUTO_POOL_REFRESH_MS, DEFAULT_REFRESH_MS);
+    return positiveMs(this.env[this.refreshEveryMsEnvKey], DEFAULT_REFRESH_MS);
   }
 
   /** Synchronous status only; this never sends a public-market request. */
@@ -163,7 +171,7 @@ export class CrossSectionalAutoPool {
     const hasDurablePool = persisted.length >= MIN_POOL_SIZE;
     const activeSymbols = hasDurablePool ? persisted : fallback;
     const effectiveLegUsd = effectiveLegUsdFor(input.baseLegUsd, input.sizeMultiplier);
-    const on = enabled(this.env);
+    const on = enabled(this.env, this.enabledEnvKey);
     return {
       version: VERSION,
       enabled: on,

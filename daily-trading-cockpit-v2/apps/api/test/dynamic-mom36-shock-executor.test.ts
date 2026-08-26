@@ -13,6 +13,7 @@ import { CrossSectionalStore, type CrossSectionalObservation } from "../src/lib/
 import type { FuturesMarketReference } from "../src/lib/futures-market-reference-cache.js";
 import {
   DYNAMIC_MOM36_HORIZON_MS,
+  DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5,
   DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
   DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3,
   DYNAMIC_MOM36_SHOCK_36H_V1,
@@ -457,22 +458,29 @@ describe("Dynamic MOM36 executor — asymmetric live lifecycle", () => {
     }
   }, DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3));
 
-  it("uses the unchanged frozen -2% / MFE / 36h exit dispatcher for a new v4 basket", async () => withDynamicEnv(async () => {
-    const run = runner(5, { strategyVersion: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4 });
-    await run.executor.tick();
-    const basket = run.store.getState().baskets[0]!;
-    expect(basket).toMatchObject({
-      status: "COMPLETE",
-      strategyVersion: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
-      dynamicMom36V3Exit: { hardCutLossThreshold: -0.02, mfeArmThreshold: 0.03, mfeGivebackFraction: 0.30 },
-    });
-    for (const leg of basket.legs) {
-      const mark = run.client.marks.get(leg.symbol)!;
-      run.client.marks.set(leg.symbol, leg.side === "LONG" ? mark * 0.975 : mark * 1.025);
+  it("uses the unchanged frozen -2% / MFE / 36h exit dispatcher for V4 and V5 baskets", async () => {
+    for (const strategyVersion of [
+      DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4,
+      DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5,
+    ] as const) {
+      await withDynamicEnv(async () => {
+        const run = runner(5, { strategyVersion });
+        await run.executor.tick();
+        const basket = run.store.getState().baskets[0]!;
+        expect(basket).toMatchObject({
+          status: "COMPLETE",
+          strategyVersion,
+          dynamicMom36V3Exit: { hardCutLossThreshold: -0.02, mfeArmThreshold: 0.03, mfeGivebackFraction: 0.30 },
+        });
+        for (const leg of basket.legs) {
+          const mark = run.client.marks.get(leg.symbol)!;
+          run.client.marks.set(leg.symbol, leg.side === "LONG" ? mark * 0.975 : mark * 1.025);
+        }
+        await run.executor.tick();
+        expect(basket).toMatchObject({ status: "CLOSED", closeReason: "HARD_CUT_LOSS_2" });
+      }, strategyVersion);
     }
-    await run.executor.tick();
-    expect(basket).toMatchObject({ status: "CLOSED", closeReason: "HARD_CUT_LOSS_2" });
-  }, DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4));
+  });
 
   it("surfaces a newer durable v4 no-entry formation instead of hiding it behind an older executable signal", async () => withDynamicEnv(async () => {
     const run = runner(5, { strategyVersion: DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4 });

@@ -686,6 +686,9 @@ export class DailyRangeAcceptanceLane {
         rangeReady: now >= firstReferenceReadyAtMs(now),
         entryWindowOpen: inDailyRangeEntryWindow(now),
         dailyUniverseCount: day?.universeSymbols.length ?? 0,
+        /** Immutable source captured at the UTC-day boundary; lets operators verify pool isolation. */
+        dailyUniverseSource: day?.universeSource ?? null,
+        dailyUniverseSymbols: day?.universeSymbols ?? [],
         monitoringSymbols: Object.keys(day?.levels ?? {}).length,
         invalidReferenceSymbols: day?.invalidReferenceSymbols ?? [],
         signals: signalsToday.length,

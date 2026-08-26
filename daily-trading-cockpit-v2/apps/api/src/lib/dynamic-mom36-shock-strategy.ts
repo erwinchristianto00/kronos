@@ -28,6 +28,13 @@ export const DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 =
   "dynamic-mom36-continuation-sl2-mfe30-36h-v3" as const;
 export const DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4 =
   "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4" as const;
+/**
+ * V5 keeps the same continuation, score-gap, cluster, and exit contract as V4, but treats the
+ * recovered SLOW_AND_FAST predicate as a selection preference.  A complete raw V3 selection from
+ * the exact same frozen snapshot is used only when the strict selection cannot fill all six legs.
+ */
+export const DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5 =
+  "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5" as const;
 export const DYNAMIC_MOM36_SHOCK_SIGNAL = "DYNAMIC_MOM36_SHOCK_36H" as const;
 export const DYNAMIC_MOM36_SHOCK_VARIANT = "DYNAMIC_MOM36_SHOCK" as const;
 export const DYNAMIC_MOM36_LOOKBACK_BARS = 36 as const;
@@ -46,7 +53,8 @@ export const DYNAMIC_MOM36_MFE_TRAILING_FRACTION = 1 - DYNAMIC_MOM36_MFE_GIVEBAC
 export type DynamicMom36StrategyVersion =
   | typeof DYNAMIC_MOM36_SHOCK_36H_V1
   | typeof DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3
-  | typeof DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4;
+  | typeof DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4
+  | typeof DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5;
 
 /** There is intentionally no synthetic or trainable fallback model. */
 export const NO_FROZEN_RUNTIME_SHOCK_ARTIFACT = "NO_FROZEN_RUNTIME_SHOCK_MAPPING" as const;
@@ -480,12 +488,23 @@ export type DynamicMom36CandidateSelectionAudit = {
 
 export type DynamicMom36SlowFastPolicy = {
   active: boolean;
+  /** V4 is a hard gate; V5 retains the exact gate as a preference with a same-snapshot raw V3 fallback. */
+  mode: DynamicMom36SlowFastMode;
   policyId: string | null;
   implementationVersion: string | null;
   interval: string | null;
   slowBars: number | null;
   fastBars: number | null;
 };
+
+export type DynamicMom36SlowFastMode = "OFF" | "STRICT" | "PREFER";
+
+/** Identifies which fully-audited selection supplied the actual basket legs. */
+export type DynamicMom36SelectionSource =
+  | "RAW_V3"
+  | "STRICT_SLOW_FAST"
+  | "RAW_V3_FALLBACK"
+  | "VETOED";
 
 export type DynamicMom36Formation = {
   activeUniverse: DynamicMom36RankedSymbol[];
@@ -499,14 +518,17 @@ export type DynamicMom36Formation = {
    * recomputing ranks from changed code, pool membership, or market data.
   */
   baseSelection: DynamicMom36Selection;
-  /** Exact current V3 selection after V4 allocation, with no SLOW_AND_FAST filtering. */
+  /** Exact current V3 selection after the frozen continuation allocation, with no SLOW_AND_FAST filtering. */
   rawV3Selection: DynamicMom36Selection;
+  /** Strict SLOW_AND_FAST selection retained as audit evidence for V4/V5; null when that policy is off. */
+  slowFastStrictSelection: DynamicMom36Selection | null;
   /** v1 has its historic shock snapshot; v3 records formation-only V4 continuation instead. */
   shock: FrozenShockOverlay;
   continuation: FrozenContinuationOverlay | null;
   slowFast: DynamicMom36SlowFastPolicy;
   finalAllocation: DynamicMom36Allocation;
   vetoed: boolean;
+  selectionSource: DynamicMom36SelectionSource;
   selection: DynamicMom36Selection;
 };
 
@@ -773,8 +795,10 @@ export function buildDynamicMom36Formation(input: {
   continuationRuntime?: DynamicMom36ContinuationRuntimeResult | null;
   /** Continuation versions have no legacy shock fallback: unavailable continuation means base MOM36, never a veto. */
   continuationOnly?: boolean;
-  /** New v4 only: exact recovered legacy per-leg eligibility after the final allocation is frozen. */
+  /** Exact recovered legacy per-leg eligibility after the final allocation is frozen. */
   slowFastRequired?: boolean;
+  /** Versioned application of the recovered per-leg predicate. `slowFastRequired` remains for V4-compatible callers. */
+  slowFastMode?: DynamicMom36SlowFastMode;
 }): DynamicMom36Formation {
   const activeUniverse = [...input.activeUniverse]
     .filter((row) => Number.isFinite(row.mom36) && Number.isFinite(row.price) && row.price > 0)
@@ -782,7 +806,7 @@ export function buildDynamicMom36Formation(input: {
   const breadth = baseDynamicMom36Allocation(activeUniverse);
   const baseSelection = selectDynamicMom36Legs(activeUniverse, breadth.allocation, input.maxPerCluster);
   const continuationOnly = input.continuationOnly === true;
-  const slowFastRequired = input.slowFastRequired === true;
+  const slowFastMode = input.slowFastMode ?? (input.slowFastRequired === true ? "STRICT" : "OFF");
   // The frozen V1 shock artifact and the V3 continuation artifact are deliberately disjoint.
   // A missing V3 result must not fall through to a future/accidentally-registered V1 shock
   // mapping, because that would turn the mandated BASE fallback into an undeclared veto.
@@ -801,20 +825,38 @@ export function buildDynamicMom36Formation(input: {
       ? { allocation: applyBoundedContinuationOverlay(breadth.allocation, continuation), vetoed: false }
       : applyBoundedShockOverlay(breadth.allocation, shock);
   const rawV3Selection = selectDynamicMom36Legs(activeUniverse, overlay.allocation, input.maxPerCluster);
-  let selection = overlay.vetoed
-    ? {
-        ...rawV3Selection,
-        selectedLongs: [],
-        selectedShorts: [],
-        insufficientReason: "frozen shock mapping vetoed this candidate",
-      }
-    : slowFastRequired
-      ? selectDynamicMom36Legs(activeUniverse, overlay.allocation, input.maxPerCluster, { slowFastApplied: true })
-      : rawV3Selection;
-  // A raw V3 basket that is complete but loses a leg only once strict side alignment is applied
-  // must never borrow an unaligned candidate or alter the allocation. State this cause explicitly.
-  if (slowFastRequired && rawV3Selection.insufficientReason === null && selection.insufficientReason !== null) {
-    selection = { ...selection, insufficientReason: "INSUFFICIENT_SLOW_FAST_ALIGNED_LEGS" };
+  const slowFastStrictSelection = slowFastMode === "OFF"
+    ? null
+    : selectDynamicMom36Legs(activeUniverse, overlay.allocation, input.maxPerCluster, { slowFastApplied: true });
+  let selection: DynamicMom36Selection;
+  let selectionSource: DynamicMom36SelectionSource;
+  if (overlay.vetoed) {
+    selection = {
+      ...rawV3Selection,
+      selectedLongs: [],
+      selectedShorts: [],
+      insufficientReason: "frozen shock mapping vetoed this candidate",
+    };
+    selectionSource = "VETOED";
+  } else if (slowFastMode === "STRICT") {
+    selection = slowFastStrictSelection!;
+    selectionSource = "STRICT_SLOW_FAST";
+    // A raw V3 basket that is complete but loses a leg only once strict side alignment is applied
+    // must never borrow an unaligned candidate or alter the allocation. State this cause explicitly.
+    if (rawV3Selection.insufficientReason === null && selection.insufficientReason !== null) {
+      selection = { ...selection, insufficientReason: "INSUFFICIENT_SLOW_FAST_ALIGNED_LEGS" };
+    }
+  } else if (slowFastMode === "PREFER" && slowFastStrictSelection?.insufficientReason === null) {
+    selection = slowFastStrictSelection;
+    selectionSource = "STRICT_SLOW_FAST";
+  } else if (slowFastMode === "PREFER" && rawV3Selection.insufficientReason === null) {
+    // V5 is intentionally not a partial-basket policy: this is the original, complete raw V3
+    // rank walk from the same data cut, allocation, execution guards, and cluster cap.
+    selection = rawV3Selection;
+    selectionSource = "RAW_V3_FALLBACK";
+  } else {
+    selection = rawV3Selection;
+    selectionSource = "RAW_V3";
   }
   return {
     activeUniverse,
@@ -824,18 +866,21 @@ export function buildDynamicMom36Formation(input: {
     baseAllocation: breadth.allocation,
     baseSelection,
     rawV3Selection,
+    slowFastStrictSelection,
     shock,
     continuation,
     slowFast: {
-      active: slowFastRequired,
-      policyId: slowFastRequired ? DYNAMIC_MOM36_SLOW_FAST_POLICY_ID : null,
-      implementationVersion: slowFastRequired ? DYNAMIC_MOM36_SLOW_FAST_IMPLEMENTATION_VERSION : null,
-      interval: slowFastRequired ? DYNAMIC_MOM36_SLOW_FAST_INTERVAL : null,
-      slowBars: slowFastRequired ? DYNAMIC_MOM36_SLOW_FAST_SLOW_BARS : null,
-      fastBars: slowFastRequired ? DYNAMIC_MOM36_SLOW_FAST_FAST_BARS : null,
+      active: slowFastMode !== "OFF",
+      mode: slowFastMode,
+      policyId: slowFastMode !== "OFF" ? DYNAMIC_MOM36_SLOW_FAST_POLICY_ID : null,
+      implementationVersion: slowFastMode !== "OFF" ? DYNAMIC_MOM36_SLOW_FAST_IMPLEMENTATION_VERSION : null,
+      interval: slowFastMode !== "OFF" ? DYNAMIC_MOM36_SLOW_FAST_INTERVAL : null,
+      slowBars: slowFastMode !== "OFF" ? DYNAMIC_MOM36_SLOW_FAST_SLOW_BARS : null,
+      fastBars: slowFastMode !== "OFF" ? DYNAMIC_MOM36_SLOW_FAST_FAST_BARS : null,
     },
     finalAllocation: overlay.allocation,
     vetoed: overlay.vetoed,
+    selectionSource,
     selection,
   };
 }
@@ -867,20 +912,33 @@ export function isDynamicMom36ContinuationStrategy(env: NodeJS.ProcessEnv = proc
 
 export function isDynamicMom36ContinuationVersion(strategyVersion: string | null | undefined): boolean {
   return strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 ||
-    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4;
+    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4 ||
+    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5;
 }
 
-/** Only v4 activates the recovered strict SLOW_AND_FAST per-leg predicate. */
+/** V4 and V5 both evaluate the recovered per-leg SLOW_AND_FAST predicate. */
 export function isDynamicMom36SlowFastStrategy(env: NodeJS.ProcessEnv = process.env): boolean {
   return isDynamicMom36SlowFastVersion(crossSectionalStrategyVersion(env));
 }
 
 export function isDynamicMom36SlowFastVersion(strategyVersion: string | null | undefined): boolean {
-  return strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4;
+  return dynamicMom36SlowFastMode(strategyVersion) !== "OFF";
+}
+
+/** Returns the versioned SLOW_AND_FAST application rule without reading process state. */
+export function dynamicMom36SlowFastMode(strategyVersion: string | null | undefined): DynamicMom36SlowFastMode {
+  if (strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4) return "STRICT";
+  if (strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5) return "PREFER";
+  return "OFF";
+}
+
+export function isDynamicMom36SlowFastStrictVersion(strategyVersion: string | null | undefined): boolean {
+  return dynamicMom36SlowFastMode(strategyVersion) === "STRICT";
 }
 
 export function isDynamicMom36Version(strategyVersion: string | null | undefined): strategyVersion is DynamicMom36StrategyVersion {
   return strategyVersion === DYNAMIC_MOM36_SHOCK_36H_V1 ||
     strategyVersion === DYNAMIC_MOM36_CONTINUATION_SL2_MFE30_36H_V3 ||
-    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4;
+    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_SL2_MFE30_36H_V4 ||
+    strategyVersion === DYNAMIC_MOM36_CONTINUATION_SLOWFAST_PREFERRED_SL2_MFE30_36H_V5;
 }

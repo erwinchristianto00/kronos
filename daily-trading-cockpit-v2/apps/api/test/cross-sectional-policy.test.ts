@@ -182,4 +182,25 @@ describe("cross-sectional effective runtime policy", () => {
       horizonHours: 36,
     });
   });
+
+  it("keeps V5 on the same continuation exit contract while versioning its fallback policy separately", () => {
+    const env = {
+      CROSS_SECTIONAL_STRATEGY_VERSION: "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+      CROSS_SECTIONAL_POLICY_VERSION: "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+      CROSS_SECTIONAL_INTERVAL: "1h",
+      CROSS_SECTIONAL_MOMENTUM_BARS: "36",
+    } as NodeJS.ProcessEnv;
+
+    expect(buildCurrentCrossSectionalPolicyFingerprint("2026-08-26T06:20:00.000Z", env).strategy).toMatchObject({
+      strategyVersion: "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+      continuationArtifactId: "dm-36h-v4-20260824T153338Z:sha256:4b49fd53aeb271185cd79f652f98ea1b50eb1395771cc6309a7a5964c9563114",
+      slowFastPolicyId: "slow-fast-mom36-fast4h-strict-sign-v1",
+    });
+    expect(currentCrossSectionalExitPolicy(env).dynamicV3Exit).toMatchObject({
+      hardCutLossNetReturn: -0.02,
+      mfeArmNetReturn: 0.03,
+      mfeGivebackFraction: 0.30,
+      horizonHours: 36,
+    });
+  });
 });
