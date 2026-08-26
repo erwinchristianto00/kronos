@@ -48,7 +48,7 @@ describe("GET /api/live/open-basket-chart", () => {
   it.each([
     ["15m", 192],
     ["1h", 168],
-    ["4h", 18],
+    ["4h", 96],
     ["1d", 120],
   ] as const)("serves the selectable %s historical window", async (interval, limit) => {
     const marketCandles = vi.fn(async () => [{
@@ -93,7 +93,7 @@ describe("GET /api/live/open-basket-chart", () => {
       expect(response.statusCode).toBe(200);
       expect(marketCandles).toHaveBeenCalledWith("SOLUSDT", "1d", 120);
       expect(marketCandles).toHaveBeenCalledWith("SOLUSDT", "5m", 576);
-      expect(marketCandles).toHaveBeenCalledWith("SOLUSDT", "4h", 18);
+      expect(marketCandles).toHaveBeenCalledWith("SOLUSDT", "4h", 96);
       expect(response.json()).toMatchObject({
         ok: true,
         symbol: "SOLUSDT",
@@ -144,7 +144,7 @@ describe("GET /api/live/open-basket-chart", () => {
       expect(response.statusCode).toBe(200);
       expect(marketCandles).toHaveBeenCalledWith("OPUSDT", "1d", 120);
       expect(marketCandles).toHaveBeenCalledWith("OPUSDT", "5m", 576);
-      expect(marketCandles).not.toHaveBeenCalledWith("OPUSDT", "4h", 18);
+      expect(marketCandles).not.toHaveBeenCalledWith("OPUSDT", "4h", 96);
       expect(response.json()).toMatchObject({
         ok: true,
         chartKind: "DAILY_RANGE_TRADE",

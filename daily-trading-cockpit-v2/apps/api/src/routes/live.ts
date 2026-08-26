@@ -99,10 +99,12 @@ const OPEN_BASKET_CHART_LIMITS = {
   "5m": 576,  // 48h
   "1d": 120,  // 120 completed daily candles
   // Kept for the older read-only chart clients and for the prior-UTC-day range
-  // reference that the new 5m view draws.
+  // reference that the new 5m view draws.  The 4h selector needs a complete
+  // EMA50 plus enough completed pivots to render structural trendlines; this
+  // remains a bounded, display-only USD-M public-candle read.
   "15m": 192,
   "1h": 168,
-  "4h": 18,   // 72h: safely contains the prior UTC 00:00-04:00 bar
+  "4h": 96,   // 16d: full EMA50 + confirmed pivots, including prior UTC 00:00-04:00 bar
 } as const;
 type OpenBasketChartInterval = keyof typeof OPEN_BASKET_CHART_LIMITS;
 const FOUR_HOURS_MS = 4 * 60 * 60_000;

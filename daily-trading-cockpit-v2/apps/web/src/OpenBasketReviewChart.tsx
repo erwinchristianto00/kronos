@@ -4,9 +4,11 @@ import {
   ColorType,
   createChart,
   HistogramSeries,
+  LineSeries,
   LineStyle,
   type UTCTimestamp,
 } from 'lightweight-charts';
+import { calculateEmaSeries, calculateStructuralTrendlines } from './openBasketChartOverlays';
 
 const C = {
   card: '#14222a',
@@ -18,6 +20,10 @@ const C = {
   bad: '#ff6b6b',
   accent: '#f0b54b',
   measure: '#6fb3d6',
+  ema20: '#f0b54b',
+  ema50: '#6f9eff',
+  structuralResistance: '#ff9f66',
+  structuralSupport: '#77b7ff',
 };
 
 const REFRESH_MS = 30_000;
@@ -177,6 +183,8 @@ function CandlePane({
   ariaLabel,
   headerRight,
   error,
+  showMovingAverages = false,
+  showStructuralTrendlines = false,
 }: {
   title: string;
   candles: Candle[];
@@ -184,6 +192,8 @@ function CandlePane({
   ariaLabel: string;
   headerRight?: ReactNode;
   error?: string | null;
+  showMovingAverages?: boolean;
+  showStructuralTrendlines?: boolean;
 }) {
   const host = useRef<HTMLDivElement | null>(null);
 
@@ -226,6 +236,37 @@ function CandlePane({
         title: level.label,
       });
     }
+    if (showMovingAverages) {
+      const addEma = (period: 20 | 50, color: string) => {
+        const values = calculateEmaSeries(candles, period);
+        if (values.length === 0) return;
+        const emaSeries = chart.addSeries(LineSeries, {
+          color,
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+          title: `EMA${period}`,
+        });
+        emaSeries.setData(values.map((point) => ({ time: toTime(point.openTime), value: point.value })));
+      };
+      addEma(20, C.ema20);
+      addEma(50, C.ema50);
+    }
+    if (showStructuralTrendlines) {
+      for (const trendline of calculateStructuralTrendlines(candles)) {
+        const isResistance = trendline.kind === 'RESISTANCE';
+        const series = chart.addSeries(LineSeries, {
+          color: isResistance ? C.structuralResistance : C.structuralSupport,
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+          title: isResistance ? 'Structural resistance · confirmed peaks' : 'Structural support · confirmed troughs',
+        });
+        series.setData(trendline.points.map((point) => ({ time: toTime(point.openTime), value: point.value })));
+      }
+    }
     chart.timeScale().fitContent();
     const resize = () => chart.resize(Math.max(1, node.clientWidth), 300);
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(resize);
@@ -236,7 +277,7 @@ function CandlePane({
       window.removeEventListener('resize', resize);
       chart.remove();
     };
-  }, [candles, levels]);
+  }, [candles, levels, showMovingAverages, showStructuralTrendlines]);
 
   return <div style={{ minWidth: 0, border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden', background: C.sub }}>
     <div style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}`, color: C.text, fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
@@ -359,8 +400,8 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
       : []),
   ] : [];
   const dailyLevels: PriceLevel[] = reference ? [
-    { price: reference.rangeHigh, label: '4H range high · resistance', color: C.accent },
-    { price: reference.rangeLow, label: '4H range low · support', color: C.good },
+    { price: reference.rangeHigh, label: '4H range high · execution breakout', color: C.accent },
+    { price: reference.rangeLow, label: '4H range low · execution breakdown', color: C.good },
     ...tradeLevels,
   ] : tradeLevels;
   const fiveMinuteLevels: PriceLevel[] = reference ? [
@@ -381,7 +422,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   const latestShortAcceptance = acceptanceEvents.filter((event) => event.side === 'SHORT').at(-1);
   const reviewTitle = isDailyRange ? 'Daily Range 4H candle review · klik trade' : 'Basket candle review · klik leg di tabel';
   const ownerNoun = isDailyRange ? 'trade' : 'basket';
-  const historicalTitle = `${historicalIntervalLabel(historicalInterval)} · historical candles + ${isDailyRange ? 'fixed 4H range / trade levels' : 'fixed 4H range high / low'}`;
+  const historicalTitle = `${historicalIntervalLabel(historicalInterval)} · EMA20/EMA50 + structural support / resistance`;
   const historicalControl = <label style={{ color: C.dim, fontSize: 10, fontWeight: 500, whiteSpace: 'nowrap' }}>
     candle{' '}
     <select
@@ -416,14 +457,16 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
           {isDailyRange
             ? <>Referensi eksekusi: candle 4H <strong style={{ color: C.text }}>{reference.dateUtc} 00:00–04:00 UTC</strong> yang dibekukan saat trade dibuat.</>
             : <>Referensi: candle 4H <strong style={{ color: C.text }}>{reference.dateUtc} 00:00–04:00 UTC</strong> (hari kalender sebelum hari ini UTC).</>}
-          Resistance <strong style={{ color: C.accent }}>{formatPrice(reference.rangeHigh)}</strong> · support <strong style={{ color: C.good }}>{formatPrice(reference.rangeLow)}</strong>.
+          Range high <strong style={{ color: C.accent }}>{formatPrice(reference.rangeHigh)}</strong> · range low <strong style={{ color: C.good }}>{formatPrice(reference.rangeLow)}</strong>.
           Acceptance memakai <strong style={{ color: C.text }}>dua close 5m selesai berturut-turut</strong> di luar level tersebut.
-          {' '}Garisnya horizontal karena ini harga high/low range 4H yang tetap, bukan trendline diagonal.
+          {' '}Garis putus-putus ini tetap horizontal karena ini harga high/low range 4H yang dibekukan untuk eksekusi.
+          {' '}Garis penuh oranye/biru di panel historis adalah resistance/support struktural: masing-masing menghubungkan dua pivot peak/trough selesai paling baru dan hanya untuk review visual.
+          {' '}EMA20/EMA50 juga memakai completed candle saja; tidak mengubah formation, entry, sizing, atau exit.
         </> : <span>Level 4H UTC belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
       </div>
       <div style={{ padding: 12, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 12 }}>
-        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} />
-        <CandlePane title={isDailyRange ? '5m · breakout / breakdown + acceptance + native bracket' : '5m · breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} />
+        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines />
+        <CandlePane title={isDailyRange ? '5m · EMA20/EMA50 + breakout / breakdown + acceptance + native bracket' : '5m · EMA20/EMA50 + breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages />
       </div>
       {reference && <div style={{ padding: '0 12px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55 }}>
         Status acceptance sekarang: <strong style={{ color: latestAcceptance === 'LONG' ? C.good : latestAcceptance === 'SHORT' ? C.bad : C.text }}>{latestAcceptance ? `${latestAcceptance} confirmed` : 'belum ada dua close 5m berturut-turut'}</strong>.
