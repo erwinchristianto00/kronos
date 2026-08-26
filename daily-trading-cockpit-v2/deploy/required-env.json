@@ -197,11 +197,11 @@
       "extra": {
         "DAILY_RANGE_AUTO_POOL_ENABLED": {
           "value": "1",
-          "why": "Testnet-only daily 4h lane owns an independent automatic C1/C2 membership pool. Its candidates are enforced disjoint from all cross-sectional basket candidates."
+          "why": "Testnet-only Daily Range lane owns an independent, auto-discovered USD-M C1-C6 pool. It never uses a static symbol catalog and hard-excludes cross-sectional or currently strategy-owned symbols."
         },
         "DAILY_RANGE_AUTO_POOL_REFRESH_MS": {
-          "value": "900000",
-          "why": "Refresh the isolated daily pool every fifteen minutes. Existing daily trades retain their frozen day snapshot and exchange-side brackets."
+          "value": "300000",
+          "why": "Refresh the isolated Daily Range C1-C6 pool every five minutes so its required 5m/4h quality check is current. Existing daily trades retain their frozen day snapshot and exchange-side brackets."
         }
       }
     },

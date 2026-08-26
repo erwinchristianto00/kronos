@@ -52,11 +52,14 @@ import {
 import { CrossSectionalAutoPool } from "./lib/cross-sectional-auto-pool.js";
 import {
   DAILY_RANGE_LANE_ID,
-  DAILY_RANGE_TRADE_NOTIONAL_USD,
   DailyRangeAcceptanceLane,
   DailyRangeLaneStore,
 } from "./lib/daily-4h-range-acceptance-lane.js";
-import { resolveDailyRangeAutoPoolInput } from "./lib/daily-range-auto-pool.js";
+import {
+  DailyRangeAutoPool,
+  type DailyRangeAutoPoolSnapshot,
+  resolveDailyRangeAutoPoolInput,
+} from "./lib/daily-range-auto-pool.js";
 import {
   DYNAMIC_MOM36_SHOCK_SIGNAL,
   DYNAMIC_MOM36_SHOCK_VARIANT,
@@ -1101,6 +1104,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // The daily range lane is deliberately nullable everywhere except the
   // testnet-only construction below.  No live process can construct it.
   let dailyRangeLane: DailyRangeAcceptanceLane | null = null;
+  // The Daily Range pool is a separate C1-C6 universe. Keeping its snapshot behind a getter lets
+  // the Testnet status route expose exactly what was eligible without giving Live any construction
+  // path to this lane.
+  let dailyRangeAutoPoolSnapshot: (() => DailyRangeAutoPoolSnapshot | null) | null = null;
   // Source-chain telemetry is process-local and read-only. It deliberately has
   // no path to an order, an eligibility override, or an execution setting.
   let futuresReferenceHealth: FuturesReferenceHealthTracker | null = null;
@@ -1211,6 +1218,31 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     crossSectionalDirectionalShortExecutor,
     ...innovationSingleSymbolExecutors,
   ];
+  /**
+   * C6 for Daily Range: exclude every symbol another internal strategy currently owns before a
+   * Daily UTC-day universe is frozen. The Daily lane's direct exchange read remains the final
+   * guard for a manual/external position that was not created by an executor.
+   *
+   * Use raw exposure accessors rather than getStatus() so this remains a pure ownership lookup and
+   * cannot recursively enter a strategy's admission gate.
+   */
+  const dailyRangeForeignStrategySymbols = (): string[] => {
+    const symbols = new Set<string>();
+    for (const executor of allCrossSectionalLaneExecutors()) {
+      if (!executor) continue;
+      for (const leg of executor.getOpenUnexitedLegs()) symbols.add(leg.symbol.toUpperCase());
+      for (const orphan of executor.getExposureSnapshot().orphanedLegs) symbols.add(orphan.symbol.toUpperCase());
+    }
+    for (const executor of allSingleSymbolLaneExecutors()) {
+      if (!executor) continue;
+      for (const position of executor.getExposureSnapshot().openPositions) symbols.add(position.symbol.toUpperCase());
+    }
+    // The legacy mirror is not one of the modern executor lists. It may still own an open intent
+    // in the same account, so keeping it out is a safe C6 reservation rather than a late netting
+    // rejection.
+    for (const intent of liveEngine?.getStatus().openIntents ?? []) symbols.add(intent.symbol.toUpperCase());
+    return [...symbols].sort();
+  };
   /** Notional already committed to `symbol` by every OTHER single-symbol executor (excludes
    *  `self` — an instance's own admission is already bounded by its own maxOpenPositions, and
    *  double-counting itself would make the cap tighter than intended).
@@ -1575,23 +1607,22 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // exchange canary is persisted and an operator arms this lane through its
     // own endpoint.
     if (!isTest && liveConfig.env === "testnet") {
-      const dailyRangePoolInput = resolveDailyRangeAutoPoolInput(CROSS_SECTIONAL_UNIVERSE);
-      const dailyRangeAutoPool = new CrossSectionalAutoPool({
+      const dailyRangePoolInput = () => resolveDailyRangeAutoPoolInput(
+        CROSS_SECTIONAL_UNIVERSE,
+        dailyRangeForeignStrategySymbols(),
+      );
+      const dailyRangeAutoPool = new DailyRangeAutoPool({
         dataDir: "data",
         fileName: "daily-range-auto-pool.json",
         fetchImpl: options.fetchImpl,
-        enabledEnvKey: "DAILY_RANGE_AUTO_POOL_ENABLED",
-        refreshEveryMsEnvKey: "DAILY_RANGE_AUTO_POOL_REFRESH_MS",
       });
+      const currentDailyRangePool = () => dailyRangeAutoPool.getSnapshot(dailyRangePoolInput());
+      dailyRangeAutoPoolSnapshot = () => currentDailyRangePool();
       const dailyRangeUniverse = () => {
-        const pool = dailyRangeAutoPool.getSnapshot({
-          ...dailyRangePoolInput,
-          baseLegUsd: DAILY_RANGE_TRADE_NOTIONAL_USD,
-          sizeMultiplier: 1,
-        });
+        const pool = currentDailyRangePool();
         return {
           symbols: pool.activeSymbols,
-          source: `DAILY_RANGE_AUTO_POOL:${pool.state}`,
+          source: "DAILY_RANGE_AUTO_POOL_V2:" + pool.state,
         };
       };
       dailyRangeLane = new DailyRangeAcceptanceLane({
@@ -1605,19 +1636,15 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         environment: "testnet",
       });
       const tickDailyRangeLane = (): void => {
-        void dailyRangeAutoPool.refreshIfDue({
-          ...dailyRangePoolInput,
-          baseLegUsd: DAILY_RANGE_TRADE_NOTIONAL_USD,
-          sizeMultiplier: 1,
-        })
+        void dailyRangeAutoPool.refreshIfDue(dailyRangePoolInput())
           .then(() => dailyRangeLane?.tick())
           .catch((error) => console.error("[daily-range-lane] AUTO_POOL_REFRESH_FAILED", error));
       };
       setTimeout(tickDailyRangeLane, 20_000);
       setInterval(tickDailyRangeLane, 30_000);
       console.log(
-        `[daily-range-lane] READY environment=testnet version=${DAILY_RANGE_LANE_ID} ` +
-        `control=DISARMED pool=DAILY_RANGE_AUTO_POOL candidates=${dailyRangePoolInput.candidateUniverse.length}`,
+        "[daily-range-lane] READY environment=testnet version=" + DAILY_RANGE_LANE_ID +
+        " control=DISARMED pool=DAILY_RANGE_AUTO_POOL_V2 candidates=ALL_USDM_PERPETUAL",
       );
     }
     // Shared account-exposure coordinator (account-exposure-coordinator.ts) — the reserve-then-
@@ -4800,6 +4827,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     configErrors: liveConfig.enabled ? liveConfig.configErrors : [],
     crossSectionalExecutor: () => crossSectionalExecutor,
     dailyRangeLane: () => dailyRangeLane,
+    dailyRangeAutoPoolSnapshot: () => dailyRangeAutoPoolSnapshot?.() ?? null,
     crossSectionalAutoPool: () => crossSectionalAutoPool,
     symbolReliabilitySnapshotGetter: currentSymbolReliabilitySnapshot,
     crossSectionalTrendExecutor: () => crossSectionalTrendExecutor,

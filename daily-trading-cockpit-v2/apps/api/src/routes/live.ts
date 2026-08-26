@@ -34,6 +34,7 @@ import {
 import type { CrossSectionalAutoPool, CrossSectionalAutoPoolSnapshot } from "../lib/cross-sectional-auto-pool.js";
 import type { SymbolReliabilitySnapshot } from "../lib/cross-sectional-symbol-reliability.js";
 import { DAILY_RANGE_LANE_ID, type DailyRangeAcceptanceLane } from "../lib/daily-4h-range-acceptance-lane.js";
+import type { DailyRangeAutoPoolSnapshot } from "../lib/daily-range-auto-pool.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
 import {
   CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
@@ -1312,6 +1313,8 @@ export async function registerLiveRoutes(
     crossSectionalExecutor?: () => CrossSectionalExecutor | null;
     /** Isolated, structurally Testnet-only daily 4h range acceptance lane. */
     dailyRangeLane?: () => DailyRangeAcceptanceLane | null;
+    /** C1-C6 pool evidence for the isolated Testnet Daily Range lane. */
+    dailyRangeAutoPoolSnapshot?: () => DailyRangeAutoPoolSnapshot | null;
     /** Same durable C1/C2 pool consumed by Dynamic formation; status only on this route. */
     crossSectionalAutoPool?: () => CrossSectionalAutoPool | null;
     /** API-owned V1 circuit-breaker state; presentation only, never recalculated by the dashboard. */
@@ -2216,7 +2219,11 @@ export async function registerLiveRoutes(
     if (!lane) {
       return { enabled: false, reason: "daily range lane is available only in the Testnet runtime" };
     }
-    return { enabled: true, ...lane.getStatus() };
+    return {
+      enabled: true,
+      ...lane.getStatus(),
+      autoPool: opts.dailyRangeAutoPoolSnapshot?.() ?? null,
+    };
   });
 
   app.get("/api/live/daily-range-lane/history", async (request, reply) => {
