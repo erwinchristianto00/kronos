@@ -142,21 +142,25 @@
       "value": "0",
       "why": "The Dynamic policy freezes six equal $25 legs and has no confidence-sized learning tier. Keep the old traffic-light scaler OFF in both environments."
     },
+    "KRONOS_RELEASE_SHA": {
+      "value": "fc7018daa5ae8a07275f6fd3bdf9753ea406182a",
+      "why": "Exact source identity for the Dynamic V5 admission-probe fix. It gives newly admitted baskets a distinct immutable policy fingerprint without changing V5 selection, sizing, or exits."
+    },
     "CROSS_SECTIONAL_POLICY_VERSION": {
       "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
       "why": "Active TESTNET Dynamic MOM36 V5 identity. Preserve the already-running continuation, SLOW_AND_FAST preference/fallback, and SL/MFE policy across dashboard-only releases; new evidence must not be reclassified as V4."
     },
     "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-      "value": "2026-08-26T06:20:00Z",
-      "why": "Active TESTNET V5 forward-cohort boundary. It is retained exactly during dashboard-only releases and does not reclassify prior baskets."
+      "value": "2026-08-26T16:52:31Z",
+      "why": "Forward-cohort boundary for the Dynamic V5 admission-probe fix. Older V5 baskets remain historical/incompatible evidence; this starts immediately before the staged Testnet cutover."
     },
     "CROSS_SECTIONAL_STRATEGY_VERSION": {
       "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
       "why": "Active TESTNET Dynamic MOM36 V5 implementation: continuation, MOM36 rank walk, SLOW_AND_FAST preference/fallback, and unchanged SL/MFE exit dispatcher for new baskets only."
     },
     "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
-      "value": "2026-08-26T06:20:00Z",
-      "why": "Active TESTNET V5 deployment timestamp captured in every new basket fingerprint."
+      "value": "2026-08-26T16:52:31Z",
+      "why": "Release timestamp captured in every new Dynamic V5 admission-probe-fix basket fingerprint."
     },
     "CROSS_SECTIONAL_EXEC_VARIANT": {
       "value": "DYNAMIC_MOM36_SHOCK",
@@ -217,24 +221,24 @@
       "role": "mainnet",
       "extra": {
         "KRONOS_RELEASE_SHA": {
-          "value": "41cc9f46975ce74e51814e6747a1b90301086edd",
-          "why": "Exact source identity for the Live-only Dynamic MOM36 V5 policy fence. Every new basket fingerprint records this immutable V5 parity commit, rather than inheriting a prior Plain or Dynamic V1 identity."
+          "value": "fc7018daa5ae8a07275f6fd3bdf9753ea406182a",
+          "why": "Same immutable Dynamic V5 admission-probe-fix source identity as Testnet. Existing Live baskets retain their frozen policy."
         },
         "CROSS_SECTIONAL_POLICY_VERSION": {
           "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
           "why": "Operator-authorized LIVE parity with the active TESTNET Dynamic MOM36 V5 architecture. New LIVE evidence is a separate V5 cohort; existing baskets retain their frozen policy."
         },
         "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-          "value": "2026-08-26T14:08:52Z",
-          "why": "Forward-cohort boundary for the LIVE Dynamic MOM36 V5 parity policy. Prior Plain, Dynamic V1, and legacy baskets remain historical and cannot be mixed into this cohort."
+          "value": "2026-08-26T16:52:31Z",
+          "why": "Forward-cohort boundary for the LIVE Dynamic V5 admission-probe fix. Prior V5 and legacy baskets remain historical and cannot be mixed into this cohort."
         },
         "CROSS_SECTIONAL_STRATEGY_VERSION": {
           "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
           "why": "Use the same V5 breadth, frozen continuation, MOM36 rank walk, SLOW_AND_FAST preference/fallback, and exact-six-leg formation as active TESTNET."
         },
         "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
-          "value": "2026-08-26T14:08:52Z",
-          "why": "Deployment identity frozen into every new LIVE Dynamic MOM36 V5 basket fingerprint."
+          "value": "2026-08-26T16:52:31Z",
+          "why": "Deployment identity frozen into every new LIVE Dynamic V5 admission-probe-fix basket fingerprint."
         },
         "CROSS_SECTIONAL_EXEC_VARIANT": {
           "value": "DYNAMIC_MOM36_SHOCK",
