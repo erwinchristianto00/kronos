@@ -297,6 +297,72 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     expect(b.scoreGap).toBeGreaterThanOrEqual(0.05);
   });
 
+  describe("[FILTERED SIDE TREND] refuses to force a symbol onto the wrong side", () => {
+    const common = {
+      k: 3,
+      now: T0,
+      openedAtMs: T0ms,
+      horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+      minScoreGap: 0,
+      maxPerCluster: 0,
+    };
+
+    it("uses only slow-and-fast aligned names and fails closed when the market has no eligible hedge side", () => {
+      const aligned = withEnv({ CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "1" }, () =>
+        buildFilteredCrossSectionalBasket([
+          { symbol: "L_REVERSING", score: 0.30, price: 100, fastReturn: -0.01 },
+          { symbol: "L1", score: 0.25, price: 100, fastReturn: 0.03 },
+          { symbol: "L2", score: 0.20, price: 100, fastReturn: 0.02 },
+          { symbol: "L3", score: 0.15, price: 100, fastReturn: 0.01 },
+          { symbol: "S_REVERSING", score: -0.30, price: 100, fastReturn: 0.01 },
+          { symbol: "S1", score: -0.25, price: 100, fastReturn: -0.03 },
+          { symbol: "S2", score: -0.20, price: 100, fastReturn: -0.02 },
+          { symbol: "S3", score: -0.15, price: 100, fastReturn: -0.01 },
+        ], {
+          ...common,
+          longAllowlist: new Set(["L_REVERSING", "L1", "L2", "L3"]),
+          shortAllowlist: new Set(["S_REVERSING", "S1", "S2", "S3"]),
+        }),
+      )!;
+      expect(aligned.longLeg.map((leg) => leg.symbol)).toEqual(["L1", "L2", "L3"]);
+      expect(aligned.shortLeg.map((leg) => leg.symbol)).toEqual(["S1", "S2", "S3"]);
+
+      const fallingOnly: ScoredSymbol[] = [
+        { symbol: "F1", score: -0.30, price: 100, fastReturn: -0.03 },
+        { symbol: "F2", score: -0.20, price: 100, fastReturn: -0.02 },
+        { symbol: "F3", score: -0.10, price: 100, fastReturn: -0.01 },
+        { symbol: "F4", score: -0.05, price: 100, fastReturn: -0.01 },
+      ];
+      withEnv({ CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "1" }, () => {
+        expect(buildFilteredCrossSectionalBasket(fallingOnly, {
+          ...common,
+          longAllowlist: new Set(fallingOnly.map((row) => row.symbol)),
+          shortAllowlist: new Set(fallingOnly.map((row) => row.symbol)),
+        })).toBeNull();
+      });
+    });
+
+    it("keeps rank-only selection available only behind the explicit OFF setting", () => {
+      const risingOnly: ScoredSymbol[] = [
+        { symbol: "R1", score: 0.30, price: 100, fastReturn: 0.03 },
+        { symbol: "R2", score: 0.20, price: 100, fastReturn: 0.02 },
+        { symbol: "R3", score: 0.10, price: 100, fastReturn: 0.01 },
+        { symbol: "R4", score: 0.05, price: 100, fastReturn: 0.01 },
+        { symbol: "R5", score: 0.04, price: 100, fastReturn: 0.01 },
+        { symbol: "R6", score: 0.03, price: 100, fastReturn: 0.01 },
+      ];
+      const allSymbols = new Set(risingOnly.map((row) => row.symbol));
+      const legacy = withEnv({ CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "0" }, () =>
+        buildFilteredCrossSectionalBasket(risingOnly, {
+          ...common,
+          longAllowlist: allSymbols,
+          shortAllowlist: allSymbols,
+        }),
+      )!;
+      expect(legacy.shortLeg.map((leg) => leg.symbol)).toEqual(["R6", "R5", "R4"]);
+    });
+  });
+
   it("[SMART BASKET V1] keeps the same FILTERED universe/K but prefers a close-ranked, confirmed normal-range leg over a stretched reversal", () => {
     const detailed: ScoredSymbol[] = [
       // Raw top long, but it just reversed hard after a 3σ extension.  This is the NEAR/AVAX

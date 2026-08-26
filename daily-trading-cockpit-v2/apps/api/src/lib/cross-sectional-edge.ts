@@ -27,9 +27,11 @@ import {
   type SymbolReliabilitySnapshot,
 } from "./cross-sectional-symbol-reliability.js";
 import {
+  crossSectionalFilteredSideTrendAlignment,
   isCrossSectionalSmartBasketLifecycleEnabled,
   isCrossSectionalSmartFormationRerankEnabled,
   type CrossSectionalFormationMode,
+  type CrossSectionalSideTrendAlignment,
 } from "./cross-sectional-runtime-mode.js";
 import {
   DYNAMIC_MOM36_SHOCK_36H_V1,
@@ -772,6 +774,8 @@ interface CrossSectionalBasketOpts {
   regimeFlipExit?: boolean;
   /** Explicit effective mode.  The default follows smartFormation for direct/research callers. */
   formationMode?: CrossSectionalFormationMode;
+  /** FILTERED-only hard side-direction eligibility. OFF preserves the historical rank-only selector. */
+  sideTrendAlignment?: CrossSectionalSideTrendAlignment;
   /** Soft candidate-combination optimizer for the FILTERED formation mode only. */
   smartFormation?: { enabled: boolean; axisScore?: number | null } | null;
 }
@@ -802,6 +806,26 @@ function selectWithClusterCap(sorted: ScoredSymbol[], k: number, maxPerCluster?:
 
 function finiteOrNull(value: number | null | undefined): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * A relative rank alone does not make a valid short or long: in an all-green market the least
+ * positive name is still rising, and in an all-red market the least negative name is still
+ * falling.  When enabled, a FILTERED long must be positive on both MOM36 and the current fast
+ * return; a short must be negative on both. Missing fast data fails closed rather than forcing a
+ * side with incomplete direction evidence.
+ */
+function sideTrendAligned(
+  candidate: ScoredSymbol,
+  side: "LONG" | "SHORT",
+  alignment: CrossSectionalSideTrendAlignment,
+): boolean {
+  if (alignment === "OFF") return true;
+  const fastReturn = finiteOrNull(candidate.fastReturn);
+  if (fastReturn === null) return false;
+  return side === "LONG"
+    ? candidate.score > 0 && fastReturn > 0
+    : candidate.score < 0 && fastReturn < 0;
 }
 
 function clamp(value: number, lo: number, hi: number): number {
@@ -1336,9 +1360,14 @@ export function buildCrossSectionalBasket(
   const mode = opts.selectionMode ?? "MOMENTUM";
   const longK = opts.longK ?? opts.k;
   const shortK = opts.shortK ?? opts.k;
-  const longPoolAll = valid.filter((s) => allowed(s.symbol, opts.longAllowlist, opts.longBlocklist));
+  const sideTrendAlignment = opts.sideTrendAlignment ?? "OFF";
+  const longPoolAll = valid.filter((s) =>
+    allowed(s.symbol, opts.longAllowlist, opts.longBlocklist) && sideTrendAligned(s, "LONG", sideTrendAlignment),
+  );
   const longSortedAll = [...longPoolAll].sort((a, b) => mode === "MEAN_REVERSION" ? a.score - b.score : b.score - a.score);
-  const shortPoolAll = valid.filter((s) => allowed(s.symbol, opts.shortAllowlist, opts.shortBlocklist));
+  const shortPoolAll = valid.filter((s) =>
+    allowed(s.symbol, opts.shortAllowlist, opts.shortBlocklist) && sideTrendAligned(s, "SHORT", sideTrendAlignment),
+  );
   const shortSortedAll = [...shortPoolAll].sort((a, b) => mode === "MEAN_REVERSION" ? b.score - a.score : a.score - b.score);
   // A symbol eligible for BOTH sides (e.g. via CROSS_SECTIONAL_REGIME_SKEW's own allowlists) can
   // only ever fill one leg. Whichever side selects first claims it. Previously long always went
@@ -1920,7 +1949,7 @@ export function filteredWeightingModel(env: NodeJS.ProcessEnv = process.env): Cr
 
 export function buildFilteredCrossSectionalBasket(
   scored: ScoredSymbol[],
-  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
+  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap" | "sideTrendAlignment"> &
     Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap">>,
 ): CrossSectionalObservation | null {
   const rerankEnabled = opts.smartFormation?.enabled === true || (
@@ -1939,6 +1968,7 @@ export function buildFilteredCrossSectionalBasket(
     maxPerCluster: opts.maxPerCluster ?? CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER,
     weightingModel: opts.weightingModel ?? filteredWeightingModel(),
     formationMode,
+    sideTrendAlignment: crossSectionalFilteredSideTrendAlignment(),
     smartFormation: opts.smartFormation ?? { enabled: formationMode === "SMART_FORMATION_RERANK" },
   });
 }

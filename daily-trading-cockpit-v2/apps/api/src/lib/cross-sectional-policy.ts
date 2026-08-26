@@ -9,11 +9,13 @@
 import { createHash } from "node:crypto";
 import {
   crossSectionalAdaptiveExitMode,
+  crossSectionalFilteredSideTrendAlignment,
   crossSectionalFormationMode,
   isCrossSectionalSmartBasketLifecycleEnabled,
   isCrossSectionalSmartFormationRerankEnabled,
   type CrossSectionalAdaptiveExitMode,
   type CrossSectionalFormationMode,
+  type CrossSectionalSideTrendAlignment,
 } from "./cross-sectional-runtime-mode.js";
 import { symbolReliabilityPolicyFingerprint } from "./cross-sectional-symbol-reliability.js";
 import {
@@ -38,7 +40,7 @@ import {
 
 export const CURRENT_POLICY_FINGERPRINT_SCHEMA = "CURRENT_POLICY_FORWARD_COHORT_V3" as const;
 
-type RuntimeConfigState = "EFFECTIVE" | "CONFIG_INEFFECTIVE";
+export type RuntimeConfigState = "EFFECTIVE" | "CONFIG_INEFFECTIVE";
 
 export type CrossSectionalExitPolicySnapshot = {
   measurementHorizonBars: number | null;
@@ -88,6 +90,11 @@ export type CrossSectionalPolicyFingerprint = {
     deploymentTimestamp: string | null;
     policyVersion: string;
     variant: string;
+    /** What the executor was explicitly configured to consume before runtime validation. */
+    configuredVariant?: string;
+    /** Explicitly distinguishes balanced Plain MOM36 from breadth-driven directional geometry. */
+    selectionMode?: CrossSectionalSelectionMode;
+    selectionState?: RuntimeConfigState;
     momentumBars: number | null;
     legsPerSide: number | null;
   };
@@ -102,6 +109,7 @@ export type CrossSectionalPolicyFingerprint = {
     weighting: string;
     formationMode: CrossSectionalFormationMode;
     smartFormationRerank: boolean;
+    sideTrendAlignment: CrossSectionalSideTrendAlignment;
     entryRevalidationEnabled: boolean;
     entryHealthBypassed: boolean;
   };
@@ -113,6 +121,7 @@ export type CrossSectionalEffectiveRuntime = {
   /** Direct, effective behaviour labels for API/dashboard consumers. */
   strategyVersion: string;
   formationMode: CrossSectionalFormationMode;
+  sideTrendAlignment: CrossSectionalSideTrendAlignment;
   adaptiveExitMode: CrossSectionalAdaptiveExitMode;
   entryRevalidation: boolean;
   executorTick: {
@@ -133,6 +142,7 @@ export type CrossSectionalEffectiveRuntime = {
     effective: boolean;
     state: RuntimeConfigState;
   };
+  selection: CrossSectionalSelectionRuntime;
   mismatches: Array<{ key: string; configured: unknown; effective: unknown; reason: string }>;
 };
 
@@ -148,6 +158,99 @@ const parseFiniteNumber = (raw: string | undefined): number | null => {
 
 const parseSymbols = (raw: string | undefined): string[] =>
   [...new Set((raw ?? "").split(",").map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))].sort();
+
+export type CrossSectionalSelectionMode = "PLAIN_MOM36_3L3S" | "DYNAMIC_MOM36_BREADTH";
+
+/**
+ * The only admission contract for the cross-sectional executor.
+ *
+ * Dynamic MOM36 is intentionally permitted to use breadth-driven 6L0S through 0L6S geometry.
+ * Plain MOM36 is intentionally a balanced 3L/3S basket.  A strategy-version/variant mismatch
+ * used to let the app silently run Dynamic selection while the environment/dashboard claimed the
+ * legacy FILTERED contract.  Expose it here so app.ts can fail closed before an order is possible.
+ */
+export type CrossSectionalSelectionRuntime = {
+  strategyVersion: string;
+  configuredVariant: string;
+  effectiveVariant: "FILTERED" | typeof DYNAMIC_MOM36_SHOCK_VARIANT;
+  selectionMode: CrossSectionalSelectionMode;
+  geometry: "3L/3S" | "BREADTH_6_TOTAL";
+  sideTrendAlignment: CrossSectionalSideTrendAlignment;
+  state: RuntimeConfigState;
+  reason: string | null;
+};
+
+export function crossSectionalSelectionRuntime(
+  env: NodeJS.ProcessEnv = process.env,
+): CrossSectionalSelectionRuntime {
+  const strategyVersion = crossSectionalStrategyVersion(env);
+  const dynamic = isDynamicMom36ShockStrategy(env);
+  const configuredVariant = (env.CROSS_SECTIONAL_EXEC_VARIANT ?? "FILTERED").trim().toUpperCase() || "FILTERED";
+  const effectiveVariant = dynamic ? DYNAMIC_MOM36_SHOCK_VARIANT : "FILTERED";
+  const configuredK = parsePositiveNumber(env.CROSS_SECTIONAL_K) ?? 3;
+  const regimeSkewEnabled = env.CROSS_SECTIONAL_REGIME_SKEW_ENABLED === "1";
+  const sideTrendAlignment = crossSectionalFilteredSideTrendAlignment(env);
+  const mode: CrossSectionalSelectionMode = dynamic ? "DYNAMIC_MOM36_BREADTH" : "PLAIN_MOM36_3L3S";
+
+  if (configuredVariant !== effectiveVariant) {
+    return {
+      strategyVersion,
+      configuredVariant,
+      effectiveVariant,
+      selectionMode: mode,
+      geometry: dynamic ? "BREADTH_6_TOTAL" : "3L/3S",
+      sideTrendAlignment,
+      state: "CONFIG_INEFFECTIVE",
+      reason: `CROSS_SECTIONAL_EXEC_VARIANT=${configuredVariant} conflicts with ${strategyVersion}, which requires ${effectiveVariant}`,
+    };
+  }
+  if (!dynamic && configuredK !== 3) {
+    return {
+      strategyVersion,
+      configuredVariant,
+      effectiveVariant,
+      selectionMode: mode,
+      geometry: "3L/3S",
+      sideTrendAlignment,
+      state: "CONFIG_INEFFECTIVE",
+      reason: `Plain MOM36 production contract requires CROSS_SECTIONAL_K=3; got ${configuredK}`,
+    };
+  }
+  if (!dynamic && regimeSkewEnabled) {
+    return {
+      strategyVersion,
+      configuredVariant,
+      effectiveVariant,
+      selectionMode: mode,
+      geometry: "3L/3S",
+      sideTrendAlignment,
+      state: "CONFIG_INEFFECTIVE",
+      reason: "Plain MOM36 production contract requires CROSS_SECTIONAL_REGIME_SKEW_ENABLED=0 to preserve 3L/3S geometry",
+    };
+  }
+  if (!dynamic && sideTrendAlignment !== "SLOW_AND_FAST") {
+    return {
+      strategyVersion,
+      configuredVariant,
+      effectiveVariant,
+      selectionMode: mode,
+      geometry: "3L/3S",
+      sideTrendAlignment,
+      state: "CONFIG_INEFFECTIVE",
+      reason: "Plain MOM36 production contract requires CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT=1 (SLOW_AND_FAST)",
+    };
+  }
+  return {
+    strategyVersion,
+    configuredVariant,
+    effectiveVariant,
+    selectionMode: mode,
+    geometry: dynamic ? "BREADTH_6_TOTAL" : "3L/3S",
+    sideTrendAlignment,
+    state: "EFFECTIVE",
+    reason: null,
+  };
+}
 
 /** Scheduler interval used by app.ts. Invalid values are never silently treated as a claimed value. */
 export function crossSectionalExecTickMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -225,7 +328,9 @@ export function currentCrossSectionalExitPolicy(env: NodeJS.ProcessEnv = process
     legNotionalUsd: parsePositiveNumber(env.CROSS_SECTIONAL_EXEC_LEG_USD),
     leverage: parsePositiveNumber(env.CROSS_SECTIONAL_EXEC_LEVERAGE),
     maxOpenBaskets: parsePositiveNumber(env.CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS),
-    ordinaryContextInvalidationEnabled: true,
+    // Plain MOM36 is Hold-to-36h while adaptive exits are OFF.  Persist this explicitly so a
+    // future lifecycle refactor cannot reinterpret a new basket as eligible for a context exit.
+    ordinaryContextInvalidationEnabled: false,
   };
 }
 
@@ -256,8 +361,9 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
   nowIso: string,
   env: NodeJS.ProcessEnv = process.env,
 ): CrossSectionalPolicyFingerprint {
-  const dynamic = isDynamicMom36ShockStrategy(env);
-  const strategyVersion = crossSectionalStrategyVersion(env);
+  const selection = crossSectionalSelectionRuntime(env);
+  const dynamic = selection.selectionMode === "DYNAMIC_MOM36_BREADTH";
+  const strategyVersion = selection.strategyVersion;
   const dynamicContinuation = isDynamicMom36ContinuationVersion(strategyVersion);
   const dynamicSlowFast = isDynamicMom36SlowFastVersion(strategyVersion);
   const sourceSha = env.KRONOS_RELEASE_SHA?.trim() || "UNKNOWN_SOURCE_SHA";
@@ -280,7 +386,10 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
       slowFastImplementationVersion: dynamicSlowFast ? DYNAMIC_MOM36_SLOW_FAST_IMPLEMENTATION_VERSION : null,
       deploymentTimestamp: validIso(env.CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT),
       policyVersion: env.CROSS_SECTIONAL_POLICY_VERSION?.trim() || "UNVERSIONED_POLICY",
-      variant: dynamic ? DYNAMIC_MOM36_SHOCK_VARIANT : env.CROSS_SECTIONAL_EXEC_VARIANT?.trim() || "FILTERED",
+      variant: selection.effectiveVariant,
+      configuredVariant: selection.configuredVariant,
+      selectionMode: selection.selectionMode,
+      selectionState: selection.state,
       momentumBars: parsePositiveNumber(env.CROSS_SECTIONAL_MOMENTUM_BARS),
       legsPerSide: parsePositiveNumber(env.CROSS_SECTIONAL_K) ?? 3,
     },
@@ -298,6 +407,7 @@ export function buildCurrentCrossSectionalPolicyFingerprint(
       weighting: dynamic ? "EQUAL_NOTIONAL" : env.CROSS_SECTIONAL_FILTERED_WEIGHTING?.trim().toUpperCase() || "EQUAL_NOTIONAL",
       formationMode: dynamic ? "PLAIN_MOM36" : crossSectionalFormationMode(env),
       smartFormationRerank: dynamic ? false : isCrossSectionalSmartFormationRerankEnabled(env),
+      sideTrendAlignment: dynamic ? "OFF" : crossSectionalFilteredSideTrendAlignment(env),
       entryRevalidationEnabled: dynamic ? false : isCrossSectionalSmartBasketLifecycleEnabled(env),
       entryHealthBypassed: env.CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH === "1",
     },
@@ -317,7 +427,8 @@ export function effectiveCrossSectionalRuntime(
   supportsMakerExit: boolean,
   env: NodeJS.ProcessEnv = process.env,
 ): CrossSectionalEffectiveRuntime {
-  const dynamic = isDynamicMom36ShockStrategy(env);
+  const selection = crossSectionalSelectionRuntime(env);
+  const dynamic = selection.selectionMode === "DYNAMIC_MOM36_BREADTH";
   const rawTick = env.CROSS_SECTIONAL_EXEC_TICK_MS ?? null;
   const parsedTick = rawTick === null ? null : Number.parseInt(rawTick, 10);
   const tickValid = rawTick === null || (parsedTick !== null && Number.isFinite(parsedTick) && parsedTick >= 1_000 && parsedTick <= 300_000);
@@ -340,9 +451,24 @@ export function effectiveCrossSectionalRuntime(
       reason: "executor lacks the quote, cancel, or client-order lookup path required for a safe post-only exit",
     });
   }
+  if (selection.state !== "EFFECTIVE") {
+    mismatches.push({
+      key: "CROSS_SECTIONAL_SELECTION_RUNTIME",
+      configured: {
+        strategyVersion: selection.strategyVersion,
+        variant: selection.configuredVariant,
+        k: env.CROSS_SECTIONAL_K ?? "3",
+        regimeSkewEnabled: env.CROSS_SECTIONAL_REGIME_SKEW_ENABLED === "1",
+        sideTrendAlignment: selection.sideTrendAlignment,
+      },
+      effective: "NO_NEW_BASKETS",
+      reason: selection.reason ?? "selection contract is not effective",
+    });
+  }
   return {
-    strategyVersion: crossSectionalStrategyVersion(env),
+    strategyVersion: selection.strategyVersion,
     formationMode: dynamic ? "PLAIN_MOM36" : crossSectionalFormationMode(env),
+    sideTrendAlignment: dynamic ? "OFF" : selection.sideTrendAlignment,
     adaptiveExitMode: dynamic ? "OFF" : crossSectionalAdaptiveExitMode(env),
     entryRevalidation: !dynamic && isCrossSectionalSmartBasketLifecycleEnabled(env),
     executorTick: {
@@ -363,6 +489,7 @@ export function effectiveCrossSectionalRuntime(
       effective: dynamic ? false : isCrossSectionalAdaptiveExitEnabled(env),
       state: "EFFECTIVE",
     },
+    selection,
     mismatches,
   };
 }

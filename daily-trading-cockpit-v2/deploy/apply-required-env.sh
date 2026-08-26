@@ -6,8 +6,9 @@
 #   deploy/apply-required-env.sh --check <path/to/.env> [id]   # exit 1 if anything drifted
 #   deploy/apply-required-env.sh --apply <path/to/.env> [id]   # back up, then set what drifted
 #
-# The optional instance id merges instances.<id>.extra on top of shared. This rollout has no
-# instance override because TESTNET and LIVE must run identical strategy settings.
+# The optional instance id merges instances.<id>.extra on top of shared. A strategy-affecting
+# override is permitted only when it is an explicit, versioned policy fence (for example, a
+# Live-only safety restoration while Testnet intentionally remains on an incumbent experiment).
 #
 # WHY THIS EXISTS: a release dir gets a REAL .env, not a symlink. A cutover that forgets to carry
 # these forward reverts them to code defaults, and nothing fails loudly — the 36h hold policy was

@@ -41,7 +41,7 @@ import {
   isCrossSectionalTrendMixedAdmissionIndependent,
   crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
-import { crossSectionalExecTickMs } from "./lib/cross-sectional-policy.js";
+import { crossSectionalExecTickMs, crossSectionalSelectionRuntime } from "./lib/cross-sectional-policy.js";
 import {
   buildCrossSectionalReport,
   CROSS_SECTIONAL_FILTERED_SIGNAL,
@@ -63,8 +63,6 @@ import {
 } from "./lib/daily-range-auto-pool.js";
 import {
   DYNAMIC_MOM36_SHOCK_SIGNAL,
-  DYNAMIC_MOM36_SHOCK_VARIANT,
-  isDynamicMom36ShockStrategy,
 } from "./lib/dynamic-mom36-shock-strategy.js";
 import { CrossSectionalSymbolReliabilityStore } from "./lib/cross-sectional-symbol-reliability.js";
 import {
@@ -2478,7 +2476,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       };
     };
 
-    const dynamicMom36ShockStrategyActive = isDynamicMom36ShockStrategy();
+    const selectionRuntime = crossSectionalSelectionRuntime();
+    const dynamicMom36ShockStrategyActive = selectionRuntime.selectionMode === "DYNAMIC_MOM36_BREADTH";
 
     // Cross-sectional market-neutral EXECUTOR (testnet-first). Env-gated; on mainnet
     // it additionally requires the engine to be ARMED, so the flag alone can never
@@ -2490,7 +2489,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         client: liveClient,
         signalStore: getCrossSectionalStore(),
         store: crossSectionalExecutorStore,
-        targetVariant: dynamicMom36ShockStrategyActive ? DYNAMIC_MOM36_SHOCK_VARIANT : undefined,
+        targetVariant: selectionRuntime.effectiveVariant,
         // These are strategy invariants, not mutable allocation settings. Legacy baskets retain
         // their own frozen fingerprint and are handled by versioned exit dispatch in the executor.
         legUsd: dynamicMom36ShockStrategyActive ? () => 25 : undefined,
@@ -2506,6 +2505,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // via canOpenNewEntriesIgnoringManualDirectional()) — otherwise fall back to the original,
         // fully-coupled behavior so disabling the flag really does disable independence, not just sizing.
         isAllowed: () => {
+          if (selectionRuntime.state !== "EFFECTIVE") return false;
           if (dynamicMom36ShockStrategyActive) {
             // Dynamic MOM36 owns its 6L0S...0L6S allocation. A manual directional selector has
             // no compatible per-symbol bias for that frozen basket and must not turn a valid
@@ -2546,6 +2546,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         fourBrainActualFillBindings: fourBrainActualFillBindingsRef ?? undefined,
         fourBrainEntryGate: fourBrainPilotEntryGate,
         entryHealthGate: () => {
+          if (selectionRuntime.state !== "EFFECTIVE") {
+            return { allowed: false, reason: selectionRuntime.reason ?? "cross-sectional selection configuration is ineffective" };
+          }
           // Dynamic MOM36's admission is frozen in cross-sectional-edge.ts (pool, freshness,
           // score gap, cluster, liquidity, cooldown, hard operational guards). The legacy rolling
           // FILTERED cohort health is not a compatible selector for a newly-versioned strategy and

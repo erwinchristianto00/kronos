@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCurrentCrossSectionalPolicyFingerprint,
+  crossSectionalSelectionRuntime,
   currentCrossSectionalExitPolicy,
   effectiveCrossSectionalRuntime,
   legacyCrossSectionalExitPolicy,
@@ -29,6 +30,7 @@ describe("cross-sectional effective runtime policy", () => {
       weighting: "CAPPED_SCORE_RANK",
     });
     expect(fingerprint.execution).toMatchObject({ adaptiveExitsEnabled: false, adaptiveExitMode: "OFF" });
+    expect(fingerprint.execution.ordinaryContextInvalidationEnabled).toBe(false);
     expect(fingerprint.reliability).toMatchObject({
       version: "SYMBOL_RELIABILITY_V1",
       enabled: false,
@@ -63,6 +65,47 @@ describe("cross-sectional effective runtime policy", () => {
       entryRevalidation: false,
       adaptiveExitMode: "ON",
     });
+  });
+
+  it("makes selection-policy drift fail closed instead of silently changing 3L/3S geometry", () => {
+    const plain = crossSectionalSelectionRuntime({
+      CROSS_SECTIONAL_STRATEGY_VERSION: "plain-mom36-filtered-3l3s-36h-usdm-v1",
+      CROSS_SECTIONAL_EXEC_VARIANT: "FILTERED",
+      CROSS_SECTIONAL_K: "3",
+      CROSS_SECTIONAL_REGIME_SKEW_ENABLED: "0",
+      CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "1",
+    } as NodeJS.ProcessEnv);
+    expect(plain).toMatchObject({
+      selectionMode: "PLAIN_MOM36_3L3S",
+      effectiveVariant: "FILTERED",
+      geometry: "3L/3S",
+      state: "EFFECTIVE",
+    });
+
+    const drift = crossSectionalSelectionRuntime({
+      CROSS_SECTIONAL_STRATEGY_VERSION: "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
+      CROSS_SECTIONAL_EXEC_VARIANT: "FILTERED",
+      CROSS_SECTIONAL_K: "3",
+      CROSS_SECTIONAL_REGIME_SKEW_ENABLED: "0",
+      CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "1",
+    } as NodeJS.ProcessEnv);
+    expect(drift).toMatchObject({
+      selectionMode: "DYNAMIC_MOM36_BREADTH",
+      effectiveVariant: "DYNAMIC_MOM36_SHOCK",
+      state: "CONFIG_INEFFECTIVE",
+    });
+
+    const runtime = effectiveCrossSectionalRuntime(true, {
+      CROSS_SECTIONAL_STRATEGY_VERSION: "plain-mom36-filtered-3l3s-36h-usdm-v1",
+      CROSS_SECTIONAL_EXEC_VARIANT: "FILTERED",
+      CROSS_SECTIONAL_K: "3",
+      CROSS_SECTIONAL_REGIME_SKEW_ENABLED: "1",
+      CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "1",
+    } as NodeJS.ProcessEnv);
+    expect(runtime.selection).toMatchObject({ state: "CONFIG_INEFFECTIVE", geometry: "3L/3S" });
+    expect(runtime.mismatches).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: "CROSS_SECTIONAL_SELECTION_RUNTIME", effective: "NO_NEW_BASKETS" }),
+    ]));
   });
 
   it("freezes Reliability V1 in the policy identity only when explicitly enabled", () => {

@@ -6,9 +6,9 @@
     "forward silently reverts them to code defaults. That is not hypothetical: the 36h hold policy",
     "was lost exactly this way once (2026-08-05), and nothing failed loudly when it happened.",
     "",
-    "'shared' applies identically to TESTNET and LIVE for this versioned strategy.",
-    "Instance-specific values belong in 'instances.<id>.extra' only when they cannot alter strategy",
-    "formation, sizing, risk, or exit behavior. This rollout intentionally has no such divergence.",
+    "'shared' applies identically to TESTNET and LIVE unless an explicitly documented real-money",
+    "policy fence appears under instances.<id>.extra. A Live-only fence must carry a new strategy",
+    "version and forward-cohort timestamp so neither side can silently inherit the other's selector.",
     "",
     "Apply or verify with deploy/apply-required-env.sh. Run --check after EVERY cutover.",
     "Values here are per-lane policy, never secrets — API keys stay out of version control."
@@ -208,6 +208,70 @@
     "3103": {
       "role": "mainnet",
       "extra": {
+        "CROSS_SECTIONAL_POLICY_VERSION": {
+          "value": "plain-mom36-filtered-3l3s-slowfast-36h-usdm-v1",
+          "why": "Live-only policy fence after the audited Dynamic MOM36 breadth drift. New LIVE evidence is a separate Plain MOM36 3L/3S cohort; Testnet remains unchanged on its existing V5 runtime."
+        },
+        "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
+          "value": "2026-08-26T13:30:00Z",
+          "why": "Forward-cohort boundary for the restored LIVE Plain MOM36 policy. Prior Dynamic and legacy baskets remain historical and cannot be mixed into this cohort."
+        },
+        "CROSS_SECTIONAL_STRATEGY_VERSION": {
+          "value": "plain-mom36-filtered-3l3s-slowfast-36h-usdm-v1",
+          "why": "Select the canonical balanced Plain MOM36 production path for LIVE: filtered universe, exactly three long and three short legs, no Dynamic breadth allocation."
+        },
+        "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
+          "value": "2026-08-26T13:30:00Z",
+          "why": "Deployment identity frozen into every new LIVE basket fingerprint under the restored Plain MOM36 policy."
+        },
+        "CROSS_SECTIONAL_EXEC_VARIANT": {
+          "value": "FILTERED",
+          "why": "The executor must consume only canonical FILTERED Plain MOM36 signals. A Dynamic variant/strategy mismatch now fail-closes new basket admission."
+        },
+        "CROSS_SECTIONAL_K": {
+          "value": "3",
+          "why": "Pin LIVE to exactly 3L/3S. Any other K makes the selection runtime CONFIG_INEFFECTIVE and blocks new baskets."
+        },
+        "CROSS_SECTIONAL_REGIME_SKEW_ENABLED": {
+          "value": "0",
+          "why": "Live restored policy is market-neutral 3L/3S; regime skew cannot alter its geometry."
+        },
+        "CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT": {
+          "value": "1",
+          "why": "Hard slow-MOM36 plus fast-confirmation eligibility. In a one-direction market, LIVE does not force the least-negative names into longs or the least-positive names into shorts; it emits NO_TRADE instead."
+        },
+        "CROSS_SECTIONAL_FILTERED_WEIGHTING": {
+          "value": "CAPPED_SCORE_RANK",
+          "why": "Canonical capped score-rank weighting for Plain MOM36, frozen separately from Dynamic equal-notional sizing."
+        },
+        "CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP": {
+          "value": "0.058",
+          "why": "Canonical production score-gap floor for the restored LIVE Plain MOM36 policy."
+        },
+        "CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER": {
+          "value": "2",
+          "why": "Concentration guardrail retained exactly for the restored LIVE Plain MOM36 policy."
+        },
+        "CROSS_SECTIONAL_SMART_FORMATION_RERANK": {
+          "value": "0",
+          "why": "Plain MOM36 rank only. Smart Basket lifecycle remains available but cannot utility-rerank LIVE symbol selection."
+        },
+        "CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS": {
+          "value": "36",
+          "why": "Keep the existing hard 36-hour execution cap for new LIVE baskets; the 48-hour value remains a measurement horizon only."
+        },
+        "CROSS_SECTIONAL_EXEC_TP_DISABLED": {
+          "value": "1",
+          "why": "No ordinary TP for new LIVE Plain MOM36 baskets; Hold-to-36h remains the production comparator. Existing baskets retain their frozen policy."
+        },
+        "CROSS_SECTIONAL_EXEC_STOP_NET_RETURN": {
+          "value": "0",
+          "why": "No new ordinary stop-loss policy is introduced by this selector repair. Existing basket exits remain frozen."
+        },
+        "CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED": {
+          "value": "0",
+          "why": "Adaptive exits stay OFF for the restored LIVE Plain MOM36 cohort; the change is selection-only."
+        },
         "DAILY_RANGE_AUTO_POOL_ENABLED": {
           "value": "1",
           "why": "Prepare the Live Daily Range C1-C6 universe with the same public USD-M evidence contract as Testnet. Observation only; lane execution remains independently disabled below."
