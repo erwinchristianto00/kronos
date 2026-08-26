@@ -15,6 +15,7 @@ import { dirname, resolve } from "node:path";
 
 import {
   BinanceFuturesPrivateError,
+  withBinanceTransportSource,
   type BinanceFuturesPrivateClient,
   type FuturesAlgoOrder,
   type FuturesIncomeEntry,
@@ -838,6 +839,10 @@ export class DailyRangeAcceptanceLane {
    * once for every completed 5m candle.
    */
   async tick(): Promise<void> {
+    return withBinanceTransportSource("daily-range.tick", () => this.runTick());
+  }
+
+  private async runTick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     const startedAt = this.nowMs();
@@ -1630,7 +1635,16 @@ export class DailyRangeAcceptanceLane {
     const active = this.store.getState().trades.filter((trade) =>
       ["PROTECTING", "OPEN", "EXIT_RECONCILING"].includes(trade.status),
     );
-    if (active.length === 0) return;
+    if (active.length === 0) {
+      // A prior transport failure is historical once there is no open lane exposure left to
+      // reconcile. Keeping it forever makes the status endpoint look exchange-broken after a
+      // successful close/restart even though there is no unresolved safety obligation.
+      if (this.store.getState().runtime.reconciliationError !== null) {
+        this.store.getState().runtime.reconciliationError = null;
+        this.store.save();
+      }
+      return;
+    }
     let positions: FuturesPosition[];
     let algos: FuturesAlgoOrder[];
     try {
@@ -1671,6 +1685,10 @@ export class DailyRangeAcceptanceLane {
         trade.status = "OPEN";
       }
     }
+    // This reaches only after the complete account snapshot and every active bracket have been
+    // verified. Clear the lane-level transport alarm here, rather than merely clearing each trade,
+    // so `/daily-range-lane/status` cannot keep reporting a stale HTTP 418 after recovery.
+    this.store.getState().runtime.reconciliationError = null;
     this.store.save();
   }
 

@@ -7,6 +7,7 @@ import {
   resolveLiveBinanceBaseUrl,
   resolveLiveBinanceEnv,
   signQueryString,
+  withBinanceTransportSource,
 } from "../src/lib/binance-futures-private.js";
 import { fillFromUserTrade } from "../src/lib/execution-fill-recorder.js";
 
@@ -176,6 +177,116 @@ describe("binance-futures-private signing", () => {
     await expect(client.getPositions()).resolves.toEqual([]);
     expect(urls.filter((url) => url.includes("/fapi/v2/positionRisk"))).toHaveLength(1);
     expect(client.getRateLimitStatus().coolingDown).toBe(false);
+  });
+
+  it("spaces signed reads globally and exposes safe caller/endpoint/weight telemetry", async () => {
+    let nowMs = 1_700_000_000_000;
+    const waits: number[] = [];
+    const signedDispatches: Array<{ path: string; at: number }> = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      if (value.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+      }
+      if (value.includes("/fapi/v2/balance")) {
+        signedDispatches.push({ path: "/fapi/v2/balance", at: nowMs });
+        return new Response(JSON.stringify([{ asset: "USDT", balance: "1", availableBalance: "1" }]), {
+          status: 200,
+          headers: { "x-mbx-used-weight-1m": "10" },
+        });
+      }
+      if (value.includes("/fapi/v2/positionRisk")) {
+        signedDispatches.push({ path: "/fapi/v2/positionRisk", at: nowMs });
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "x-mbx-used-weight-1m": "14" },
+        });
+      }
+      throw new Error(`unexpected URL ${value}`);
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "testnet",
+      fetchImpl,
+      nowMs: () => nowMs,
+      signedReadMinIntervalMs: 1_000,
+      sleep: async (ms) => { waits.push(ms); nowMs += ms; },
+    });
+
+    await withBinanceTransportSource("dashboard.account", async () => {
+      await Promise.all([client.getBalances(), client.getPositions()]);
+    });
+
+    expect(signedDispatches).toEqual([
+      { path: "/fapi/v2/balance", at: 1_700_000_000_000 },
+      { path: "/fapi/v2/positionRisk", at: 1_700_000_001_000 },
+    ]);
+    expect(waits).toEqual([1_000]);
+    expect(client.getRateLimitStatus()).toMatchObject({
+      coolingDown: false,
+      readBudget: {
+        signedReadMinIntervalMs: 1_000,
+        queuedReads: 0,
+        nextEligibleAt: new Date(1_700_000_002_000).toISOString(),
+      },
+    });
+    const signedEvents = client.getRateLimitStatus().recentRequests.filter((event) => event.signed);
+    expect(signedEvents).toEqual([
+      expect.objectContaining({
+        source: "dashboard.account",
+        path: "/fapi/v2/balance",
+        outcome: "OK",
+        usedWeight1m: 10,
+        usedWeight1mDelta: null,
+        readBudgetWaitMs: 0,
+      }),
+      expect.objectContaining({
+        source: "dashboard.account",
+        path: "/fapi/v2/positionRisk",
+        outcome: "OK",
+        usedWeight1m: 14,
+        usedWeight1mDelta: 4,
+        readBudgetWaitMs: 1_000,
+      }),
+    ]);
+  });
+
+  it("does not make a risk-reducing DELETE wait behind a budgeted signed read", async () => {
+    let nowMs = 1_700_000_000_000;
+    let releaseBudgetWait: (() => void) | null = null;
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      urls.push(value);
+      if (value.includes("/fapi/v1/time")) return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+      if (value.includes("/fapi/v2/balance")) return new Response(JSON.stringify([{ asset: "USDT", balance: "1", availableBalance: "1" }]), { status: 200 });
+      if (value.includes("/fapi/v2/positionRisk")) return new Response(JSON.stringify([]), { status: 200 });
+      if (value.includes("/fapi/v1/allOpenOrders")) return new Response(JSON.stringify({ code: 200 }), { status: 200 });
+      throw new Error(`unexpected URL ${value}`);
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "testnet",
+      fetchImpl,
+      nowMs: () => nowMs,
+      signedReadMinIntervalMs: 1_000,
+      sleep: (ms) => new Promise<void>((resolve) => {
+        releaseBudgetWait = () => { nowMs += ms; resolve(); };
+      }),
+    });
+
+    await client.getBalances(); // consumes the first immediate signed-read slot
+    const queuedRead = client.getPositions();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(releaseBudgetWait).not.toBeNull();
+
+    await client.cancelAllOrders("BTCUSDT");
+    expect(urls.some((url) => url.includes("/fapi/v1/allOpenOrders"))).toBe(true);
+
+    releaseBudgetWait?.();
+    await queuedRead;
   });
 
   it("accepts only actively trading USD-M perpetual filters", async () => {

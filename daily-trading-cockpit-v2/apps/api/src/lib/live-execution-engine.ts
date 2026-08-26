@@ -30,6 +30,7 @@ import {
   BinanceFuturesPrivateError,
   resolveConfirmedFillPrice,
   resolveLiveBinanceEnv,
+  withBinanceTransportSource,
   type BinanceFuturesPrivateClient,
   type FuturesIncomeEntry,
   type FuturesOrder,
@@ -3384,6 +3385,10 @@ export class LiveExecutionEngine {
   // ── tick orchestration ─────────────────────────────────────────────────────
 
   async tick(): Promise<void> {
+    return withBinanceTransportSource("live-engine.tick", () => this.runTick());
+  }
+
+  private async runTick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     this.lastTickError = null;

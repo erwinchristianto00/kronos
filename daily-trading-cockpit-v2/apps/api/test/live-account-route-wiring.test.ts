@@ -1,9 +1,10 @@
 import { describe, it, expect, afterEach } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 
-import { registerLiveRoutes } from "../src/routes/live.js";
+import { registerLiveRoutes, resolveDashboardAccountCacheTtlMs } from "../src/routes/live.js";
 import type { LiveExecutionEngine } from "../src/lib/live-execution-engine.js";
 import { BinanceFuturesPrivateError } from "../src/lib/binance-futures-private.js";
+import type { BinanceFuturesRateLimitStatus } from "../src/lib/binance-futures-private.js";
 import type { CrossSectionalExecutor, ExecutorBasket } from "../src/lib/cross-sectional-executor.js";
 import type { DailyRangeAcceptanceLane, DailyRangeOpenPositionClaim } from "../src/lib/daily-4h-range-acceptance-lane.js";
 import type { SingleSymbolLaneExecutor, SingleSymbolPosition } from "../src/lib/single-symbol-lane-executor.js";
@@ -121,6 +122,50 @@ function fakeDailyRangeAccountSnapshot(): Awaited<ReturnType<LiveExecutionEngine
 let app: FastifyInstance | null = null;
 afterEach(async () => {
   if (app) { await app.close(); app = null; }
+});
+
+describe("dashboard account cache policy", () => {
+  it("uses a slower observability-only cache on Testnet without changing Live", () => {
+    expect(resolveDashboardAccountCacheTtlMs({ LIVE_BINANCE_ENV: "testnet" } as NodeJS.ProcessEnv)).toBe(30_000);
+    expect(resolveDashboardAccountCacheTtlMs({ LIVE_BINANCE_ENV: "mainnet" } as NodeJS.ProcessEnv)).toBe(15_000);
+    expect(resolveDashboardAccountCacheTtlMs({
+      LIVE_BINANCE_ENV: "testnet",
+      LIVE_DASHBOARD_ACCOUNT_CACHE_TTL_MS: "45000",
+    } as NodeJS.ProcessEnv)).toBe(45_000);
+  });
+});
+
+describe("private Binance transport telemetry route", () => {
+  it("returns only bounded, caller-labelled diagnostics without causing account I/O", async () => {
+    const transport: BinanceFuturesRateLimitStatus = {
+      coolingDown: false,
+      retryAt: null,
+      lastHttpStatus: 418,
+      lastFailure: "rate limited (HTTP 418)",
+      readBudget: { signedReadMinIntervalMs: 4_000, queuedReads: 0, nextEligibleAt: null },
+      recentRequests: [{
+        at: "2026-08-26T07:00:00.000Z", source: "cross-sectional.CROSS_SECTIONAL_MARKET_NEUTRAL",
+        method: "GET", path: "/fapi/v2/positionRisk", signed: true, outcome: "OK", httpStatus: 200,
+        durationMs: 42, readBudgetWaitMs: 4_000, usedWeight1m: 12, usedWeight1mDelta: 4, retryAt: null,
+      }],
+    };
+    app = Fastify();
+    await registerLiveRoutes(app, null, { binanceTransportStatus: () => transport });
+    await app.ready();
+
+    const response = await app.inject({ method: "GET", url: "/api/live/binance-transport" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      available: true,
+      coolingDown: false,
+      readBudget: { signedReadMinIntervalMs: 4_000 },
+      recentRequests: [expect.objectContaining({
+        source: "cross-sectional.CROSS_SECTIONAL_MARKET_NEUTRAL",
+        path: "/fapi/v2/positionRisk",
+        usedWeight1mDelta: 4,
+      })],
+    });
+  });
 });
 
 async function buildApp(): Promise<FastifyInstance> {

@@ -24,7 +24,7 @@ import { registerOutcomesRoutes } from "./routes/outcomes.js";
 import { registerScanRoute } from "./routes/scan.js";
 import { registerShadowRoutes } from "./routes/shadow.js";
 import { registerTradingAssistantRoutes } from "./routes/trading-assistant.js";
-import { BinanceFuturesPrivateClient } from "./lib/binance-futures-private.js";
+import { BinanceFuturesPrivateClient, DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS, type BinanceFuturesRateLimitStatus } from "./lib/binance-futures-private.js";
 import { FuturesMarketReferenceCache } from "./lib/futures-market-reference-cache.js";
 import {
   FuturesReferenceHealthTracker,
@@ -1063,6 +1063,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // Declared here (assigned below) so the shadow routes can READ the live engine's in-memory
   // status (sync getStatus, no I/O) for the order-reconciliation readiness gate, via a lazy getter.
   let liveEngine: LiveExecutionEngine | null = null;
+  // Same lazy-getter pattern as liveEngine: routes can expose bounded private-transport evidence
+  // without constructing another client or causing an additional Binance request.
+  let binanceTransportStatusGetter: (() => BinanceFuturesRateLimitStatus) | null = null;
   // Declared here (assigned inside the four-brain `if (!isTest)` block below, from that block's OWN
   // local `const`s — see the "Ref" suffix) so the shadow routes' /api/shadow/four-brain handler can
   // READ the live metrics aggregator + recent-decisions ring buffer via a lazy getter — same threading
@@ -1311,12 +1314,22 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   const fourBrainOutcomeDataDirRuntime = fourBrainTestnetFocusEnabled ? "data/four-brain-testnet-focus" : "data";
   fourBrainExactFillCohortSinceMs = resolveFourBrainExactFillCohortSinceMs();
   if (liveConfig.enabled && liveConfig.configErrors.length === 0 && liveConfig.env) {
+    const configuredSignedReadIntervalMs = Number(process.env.LIVE_BINANCE_SIGNED_READ_MIN_INTERVAL_MS ?? "");
+    const signedReadMinIntervalMs = Number.isFinite(configuredSignedReadIntervalMs) &&
+      configuredSignedReadIntervalMs >= 0 && configuredSignedReadIntervalMs <= 60_000
+      ? Math.floor(configuredSignedReadIntervalMs)
+      : liveConfig.env === "testnet"
+        ? DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS
+        : 0;
     const liveClient = new BinanceFuturesPrivateClient({
       apiKey: liveConfig.apiKey,
       apiSecret: liveConfig.apiSecret,
       env: liveConfig.env,
       fetchImpl: options.fetchImpl,
+      signedReadMinIntervalMs,
     });
+    binanceTransportStatusGetter = () => liveClient.getRateLimitStatus();
+    console.log(`[binance-transport] env=${liveConfig.env} signedReadMinIntervalMs=${signedReadMinIntervalMs}`);
     // RECORDING-ONLY (2026-07-27). Keep the existing SPOT mid as the entry-quality gate input, while
     // prewarming an independent book reference from the SAME USD-M testnet/mainnet base used for
     // execution. The execution-book fetch runs in parallel and is capped at 750ms; failure/timeout
@@ -4811,6 +4824,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     unifiedProposalStore: () => unifiedProposalStore,
     singleSymbolPriceTimeline: () => singleSymbolPriceTimeline,
     marketCandles: (symbol, interval, limit) => binanceClient.getFuturesCandles(symbol, interval, limit),
+    binanceTransportStatus: () => binanceTransportStatusGetter?.() ?? null,
     futuresReferenceHealth: () => futuresReferenceHealth?.snapshot() ?? null,
     probeFuturesReferenceHealth: (symbols) =>
       probeFuturesReferenceHealth ? probeFuturesReferenceHealth(symbols) : Promise.resolve(null),

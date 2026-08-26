@@ -17,7 +17,7 @@ import { buildInstrumentationReport } from "../lib/instrumentation-report.js";
 import { rejectedBasketLogPath } from "../lib/rejected-basket-recorder.js";
 import type { FastifyInstance } from "fastify";
 
-import { BinanceFuturesPrivateError } from "../lib/binance-futures-private.js";
+import { BinanceFuturesPrivateError, withBinanceTransportSource, type BinanceFuturesRateLimitStatus } from "../lib/binance-futures-private.js";
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
 import { fullyCostedNetPnlUsd, fullyCostedFeeUsd } from "../lib/fully-costed-net-pnl.js";
 import { poolReconciliationPlan } from "../lib/symbol-pool-reconciliation.js";
@@ -236,7 +236,24 @@ export function scheduledOpenBasketDeadline(
 }
 
 const DASHBOARD_ACCOUNT_CACHE_TTL_MS = 15_000;
+const TESTNET_DASHBOARD_ACCOUNT_CACHE_TTL_MS = 30_000;
 const DASHBOARD_ACCOUNT_RATE_LIMIT_BACKOFF_MS = 60_000;
+
+/**
+ * The dashboard is observability-only. Testnet's private REST path repeatedly hit 418 when a 15s
+ * account snapshot ran beside active reconciliation loops, so retain a fresh-enough 30s view there
+ * while keeping Live's existing 15s display cadence unchanged. A bounded env override is provided
+ * for an incident response, but cannot accidentally turn this into a sub-second poller.
+ */
+export function resolveDashboardAccountCacheTtlMs(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = Number(env.LIVE_DASHBOARD_ACCOUNT_CACHE_TTL_MS ?? "");
+  if (Number.isFinite(configured) && configured >= 5_000 && configured <= 5 * 60_000) {
+    return Math.floor(configured);
+  }
+  return env.LIVE_BINANCE_ENV === "testnet"
+    ? TESTNET_DASHBOARD_ACCOUNT_CACHE_TTL_MS
+    : DASHBOARD_ACCOUNT_CACHE_TTL_MS;
+}
 
 /**
  * Account data is observability-only here.  Never feed this cache into entry, exit, reconciliation,
@@ -298,7 +315,7 @@ function createDashboardAccountSnapshotReader(
   } = {},
 ): () => Promise<DashboardAccountSnapshot> {
   const nowMs = options.nowMs ?? (() => Date.now());
-  const cacheTtlMs = options.cacheTtlMs ?? DASHBOARD_ACCOUNT_CACHE_TTL_MS;
+  const cacheTtlMs = options.cacheTtlMs ?? resolveDashboardAccountCacheTtlMs();
   const rateLimitBackoffMs = options.rateLimitBackoffMs ?? DASHBOARD_ACCOUNT_RATE_LIMIT_BACKOFF_MS;
   let cache: { snapshot: LiveAccountSnapshot; fetchedAtMs: number } | null = null;
   let retryAfterMs = 0;
@@ -322,7 +339,7 @@ function createDashboardAccountSnapshotReader(
     };
   };
 
-  return async (): Promise<DashboardAccountSnapshot> => {
+  return async (): Promise<DashboardAccountSnapshot> => withBinanceTransportSource("dashboard.account", async () => {
     const now = nowMs();
     if (cache && now - cache.fetchedAtMs < cacheTtlMs) {
       return cached("USD_M_PRIVATE_CACHE", false);
@@ -359,7 +376,7 @@ function createDashboardAccountSnapshotReader(
       }
     })();
     return inFlight;
-  };
+  });
 }
 
 /** The account route adds report-only executor attribution. Keep that mutation out of the shared
@@ -1333,9 +1350,11 @@ export async function registerLiveRoutes(
     openBasketChartNowMs?: () => number;
     /** Read-only USD-M sizing-reference diagnostics. Never reaches any order route. */
     futuresReferenceHealth?: () => FuturesReferenceHealthSnapshot | null;
+    /** Read-only private-transport telemetry. The route never makes a Binance request itself. */
+    binanceTransportStatus?: () => BinanceFuturesRateLimitStatus | null;
     /** Optional, bounded public-USD-M refresh for a diagnostic watch list. */
     probeFuturesReferenceHealth?: (symbols: string[]) => Promise<FuturesReferenceHealthSnapshot | null>;
-    /** Test seam only. Production uses a 15s shared read and a 60s HTTP-418 cooldown. */
+    /** Test seam only. Production uses a 30s Testnet / 15s Live shared read and a 60s HTTP-418 cooldown. */
     dashboardAccountSnapshot?: {
       nowMs?: () => number;
       cacheTtlMs?: number;
@@ -1421,6 +1440,18 @@ export async function registerLiveRoutes(
       unifiedOrchestrator: opts.unifiedOrchestrator?.()?.getStatus() ?? null,
       unifiedProposalSource: opts.unifiedProposalStore?.()?.getStatus() ?? null,
     };
+  });
+
+  // This intentionally returns the client-owned evidence as-is and does no network I/O.  It lets
+  // an operator distinguish an active cooldown from an old failure, and identify the bounded
+  // caller/endpoint/weight history without ever exposing signed URLs, API keys, or signatures.
+  app.get("/api/live/binance-transport", async (request, reply) => {
+    const status = opts.binanceTransportStatus?.() ?? null;
+    if (!status) {
+      reply.code(503);
+      return { available: false, reason: "private Binance transport is unavailable because execution runtime is disabled" };
+    }
+    return { available: true, ...status };
   });
 
   app.get("/api/live/futures-reference-health", async (request, reply) => {

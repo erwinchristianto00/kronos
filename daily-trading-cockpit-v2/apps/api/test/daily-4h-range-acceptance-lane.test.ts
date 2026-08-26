@@ -336,9 +336,11 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     const trade = store.getState().trades[0]!;
     expect(trade.status).toBe("OPEN");
     trade.lastReconcileError = "account reconciliation unavailable: rate limited (HTTP 418)";
+    store.getState().runtime.reconciliationError = "rate limited (HTTP 418)";
     await (lane as unknown as { reconcileOpenTrades(): Promise<void> }).reconcileOpenTrades();
 
     expect(trade.lastReconcileError).toBeNull();
+    expect(store.getState().runtime.reconciliationError).toBeNull();
     expect(lane.getOpenPositionClaims()).toEqual([expect.objectContaining({
       laneId: "DAILY_4H_RANGE_ACCEPTANCE",
       tradeId: trade.tradeId,

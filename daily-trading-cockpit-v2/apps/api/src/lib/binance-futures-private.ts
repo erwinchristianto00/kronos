@@ -17,6 +17,7 @@
  *  - This module performs NO strategy logic and NO sizing. It is a transport.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHmac } from "node:crypto";
 
 // ─── env / base urls ─────────────────────────────────────────────────────────
@@ -72,6 +73,15 @@ const TIME_SYNC_TTL_MS = 60_000;
 const HTTP_418_FALLBACK_COOLDOWN_MS = 2 * 60_000;
 /** A plain 429 may be a short endpoint throttle; honour it too, but do not turn it into a ban. */
 const HTTP_429_FALLBACK_COOLDOWN_MS = 5_000;
+/**
+ * Testnet has a materially tighter and less predictable REST envelope than mainnet.  The active
+ * account has several independent reconciliation loops, so merely serialising reads still lets a
+ * steady 15s dashboard refresh + lane ticks accumulate into an IP ban.  This is intentionally a
+ * minimum spacing between SIGNED reads only: public market-data remains unaffected and
+ * risk-reducing POST/DELETE requests bypass it entirely.
+ */
+export const DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS = 4_000;
+const DEFAULT_MAX_RECENT_TRANSPORT_EVENTS = 40;
 // Re-fetch exchange filters (tickSize/stepSize/minQty/minNotional) periodically instead of caching
 // them for the process lifetime. Binance occasionally updates a symbol's LOT_SIZE/PRICE_FILTER/
 // MIN_NOTIONAL specs; without a TTL, a long-running process (days between restarts) would keep
@@ -483,6 +493,15 @@ export interface BinanceFuturesPrivateClientOptions {
   fetchImpl?: typeof fetch;
   /** Test hook: deterministic clock. */
   nowMs?: () => number;
+  /**
+   * Global minimum spacing for authenticated GETs issued through this client.  Production wires a
+   * conservative value on Testnet; leave 0 for callers that deliberately own an external budget.
+   */
+  signedReadMinIntervalMs?: number;
+  /** Test hook for deterministic budget waits. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Bounded diagnostic history. Never contains API keys, signatures, or query parameters. */
+  maxRecentTransportEvents?: number;
 }
 
 export interface FuturesExecutionBookTicker {
@@ -499,6 +518,41 @@ export interface BinanceFuturesRateLimitStatus {
   retryAt: string | null;
   lastHttpStatus: 418 | 429 | null;
   lastFailure: string | null;
+  readBudget: {
+    signedReadMinIntervalMs: number;
+    queuedReads: number;
+    nextEligibleAt: string | null;
+  };
+  recentRequests: BinanceFuturesTransportEvent[];
+}
+
+export interface BinanceFuturesTransportEvent {
+  at: string;
+  source: string;
+  method: "GET" | "POST" | "DELETE";
+  /** URL pathname only — never leak signed query parameters or credentials into diagnostics. */
+  path: string;
+  signed: boolean;
+  outcome: "OK" | "RATE_LIMITED" | "TIMEOUT" | "NETWORK" | "HTTP_ERROR" | "BINANCE_ERROR" | "INVALID_RESPONSE" | "CLOCK_SKEW";
+  httpStatus: number | null;
+  durationMs: number;
+  readBudgetWaitMs: number;
+  /** Binance's cumulative one-minute weight header, when the venue supplies it. */
+  usedWeight1m: number | null;
+  /** Delta from the preceding observed cumulative header, when comparable. */
+  usedWeight1mDelta: number | null;
+  retryAt: string | null;
+}
+
+/**
+ * Annotates outbound Binance work with a high-level owner (dashboard, lifecycle, lane, etc.).
+ * AsyncLocalStorage keeps the label across awaits without ever threading a mutable "caller" field
+ * through order methods.  Unannotated callers remain explicitly visible as `unspecified`.
+ */
+const transportSourceContext = new AsyncLocalStorage<string>();
+
+export function withBinanceTransportSource<T>(source: string, work: () => Promise<T>): Promise<T> {
+  return transportSourceContext.run(source, work);
 }
 
 function parseRetryAfterMs(raw: string | null, nowMs: number): number | null {
@@ -535,6 +589,9 @@ export class BinanceFuturesPrivateClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly nowMs: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly signedReadMinIntervalMs: number;
+  private readonly maxRecentTransportEvents: number;
   readonly env: LiveBinanceEnv;
 
   private serverTimeOffsetMs = 0;
@@ -546,6 +603,11 @@ export class BinanceFuturesPrivateClient {
   private timeSyncInFlight: Promise<void> | null = null;
   /** Serialises actual HTTP dispatch, so a Promise.all cannot race several requests past a new 418. */
   private transportTail: Promise<void> = Promise.resolve();
+  /** Next reserved dispatch time for authenticated GETs sharing this account-level transport. */
+  private nextSignedReadAtMs = 0;
+  private queuedReads = 0;
+  private lastObservedUsedWeight1m: number | null = null;
+  private readonly recentTransportEvents: BinanceFuturesTransportEvent[] = [];
   private rateLimitCooldownUntilMs = 0;
   private lastRateLimitHttpStatus: 418 | 429 | null = null;
   private lastRateLimitFailure: string | null = null;
@@ -557,6 +619,9 @@ export class BinanceFuturesPrivateClient {
     this.baseUrl = resolveLiveBinanceBaseUrl(options.env);
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.nowMs = options.nowMs ?? (() => Date.now());
+    this.sleep = options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    this.signedReadMinIntervalMs = Math.max(0, Math.floor(options.signedReadMinIntervalMs ?? 0));
+    this.maxRecentTransportEvents = Math.max(1, Math.floor(options.maxRecentTransportEvents ?? DEFAULT_MAX_RECENT_TRANSPORT_EVENTS));
   }
 
   // ── raw transport ──────────────────────────────────────────────────────────
@@ -566,10 +631,13 @@ export class BinanceFuturesPrivateClient {
     // Never queue a risk-reducing POST/DELETE behind a slow read: it still respects an already-open
     // 418 circuit, but an operator/engine close keeps its normal immediate dispatch priority.
     if (method === "GET") {
-      return this.withTransportSlot(() => this.dispatchRawRequest(method, url, signed));
+      return this.withTransportSlot(
+        (readBudgetWaitMs) => this.dispatchRawRequest(method, url, signed, readBudgetWaitMs),
+        signed,
+      );
     }
     this.assertRateLimitCircuitClosed();
-    return this.dispatchRawRequest(method, url, signed);
+    return this.dispatchRawRequest(method, url, signed, 0);
   }
 
   /**
@@ -578,7 +646,11 @@ export class BinanceFuturesPrivateClient {
    * learning that Binance has banned this IP. POST/DELETE intentionally bypass this queue so an
    * exit never waits behind a slow observability read.
    */
-  private async withTransportSlot<T>(operation: () => Promise<T>): Promise<T> {
+  private async withTransportSlot<T>(
+    operation: (readBudgetWaitMs: number) => Promise<T>,
+    signed: boolean,
+  ): Promise<T> {
+    this.queuedReads += 1;
     const previous = this.transportTail;
     let release = (): void => {};
     this.transportTail = new Promise<void>((resolve) => {
@@ -587,10 +659,27 @@ export class BinanceFuturesPrivateClient {
     await previous;
     try {
       this.assertRateLimitCircuitClosed();
-      return await operation();
+      const readBudgetWaitMs = signed ? await this.waitForSignedReadBudget() : 0;
+      return await operation(readBudgetWaitMs);
     } finally {
+      this.queuedReads = Math.max(0, this.queuedReads - 1);
       release();
     }
+  }
+
+  /**
+   * Reserve first, then wait. The enclosing queue guarantees deterministic spacing for concurrent
+   * dashboard/lifecycle callers. POST/DELETE never call this method, so risk-reducing exits remain
+   * immediate rather than waiting behind observability reads.
+   */
+  private async waitForSignedReadBudget(): Promise<number> {
+    if (this.signedReadMinIntervalMs <= 0) return 0;
+    const now = this.nowMs();
+    const scheduledAt = Math.max(now, this.nextSignedReadAtMs);
+    const waitMs = Math.max(0, scheduledAt - now);
+    this.nextSignedReadAtMs = scheduledAt + this.signedReadMinIntervalMs;
+    if (waitMs > 0) await this.sleep(waitMs);
+    return waitMs;
   }
 
   private assertRateLimitCircuitClosed(): void {
@@ -626,7 +715,14 @@ export class BinanceFuturesPrivateClient {
     );
   }
 
-  private async dispatchRawRequest(method: "GET" | "POST" | "DELETE", url: string, signed: boolean): Promise<unknown> {
+  private async dispatchRawRequest(
+    method: "GET" | "POST" | "DELETE",
+    url: string,
+    signed: boolean,
+    readBudgetWaitMs: number,
+  ): Promise<unknown> {
+    const startedAtMs = this.nowMs();
+    const path = this.requestPath(url);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let response: Response;
@@ -638,25 +734,37 @@ export class BinanceFuturesPrivateClient {
       });
     } catch (error) {
       const aborted = error instanceof Error && error.name === "AbortError";
-      throw new BinanceFuturesPrivateError(
+      const transportError = new BinanceFuturesPrivateError(
         aborted ? "timeout" : "network",
         aborted ? `request timed out after ${REQUEST_TIMEOUT_MS}ms` : `network failure: ${(error as Error)?.message ?? "unknown"}`,
       );
+      this.recordTransportEvent({
+        method, path, signed, startedAtMs, readBudgetWaitMs, response: null, error: transportError,
+      });
+      throw transportError;
     } finally {
       clearTimeout(timer);
     }
 
     const bodyText = await response.text().catch(() => "");
     if (response.status === 429 || response.status === 418) {
-      throw this.registerRateLimit(response, bodyText);
+      const rateLimitError = this.registerRateLimit(response, bodyText);
+      this.recordTransportEvent({
+        method, path, signed, startedAtMs, readBudgetWaitMs, response, error: rateLimitError,
+      });
+      throw rateLimitError;
     }
     let parsed: unknown = null;
     try {
       parsed = bodyText.length > 0 ? JSON.parse(preserveOrderIdPrecision(bodyText)) : null;
     } catch {
-      throw new BinanceFuturesPrivateError("invalid_response", `non-JSON response (HTTP ${response.status})`, {
+      const invalidResponseError = new BinanceFuturesPrivateError("invalid_response", `non-JSON response (HTTP ${response.status})`, {
         httpStatus: response.status,
       });
+      this.recordTransportEvent({
+        method, path, signed, startedAtMs, readBudgetWaitMs, response, error: invalidResponseError,
+      });
+      throw invalidResponseError;
     }
     if (!response.ok) {
       const binanceCode =
@@ -667,13 +775,76 @@ export class BinanceFuturesPrivateClient {
         parsed && typeof parsed === "object" && typeof (parsed as { msg?: unknown }).msg === "string"
           ? (parsed as { msg: string }).msg
           : "";
-      throw new BinanceFuturesPrivateError(
+      const binanceError = new BinanceFuturesPrivateError(
         "binance_error",
         `Binance error HTTP ${response.status}${binanceCode !== null ? ` code ${binanceCode}` : ""}: ${binanceMsg}`,
         { httpStatus: response.status, binanceCode },
       );
+      this.recordTransportEvent({
+        method, path, signed, startedAtMs, readBudgetWaitMs, response, error: binanceError,
+      });
+      throw binanceError;
     }
+    this.recordTransportEvent({ method, path, signed, startedAtMs, readBudgetWaitMs, response, error: null });
     return parsed;
+  }
+
+  private requestPath(url: string): string {
+    try {
+      return new URL(url).pathname;
+    } catch {
+      return "(invalid-url)";
+    }
+  }
+
+  private recordTransportEvent(input: {
+    method: BinanceFuturesTransportEvent["method"];
+    path: string;
+    signed: boolean;
+    startedAtMs: number;
+    readBudgetWaitMs: number;
+    response: Response | null;
+    error: BinanceFuturesPrivateError | null;
+  }): void {
+    const usedWeight1m = this.readUsedWeight1m(input.response);
+    const usedWeight1mDelta = usedWeight1m !== null && this.lastObservedUsedWeight1m !== null && usedWeight1m >= this.lastObservedUsedWeight1m
+      ? usedWeight1m - this.lastObservedUsedWeight1m
+      : null;
+    if (usedWeight1m !== null) this.lastObservedUsedWeight1m = usedWeight1m;
+    const error = input.error;
+    const outcome: BinanceFuturesTransportEvent["outcome"] = error === null
+      ? "OK"
+      : error.failureType === "429" ? "RATE_LIMITED"
+      : error.failureType === "timeout" ? "TIMEOUT"
+      : error.failureType === "network" ? "NETWORK"
+      : error.failureType === "invalid_response" ? "INVALID_RESPONSE"
+      : error.failureType === "clock_skew" ? "CLOCK_SKEW"
+      : error.failureType === "binance_error" ? "BINANCE_ERROR"
+      : "HTTP_ERROR";
+    this.recentTransportEvents.push({
+      at: new Date(this.nowMs()).toISOString(),
+      source: transportSourceContext.getStore() ?? "unspecified",
+      method: input.method,
+      path: input.path,
+      signed: input.signed,
+      outcome,
+      httpStatus: input.response?.status ?? error?.httpStatus ?? null,
+      durationMs: Math.max(0, this.nowMs() - input.startedAtMs),
+      readBudgetWaitMs: input.readBudgetWaitMs,
+      usedWeight1m,
+      usedWeight1mDelta,
+      retryAt: error?.retryAt ?? null,
+    });
+    if (this.recentTransportEvents.length > this.maxRecentTransportEvents) {
+      this.recentTransportEvents.splice(0, this.recentTransportEvents.length - this.maxRecentTransportEvents);
+    }
+  }
+
+  private readUsedWeight1m(response: Response | null): number | null {
+    if (!response) return null;
+    const raw = response.headers.get("x-mbx-used-weight-1m") ?? response.headers.get("x-mbx-used-weight");
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : null;
   }
 
   /** GETs retry on transient failures; mutations never do. */
@@ -791,6 +962,12 @@ export class BinanceFuturesPrivateClient {
       retryAt: this.rateLimitCooldownUntilMs > now ? new Date(this.rateLimitCooldownUntilMs).toISOString() : null,
       lastHttpStatus: this.lastRateLimitHttpStatus,
       lastFailure: this.lastRateLimitFailure,
+      readBudget: {
+        signedReadMinIntervalMs: this.signedReadMinIntervalMs,
+        queuedReads: this.queuedReads,
+        nextEligibleAt: this.nextSignedReadAtMs > now ? new Date(this.nextSignedReadAtMs).toISOString() : null,
+      },
+      recentRequests: this.recentTransportEvents.map((event) => ({ ...event })),
     };
   }
 
