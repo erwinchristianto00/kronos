@@ -22,6 +22,18 @@ case "$here" in
   /root/kronos-testnet-releases/*) instance=3102 ;;
 esac
 if [ -n "$instance" ]; then
+    # Runtime state must be shared deliberately with the durable lane store. A source archive
+    # contains historical data fixtures, so merely creating a link *inside* apps/api/data leaves
+    # a new process blind to existing baskets. Refuse to start a governed release unless the
+    # directory itself is a symlink to an existing state directory.
+    state_dir="$here/../apps/api/data"
+    if [ ! -L "$state_dir" ] || [ ! -d "$state_dir" ]; then
+      echo ""
+      echo "!!  RELEASE STATE WIRING INVALID — $state_dir must be a symlink to the durable state store."
+      echo "!!  Refusing to start: an unshared data directory can lose management of open baskets."
+      echo ""
+      exit 78 # EX_CONFIG
+    fi
     envfile="$here/../.env"
     checker="$here/apply-required-env.sh"
     mode="${REQUIRED_ENV_CHECK:-enforce}"
