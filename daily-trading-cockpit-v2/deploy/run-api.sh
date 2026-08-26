@@ -68,6 +68,19 @@ if [ -n "$instance" ]; then
     fi
 fi
 
+# A source archive intentionally excludes node_modules.  The governed release must carry the
+# approved dependency link/cache before PM2 replaces a healthy process; otherwise `npx` can start
+# retrying while the API port is down and leave an open basket without its lifecycle owner.  Check
+# the two runtime imports up front, including in the non-mutating staged precheck below.
+if ! (
+  cd "$here/../apps/api"
+  node -e 'require.resolve("dotenv/package.json"); require.resolve("tsx/package.json")' >/dev/null
+); then
+  echo "!! RELEASE DEPENDENCY WIRING INVALID — dotenv/tsx are not resolvable from this release."
+  echo "!! Refusing to replace a healthy API; restore the approved node_modules link/cache first."
+  exit 78
+fi
+
 # Staged releases use this non-mutating path before PM2 replaces a healthy
 # process.  It validates the exact same state/env guards as a real start.
 if [ "${RUN_API_PRECHECK_ONLY:-0}" = "1" ]; then
