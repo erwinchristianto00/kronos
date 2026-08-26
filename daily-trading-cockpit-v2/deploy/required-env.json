@@ -28,7 +28,7 @@
     },
     "CROSS_SECTIONAL_EXEC_TP_DISABLED": {
       "value": "1",
-      "why": "Dynamic MOM36 never uses an ordinary TP. The numeric value remains explicitly present only so a future flag drift cannot silently revive the default TP. Existing baskets use their frozen or legacy contract."
+      "why": "NoTP/Hold remains the current new-basket policy. The numeric value remains explicitly present only so a future flag drift cannot silently revive the default TP. Existing baskets use their frozen or legacy contract."
     },
     "CROSS_SECTIONAL_SMART_BASKET_V1": {
       "value": "1",
@@ -48,7 +48,7 @@
     },
     "CROSS_SECTIONAL_K": {
       "value": "3",
-      "why": "Legacy admission probe geometry only. Dynamic MOM36 itself freezes one of 6L0S through 0L6S after breadth, always six total legs."
+      "why": "Exact balanced basket geometry: three LONG and three SHORT legs. If either side cannot fill all three after pool, cluster, and score-gap controls, formation must not open."
     },
     "CROSS_SECTIONAL_INTERVAL": {
       "value": "1h",
@@ -72,7 +72,7 @@
     },
     "CROSS_SECTIONAL_FILTERED_WEIGHTING": {
       "value": "CAPPED_SCORE_RANK",
-      "why": "Preserved for the existing production admission probe and legacy baskets. Dynamic MOM36 final selection is always six equal $25 legs."
+      "why": "Production weighting: each side remains 50% of capital while stronger MOM36 ranks receive the larger capped share."
     },
     "CROSS_SECTIONAL_EDGE_MAX_STORED_OBSERVATIONS": {
       "value": "15000",
@@ -88,7 +88,7 @@
     },
     "CROSS_SECTIONAL_MAKER_EXIT_ENABLED": {
       "value": "0",
-      "why": "Preserves the current market-exit runtime behaviour. Dynamic MOM36's scheduled horizon and every exceptional/manual exit use the established immediate market/reconciliation path."
+      "why": "Preserves the current market-exit runtime behaviour. Scheduled horizon and every exceptional/manual exit use the established immediate market/reconciliation path."
     },
     "CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS": {
       "value": "20000",
@@ -136,47 +136,47 @@
     },
     "CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH": {
       "value": "0",
-      "why": "Dynamic MOM36 uses its versioned admission path directly. Pin the legacy bypass OFF in both environments so testnet/live configuration stays strategy-identical and an old testnet override cannot silently leak into reporting."
+      "why": "Pin the bypass OFF in both environments so testnet/live configuration stays strategy-identical and an old testnet override cannot silently leak into reporting."
     },
     "CROSS_SECTIONAL_ENTRY_TRAFFIC_LIGHT": {
       "value": "0",
-      "why": "The Dynamic policy freezes six equal $25 legs and has no confidence-sized learning tier. Keep the old traffic-light scaler OFF in both environments."
+      "why": "Keep the traffic-light scaler OFF in both environments; the current policy does not use confidence-sized learning tiers."
     },
     "CROSS_SECTIONAL_POLICY_VERSION": {
-      "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
-      "why": "Immutable policy identity for Dynamic MOM36 V5. It preserves continuation, score-gap, cluster cap, and SL/MFE exits, but uses a complete same-snapshot raw-V3 selection when strict SLOW_AND_FAST cannot fill all six legs. New evidence must never be mixed with V4."
+      "value": "plain-mom36-filtered-capped-score-rank-36h-v1",
+      "why": "Immutable policy identity for the canonical Plain MOM36 FILTERED selector: exact 3L/3S, cluster cap 2, score-gap 0.058, CAPPED_SCORE_RANK weighting, Smart Formation OFF, lifecycle revalidation ON, and adaptive exits OFF. New evidence must never be mixed with Dynamic V1-V5."
     },
     "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-      "value": "2026-08-26T06:20:00Z",
-      "why": "Forward-cohort boundary for Dynamic MOM36 V5. It is set at V5 cutover preparation and does not reclassify prior baskets."
+      "value": "2026-08-26T12:15:00Z",
+      "why": "Forward-cohort boundary for the canonical Plain MOM36 policy. It is set at the parity-fix cutover and does not reclassify prior baskets."
     },
     "CROSS_SECTIONAL_STRATEGY_VERSION": {
-      "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
-      "why": "Selects the versioned Dynamic MOM36 continuation with strict SLOW_AND_FAST preferred first, exact complete raw-V3 fallback second, and the unchanged SL/MFE exit dispatcher for new baskets only."
+      "value": "plain-mom36-filtered-capped-score-rank-36h-v1",
+      "why": "Selects the canonical FILTERED formation path: MOM36 rank, cluster cap, score-gap, then CAPPED_SCORE_RANK sizing. It does not run SLOW_AND_FAST or Dynamic fallback allocation."
     },
     "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
-      "value": "2026-08-26T06:20:00Z",
-      "why": "Frozen strategy deployment timestamp captured in every new V5 basket fingerprint."
+      "value": "2026-08-26T12:15:00Z",
+      "why": "Frozen strategy deployment timestamp captured in every new canonical Plain MOM36 basket fingerprint."
     },
     "CROSS_SECTIONAL_EXEC_VARIANT": {
-      "value": "DYNAMIC_MOM36_SHOCK",
-      "why": "Makes the intended execution variant explicit even though app wiring also pins the Dynamic target variant."
+      "value": "FILTERED",
+      "why": "Makes the canonical FILTERED selector explicit. A Dynamic strategy version or Dynamic execution variant is a configuration mismatch and must not be promoted."
     },
     "CROSS_SECTIONAL_EXEC_LEG_USD": {
       "value": "25",
-      "why": "Six fixed equal-notional legs: every Dynamic basket is exactly $150 gross before exchange rounding."
+      "why": "Per-leg base notional. Plain CAPPED_SCORE_RANK preserves the same gross target while applying its bounded rank weights."
     },
     "CROSS_SECTIONAL_EXEC_LEVERAGE": {
       "value": "1",
-      "why": "Dynamic MOM36 invariant: no leverage increase or confidence scaling."
+      "why": "Current cross-sectional leverage. No leverage increase or confidence scaling is introduced by this alignment fix."
     },
     "CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS": {
       "value": "1",
-      "why": "Global Dynamic slot limit: an existing cross basket blocks a new portfolio."
+      "why": "Global cross-sectional slot limit: an existing basket blocks a new portfolio."
     },
     "CROSS_SECTIONAL_AUTO_POOL_ENABLED": {
       "value": "1",
-      "why": "Durable C1/C2 runtime membership refresh for new Dynamic baskets only. It uses public USD-M mainnet data in both environments; existing baskets retain their frozen legs and exit contract."
+      "why": "Durable C1/C2 runtime membership refresh for new baskets only. It uses public USD-M mainnet data in both environments; existing baskets retain their frozen legs and exit contract."
     },
     "CROSS_SECTIONAL_AUTO_POOL_REFRESH_MS": {
       "value": "900000",
@@ -184,7 +184,7 @@
     },
     "CROSS_SECTIONAL_REGIME_SKEW_ENABLED": {
       "value": "0",
-      "why": "Legacy regime skew cannot modify Dynamic MOM36 breadth allocation."
+      "why": "Directional regime skew is disabled: Plain MOM36 must remain exactly 3L/3S."
     },
     "CONTINUATION_LIFECYCLE_ROOT": {
       "value": "/root/kronos-continuation",

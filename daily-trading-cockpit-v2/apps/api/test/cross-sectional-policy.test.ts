@@ -38,10 +38,25 @@ describe("cross-sectional effective runtime policy", () => {
       requiredConsecutiveEvaluations: 2,
     });
     expect(runtime).toMatchObject({
+      selectionVariant: "FILTERED",
       formationMode: "PLAIN_MOM36",
       entryRevalidation: true,
       adaptiveExitMode: "OFF",
     });
+  });
+
+  it("marks selector intent as ineffective when the versioned strategy takes a different branch", () => {
+    const runtime = effectiveCrossSectionalRuntime(true, {
+      CROSS_SECTIONAL_EXEC_VARIANT: "FILTERED",
+      CROSS_SECTIONAL_STRATEGY_VERSION: "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+    } as NodeJS.ProcessEnv);
+
+    expect(runtime).toMatchObject({ selectionVariant: "DYNAMIC_MOM36_SHOCK" });
+    expect(runtime.mismatches).toContainEqual(expect.objectContaining({
+      key: "CROSS_SECTIONAL_EXEC_VARIANT",
+      configured: "FILTERED",
+      effective: "DYNAMIC_MOM36_SHOCK",
+    }));
   });
 
   it("reports Smart Formation only when its own rerank switch is ON", () => {

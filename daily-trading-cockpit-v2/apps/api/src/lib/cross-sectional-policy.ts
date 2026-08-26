@@ -112,6 +112,8 @@ export type CrossSectionalPolicyFingerprint = {
 export type CrossSectionalEffectiveRuntime = {
   /** Direct, effective behaviour labels for API/dashboard consumers. */
   strategyVersion: string;
+  /** The actual selector family, separate from whether Plain or Smart Formation ranks it. */
+  selectionVariant: string;
   formationMode: CrossSectionalFormationMode;
   adaptiveExitMode: CrossSectionalAdaptiveExitMode;
   entryRevalidation: boolean;
@@ -318,6 +320,8 @@ export function effectiveCrossSectionalRuntime(
   env: NodeJS.ProcessEnv = process.env,
 ): CrossSectionalEffectiveRuntime {
   const dynamic = isDynamicMom36ShockStrategy(env);
+  const configuredSelectionVariant = env.CROSS_SECTIONAL_EXEC_VARIANT?.trim().toUpperCase() || "FILTERED";
+  const effectiveSelectionVariant = dynamic ? DYNAMIC_MOM36_SHOCK_VARIANT : configuredSelectionVariant;
   const rawTick = env.CROSS_SECTIONAL_EXEC_TICK_MS ?? null;
   const parsedTick = rawTick === null ? null : Number.parseInt(rawTick, 10);
   const tickValid = rawTick === null || (parsedTick !== null && Number.isFinite(parsedTick) && parsedTick >= 1_000 && parsedTick <= 300_000);
@@ -340,8 +344,22 @@ export function effectiveCrossSectionalRuntime(
       reason: "executor lacks the quote, cancel, or client-order lookup path required for a safe post-only exit",
     });
   }
+  // `CROSS_SECTIONAL_EXEC_VARIANT` is an operator-facing intent while the versioned strategy
+  // selects the actual implementation.  Do not let a dashboard claim FILTERED when a dynamic
+  // strategy version is still taking the Dynamic branch (or vice versa).
+  if ((configuredSelectionVariant === DYNAMIC_MOM36_SHOCK_VARIANT) !== dynamic) {
+    mismatches.push({
+      key: "CROSS_SECTIONAL_EXEC_VARIANT",
+      configured: configuredSelectionVariant,
+      effective: effectiveSelectionVariant,
+      reason: dynamic
+        ? "strategy version activates the Dynamic MOM36 selector; use a non-Dynamic strategy version for FILTERED selection"
+        : "strategy version is non-Dynamic, so the Dynamic MOM36 selector is not active",
+    });
+  }
   return {
     strategyVersion: crossSectionalStrategyVersion(env),
+    selectionVariant: effectiveSelectionVariant,
     formationMode: dynamic ? "PLAIN_MOM36" : crossSectionalFormationMode(env),
     adaptiveExitMode: dynamic ? "OFF" : crossSectionalAdaptiveExitMode(env),
     entryRevalidation: !dynamic && isCrossSectionalSmartBasketLifecycleEnabled(env),
