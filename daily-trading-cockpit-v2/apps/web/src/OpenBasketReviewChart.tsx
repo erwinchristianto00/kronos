@@ -57,6 +57,7 @@ export type OpenBasketReviewLeg = {
   reviewKind?: 'cross-sectional' | 'daily-range';
   stopPrice?: number | null;
   takeProfitPrice?: number | null;
+  entryPolicy?: 'LEGACY_CONTINUATION' | 'CONTINUATION' | 'FADE';
 };
 
 type Candle = {
@@ -74,6 +75,7 @@ type ChartReference = {
   fourHourCloseTime: number;
   rangeHigh: number;
   rangeLow: number;
+  timezone?: 'UTC' | 'America/New_York';
   source?: 'TRADE_PERSISTED';
 };
 
@@ -85,6 +87,7 @@ type ChartResponse = {
   asOf: string;
   daily: { interval: '1d'; candles: Candle[] };
   fiveMinute: { interval: '5m'; candles: Candle[] };
+  entryPolicy?: 'LEGACY_CONTINUATION' | 'CONTINUATION' | 'FADE';
   previousUtcReference4h?: ChartReference | null;
   reference4h?: ChartReference | null;
   referenceReason: string | null;
@@ -483,6 +486,9 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
 
   const isDailyRange = leg?.reviewKind === 'daily-range';
   const reference = data?.reference4h ?? data?.previousUtcReference4h ?? null;
+  const entryPolicy = data?.entryPolicy ?? leg?.entryPolicy ?? 'LEGACY_CONTINUATION';
+  const isAutoRouterTrade = entryPolicy === 'CONTINUATION' || entryPolicy === 'FADE';
+  const referenceSession = reference?.timezone === 'America/New_York' ? '00:00–04:00 New York' : '00:00–04:00 UTC';
   const historicalCandles = historicalInterval === '1d'
     ? data?.daily.candles ?? []
     : historicalSeries?.candles ?? [];
@@ -506,8 +512,8 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     ...tradeLevels,
   ] : tradeLevels, [reference?.rangeHigh, reference?.rangeLow, tradeLevels]);
   const fiveMinuteLevels = useMemo<PriceLevel[]>(() => reference ? [
-    { price: reference.rangeHigh, label: '4H range high · breakout + acceptance long', color: C.accent },
-    { price: reference.rangeLow, label: '4H range low · breakdown + acceptance short', color: C.bad },
+    { price: reference.rangeHigh, label: '4H range high · breakout', color: C.accent },
+    { price: reference.rangeLow, label: '4H range low · breakdown', color: C.bad },
     ...tradeLevels,
   ] : tradeLevels, [reference?.rangeHigh, reference?.rangeLow, tradeLevels]);
   const dailyRangeEntryMarker = useMemo<ExecutionMarker | null>(() => isDailyRange && leg?.openedAt && (leg.entryPrice ?? 0) > 0
@@ -571,24 +577,30 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
       <div style={{ padding: '9px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55, borderBottom: `1px solid ${C.border}` }}>
         {reference ? <>
           {isDailyRange
-            ? <>Referensi eksekusi: candle 4H <strong style={{ color: C.text }}>{reference.dateUtc} 00:00–04:00 UTC</strong> yang dibekukan saat trade dibuat.</>
+            ? <>Referensi eksekusi: session <strong style={{ color: C.text }}>{reference.dateUtc} {referenceSession}</strong> yang dibekukan saat trade dibuat.</>
             : <>Referensi: candle 4H <strong style={{ color: C.text }}>{reference.dateUtc} 00:00–04:00 UTC</strong> (hari kalender sebelum hari ini UTC).</>}
           Range high <strong style={{ color: C.accent }}>{formatPrice(reference.rangeHigh)}</strong> · range low <strong style={{ color: C.good }}>{formatPrice(reference.rangeLow)}</strong>.
-          Acceptance memakai <strong style={{ color: C.text }}>dua close 5m selesai berturut-turut</strong> di luar level tersebut.
+          {isDailyRange && entryPolicy === 'FADE'
+            ? <>Router: satu close 5m selesai di luar, lalu close kembali masuk range → <strong style={{ color: C.text }}>FADE</strong> berlawanan arah dengan SL di extreme breakout.</>
+            : isDailyRange && entryPolicy === 'CONTINUATION'
+              ? <>Router: close 5m tetap di luar dan <strong style={{ color: C.text }}>meluas lebih jauh</strong> → <strong style={{ color: C.text }}>CONTINUATION</strong> mengikuti arah breakout.</>
+              : <>Acceptance memakai <strong style={{ color: C.text }}>dua close 5m selesai berturut-turut</strong> di luar level tersebut.</>}
           {' '}Garis putus-putus ini tetap horizontal karena ini harga high/low range 4H yang dibekukan untuk eksekusi.
           {isDailyRange && <> Titik <strong style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>ENTRY {leg.side}</strong> di panel 5m adalah fill entry aktual pada waktu fill yang tersimpan.</>}
           {' '}Garis penuh oranye/biru di panel historis adalah resistance/support struktural: masing-masing menghubungkan dua pivot peak/trough selesai paling baru dan hanya untuk review visual.
           {' '}EMA20/EMA50 juga memakai completed candle saja; tidak mengubah formation, entry, sizing, atau exit.
-        </> : <span>Level 4H UTC belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
+        </> : <span>Level Daily Range belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
       </div>
       <div className="candle-review-chart-stack">
         <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines viewportKey={`${apiPrefix}:${leg.key}:historical:${historicalInterval}`} />
-        <CandlePane title={isDailyRange ? '5m · EMA20/EMA50 + breakout / breakdown + acceptance + native bracket' : '5m · EMA20/EMA50 + breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages executionMarker={dailyRangeEntryMarker} viewportKey={`${apiPrefix}:${leg.key}:5m`} />
+        <CandlePane title={isDailyRange ? '5m · EMA20/EMA50 + breakout / breakdown + router + native bracket' : '5m · EMA20/EMA50 + breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages executionMarker={dailyRangeEntryMarker} viewportKey={`${apiPrefix}:${leg.key}:5m`} />
       </div>
       {reference && <div style={{ padding: '0 12px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55 }}>
-        Status acceptance sekarang: <strong style={{ color: latestAcceptance === 'LONG' ? C.good : latestAcceptance === 'SHORT' ? C.bad : C.text }}>{latestAcceptance ? `${latestAcceptance} confirmed` : 'belum ada dua close 5m berturut-turut'}</strong>.
-        {' '}Terakhir long {latestLongAcceptance ? formatUtc(latestLongAcceptance.at) + ' UTC' : '—'} · terakhir short {latestShortAcceptance ? formatUtc(latestShortAcceptance.at) + ' UTC' : '—'}.
-        {' '}Garis acceptance sama dengan level breakout/breakdown—yang membedakan adalah dua close 5m, bukan harga baru—jadi tidak dibuat garis harga palsu kedua.
+        {isAutoRouterTrade
+          ? <>Policy entry trade ini: <strong style={{ color: entryPolicy === 'FADE' ? C.accent : C.good }}>{entryPolicy}</strong>. Satu breakout event hanya menghasilkan satu kandidat; router tidak membalik posisi continuation yang sudah terbentuk.</>
+          : <>Status acceptance sekarang: <strong style={{ color: latestAcceptance === 'LONG' ? C.good : latestAcceptance === 'SHORT' ? C.bad : C.text }}>{latestAcceptance ? `${latestAcceptance} confirmed` : 'belum ada dua close 5m berturut-turut'}</strong>.
+            {' '}Terakhir long {latestLongAcceptance ? formatUtc(latestLongAcceptance.at) + ' UTC' : '—'} · terakhir short {latestShortAcceptance ? formatUtc(latestShortAcceptance.at) + ' UTC' : '—'}.
+            {' '}Garis acceptance sama dengan level breakout/breakdown—yang membedakan adalah dua close 5m, bukan harga baru—jadi tidak dibuat garis harga palsu kedua.</>}
       </div>}
     </>}
   </section>;

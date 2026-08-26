@@ -1689,6 +1689,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           env: process.env,
           mainnetControls: dailyRangeMainnetControls,
         }),
+        // V2 routes each completed NY-session breakout event by its observed
+        // path. Durable v1 trades remain in the same store solely for bracket
+        // reconciliation and reporting; they are never reinterpreted or used
+        // as new-entry candidates.
+        strategyMode: "AUTO_ROUTE_NY_V2",
         entryGate: () => {
           if (liveConfig.env !== "mainnet") return { allowed: true, reason: null };
           const engine = liveEngine;

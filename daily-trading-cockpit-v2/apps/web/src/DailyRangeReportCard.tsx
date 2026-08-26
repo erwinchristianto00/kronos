@@ -35,6 +35,8 @@ type DailyRangeTrade = DailyRangeHeadlineTrade & {
   entryNotionalUsd: number | null;
   rangeHigh: number;
   rangeLow: number;
+  entryPolicy?: 'LEGACY_CONTINUATION' | 'CONTINUATION' | 'FADE';
+  referenceTimezone?: 'UTC' | 'America/New_York';
   stopPrice: number | null;
   takeProfitPrice: number | null;
   lastMarkPrice: number | null;
@@ -311,7 +313,11 @@ export default function DailyRangeReportCard({
   const reviewLeg: OpenBasketReviewLeg | null = selectedTrade ? {
     key: `daily-range:${selectedTrade.tradeId}`,
     basketId: selectedTrade.tradeId,
-    signal: 'two completed 5m closes beyond 00:00–04:00 UTC range',
+    signal: selectedTrade.entryPolicy === 'FADE'
+      ? 'failed breakout: outside close → inside re-entry'
+      : selectedTrade.entryPolicy === 'CONTINUATION'
+        ? 'expanding outside closes: continuation'
+        : 'two completed 5m closes beyond 00:00–04:00 UTC range',
     variant: data?.strategyVersion ?? 'daily-4h-range-acceptance-2r-v1',
     symbol: selectedTrade.symbol,
     side: selectedTrade.direction,
@@ -323,6 +329,7 @@ export default function DailyRangeReportCard({
     reviewKind: 'daily-range',
     stopPrice: selectedTrade.stopPrice,
     takeProfitPrice: selectedTrade.takeProfitPrice,
+    entryPolicy: selectedTrade.entryPolicy,
   } : null;
 
   const notional = openTrades.reduce((sum, trade) => sum + (tradeNotional(trade) ?? 0), 0);

@@ -36,7 +36,20 @@ import {
 } from "./daily-range-selector.js";
 
 export const DAILY_RANGE_LANE_ID = "DAILY_4H_RANGE_ACCEPTANCE";
+/** Preserved solely for legacy trades and their immutable exit/reconciliation lineage. */
 export const DAILY_RANGE_STRATEGY_VERSION = "daily-4h-range-acceptance-2r-v1";
+/**
+ * New entries route one completed 5m breakout event by its observed path:
+ * persistent expanding closes continue; a close back inside fades the failed
+ * breakout.  The reference session is 00:00-04:00 America/New_York.
+ */
+export const DAILY_RANGE_AUTO_ROUTE_STRATEGY_VERSION = "daily-4h-range-auto-route-ny-2r-v2";
+export type DailyRangeStrategyVersion =
+  | typeof DAILY_RANGE_STRATEGY_VERSION
+  | typeof DAILY_RANGE_AUTO_ROUTE_STRATEGY_VERSION;
+export type DailyRangeStrategyMode = "LEGACY_CONTINUATION" | "AUTO_ROUTE_NY_V2";
+export type DailyRangeEntryPolicy = "LEGACY_CONTINUATION" | "CONTINUATION" | "FADE";
+export type DailyRangeBreakoutDirection = "UP" | "DOWN";
 /** No model has allocation authority. New data is collected under this immutable policy label. */
 export const DAILY_RANGE_SELECTOR_POLICY_VERSION = "DAILY_RANGE_BATCH_SELECTOR_SHADOW_V1";
 export const DAILY_RANGE_TRADE_NOTIONAL_USD = 25;
@@ -58,6 +71,7 @@ const ALLOCATOR_LOCK_STALE_MS = 10 * 60_000;
 const RESEARCH_ENTRY_FEE_BPS = 4;
 const RESEARCH_EXIT_FEE_BPS = 4;
 const RESEARCH_SLIPPAGE_BPS = 0;
+const NEW_YORK_TIME_ZONE = "America/New_York";
 
 export type DailyRangeDirection = "LONG" | "SHORT";
 export type DailyRangeControlMode = "DISARMED" | "ARMED";
@@ -96,7 +110,8 @@ export type DailyRangeSignalReason =
   | "SPREAD_HARD_REJECT"
   | "SELECTOR_NOT_READY"
   | "LIVE_NEW_ENTRY_PAUSED"
-  | "SELECTED_EXECUTION_FAILED";
+  | "SELECTED_EXECUTION_FAILED"
+  | "RETIRED_STRATEGY_VERSION";
 
 export interface DailyRangeCandle {
   openTime: number;
@@ -121,6 +136,17 @@ export interface DailyRangeLevel {
   createdAt: string;
 }
 
+interface DailyRangeRouterState {
+  phase: "IDLE" | "ARMED" | "CONTINUATION_LOCKED";
+  breakoutId: string | null;
+  breakoutDirection: DailyRangeBreakoutDirection | null;
+  firstOutsideCandle: DailyRangeCandle | null;
+  lastOutsideCandle: DailyRangeCandle | null;
+  breakoutExtreme: number | null;
+  outsideCloseCount: number;
+  maxCloseExtension: number;
+}
+
 export interface DailyRangeSymbolState {
   lastProcessedBarOpenTime: number | null;
   previousClosedCandle: DailyRangeCandle | null;
@@ -128,6 +154,8 @@ export interface DailyRangeSymbolState {
   shortCount: 0 | 1 | 2;
   longLocked: boolean;
   shortLocked: boolean;
+  /** Present only for the V2 per-symbol breakout router. Legacy rows stay valid. */
+  router?: DailyRangeRouterState;
 }
 
 export interface DailyRangeDayState {
@@ -140,11 +168,18 @@ export interface DailyRangeDayState {
   levels: Record<string, DailyRangeLevel>;
   invalidReferenceSymbols: Array<{ symbol: string; reason: string }>;
   symbolStates: Record<string, DailyRangeSymbolState>;
+  /** Optional because legacy UTC-v1 day records remain immutable and readable. */
+  strategyVersion?: DailyRangeStrategyVersion;
+  strategyMode?: DailyRangeStrategyMode;
+  referenceTimezone?: "UTC" | "America/New_York";
+  referenceRangeOpenTime?: number;
+  referenceRangeCloseTime?: number;
+  entryWindowCloseTime?: number;
 }
 
 export interface DailyRangeSignal {
   signalId: string;
-  strategyVersion: typeof DAILY_RANGE_STRATEGY_VERSION;
+  strategyVersion: DailyRangeStrategyVersion;
   laneId: typeof DAILY_RANGE_LANE_ID;
   dateUtc: string;
   symbol: string;
@@ -171,6 +206,14 @@ export interface DailyRangeSignal {
   actuallySelected?: boolean;
   actuallyExecuted?: boolean;
   research?: DailyRangeSignalResearchRecord | null;
+  /** V2 lineage. Absent is an intentional legacy-v1 continuation record. */
+  entryPolicy?: DailyRangeEntryPolicy;
+  breakoutDirection?: DailyRangeBreakoutDirection | null;
+  breakoutId?: string | null;
+  breakoutExtreme?: number | null;
+  referenceTimezone?: "UTC" | "America/New_York";
+  referenceRangeOpenTime?: number | null;
+  referenceRangeCloseTime?: number | null;
 }
 
 export type DailyRangePitQuality = "FULL_PIT" | "PARTIAL_RECONSTRUCTION" | "UNAVAILABLE";
@@ -277,7 +320,7 @@ export interface DailyRangeSignalFeatureSnapshot {
 /** Research-only mirror of the incumbent entry/SL/2R semantics; never sends an order. */
 export interface DailyRangeCounterfactualOutcome {
   status: DailyRangeCounterfactualStatus;
-  entryConvention: "C2_CLOSE_PIT_CANONICAL_V1";
+  entryConvention: "C2_CLOSE_PIT_CANONICAL_V1" | "AUTO_ROUTE_5M_CLOSE_PIT_V2";
   entryPrice: number;
   structuralStop: number;
   takeProfit: number;
@@ -317,7 +360,11 @@ export interface DailyRangeSignalCohortCandidate {
   rangeWidth: number;
   rangeWidthPct: number | null;
   confirmationClose: number;
-  /** Distance past the range boundary at C2 close; positive means it qualified. */
+  /**
+   * Signed C2 distance from the original breakout boundary. It is positive
+   * while price remains outside; a FADE correctly records a non-positive
+   * value because C2 is the confirmed re-entry inside the range.
+   */
   breakoutDistancePrice: number;
   /** Same distance normalized by that symbol's frozen 4h range width. */
   breakoutDistanceOfRange: number | null;
@@ -346,7 +393,7 @@ export interface DailyRangeSignalCohortCandidate {
 /** Candidates that competed in one completed 5m bar.  This is observation-only. */
 export interface DailyRangeSignalCohort {
   cohortId: string;
-  strategyVersion: typeof DAILY_RANGE_STRATEGY_VERSION;
+  strategyVersion: DailyRangeStrategyVersion;
   laneId: typeof DAILY_RANGE_LANE_ID;
   selectorPolicyVersion: string;
   dateUtc: string;
@@ -378,7 +425,7 @@ export type DailyRangeHistoryKind = "levels" | "signals" | "trades" | "cohorts" 
 export interface DailyRangeTrade {
   tradeId: string;
   signalId: string;
-  strategyVersion: typeof DAILY_RANGE_STRATEGY_VERSION;
+  strategyVersion: DailyRangeStrategyVersion;
   laneId: typeof DAILY_RANGE_LANE_ID;
   dateUtc: string;
   symbol: string;
@@ -398,6 +445,14 @@ export interface DailyRangeTrade {
   signalReferencePrice: number | null;
   rangeHigh: number;
   rangeLow: number;
+  /** V2 route + reference lineage; absent fields identify untouched legacy trades. */
+  entryPolicy?: DailyRangeEntryPolicy;
+  breakoutDirection?: DailyRangeBreakoutDirection | null;
+  breakoutId?: string | null;
+  breakoutExtreme?: number | null;
+  referenceTimezone?: "UTC" | "America/New_York";
+  referenceRangeOpenTime?: number | null;
+  referenceRangeCloseTime?: number | null;
   confirmationBar1: DailyRangeCandle;
   confirmationBar2: DailyRangeCandle;
   structuralStopRaw: number;
@@ -534,6 +589,81 @@ export function inDailyRangeEntryWindow(ms: number): boolean {
   return ms >= start + FOUR_HOURS_MS && ms < start + DAY_MS;
 }
 
+export interface DailyRangeReferenceWindow {
+  date: string;
+  timezone: "America/New_York";
+  rangeOpenTime: number;
+  rangeCloseTime: number;
+  entryWindowCloseTime: number;
+}
+
+function zonedDateParts(ms: number, timeZone: string): { year: number; month: number; day: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(ms));
+  const read = (kind: "year" | "month" | "day"): number => Number(parts.find((part) => part.type === kind)?.value);
+  const year = read("year");
+  const month = read("month");
+  const day = read("day");
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+    throw new Error(`cannot resolve ${timeZone} calendar date`);
+  }
+  return { year, month, day };
+}
+
+function zonedOffsetMs(ms: number, timeZone: string): number {
+  const token = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    timeZoneName: "longOffset",
+  }).formatToParts(new Date(ms)).find((part) => part.type === "timeZoneName")?.value ?? "";
+  if (token === "GMT") return 0;
+  const match = /^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(token);
+  if (!match) throw new Error(`cannot resolve ${timeZone} offset (${token || "missing"})`);
+  const minutes = Number(match[2]) * 60 + Number(match[3] ?? 0);
+  return (match[1] === "+" ? 1 : -1) * minutes * 60_000;
+}
+
+/**
+ * Convert an unambiguous wall-clock New York timestamp to UTC.  The strategy
+ * only asks for midnight and 04:00, which exist on both US DST transition days;
+ * the iteration still rechecks the offset at the candidate instant so a 3h/5h
+ * real-time session is represented correctly.
+ */
+function newYorkWallClockMs(year: number, month: number, day: number, hour: number): number {
+  const nominalUtc = Date.UTC(year, month - 1, day, hour, 0, 0, 0);
+  let candidate = nominalUtc - zonedOffsetMs(nominalUtc, NEW_YORK_TIME_ZONE);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const corrected = nominalUtc - zonedOffsetMs(candidate, NEW_YORK_TIME_ZONE);
+    if (corrected === candidate) return corrected;
+    candidate = corrected;
+  }
+  return candidate;
+}
+
+/** Completed 00:00-04:00 America/New_York session and same-local-day entry window. */
+export function newYorkDailyRangeWindow(ms: number): DailyRangeReferenceWindow {
+  const { year, month, day } = zonedDateParts(ms, NEW_YORK_TIME_ZONE);
+  const next = new Date(Date.UTC(year, month - 1, day + 1));
+  const rangeOpenTime = newYorkWallClockMs(year, month, day, 0);
+  const rangeCloseTime = newYorkWallClockMs(year, month, day, 4);
+  const entryWindowCloseTime = newYorkWallClockMs(next.getUTCFullYear(), next.getUTCMonth() + 1, next.getUTCDate(), 0);
+  return {
+    date: `${year.toString().padStart(4, "0")}-${month.toString().padStart(2, "0")}-${day.toString().padStart(2, "0")}`,
+    timezone: NEW_YORK_TIME_ZONE,
+    rangeOpenTime,
+    rangeCloseTime,
+    entryWindowCloseTime,
+  };
+}
+
+export function inNewYorkDailyRangeEntryWindow(ms: number): boolean {
+  const window = newYorkDailyRangeWindow(ms);
+  return ms >= window.rangeCloseTime && ms < window.entryWindowCloseTime;
+}
+
 function lastClosedFiveMinuteOpenTime(ms: number): number | null {
   const currentOpen = Math.floor(ms / FIVE_MIN_MS) * FIVE_MIN_MS;
   const completedOpen = currentOpen - FIVE_MIN_MS;
@@ -557,6 +687,27 @@ function blankSymbolState(lastProcessedBarOpenTime: number | null): DailyRangeSy
     longLocked: false,
     shortLocked: false,
   };
+}
+
+function blankRouterState(): DailyRangeRouterState {
+  return {
+    phase: "IDLE",
+    breakoutId: null,
+    breakoutDirection: null,
+    firstOutsideCandle: null,
+    lastOutsideCandle: null,
+    breakoutExtreme: null,
+    outsideCloseCount: 0,
+    maxCloseExtension: 0,
+  };
+}
+
+function routerStateFor(symbolState: DailyRangeSymbolState): DailyRangeRouterState {
+  const prior = symbolState.router;
+  if (prior) return prior;
+  const next = blankRouterState();
+  symbolState.router = next;
+  return next;
 }
 
 function clonePoolAudit(audit: DailyRangePoolSymbolAudit): DailyRangePoolSymbolAudit {
@@ -591,8 +742,9 @@ function cloneCohortPoolAudit(day: DailyRangeDayState, symbol: string): DailyRan
   return audit ? clonePoolAudit(audit) : null;
 }
 
-function signalCohortId(dateUtc: string, signalTimestampMs: number): string {
-  return `drra-cohort-${dateUtc}-${signalTimestampMs}`;
+function signalCohortId(strategyVersion: DailyRangeStrategyVersion, dateUtc: string, signalTimestampMs: number): string {
+  const prefix = strategyVersion === DAILY_RANGE_AUTO_ROUTE_STRATEGY_VERSION ? "drra2-cohort" : "drra-cohort";
+  return `${prefix}-${dateUtc}-${signalTimestampMs}`;
 }
 
 function emptyState(nowMs: number): DailyRangePersistedState {
@@ -832,6 +984,11 @@ export interface DailyRangeAcceptanceLaneOptions {
   allocatorMode?: DailyRangeAllocatorMode;
   /** Null until a separately promoted model artifact exists. */
   selectorId?: string | null;
+  /**
+   * Production selects AUTO_ROUTE_NY_V2 explicitly.  The legacy default is
+   * retained for deterministic historical fixtures and old durable records.
+   */
+  strategyMode?: DailyRangeStrategyMode;
   nowMs?: () => number;
   confirmRetryMs?: number;
 }
@@ -895,6 +1052,46 @@ export function structuralStopForAcceptance(input: {
   return input.direction === "LONG"
     ? Math.min(input.rangeHigh, input.confirmationBar1.low, input.confirmationBar2.low)
     : Math.max(input.rangeLow, input.confirmationBar1.high, input.confirmationBar2.high);
+}
+
+/** Exact per-policy stop source. Fade never substitutes a discretionary level. */
+export function structuralStopForDailyRangeSignal(signal: Pick<
+  DailyRangeSignal,
+  "direction" | "rangeHigh" | "rangeLow" | "confirmationBar1" | "confirmationBar2" | "entryPolicy" | "breakoutExtreme"
+>): number {
+  if (signal.entryPolicy === "FADE") {
+    const extreme = signal.breakoutExtreme;
+    if (!finitePositive(extreme)) return Number.NaN;
+    const entry = signal.confirmationBar2.close;
+    if (signal.direction === "LONG" ? extreme >= entry - EPSILON : extreme <= entry + EPSILON) return Number.NaN;
+    return extreme;
+  }
+  if (!signal.confirmationBar1) return Number.NaN;
+  return structuralStopForAcceptance({
+    direction: signal.direction,
+    rangeHigh: signal.rangeHigh,
+    rangeLow: signal.rangeLow,
+    confirmationBar1: signal.confirmationBar1,
+    confirmationBar2: signal.confirmationBar2,
+  });
+}
+
+/** The breakout event side is distinct from the eventual trade side for a fade. */
+function breakoutDirectionForSignal(signal: Pick<DailyRangeSignal, "direction" | "entryPolicy" | "breakoutDirection">): DailyRangeBreakoutDirection {
+  if (signal.entryPolicy === "FADE" && signal.breakoutDirection) return signal.breakoutDirection;
+  return signal.direction === "LONG" ? "UP" : "DOWN";
+}
+
+function breakoutBoundaryForSignal(signal: Pick<DailyRangeSignal, "direction" | "entryPolicy" | "breakoutDirection" | "rangeHigh" | "rangeLow">): number {
+  return breakoutDirectionForSignal(signal) === "UP" ? signal.rangeHigh : signal.rangeLow;
+}
+
+function breakoutExtensionForSignal(
+  signal: Pick<DailyRangeSignal, "direction" | "entryPolicy" | "breakoutDirection" | "rangeHigh" | "rangeLow">,
+  candle: Pick<DailyRangeCandle, "close">,
+): number {
+  const boundary = breakoutBoundaryForSignal(signal);
+  return breakoutDirectionForSignal(signal) === "UP" ? candle.close - boundary : boundary - candle.close;
 }
 
 function asDailyCandle(value: FuturesKline): DailyRangeCandle {
@@ -1044,13 +1241,15 @@ function canaryClientId(kind: "E" | "SL" | "TP" | "X", symbol: string, nowMs: nu
   return `DRCANARY-${symbol.slice(0, 7)}-${nowMs.toString(36)}-${kind}`.slice(0, 36);
 }
 
-function signalId(dateUtc: string, symbol: string, direction: DailyRangeDirection, closeTime: number): string {
-  return `drra1-${dateUtc.replaceAll("-", "")}-${symbol.toLowerCase().slice(0, 8)}-${direction[0]}-${closeTime.toString(36)}`.slice(0, 60);
+function signalId(strategyVersion: DailyRangeStrategyVersion, dateUtc: string, symbol: string, direction: DailyRangeDirection, closeTime: number): string {
+  const prefix = strategyVersion === DAILY_RANGE_AUTO_ROUTE_STRATEGY_VERSION ? "drra2" : "drra1";
+  return `${prefix}-${dateUtc.replaceAll("-", "")}-${symbol.toLowerCase().slice(0, 8)}-${direction[0]}-${closeTime.toString(36)}`.slice(0, 60);
 }
 
 function tradeIdFromSignal(signal: DailyRangeSignal): string {
   const nonce = randomUUID().replaceAll("-", "").slice(0, 8);
-  return `drra1-${signal.symbol.toLowerCase().slice(0, 8)}-${signal.signalTimestampMs.toString(36)}-${nonce}`.slice(0, 32);
+  const prefix = signal.strategyVersion === DAILY_RANGE_AUTO_ROUTE_STRATEGY_VERSION ? "drra2" : "drra1";
+  return `${prefix}-${signal.symbol.toLowerCase().slice(0, 8)}-${signal.signalTimestampMs.toString(36)}-${nonce}`.slice(0, 32);
 }
 
 function entryClientId(tradeId: string): string {
@@ -1079,6 +1278,8 @@ export class DailyRangeAcceptanceLane {
   private readonly onTradeClosed: ((netPnlUsd: number) => void) | null;
   private readonly allocatorMode: DailyRangeAllocatorMode;
   private readonly selectorId: string | null;
+  private readonly strategyMode: DailyRangeStrategyMode;
+  private readonly strategyVersion: DailyRangeStrategyVersion;
   private readonly nowMs: () => number;
   private readonly confirmRetryMs: number;
   private ticking = false;
@@ -1103,8 +1304,51 @@ export class DailyRangeAcceptanceLane {
     this.allocatorMode = opts.allocatorMode
       ?? (opts.environment === "mainnet" ? opts.mainnetControls?.allocatorMode ?? "PAUSED" : "SEEDED_RANDOM_BASELINE");
     this.selectorId = opts.selectorId ?? null;
+    this.strategyMode = opts.strategyMode ?? "LEGACY_CONTINUATION";
+    this.strategyVersion = this.strategyMode === "AUTO_ROUTE_NY_V2"
+      ? DAILY_RANGE_AUTO_ROUTE_STRATEGY_VERSION
+      : DAILY_RANGE_STRATEGY_VERSION;
     this.nowMs = opts.nowMs ?? (() => Date.now());
     this.confirmRetryMs = opts.confirmRetryMs ?? DEFAULT_CONFIRM_RETRY_MS;
+  }
+
+  private isAutoRoute(): boolean {
+    return this.strategyMode === "AUTO_ROUTE_NY_V2";
+  }
+
+  private currentReferenceWindow(now: number): {
+    dayKey: string;
+    date: string;
+    referenceTimezone: "UTC" | "America/New_York";
+    rangeOpenTime: number;
+    rangeCloseTime: number;
+    entryWindowCloseTime: number;
+  } {
+    if (this.isAutoRoute()) {
+      const window = newYorkDailyRangeWindow(now);
+      return {
+        dayKey: `NY:${window.date}`,
+        date: window.date,
+        referenceTimezone: window.timezone,
+        rangeOpenTime: window.rangeOpenTime,
+        rangeCloseTime: window.rangeCloseTime,
+        entryWindowCloseTime: window.entryWindowCloseTime,
+      };
+    }
+    const start = utcDayStartMs(now);
+    return {
+      dayKey: utcDate(now),
+      date: utcDate(now),
+      referenceTimezone: "UTC",
+      rangeOpenTime: start,
+      rangeCloseTime: start + FOUR_HOURS_MS,
+      entryWindowCloseTime: start + DAY_MS,
+    };
+  }
+
+  private inEntryWindow(ms: number): boolean {
+    if (this.isAutoRoute()) return inNewYorkDailyRangeEntryWindow(ms);
+    return inDailyRangeEntryWindow(ms);
   }
 
   isSymbolLeased(symbol: string): { tradeId: string; direction: DailyRangeDirection; status: DailyRangeTradeStatus } | null {
@@ -1269,14 +1513,15 @@ export class DailyRangeAcceptanceLane {
   getStatus(): Record<string, unknown> {
     const now = this.nowMs();
     const state = this.store.getState();
-    const date = utcDate(now);
-    const day = state.days[date] ?? null;
+    const window = this.currentReferenceWindow(now);
+    const date = window.date;
+    const day = state.days[window.dayKey] ?? null;
     const performance = this.performanceSummary();
-    const signalsToday = state.signals.filter((signal) => signal.dateUtc === date);
-    const tradesToday = state.trades.filter((trade) => trade.dateUtc === date);
+    const signalsToday = state.signals.filter((signal) => signal.strategyVersion === this.strategyVersion && signal.dateUtc === date);
+    const tradesToday = state.trades.filter((trade) => trade.strategyVersion === this.strategyVersion && trade.dateUtc === date);
     const openTrades = state.trades.filter((trade) => !isTerminalTradeStatus(trade.status));
     const capacity = this.allocationCapacity();
-    const batches = state.signalCohorts.filter((batch) => batch.allocation);
+    const batches = state.signalCohorts.filter((batch) => batch.strategyVersion === this.strategyVersion && batch.allocation);
     const lastBatch = [...batches]
       .sort((a, b) => b.signalTimestampMs - a.signalTimestampMs || b.cohortId.localeCompare(a.cohortId))[0] ?? null;
     const researchSignals = state.signals.filter((signal) => signal.research?.counterfactual !== null && signal.research?.counterfactual !== undefined);
@@ -1297,7 +1542,8 @@ export class DailyRangeAcceptanceLane {
       ok: true,
       environment: this.environment,
       laneId: DAILY_RANGE_LANE_ID,
-      strategyVersion: DAILY_RANGE_STRATEGY_VERSION,
+      strategyVersion: this.strategyVersion,
+      strategyMode: this.strategyMode,
       utcNow: iso(now),
       control: state.control,
       reconciled: this.startupReconciled,
@@ -1305,10 +1551,14 @@ export class DailyRangeAcceptanceLane {
       today: {
         dateUtc: date,
         rangeInitialized: day !== null,
-        rangeReady: now >= firstReferenceReadyAtMs(now),
-        entryWindowOpen: inDailyRangeEntryWindow(now),
+        rangeReady: now >= window.rangeCloseTime,
+        entryWindowOpen: this.inEntryWindow(now),
+        referenceTimezone: window.referenceTimezone,
+        referenceRangeOpenTime: window.rangeOpenTime,
+        referenceRangeCloseTime: window.rangeCloseTime,
+        entryWindowCloseTime: window.entryWindowCloseTime,
         dailyUniverseCount: day?.universeSymbols.length ?? 0,
-        /** Immutable source captured at the UTC-day boundary; lets operators verify pool isolation. */
+        /** Immutable source captured for this reference session; lets operators verify pool isolation. */
         dailyUniverseSource: day?.universeSource ?? null,
         dailyUniverseSymbols: day?.universeSymbols ?? [],
         poolEvidence: day?.poolEvidence ? {
@@ -1322,11 +1572,11 @@ export class DailyRangeAcceptanceLane {
         monitoringSymbols: Object.keys(day?.levels ?? {}).length,
         invalidReferenceSymbols: day?.invalidReferenceSymbols ?? [],
         signals: signalsToday.length,
-        signalCohorts: state.signalCohorts.filter((cohort) => cohort.dateUtc === date).length,
+        signalCohorts: state.signalCohorts.filter((cohort) => cohort.strategyVersion === this.strategyVersion && cohort.dateUtc === date).length,
         executedTrades: tradesToday.filter((trade) => trade.entryOrderId !== null).length,
         closedTrades: tradesToday.filter((trade) => trade.status === "CLOSED").length,
       },
-      nextReferenceReset: iso(utcDayStartMs(now) + DAY_MS + FOUR_HOURS_MS),
+      nextReferenceReset: iso(this.currentReferenceWindow(window.entryWindowCloseTime + 1).rangeCloseTime),
       openTrades,
       totalHistoricalTrades: state.trades.filter((trade) => trade.entryOrderId !== null).length,
       performance,
@@ -1519,7 +1769,7 @@ export class DailyRangeAcceptanceLane {
   private resetTodayDetectionAtArm(): void {
     const now = this.nowMs();
     const state = this.store.getState();
-    const day = state.days[utcDate(now)];
+    const day = state.days[this.currentReferenceWindow(now).dayKey];
     const latestCompletedOpen = lastClosedFiveMinuteOpenTime(now);
     if (!day || latestCompletedOpen === null) return;
 
@@ -1531,6 +1781,7 @@ export class DailyRangeAcceptanceLane {
       symbolState.shortCount = 0;
       symbolState.longLocked = false;
       symbolState.shortLocked = false;
+      if (this.isAutoRoute()) symbolState.router = blankRouterState();
       day.symbolStates[symbol] = symbolState;
     }
     state.runtime.lastProcessedMarketBarOpenTime = Math.max(
@@ -1565,7 +1816,7 @@ export class DailyRangeAcceptanceLane {
         this.store.save();
         return;
       }
-      if (!inDailyRangeEntryWindow(this.nowMs())) {
+      if (!this.inEntryWindow(this.nowMs())) {
         state.runtime.lastError = null;
         this.store.save();
         return;
@@ -1608,36 +1859,70 @@ export class DailyRangeAcceptanceLane {
 
   private async ensureTodayRange(): Promise<void> {
     const now = this.nowMs();
-    if (now < firstReferenceReadyAtMs(now)) return;
+    const window = this.currentReferenceWindow(now);
+    if (now < window.rangeCloseTime) return;
     const state = this.store.getState();
-    const date = utcDate(now);
-    if (state.days[date]) return;
+    if (state.days[window.dayKey]) return;
 
     const snapshot = this.getUniverse();
     const symbols = [...new Set(snapshot.symbols.map(normalizeSymbol).filter(Boolean))].sort();
     if (symbols.length === 0) throw new Error("daily universe snapshot is empty");
-    const dayStart = utcDayStartMs(now);
     const levelResults = await Promise.all(
       symbols.map(async (symbol) => {
         try {
-          const candles = await this.client.getKlines(symbol, "4h", {
-            startTime: dayStart,
-            endTime: dayStart + FOUR_HOURS_MS - 1,
-            limit: 3,
-          });
-          const exact = candles.find((candle) => candle.openTime === dayStart && candle.closeTime < dayStart + FOUR_HOURS_MS);
-          if (!exact || !(exact.high > exact.low) || !finitePositive(exact.high) || !finitePositive(exact.low)) {
-            return { symbol, level: null as DailyRangeLevel | null, reason: "missing or invalid completed UTC 00:00-04:00 candle" };
+          let high: number;
+          let low: number;
+          if (this.isAutoRoute()) {
+            // Binance native 4h bars are UTC anchored. A NY-local session must
+            // therefore be composed from completed 5m USD-M bars, otherwise DST
+            // silently selects the prior NY evening rather than 00:00-04:00.
+            const rows = await this.client.getKlines(symbol, "5m", {
+              startTime: window.rangeOpenTime,
+              endTime: window.rangeCloseTime - 1,
+              limit: 100,
+            });
+            const exact = rows.map(asDailyCandle)
+              .filter((candle) => candle.openTime >= window.rangeOpenTime && candle.closeTime < window.rangeCloseTime)
+              .sort((left, right) => left.openTime - right.openTime);
+            const expectedCount = (window.rangeCloseTime - window.rangeOpenTime) / FIVE_MIN_MS;
+            const complete = exact.length === expectedCount
+              && exact[0]?.openTime === window.rangeOpenTime
+              && exact.at(-1)?.closeTime === window.rangeCloseTime - 1
+              && contiguousFiveMinuteBars(exact);
+            if (!complete) {
+              return {
+                symbol,
+                level: null as DailyRangeLevel | null,
+                reason: "missing/gapped completed 5m candles for NY 00:00-04:00 reference",
+              };
+            }
+            high = Math.max(...exact.map((candle) => candle.high));
+            low = Math.min(...exact.map((candle) => candle.low));
+          } else {
+            const candles = await this.client.getKlines(symbol, "4h", {
+              startTime: window.rangeOpenTime,
+              endTime: window.rangeCloseTime - 1,
+              limit: 3,
+            });
+            const exact = candles.find((candle) => candle.openTime === window.rangeOpenTime && candle.closeTime < window.rangeCloseTime);
+            if (!exact) {
+              return { symbol, level: null as DailyRangeLevel | null, reason: "missing completed UTC 00:00-04:00 candle" };
+            }
+            high = exact.high;
+            low = exact.low;
+          }
+          if (!(high > low) || !finitePositive(high) || !finitePositive(low)) {
+            return { symbol, level: null as DailyRangeLevel | null, reason: "invalid completed Daily Range high/low" };
           }
           const level: DailyRangeLevel = {
-            dateUtc: date,
+            dateUtc: window.date,
             symbol,
-            fourHourOpenTime: dayStart,
-            fourHourCloseTime: dayStart + FOUR_HOURS_MS,
-            rangeHigh: exact.high,
-            rangeLow: exact.low,
-            rangeWidth: exact.high - exact.low,
-            rangeWidthPct: exact.low > 0 ? (exact.high - exact.low) / exact.low : null,
+            fourHourOpenTime: window.rangeOpenTime,
+            fourHourCloseTime: window.rangeCloseTime,
+            rangeHigh: high,
+            rangeLow: low,
+            rangeWidth: high - low,
+            rangeWidthPct: low > 0 ? (high - low) / low : null,
             dailyUniverseMembership: true,
             createdAt: iso(this.nowMs()),
           };
@@ -1660,13 +1945,15 @@ export class DailyRangeAcceptanceLane {
         levels[result.symbol] = result.level;
         // Startup is never an excuse to enter based on a bar which closed before
         // this lane was armed. An already-armed restart retains a persisted watermark.
-        symbolStates[result.symbol] = blankSymbolState(latestCompleted);
+        const symbolState = blankSymbolState(latestCompleted);
+        if (this.isAutoRoute()) symbolState.router = blankRouterState();
+        symbolStates[result.symbol] = symbolState;
       } else {
         invalidReferenceSymbols.push({ symbol: result.symbol, reason: result.reason ?? "invalid reference" });
       }
     }
-    state.days[date] = {
-      dateUtc: date,
+    state.days[window.dayKey] = {
+      dateUtc: window.date,
       initializedAt: iso(this.nowMs()),
       universeSymbols: symbols,
       universeSource: snapshot.source,
@@ -1674,27 +1961,35 @@ export class DailyRangeAcceptanceLane {
       levels,
       invalidReferenceSymbols,
       symbolStates,
+      strategyVersion: this.strategyVersion,
+      strategyMode: this.strategyMode,
+      referenceTimezone: window.referenceTimezone,
+      referenceRangeOpenTime: window.rangeOpenTime,
+      referenceRangeCloseTime: window.rangeCloseTime,
+      entryWindowCloseTime: window.entryWindowCloseTime,
     };
     this.store.save();
     console.log(
-      `[daily-range-lane] DAILY_RANGE_INITIALIZED date=${date} universe=${symbols.length} valid=${Object.keys(levels).length} invalid=${invalidReferenceSymbols.length} source=${snapshot.source} poolEvidence=${snapshot.poolEvidence ? "CAPTURED" : "UNAVAILABLE"}`,
+      `[daily-range-lane] DAILY_RANGE_INITIALIZED date=${window.date} mode=${this.strategyMode} timezone=${window.referenceTimezone} universe=${symbols.length} valid=${Object.keys(levels).length} invalid=${invalidReferenceSymbols.length} source=${snapshot.source} poolEvidence=${snapshot.poolEvidence ? "CAPTURED" : "UNAVAILABLE"}`,
     );
   }
 
   private async processCompletedBars(): Promise<void> {
     const now = this.nowMs();
-    const dayStart = utcDayStartMs(now);
-    const date = utcDate(now);
+    const window = this.currentReferenceWindow(now);
     const state = this.store.getState();
-    const day = state.days[date];
+    const day = state.days[window.dayKey];
     if (!day) return;
     const latestCompletedOpen = lastClosedFiveMinuteOpenTime(now);
-    if (latestCompletedOpen === null || latestCompletedOpen < dayStart + FOUR_HOURS_MS) return;
+    if (latestCompletedOpen === null || latestCompletedOpen < window.rangeCloseTime) return;
     const actions: DailyRangeSignal[] = [];
     for (const [symbol, level] of Object.entries(day.levels)) {
       const symbolState = day.symbolStates[symbol] ?? blankSymbolState(latestCompletedOpen);
       day.symbolStates[symbol] = symbolState;
-      const initialOpen = Math.max(dayStart + FOUR_HOURS_MS, (symbolState.lastProcessedBarOpenTime ?? (dayStart + FOUR_HOURS_MS - FIVE_MIN_MS)) + FIVE_MIN_MS);
+      const initialOpen = Math.max(
+        window.rangeCloseTime,
+        (symbolState.lastProcessedBarOpenTime ?? (window.rangeCloseTime - FIVE_MIN_MS)) + FIVE_MIN_MS,
+      );
       if (initialOpen > latestCompletedOpen) continue;
       let candles: DailyRangeCandle[];
       try {
@@ -1751,6 +2046,7 @@ export class DailyRangeAcceptanceLane {
     symbolState: DailyRangeSymbolState,
     candle: DailyRangeCandle,
   ): DailyRangeSignal | null {
+    if (this.isAutoRoute()) return this.applyAutoRouteCandle(day, level, symbolState, candle);
     const longQualified = candle.close >= level.rangeHigh;
     const shortQualified = candle.close <= level.rangeLow;
     // The locks are directional.  A close below HIGH resets the LONG run and a
@@ -1788,23 +2084,131 @@ export class DailyRangeAcceptanceLane {
     return emitted;
   }
 
+  /**
+   * V2 router: a breakout becomes an event, not an order by itself. A later
+   * close farther outside confirms expansion and continues; a close back inside
+   * before that point proves rejection and fades. This uses only completed 5m
+   * bars and preserves exactly one candidate per breakout event.
+   */
+  private applyAutoRouteCandle(
+    day: DailyRangeDayState,
+    level: DailyRangeLevel,
+    symbolState: DailyRangeSymbolState,
+    candle: DailyRangeCandle,
+  ): DailyRangeSignal | null {
+    const position: "ABOVE" | "BELOW" | "INSIDE" = candle.close > level.rangeHigh + EPSILON
+      ? "ABOVE"
+      : candle.close < level.rangeLow - EPSILON ? "BELOW" : "INSIDE";
+    const directionFor = (value: "ABOVE" | "BELOW"): DailyRangeBreakoutDirection => value === "ABOVE" ? "UP" : "DOWN";
+    const extensionFor = (direction: DailyRangeBreakoutDirection, row: DailyRangeCandle): number => direction === "UP"
+      ? row.close - level.rangeHigh
+      : level.rangeLow - row.close;
+    const extremeFor = (direction: DailyRangeBreakoutDirection, row: DailyRangeCandle): number => direction === "UP" ? row.high : row.low;
+    const mergeExtreme = (direction: DailyRangeBreakoutDirection, prior: number | null, row: DailyRangeCandle): number => {
+      const value = extremeFor(direction, row);
+      return prior === null ? value : direction === "UP" ? Math.max(prior, value) : Math.min(prior, value);
+    };
+    const arm = (direction: DailyRangeBreakoutDirection): void => {
+      const router = routerStateFor(symbolState);
+      router.phase = "ARMED";
+      router.breakoutId = `drra2-break-${day.dateUtc.replaceAll("-", "")}-${level.symbol.toLowerCase().slice(0, 8)}-${direction[0]}-${candle.closeTime.toString(36)}`.slice(0, 72);
+      router.breakoutDirection = direction;
+      router.firstOutsideCandle = candle;
+      router.lastOutsideCandle = candle;
+      router.breakoutExtreme = extremeFor(direction, candle);
+      router.outsideCloseCount = 1;
+      router.maxCloseExtension = extensionFor(direction, candle);
+    };
+
+    const router = routerStateFor(symbolState);
+    if (router.phase === "IDLE") {
+      if (position !== "INSIDE") arm(directionFor(position));
+      return null;
+    }
+    if (router.phase === "CONTINUATION_LOCKED") {
+      // A continuation event is spent. Its first re-entry only resets the
+      // detector; it must never reverse an existing/open continuation trade.
+      if (position === "INSIDE") symbolState.router = blankRouterState();
+      return null;
+    }
+
+    const breakoutDirection = router.breakoutDirection;
+    const previousOutside = router.lastOutsideCandle;
+    if (!breakoutDirection || !previousOutside) {
+      symbolState.router = blankRouterState();
+      if (position !== "INSIDE") arm(directionFor(position));
+      return null;
+    }
+    const sameOutside = (breakoutDirection === "UP" && position === "ABOVE")
+      || (breakoutDirection === "DOWN" && position === "BELOW");
+    if (sameOutside) {
+      const extension = extensionFor(breakoutDirection, candle);
+      const priorMaximum = router.maxCloseExtension;
+      router.lastOutsideCandle = candle;
+      router.breakoutExtreme = mergeExtreme(breakoutDirection, router.breakoutExtreme, candle);
+      router.outsideCloseCount += 1;
+      router.maxCloseExtension = Math.max(router.maxCloseExtension, extension);
+      if (router.outsideCloseCount >= 2 && extension > priorMaximum + EPSILON) {
+        const direction: DailyRangeDirection = breakoutDirection === "UP" ? "LONG" : "SHORT";
+        const signal = this.recordSignal(day, level, direction, previousOutside, candle, {
+          entryPolicy: "CONTINUATION",
+          breakoutDirection,
+          breakoutId: router.breakoutId,
+          breakoutExtreme: router.breakoutExtreme,
+        });
+        router.phase = "CONTINUATION_LOCKED";
+        return signal;
+      }
+      return null;
+    }
+    if (position === "INSIDE") {
+      // Include the rejection candle wick in the excursion extreme. A re-entry
+      // that makes a new high/low but closes inside cannot receive a stop that
+      // was already penetrated by that same completed candle.
+      const breakoutExtreme = mergeExtreme(breakoutDirection, router.breakoutExtreme, candle);
+      const direction: DailyRangeDirection = breakoutDirection === "UP" ? "SHORT" : "LONG";
+      const signal = this.recordSignal(day, level, direction, previousOutside, candle, {
+        entryPolicy: "FADE",
+        breakoutDirection,
+        breakoutId: router.breakoutId,
+        breakoutExtreme,
+      });
+      symbolState.router = blankRouterState();
+      return signal;
+    }
+
+    // A close directly through the entire range did not re-enter inside, so it
+    // is neither a valid fade nor a continuation of the prior side. Start a
+    // fresh opposite breakout event without inventing a trade.
+    symbolState.router = blankRouterState();
+    arm(directionFor(position));
+    return null;
+  }
+
   private recordSignal(
     day: DailyRangeDayState,
     level: DailyRangeLevel,
     direction: DailyRangeDirection,
     confirmationBar1: DailyRangeCandle | null,
     confirmationBar2: DailyRangeCandle,
+    route: {
+      entryPolicy: DailyRangeEntryPolicy;
+      breakoutDirection: DailyRangeBreakoutDirection | null;
+      breakoutId: string | null;
+      breakoutExtreme: number | null;
+    } | null = null,
   ): DailyRangeSignal {
     const state = this.store.getState();
-    // A missing predecessor indicates a corrupt/missing path. Do not manufacture a
-    // candle from C2: the signal is retained as stale diagnostic evidence and cannot
-    // be executable.
-    const bar1 = confirmationBar1 && confirmationBar1.openTime === confirmationBar2.openTime - FIVE_MIN_MS
+    // A fade can legitimately re-enter several completed bars after its first
+    // outside close. Continuation and legacy signals still require adjacent C1/C2.
+    const allowNonContiguousBreakout = route?.entryPolicy === "FADE";
+    const bar1 = confirmationBar1 && (allowNonContiguousBreakout || confirmationBar1.openTime === confirmationBar2.openTime - FIVE_MIN_MS)
       ? confirmationBar1
       : null;
+    const window = this.currentReferenceWindow(confirmationBar2.closeTime + 1);
     const signal: DailyRangeSignal = {
-      signalId: signalId(day.dateUtc, level.symbol, direction, confirmationBar2.closeTime),
-      strategyVersion: DAILY_RANGE_STRATEGY_VERSION,
+      signalId: signalId(this.strategyVersion, day.dateUtc, level.symbol, direction, confirmationBar2.closeTime),
+      strategyVersion: this.strategyVersion,
       laneId: DAILY_RANGE_LANE_ID,
       dateUtc: day.dateUtc,
       symbol: level.symbol,
@@ -1830,9 +2234,16 @@ export class DailyRangeAcceptanceLane {
       actuallySelected: false,
       actuallyExecuted: false,
       research: { marketQuality: null, features: null, counterfactual: null },
+      entryPolicy: route?.entryPolicy ?? "LEGACY_CONTINUATION",
+      breakoutDirection: route?.breakoutDirection ?? null,
+      breakoutId: route?.breakoutId ?? null,
+      breakoutExtreme: route?.breakoutExtreme ?? null,
+      referenceTimezone: day.referenceTimezone ?? window.referenceTimezone,
+      referenceRangeOpenTime: day.referenceRangeOpenTime ?? level.fourHourOpenTime,
+      referenceRangeCloseTime: day.referenceRangeCloseTime ?? level.fourHourCloseTime,
     };
     state.signals.push(signal);
-    console.log(`[daily-range-lane] ACCEPTANCE_${direction}_CONFIRMED symbol=${signal.symbol} signal=${signal.signalId}`);
+    console.log(`[daily-range-lane] ${signal.entryPolicy}_${direction}_CONFIRMED symbol=${signal.symbol} signal=${signal.signalId} breakout=${signal.breakoutId ?? "legacy"}`);
     return signal;
   }
 
@@ -1843,10 +2254,7 @@ export class DailyRangeAcceptanceLane {
     cohortSequence: number,
   ): DailyRangeSignalCohortCandidate {
     const rangeWidth = signal.rangeHigh - signal.rangeLow;
-    const boundary = signal.direction === "LONG" ? signal.rangeHigh : signal.rangeLow;
-    const breakoutDistancePrice = signal.direction === "LONG"
-      ? signal.confirmationBar2.close - boundary
-      : boundary - signal.confirmationBar2.close;
+    const breakoutDistancePrice = breakoutExtensionForSignal(signal, signal.confirmationBar2);
     return {
       signalId: signal.signalId,
       symbol: signal.symbol,
@@ -1893,12 +2301,12 @@ export class DailyRangeAcceptanceLane {
     });
     let changed = false;
     for (const [signalTimestampMs, rows] of grouped) {
-      const cohortId = signalCohortId(day.dateUtc, signalTimestampMs);
+      const cohortId = signalCohortId(this.strategyVersion, day.dateUtc, signalTimestampMs);
       let cohort = byId.get(cohortId);
       if (!cohort) {
         cohort = {
           cohortId,
-          strategyVersion: DAILY_RANGE_STRATEGY_VERSION,
+          strategyVersion: this.strategyVersion,
           laneId: DAILY_RANGE_LANE_ID,
           selectorPolicyVersion: DAILY_RANGE_SELECTOR_POLICY_VERSION,
           dateUtc: day.dateUtc,
@@ -2060,6 +2468,7 @@ export class DailyRangeAcceptanceLane {
 
   private batchCandidateBlockReason(signal: DailyRangeSignal): DailyRangeSignalReason | null {
     const state = this.store.getState();
+    if (signal.strategyVersion !== this.strategyVersion) return "RETIRED_STRATEGY_VERSION";
     if (state.control.mode !== "ARMED") return "LANE_DISARMED";
     const mainnetBlock = this.mainnetControlBlockReason("entry");
     if (mainnetBlock) {
@@ -2074,7 +2483,7 @@ export class DailyRangeAcceptanceLane {
       accountGate = { allowed: false, reason: error instanceof Error ? error.message : String(error) };
     }
     if (!accountGate.allowed) return "ACCOUNT_ENTRY_BLOCKED";
-    if (!inDailyRangeEntryWindow(signal.signalTimestampMs)) return "OUTSIDE_ENTRY_WINDOW";
+    if (!this.inEntryWindow(signal.signalTimestampMs)) return "OUTSIDE_ENTRY_WINDOW";
     if (this.nowMs() - signal.signalTimestampMs > MAX_FRESH_SIGNAL_AGE_MS) return "MISSED_SIGNAL_RECOVERY";
     if (!signal.confirmationBar1 || signal.reason === "STALE_DATA") return "STALE_DATA";
     if (signal.direction === "SHORT" && this.getShortBlocklist().has(signal.symbol)) return "SHORT_BLOCKED";
@@ -2093,7 +2502,7 @@ export class DailyRangeAcceptanceLane {
 
   private async finalizePendingSignalBatches(day: DailyRangeDayState): Promise<void> {
     const batches = this.store.getState().signalCohorts
-      .filter((cohort) => cohort.dateUtc === day.dateUtc && cohort.allocation && cohort.allocation.finalizedAt === null)
+      .filter((cohort) => cohort.strategyVersion === this.strategyVersion && cohort.dateUtc === day.dateUtc && cohort.allocation && cohort.allocation.finalizedAt === null)
       .sort((a, b) => a.signalTimestampMs - b.signalTimestampMs || a.cohortId.localeCompare(b.cohortId));
     for (const batch of batches) {
       if (!this.batchIsComplete(day, batch)) continue;
@@ -2149,7 +2558,7 @@ export class DailyRangeAcceptanceLane {
 
       const result = allocateDailyRangeBatch({
         mode: this.allocatorMode,
-        strategyVersion: DAILY_RANGE_STRATEGY_VERSION,
+        strategyVersion: batch.strategyVersion,
         batchTimestampMs: batch.signalTimestampMs,
         environment: this.environment,
         availableSlots: capacity.slots,
@@ -2306,7 +2715,7 @@ export class DailyRangeAcceptanceLane {
 
   private async capturePendingResearchSnapshots(day: DailyRangeDayState): Promise<void> {
     const batches = this.store.getState().signalCohorts
-      .filter((batch) => batch.dateUtc === day.dateUtc && batch.allocation?.batchComplete)
+      .filter((batch) => batch.strategyVersion === this.strategyVersion && batch.dateUtc === day.dateUtc && batch.allocation?.batchComplete)
       .sort((a, b) => a.signalTimestampMs - b.signalTimestampMs || a.cohortId.localeCompare(b.cohortId));
     for (const batch of batches) {
       const signals = batch.candidates
@@ -2392,6 +2801,28 @@ export class DailyRangeAcceptanceLane {
     const level = day.levels[signal.symbol];
     if (!level) return [];
     try {
+      if (signal.strategyVersion === DAILY_RANGE_AUTO_ROUTE_STRATEGY_VERSION) {
+        const startTime = signal.referenceRangeOpenTime ?? level.fourHourOpenTime;
+        const endTime = signal.referenceRangeCloseTime ?? level.fourHourCloseTime;
+        const rows = await this.client.getKlines(signal.symbol, "5m", {
+          startTime,
+          endTime: endTime - 1,
+          limit: 100,
+        });
+        const candles = rows.map(asDailyCandle)
+          .filter((row) => row.openTime >= startTime && row.closeTime < endTime)
+          .sort((left, right) => left.openTime - right.openTime);
+        if (candles.length === 0 || !contiguousFiveMinuteBars(candles)) return [];
+        return [{
+          openTime: startTime,
+          closeTime: endTime - 1,
+          open: candles[0]!.open,
+          high: Math.max(...candles.map((row) => row.high)),
+          low: Math.min(...candles.map((row) => row.low)),
+          close: candles.at(-1)!.close,
+          volume: candles.reduce((sum, row) => sum + row.volume, 0),
+        }];
+      }
       const rows = await this.client.getKlines(signal.symbol, "4h", {
         startTime: level.fourHourOpenTime - 7 * FOUR_HOURS_MS,
         endTime: level.fourHourCloseTime - 1,
@@ -2414,10 +2845,8 @@ export class DailyRangeAcceptanceLane {
   }): DailyRangeSignalFeatureSnapshot {
     const { signal, candles, reference } = input;
     const rangeWidth = signal.rangeHigh - signal.rangeLow;
-    const boundary = signal.direction === "LONG" ? signal.rangeHigh : signal.rangeLow;
-    const extension = (candle: DailyRangeCandle): number => signal.direction === "LONG"
-      ? candle.close - boundary
-      : boundary - candle.close;
+    const boundary = breakoutBoundaryForSignal(signal);
+    const extension = (candle: DailyRangeCandle): number => breakoutExtensionForSignal(signal, candle);
     const c1ExtensionPrice = extension(signal.confirmationBar1 ?? signal.confirmationBar2);
     const c2ExtensionPrice = extension(signal.confirmationBar2);
     const atr14 = atr(candles, 14);
@@ -2431,7 +2860,8 @@ export class DailyRangeAcceptanceLane {
       const c1 = signal.confirmationBar1?.volume ?? null;
       return c1 === null ? null : ratio(c1 + signal.confirmationBar2.volume, baseline === null ? null : 2 * baseline);
     };
-    const referenceCandle = reference.find((row) => row.openTime === utcDayStartMs(signal.signalTimestampMs)) ?? null;
+    const referenceStart = signal.referenceRangeOpenTime ?? utcDayStartMs(signal.signalTimestampMs);
+    const referenceCandle = reference.find((row) => row.openTime === referenceStart) ?? null;
     const referenceRange = referenceCandle ? referenceCandle.high - referenceCandle.low : null;
     const referenceBody = referenceCandle && referenceRange && referenceRange > EPSILON
       ? Math.abs(referenceCandle.close - referenceCandle.open) / referenceRange
@@ -2520,12 +2950,9 @@ export class DailyRangeAcceptanceLane {
 
   private initializeCounterfactual(signal: DailyRangeSignal, filter: FuturesSymbolFilters | null): DailyRangeCounterfactualOutcome {
     const entryPrice = signal.confirmationBar2.close;
-    const structuralStop = structuralStopForAcceptance({
-      direction: signal.direction,
-      rangeHigh: signal.rangeHigh,
-      rangeLow: signal.rangeLow,
+    const structuralStop = structuralStopForDailyRangeSignal({
+      ...signal,
       confirmationBar1: signal.confirmationBar1 ?? signal.confirmationBar2,
-      confirmationBar2: signal.confirmationBar2,
     });
     const rounded = filter ? roundDailyRangeBracket({
       direction: signal.direction,
@@ -2540,7 +2967,9 @@ export class DailyRangeAcceptanceLane {
     const quantity = filter ? clampQty(DAILY_RANGE_TRADE_NOTIONAL_USD / entryPrice, filter) : null;
     return {
       status: "PENDING",
-      entryConvention: "C2_CLOSE_PIT_CANONICAL_V1",
+      entryConvention: signal.strategyVersion === DAILY_RANGE_AUTO_ROUTE_STRATEGY_VERSION
+        ? "AUTO_ROUTE_5M_CLOSE_PIT_V2"
+        : "C2_CLOSE_PIT_CANONICAL_V1",
       entryPrice,
       structuralStop: rounded?.stop ?? structuralStop,
       takeProfit,
@@ -2646,17 +3075,12 @@ export class DailyRangeAcceptanceLane {
   private createPendingTrade(signal: DailyRangeSignal, options: { persist?: boolean } = {}): DailyRangeTrade | null {
     if (!signal.confirmationBar1) return null;
     const tradeId = tradeIdFromSignal(signal);
-    const rawStop = structuralStopForAcceptance({
-      direction: signal.direction,
-      rangeHigh: signal.rangeHigh,
-      rangeLow: signal.rangeLow,
-      confirmationBar1: signal.confirmationBar1,
-      confirmationBar2: signal.confirmationBar2,
-    });
+    const rawStop = structuralStopForDailyRangeSignal(signal);
+    if (!finitePositive(rawStop)) return null;
     const trade: DailyRangeTrade = {
       tradeId,
       signalId: signal.signalId,
-      strategyVersion: DAILY_RANGE_STRATEGY_VERSION,
+      strategyVersion: signal.strategyVersion,
       laneId: DAILY_RANGE_LANE_ID,
       dateUtc: signal.dateUtc,
       symbol: signal.symbol,
@@ -2675,6 +3099,13 @@ export class DailyRangeAcceptanceLane {
       signalReferencePrice: null,
       rangeHigh: signal.rangeHigh,
       rangeLow: signal.rangeLow,
+      entryPolicy: signal.entryPolicy ?? "LEGACY_CONTINUATION",
+      breakoutDirection: signal.breakoutDirection ?? null,
+      breakoutId: signal.breakoutId ?? null,
+      breakoutExtreme: signal.breakoutExtreme ?? null,
+      referenceTimezone: signal.referenceTimezone ?? "UTC",
+      referenceRangeOpenTime: signal.referenceRangeOpenTime ?? null,
+      referenceRangeCloseTime: signal.referenceRangeCloseTime ?? null,
       confirmationBar1: signal.confirmationBar1,
       confirmationBar2: signal.confirmationBar2,
       structuralStopRaw: rawStop,
@@ -2724,6 +3155,10 @@ export class DailyRangeAcceptanceLane {
       this.markSignal(signal, { eligible: false, reason: "LANE_DISARMED" });
       return;
     }
+    if (signal.strategyVersion !== this.strategyVersion) {
+      this.markSignal(signal, { eligible: false, reason: "RETIRED_STRATEGY_VERSION" });
+      return;
+    }
     if (this.mainnetControlBlockReason("entry")) {
       this.markSignal(signal, { eligible: false, reason: "MAINNET_EXECUTION_DISABLED" });
       return;
@@ -2743,7 +3178,7 @@ export class DailyRangeAcceptanceLane {
       this.markSignal(signal, { eligible: false, reason: limitReason });
       return;
     }
-    if (!inDailyRangeEntryWindow(signal.signalTimestampMs)) {
+    if (!this.inEntryWindow(signal.signalTimestampMs)) {
       this.markSignal(signal, { eligible: false, reason: "OUTSIDE_ENTRY_WINDOW" });
       return;
     }

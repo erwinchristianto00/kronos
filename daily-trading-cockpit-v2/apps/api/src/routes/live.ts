@@ -2227,8 +2227,8 @@ export async function registerLiveRoutes(
   // ── Daily 4h range-acceptance lane (isolated from MOM36) ──────────────────
   // Read-only chart feed for a specific durable Daily Range trade.  Unlike the
   // generic basket review route, this intentionally takes the persisted range
-  // from the trade, so an open trade keeps the exact 00:00-04:00 UTC reference
-  // it was created with even after the calendar day changes.
+  // from the trade, so a legacy UTC-v1 or NY-v2 trade keeps its exact reference
+  // session even after the calendar day changes.
   app.get("/api/live/daily-range-lane/chart", async (request, reply) => {
     const lane = opts.dailyRangeLane?.() ?? null;
     if (!lane) {
@@ -2251,8 +2251,20 @@ export async function registerLiveRoutes(
       return { ok: false, reason: "daily range trade has an invalid USD-M symbol" };
     }
 
-    const referenceStartMs = utcDateStartMs(trade.dateUtc);
+    const fallbackReferenceStartMs = utcDateStartMs(trade.dateUtc);
+    const persistedReferenceStartMs = typeof trade.referenceRangeOpenTime === "number" && Number.isFinite(trade.referenceRangeOpenTime)
+      ? trade.referenceRangeOpenTime
+      : null;
+    const persistedReferenceCloseMs = typeof trade.referenceRangeCloseTime === "number" && Number.isFinite(trade.referenceRangeCloseTime)
+      ? trade.referenceRangeCloseTime
+      : null;
+    const referenceStartMs = persistedReferenceStartMs ?? fallbackReferenceStartMs;
+    const referenceCloseMs = persistedReferenceCloseMs !== null && referenceStartMs !== null && persistedReferenceCloseMs > referenceStartMs
+      ? persistedReferenceCloseMs
+      : referenceStartMs === null ? null : referenceStartMs + FOUR_HOURS_MS;
+    const referenceTimezone = trade.referenceTimezone ?? "UTC";
     const referenceValid = referenceStartMs !== null
+      && referenceCloseMs !== null
       && Number.isFinite(trade.rangeHigh)
       && Number.isFinite(trade.rangeLow)
       && trade.rangeHigh > trade.rangeLow;
@@ -2265,6 +2277,7 @@ export async function registerLiveRoutes(
         ok: true,
         chartKind: "DAILY_RANGE_TRADE" as const,
         tradeId: trade.tradeId,
+        entryPolicy: trade.entryPolicy ?? "LEGACY_CONTINUATION",
         symbol: trade.symbol,
         source: "BINANCE_USDM_PUBLIC" as const,
         completedOnly: true,
@@ -2275,13 +2288,14 @@ export async function registerLiveRoutes(
           ? {
             dateUtc: trade.dateUtc,
             fourHourOpenTime: referenceStartMs,
-            fourHourCloseTime: referenceStartMs + FOUR_HOURS_MS,
+            fourHourCloseTime: referenceCloseMs,
+            timezone: referenceTimezone,
             rangeHigh: trade.rangeHigh,
             rangeLow: trade.rangeLow,
             source: "TRADE_PERSISTED" as const,
           }
           : null,
-        referenceReason: referenceValid ? null : "trade's persisted 00:00-04:00 UTC range is missing or invalid",
+        referenceReason: referenceValid ? null : "trade's persisted Daily Range reference is missing or invalid",
       };
     } catch (error) {
       reply.code(503);

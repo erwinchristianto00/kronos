@@ -20,7 +20,9 @@ import {
   DailyRangeAcceptanceLane,
   DailyRangeLaneStore,
   inDailyRangeEntryWindow,
+  newYorkDailyRangeWindow,
   roundDailyRangeBracket,
+  structuralStopForDailyRangeSignal,
   structuralStopForAcceptance,
   type DailyRangeCandle,
   type DailyRangeCanaryEvidence,
@@ -28,6 +30,7 @@ import {
   type DailyRangeExecClient,
   type DailyRangeLevel,
   type DailyRangeSignal,
+  type DailyRangeStrategyMode,
   type DailyRangeSymbolState,
 } from "../src/lib/daily-4h-range-acceptance-lane.js";
 import type { DailyRangePoolEvidence } from "../src/lib/daily-range-auto-pool.js";
@@ -210,7 +213,13 @@ function researchFiveMinuteHistory(c1Open: number, c2Open: number): FuturesKline
   return rows;
 }
 
-function makeLane(client: FakeDailyClient, nowRef: { value: number }, universe = ["AAAUSDT"], claim = { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} }) {
+function makeLane(
+  client: FakeDailyClient,
+  nowRef: { value: number },
+  universe = ["AAAUSDT"],
+  claim = { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+  strategyMode: DailyRangeStrategyMode = "LEGACY_CONTINUATION",
+) {
   const dir = dataDir();
   const store = new DailyRangeLaneStore(dir, "state.json", nowRef.value);
   const lane = new DailyRangeAcceptanceLane({
@@ -220,6 +229,7 @@ function makeLane(client: FakeDailyClient, nowRef: { value: number }, universe =
     getShortBlocklist: () => new Set<string>(),
     entryClaims: claim,
     environment: "testnet",
+    strategyMode,
     nowMs: () => nowRef.value,
     confirmRetryMs: 0,
   });
@@ -1111,5 +1121,286 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     const secondRestart = new DailyRangeAcceptanceLane({ client, store: new DailyRangeLaneStore(dir, "state.json", now.value), getUniverse: () => ({ symbols: ["AAAUSDT"], source: "TEST" }), getShortBlocklist: () => new Set(), entryClaims: claim, environment: "testnet", nowMs: () => now.value, confirmRetryMs: 0 });
     await secondRestart.tick();
     expect(new DailyRangeLaneStore(dir, "state.json", now.value).getState().signals).toHaveLength(1);
+  });
+
+  it("uses the real New York midnight session across DST, not a UTC-anchored 4h candle", () => {
+    const summer = newYorkDailyRangeWindow(Date.UTC(2026, 7, 26, 12));
+    expect(summer).toMatchObject({
+      date: "2026-08-26",
+      rangeOpenTime: Date.UTC(2026, 7, 26, 4),
+      rangeCloseTime: Date.UTC(2026, 7, 26, 8),
+      entryWindowCloseTime: Date.UTC(2026, 7, 27, 4),
+    });
+
+    const springForward = newYorkDailyRangeWindow(Date.UTC(2026, 2, 8, 12));
+    expect(springForward.rangeOpenTime).toBe(Date.UTC(2026, 2, 8, 5));
+    expect(springForward.rangeCloseTime).toBe(Date.UTC(2026, 2, 8, 8)); // 3 real hours: EST -> EDT
+
+    const fallBack = newYorkDailyRangeWindow(Date.UTC(2026, 10, 1, 12));
+    expect(fallBack.rangeOpenTime).toBe(Date.UTC(2026, 10, 1, 4));
+    expect(fallBack.rangeCloseTime).toBe(Date.UTC(2026, 10, 1, 9)); // 5 real hours: EDT -> EST
+  });
+
+  it("routes one outside event to continuation only on further expansion, otherwise fades the inside re-entry at the recorded extreme", () => {
+    const window = newYorkDailyRangeWindow(Date.UTC(2026, 7, 26, 12));
+    const now = { value: window.rangeCloseTime + 30 * 60_000 };
+    const client = new FakeDailyClient();
+    client.now = now.value;
+    const { lane, store } = makeLane(client, now, ["AAAUSDT"], { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} }, "AUTO_ROUTE_NY_V2");
+    const routeLevel: DailyRangeLevel = {
+      ...level(),
+      dateUtc: window.date,
+      fourHourOpenTime: window.rangeOpenTime,
+      fourHourCloseTime: window.rangeCloseTime,
+    };
+    const continuationState: DailyRangeSymbolState = {
+      lastProcessedBarOpenTime: null,
+      previousClosedCandle: null,
+      longCount: 0,
+      shortCount: 0,
+      longLocked: false,
+      shortLocked: false,
+    };
+    const day: DailyRangeDayState = {
+      dateUtc: window.date,
+      initializedAt: new Date(now.value).toISOString(),
+      universeSymbols: ["AAAUSDT"],
+      universeSource: "TEST",
+      levels: { AAAUSDT: routeLevel },
+      invalidReferenceSymbols: [],
+      symbolStates: { AAAUSDT: continuationState },
+      strategyVersion: "daily-4h-range-auto-route-ny-2r-v2",
+      strategyMode: "AUTO_ROUTE_NY_V2",
+      referenceTimezone: "America/New_York",
+      referenceRangeOpenTime: window.rangeOpenTime,
+      referenceRangeCloseTime: window.rangeCloseTime,
+      entryWindowCloseTime: window.entryWindowCloseTime,
+    };
+    const apply = (state: DailyRangeSymbolState, row: DailyRangeCandle) =>
+      (lane as unknown as {
+        applyCandle(dayArg: DailyRangeDayState, levelArg: DailyRangeLevel, stateArg: DailyRangeSymbolState, rowArg: DailyRangeCandle): DailyRangeSignal | null;
+      }).applyCandle(day, routeLevel, state, row);
+
+    const upFirst = candle(window.rangeCloseTime, 101, 100.5, 102);
+    const upExpands = candle(window.rangeCloseTime + 5 * 60_000, 102, 101, 103);
+    expect(apply(continuationState, upFirst)).toBeNull();
+    const continuation = apply(continuationState, upExpands)!;
+    expect(continuation).toMatchObject({
+      strategyVersion: "daily-4h-range-auto-route-ny-2r-v2",
+      entryPolicy: "CONTINUATION",
+      breakoutDirection: "UP",
+      direction: "LONG",
+      referenceTimezone: "America/New_York",
+    });
+    expect(apply(continuationState, candle(window.rangeCloseTime + 10 * 60_000, 99, 98, 102))).toBeNull();
+    expect(store.getState().signals).toHaveLength(1); // no automatic reversal of a spent continuation event
+
+    const fadeState: DailyRangeSymbolState = {
+      lastProcessedBarOpenTime: null,
+      previousClosedCandle: null,
+      longCount: 0,
+      shortCount: 0,
+      longLocked: false,
+      shortLocked: false,
+    };
+    const fadeFirst = candle(window.rangeCloseTime + 15 * 60_000, 101, 100.5, 103);
+    const reentryInside = candle(window.rangeCloseTime + 20 * 60_000, 99, 98, 104);
+    expect(apply(fadeState, fadeFirst)).toBeNull();
+    const fade = apply(fadeState, reentryInside)!;
+    expect(fade).toMatchObject({
+      entryPolicy: "FADE",
+      breakoutDirection: "UP",
+      direction: "SHORT",
+      breakoutExtreme: 104,
+    });
+    expect(structuralStopForDailyRangeSignal(fade)).toBe(104);
+    const fadeFeatures = (lane as unknown as {
+      buildFeatureSnapshot(input: {
+        signal: DailyRangeSignal;
+        candles: DailyRangeCandle[];
+        reference: DailyRangeCandle[];
+        btcCandles: DailyRangeCandle[];
+        ethCandles: DailyRangeCandle[];
+        universePositive1hPct: number | null;
+        universeNegative1hPct: number | null;
+      }): { breakout: { boundary: number; c1ExtensionPrice: number; c2ExtensionPrice: number } };
+    }).buildFeatureSnapshot({
+      signal: fade,
+      candles: [fadeFirst, reentryInside],
+      reference: [],
+      btcCandles: [],
+      ethCandles: [],
+      universePositive1hPct: null,
+      universeNegative1hPct: null,
+    });
+    expect(fadeFeatures.breakout).toMatchObject({ boundary: 100, c1ExtensionPrice: 1, c2ExtensionPrice: -1 });
+    const pending = (lane as unknown as {
+      createPendingTrade(signalArg: DailyRangeSignal, options?: { persist?: boolean }): { strategyVersion: string; entryPolicy?: string; structuralStopRaw: number } | null;
+    }).createPendingTrade(fade, { persist: false });
+    expect(pending).toMatchObject({
+      strategyVersion: "daily-4h-range-auto-route-ny-2r-v2",
+      entryPolicy: "FADE",
+      structuralStopRaw: 104,
+    });
+  });
+
+  it("builds the NY range from completed 5m candles and executes a fresh fade with its own bracket lineage", async () => {
+    const window = newYorkDailyRangeWindow(Date.UTC(2026, 7, 26, 12));
+    const now = { value: window.rangeCloseTime + 60_000 };
+    const client = new FakeDailyClient();
+    client.now = now.value;
+    const reference: FuturesKline[] = [];
+    for (let openTime = window.rangeOpenTime; openTime < window.rangeCloseTime; openTime += 5 * 60_000) {
+      reference.push(candle(openTime, 95, 90, 100));
+    }
+    const inside = candle(window.rangeCloseTime, 99, 95, 100);
+    const firstOutside = candle(window.rangeCloseTime + 5 * 60_000, 101, 100.5, 103);
+    const reentryInside = candle(window.rangeCloseTime + 10 * 60_000, 99, 98, 104);
+    client.klines.set("AAAUSDT|5m", [...reference, inside, firstOutside, reentryInside]);
+    const { lane, store } = makeLane(
+      client,
+      now,
+      ["AAAUSDT"],
+      { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+      "AUTO_ROUTE_NY_V2",
+    );
+
+    await lane.tick(); // freezes only a completed NY 00:00-04:00 reference; still disarmed
+    const day = store.getState().days[`NY:${window.date}`]!;
+    expect(day).toMatchObject({
+      strategyVersion: "daily-4h-range-auto-route-ny-2r-v2",
+      strategyMode: "AUTO_ROUTE_NY_V2",
+      referenceTimezone: "America/New_York",
+      referenceRangeOpenTime: window.rangeOpenTime,
+      referenceRangeCloseTime: window.rangeCloseTime,
+    });
+    expect(day.levels.AAAUSDT).toMatchObject({ rangeHigh: 100, rangeLow: 90 });
+    expect(store.getState().signals).toHaveLength(0);
+
+    // The re-arm boundary deliberately starts after the completed 08:00 bar;
+    // only the two subsequently completed event candles may produce an order.
+    store.arm(new Date(now.value).toISOString());
+    now.value = window.rangeCloseTime + 16 * 60_000;
+    client.now = now.value;
+    await lane.tick();
+
+    const emitted = store.getState().signals;
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      strategyVersion: "daily-4h-range-auto-route-ny-2r-v2",
+      entryPolicy: "FADE",
+      breakoutDirection: "UP",
+      direction: "SHORT",
+      breakoutExtreme: 104,
+      referenceTimezone: "America/New_York",
+      referenceRangeOpenTime: window.rangeOpenTime,
+      referenceRangeCloseTime: window.rangeCloseTime,
+    });
+    const trade = store.getState().trades[0]!;
+    expect(trade).toMatchObject({
+      strategyVersion: "daily-4h-range-auto-route-ny-2r-v2",
+      entryPolicy: "FADE",
+      direction: "SHORT",
+      status: "OPEN",
+      structuralStopRaw: 104,
+      stopPrice: 104,
+      takeProfitPrice: 92,
+      referenceTimezone: "America/New_York",
+      referenceRangeOpenTime: window.rangeOpenTime,
+      referenceRangeCloseTime: window.rangeCloseTime,
+    });
+    expect(client.placed.filter((row) => !row.reduceOnly)).toMatchObject([{ symbol: "AAAUSDT", side: "SELL", type: "MARKET" }]);
+    expect(client.algoPlaced.map((row) => [row.type, row.side, row.triggerPrice]))
+      .toEqual(expect.arrayContaining([["STOP_MARKET", "BUY", 104], ["TAKE_PROFIT_MARKET", "BUY", 92]]));
+    expect(client.fiveMinuteReadSymbols.has("AAAUSDT")).toBe(true);
+    expect(store.getState().signalCohorts[0]?.candidates[0]).toMatchObject({ breakoutDistancePrice: -1, breakoutDistanceOfRange: -0.1 });
+  });
+
+  it("never lets a pending V1 signal cross the V2 cutover boundary into an order", async () => {
+    const window = newYorkDailyRangeWindow(Date.UTC(2026, 7, 26, 12));
+    const now = { value: window.rangeCloseTime + 10 * 60_000 };
+    const client = new FakeDailyClient();
+    client.now = now.value;
+    const { lane, store } = makeLane(
+      client,
+      now,
+      ["AAAUSDT"],
+      { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+      "AUTO_ROUTE_NY_V2",
+    );
+    store.arm(new Date(now.value).toISOString());
+    const legacy = signal("AAAUSDT", now.value, "LONG");
+    store.getState().signals.push(legacy);
+
+    await (lane as unknown as {
+      executeFreshSignal(signalArg: DailyRangeSignal): Promise<void>;
+    }).executeFreshSignal(legacy);
+
+    expect(legacy.reason).toBe("RETIRED_STRATEGY_VERSION");
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().trades).toHaveLength(0);
+  });
+
+  it("reconciles an existing V1 trade unchanged while V2 takes over only new entries", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const dir = dataDir();
+    const firstStore = new DailyRangeLaneStore(dir, "state.json", now.value);
+    const legacy = new DailyRangeAcceptanceLane({
+      client,
+      store: firstStore,
+      getUniverse: () => ({ symbols: ["AAAUSDT"], source: "TEST" }),
+      getShortBlocklist: () => new Set<string>(),
+      entryClaims: { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+      environment: "testnet",
+      nowMs: () => now.value,
+      confirmRetryMs: 0,
+    });
+    firstStore.arm(new Date(now.value).toISOString());
+    const oldSignal = signal("AAAUSDT", now.value, "SHORT");
+    firstStore.getState().signals.push(oldSignal);
+    await (legacy as unknown as {
+      executeFreshSignal(signalArg: DailyRangeSignal): Promise<void>;
+    }).executeFreshSignal(oldSignal);
+    const before = firstStore.getState().trades[0]!;
+    const identity = {
+      strategyVersion: before.strategyVersion,
+      direction: before.direction,
+      entryQty: before.entryQty,
+      entryFillPrice: before.entryFillPrice,
+      stopAlgoOrderId: before.stopAlgoOrderId,
+      takeProfitAlgoOrderId: before.takeProfitAlgoOrderId,
+      stopPrice: before.stopPrice,
+      takeProfitPrice: before.takeProfitPrice,
+    };
+
+    const v2Store = new DailyRangeLaneStore(dir, "state.json", now.value);
+    const v2 = new DailyRangeAcceptanceLane({
+      client,
+      store: v2Store,
+      getUniverse: () => ({ symbols: ["AAAUSDT"], source: "TEST" }),
+      getShortBlocklist: () => new Set<string>(),
+      entryClaims: { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+      environment: "testnet",
+      strategyMode: "AUTO_ROUTE_NY_V2",
+      nowMs: () => now.value,
+      confirmRetryMs: 0,
+    });
+    await v2.tick(); // NY range is not complete yet; this is reconciliation only.
+
+    const after = v2Store.getState().trades[0]!;
+    expect({
+      strategyVersion: after.strategyVersion,
+      direction: after.direction,
+      entryQty: after.entryQty,
+      entryFillPrice: after.entryFillPrice,
+      stopAlgoOrderId: after.stopAlgoOrderId,
+      takeProfitAlgoOrderId: after.takeProfitAlgoOrderId,
+      stopPrice: after.stopPrice,
+      takeProfitPrice: after.takeProfitPrice,
+    }).toEqual(identity);
+    expect(after.status).toBe("OPEN");
+    expect(v2.getStatus()).toMatchObject({ strategyVersion: "daily-4h-range-auto-route-ny-2r-v2" });
+    expect(client.cancelledAlgos).toHaveLength(0);
   });
 });
