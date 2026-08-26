@@ -663,6 +663,18 @@ export class BinanceFuturesPrivateClient {
   }
 
   /**
+   * A signed URL contains a short-lived timestamp.  Build it only after this
+   * request owns the shared read slot; otherwise a 4s budget wait can make the
+   * signature stale before it ever reaches Binance.
+   */
+  private async dispatchSignedRead(buildUrl: () => string): Promise<unknown> {
+    return this.withTransportSlot(
+      (readBudgetWaitMs) => this.dispatchRawRequest("GET", buildUrl(), true, readBudgetWaitMs),
+      true,
+    );
+  }
+
+  /**
    * Queue read dispatches, rather than merely retrying callers independently: a concurrent
    * balance/positions/orders snapshot must not send a second request while the first one is
    * learning that Binance has banned this IP. POST/DELETE intentionally bypass this queue so an
@@ -874,12 +886,28 @@ export class BinanceFuturesPrivateClient {
 
   /** GETs retry on transient failures; mutations never do. */
   private async requestPublic(path: string, params: Record<string, string | number | boolean | undefined> = {}): Promise<unknown> {
+    return (await this.requestPublicWithTiming(path, params)).value;
+  }
+
+  /**
+   * The time-sync midpoint must measure network time, not time spent waiting
+   * behind another account read.  Its timestamps therefore start inside the
+   * shared transport slot immediately before dispatch.
+   */
+  private async requestPublicWithTiming(
+    path: string,
+    params: Record<string, string | number | boolean | undefined> = {},
+  ): Promise<{ value: unknown; dispatchedAtMs: number; completedAtMs: number }> {
     const qs = buildQueryString(params);
     const url = `${this.baseUrl}${path}${qs ? `?${qs}` : ""}`;
     let lastError: unknown;
     for (let attempt = 0; attempt <= GET_MAX_RETRIES; attempt++) {
       try {
-        return await this.rawRequest("GET", url, false);
+        return await this.withTransportSlot(async (readBudgetWaitMs) => {
+          const dispatchedAtMs = this.nowMs();
+          const value = await this.dispatchRawRequest("GET", url, false, readBudgetWaitMs);
+          return { value, dispatchedAtMs, completedAtMs: this.nowMs() };
+        }, false);
       } catch (error) {
         lastError = error;
         if (!shouldRetryGet(error) || attempt === GET_MAX_RETRIES) throw error;
@@ -897,6 +925,7 @@ export class BinanceFuturesPrivateClient {
     await this.ensureTimeSync();
     this.assertClockSkewOk();
     const buildSignedUrl = (): string => {
+      this.assertClockSkewOk();
       const qs = buildQueryString({
         ...params,
         recvWindow: RECV_WINDOW_MS,
@@ -909,7 +938,7 @@ export class BinanceFuturesPrivateClient {
       let lastError: unknown;
       for (let attempt = 0; attempt <= GET_MAX_RETRIES; attempt++) {
         try {
-          return await this.rawRequest("GET", buildSignedUrl(), true);
+          return await this.dispatchSignedRead(buildSignedUrl);
         } catch (error) {
           lastError = error;
           if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021 && attempt < GET_MAX_RETRIES) {
@@ -997,14 +1026,12 @@ export class BinanceFuturesPrivateClient {
   }
 
   private async forceTimeSync(): Promise<void> {
-    const before = this.nowMs();
-    const parsed = await this.requestPublic("/fapi/v1/time");
-    const after = this.nowMs();
-    const serverTime = toNum((parsed as { serverTime?: unknown })?.serverTime);
+    const timed = await this.requestPublicWithTiming("/fapi/v1/time");
+    const serverTime = toNum((timed.value as { serverTime?: unknown })?.serverTime);
     if (serverTime <= 0) {
       throw new BinanceFuturesPrivateError("invalid_response", "server time missing from /fapi/v1/time");
     }
-    const midpoint = (before + after) / 2;
+    const midpoint = (timed.dispatchedAtMs + timed.completedAtMs) / 2;
     this.serverTimeOffsetMs = serverTime - midpoint;
     this.lastMeasuredSkewMs = Math.abs(this.serverTimeOffsetMs);
     this.lastTimeSyncAtMs = this.nowMs();

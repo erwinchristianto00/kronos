@@ -192,21 +192,29 @@ describe("binance-futures-private signing", () => {
   it("spaces signed reads globally and exposes safe caller/endpoint/weight telemetry", async () => {
     let nowMs = 1_700_000_000_000;
     const waits: number[] = [];
-    const signedDispatches: Array<{ path: string; at: number }> = [];
+    const signedDispatches: Array<{ path: string; at: number; timestamp: number | null }> = [];
     const fetchImpl = (async (url: RequestInfo | URL) => {
       const value = String(url);
       if (value.includes("/fapi/v1/time")) {
         return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
       }
       if (value.includes("/fapi/v2/balance")) {
-        signedDispatches.push({ path: "/fapi/v2/balance", at: nowMs });
+        signedDispatches.push({
+          path: "/fapi/v2/balance",
+          at: nowMs,
+          timestamp: Number(new URL(value).searchParams.get("timestamp")),
+        });
         return new Response(JSON.stringify([{ asset: "USDT", balance: "1", availableBalance: "1" }]), {
           status: 200,
           headers: { "x-mbx-used-weight-1m": "10" },
         });
       }
       if (value.includes("/fapi/v2/positionRisk")) {
-        signedDispatches.push({ path: "/fapi/v2/positionRisk", at: nowMs });
+        signedDispatches.push({
+          path: "/fapi/v2/positionRisk",
+          at: nowMs,
+          timestamp: Number(new URL(value).searchParams.get("timestamp")),
+        });
         return new Response(JSON.stringify([]), {
           status: 200,
           headers: { "x-mbx-used-weight-1m": "14" },
@@ -220,7 +228,7 @@ describe("binance-futures-private signing", () => {
       env: "testnet",
       fetchImpl,
       nowMs: () => nowMs,
-      signedReadMinIntervalMs: 1_000,
+      signedReadMinIntervalMs: 6_000,
       sleep: async (ms) => { waits.push(ms); nowMs += ms; },
     });
 
@@ -229,16 +237,16 @@ describe("binance-futures-private signing", () => {
     });
 
     expect(signedDispatches).toEqual([
-      { path: "/fapi/v2/balance", at: 1_700_000_000_000 },
-      { path: "/fapi/v2/positionRisk", at: 1_700_000_001_000 },
+      { path: "/fapi/v2/balance", at: 1_700_000_000_000, timestamp: 1_700_000_000_000 },
+      { path: "/fapi/v2/positionRisk", at: 1_700_000_006_000, timestamp: 1_700_000_006_000 },
     ]);
-    expect(waits).toEqual([1_000]);
+    expect(waits).toEqual([6_000]);
     expect(client.getRateLimitStatus()).toMatchObject({
       coolingDown: false,
       readBudget: {
-        signedReadMinIntervalMs: 1_000,
+        signedReadMinIntervalMs: 6_000,
         queuedReads: 0,
-        nextEligibleAt: new Date(1_700_000_002_000).toISOString(),
+        nextEligibleAt: new Date(1_700_000_012_000).toISOString(),
       },
     });
     const signedEvents = client.getRateLimitStatus().recentRequests.filter((event) => event.signed);
@@ -257,9 +265,46 @@ describe("binance-futures-private signing", () => {
         outcome: "OK",
         usedWeight1m: 14,
         usedWeight1mDelta: 4,
-        readBudgetWaitMs: 1_000,
+        readBudgetWaitMs: 6_000,
       }),
     ]);
+  });
+
+  it("measures server-time skew at actual dispatch rather than time spent queued", async () => {
+    let nowMs = 1_700_000_000_000;
+    let releaseBalance: (() => void) | null = null;
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      if (value.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+      }
+      if (value.includes("/fapi/v2/balance")) {
+        return new Promise<Response>((resolve) => {
+          releaseBalance = () => resolve(new Response(JSON.stringify([
+            { asset: "USDT", balance: "1", availableBalance: "1" },
+          ]), { status: 200 }));
+        });
+      }
+      throw new Error(`unexpected URL ${value}`);
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "testnet",
+      fetchImpl,
+      nowMs: () => nowMs,
+    });
+
+    const balance = client.getBalances();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(releaseBalance).not.toBeNull();
+    const forcedTimeSync = (client as unknown as { forceTimeSync: () => Promise<void> }).forceTimeSync();
+    nowMs += 12_000;
+    releaseBalance?.();
+    await balance;
+    await forcedTimeSync;
+
+    expect(client.getClockSkewMs()).toBe(0);
   });
 
   it("does not make a risk-reducing DELETE wait behind a budgeted signed read", async () => {
