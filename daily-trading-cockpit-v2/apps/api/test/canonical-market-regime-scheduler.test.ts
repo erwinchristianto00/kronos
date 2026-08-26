@@ -328,6 +328,13 @@ describe("app.ts wiring (source-level guard, mirrors kronos-btc-anchor.test.ts's
     expect(intervalAt).toBeGreaterThan(startAt);
   });
 
+  it("starts reconciliation only after the shared-account cross executor is constructed", () => {
+    const startAt = APP.indexOf("if (!isTest) liveEngine.start();");
+    const crossExecutorAt = APP.indexOf("crossSectionalExecutor = new CrossSectionalExecutor({");
+    expect(crossExecutorAt).toBeGreaterThanOrEqual(0);
+    expect(startAt).toBeGreaterThan(crossExecutorAt);
+  });
+
   it("ticks through the GUARDED entry point, never the raw ungated one directly", () => {
     const at = APP.indexOf("const runCanonicalMarketRegimeEngineTick = ");
     expect(at).toBeGreaterThanOrEqual(0);

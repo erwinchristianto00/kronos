@@ -2426,8 +2426,6 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     const unifiedPortfolioExitPolicy: SingleSymbolExitPolicy | undefined = unifiedOrchestrator?.isEnabled()
       ? (ctx) => unifiedOrchestrator!.legacyExitDecision(ctx)
       : undefined;
-    if (!isTest) liveEngine.start();
-
     crossSectionalDirectionalDecisionRef = () => {
       const canonical = canonicalMarketRegimeExecutionPolicy({
         snapshot: getCanonicalMarketRegimeSnapshot(),
@@ -3546,6 +3544,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         setInterval(pilotTick, 5 * 60_000);
       }
     }
+
+    // Start reconciliation only after every executor sharing this Binance account has been
+    // constructed and loaded its durable state. Otherwise an early first tick can see a valid
+    // cross-basket leg before externalManagedNetQty can claim it, and falsely latch the engine
+    // as if the exchange position were foreign.
+    if (!isTest) liveEngine.start();
   }
 
   // 2026-08 canonical-market-regime scheduler wiring fix (HIGH deployment-scope gap) — the missing
