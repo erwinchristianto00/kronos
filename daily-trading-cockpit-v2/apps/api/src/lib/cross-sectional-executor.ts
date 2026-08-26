@@ -1752,6 +1752,12 @@ export interface CrossSectionalExecutorOptions {
   /** Populates that cache for one symbol. Awaited immediately before placeOrder so the
    *  reference belongs to THIS submission; failure is swallowed and the order proceeds. */
   warmPublicQuote?: (symbol: string) => Promise<unknown>;
+  /**
+   * Require a fresh, two-sided USD-M execution-book quote for every remaining leg before the
+   * first order of a basket is sent. This is opt-in so legacy callers retain their semantics;
+   * production cross executors turn it on explicitly.
+   */
+  requireExecutionVenueQuote?: boolean;
   /** Fresh, exact-symbol USD-M sizing reference.  It is intentionally separate from the
    * public quote cache, which may contain a spot observation for other entry telemetry. */
   readFuturesMarketReference?: (symbol: string) => FuturesMarketReference | null;
@@ -1931,6 +1937,7 @@ export class CrossSectionalExecutor {
   private readonly nowIso: () => string;
   private readonly readPublicQuoteFn: CrossSectionalExecutorOptions["readPublicQuote"] | null;
   private readonly warmPublicQuoteFn: CrossSectionalExecutorOptions["warmPublicQuote"] | null;
+  private readonly requireExecutionVenueQuote: boolean;
   private readonly readFuturesMarketReferenceFn: CrossSectionalExecutorOptions["readFuturesMarketReference"] | null;
   private readonly warmFuturesMarketReferenceFn: CrossSectionalExecutorOptions["warmFuturesMarketReference"] | null;
   private readonly futuresReferenceHealth: FuturesReferenceHealthTracker | null;
@@ -2005,6 +2012,7 @@ export class CrossSectionalExecutor {
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
     this.readPublicQuoteFn = opts.readPublicQuote ?? null;
     this.warmPublicQuoteFn = opts.warmPublicQuote ?? null;
+    this.requireExecutionVenueQuote = opts.requireExecutionVenueQuote === true;
     this.readFuturesMarketReferenceFn = opts.readFuturesMarketReference ?? null;
     this.warmFuturesMarketReferenceFn = opts.warmFuturesMarketReference ?? null;
     this.futuresReferenceHealth = opts.futuresReferenceHealth ?? null;
@@ -5598,6 +5606,34 @@ export class CrossSectionalExecutor {
     }
   }
 
+  /**
+   * A Spot cache observation can help unrelated single-symbol telemetry, but it is never a valid
+   * maker reference for a USD-M order. Validate the entire remaining plan before pre-placing any
+   * maker order so the invariant stays "full hedge or no new exposure".
+   */
+  private executionVenueQuoteFailure(plan: readonly PlannedLeg[], observeStartMs: number): string | null {
+    if (!this.requireExecutionVenueQuote) return null;
+    if (!this.readPublicQuoteFn || !this.warmPublicQuoteFn) {
+      return "USD-M execution-quote providers unavailable";
+    }
+    const unavailable: string[] = [];
+    for (const planned of plan) {
+      if (planned.status === "FILLED") continue;
+      let ref: ReturnType<typeof buildSubmitRefBase> = null;
+      try {
+        ref = buildSubmitRefBase(this.readPublicQuoteFn(planned.symbol), observeStartMs, planned.side);
+      } catch {
+        ref = null;
+      }
+      if (!ref || ref.source !== "BOOK_TICKER" || !ref.venueMatchesExecution || ref.touch === null) {
+        unavailable.push(planned.symbol);
+      }
+    }
+    return unavailable.length > 0
+      ? `USD-M two-sided execution book unavailable for ${unavailable.join(", ")}`
+      : null;
+  }
+
   /** Flattens every already-filled leg on `basket` that isn't already exited (reduceOnly MARKET,
    *  one at a time) — the ROLLBACK half of the hedge-vs-rollback decision (see placeRemainingLegs).
    *  Extracted verbatim (same reduceOnly call, same executedQty/shortfall honoring, same
@@ -5767,18 +5803,32 @@ export class CrossSectionalExecutor {
     // more time for the market to move between legs, which is a real execution cost paid to obtain
     // a measurement. One parallel fetch costs a single round trip; the reference is then slightly
     // older for later legs, and `ageAtSubmitMs` records exactly how much so a report can filter on
-    // it rather than be misled by it. Fail-open throughout: no quote simply means no submitRef.
+    // it rather than be misled by it. Legacy callers remain fail-open; production cross executors
+    // enable the all-leg USD-M guard immediately below.
     const quoteObserveStartMs = Date.parse(this.nowIso());
+    const pending = plan
+      .slice(startIndex)
+      .filter((p) => p.status !== "FILLED");
     if (this.warmPublicQuoteFn) {
-      const pending = plan
-        .slice(startIndex)
-        .filter((p) => p.status !== "FILLED")
-        .map((p) => p.symbol);
       await Promise.all(
-        [...new Set(pending)].map((symbol) =>
+        [...new Set(pending.map((p) => p.symbol))].map((symbol) =>
           this.warmPublicQuoteFn!(symbol).catch(() => null),
         ),
       ).catch(() => null);
+    }
+    const quoteGuardFailure = this.executionVenueQuoteFailure(pending, quoteObserveStartMs);
+    if (quoteGuardFailure) {
+      const reason = `OPEN_BLOCKED_USDM_QUOTE:${quoteGuardFailure}`;
+      await this.markRemainingNeverAttempted(basket, startIndex, reason);
+      basket.status = "ABORTED";
+      basket.closedAt = this.nowIso();
+      basket.closeReason = reason;
+      this.store.save();
+      // Normally no-op: this runs before maker pre-placement. On restart recovery it rolls back
+      // any earlier fills rather than leave a partial basket directional.
+      await this.flattenFilledLegs(basket);
+      this.lastError = `basket ${basket.basketId}: ${quoteGuardFailure} — no new leg placed`;
+      return;
     }
     // Post every maker leg AT ONCE and serve ONE wait for all of them, before the sequential loop
     // starts resolving them. Without this the timeout multiplies by leg count, and the delay

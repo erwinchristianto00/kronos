@@ -282,6 +282,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
   isSymbolEntryBlocked?: (symbol: string) => string | null;
   tryClaimEntrySymbol?: (symbol: string, owner?: string) => boolean;
   smartBasketEnabled?: boolean; smartMaxAdverseEntryDriftVol?: number; smartMinAdverseEntryDriftPct?: number; smartInvalidationScans?: number; smartMfeArmNetReturn?: number; smartMfeGivebackFraction?: number;
+  requireExecutionVenueQuote?: boolean;
   reserveExposure?: (req: { executorId: string; symbol: string; direction: "LONG" | "SHORT"; requestedNotionalUsd: number; clientOrderId: string; basketId?: string }) => { ok: boolean; reservationId: string | null; reason?: string };
   commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
   releaseExposureReservation?: (reservationId: string, reason: string) => void;
@@ -336,6 +337,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     ...(opts.commitExposureReservation ? { commitExposureReservation: opts.commitExposureReservation } : {}),
     ...(opts.releaseExposureReservation ? { releaseExposureReservation: opts.releaseExposureReservation } : {}),
     ...(opts.warmPublicQuote ? { warmPublicQuote: opts.warmPublicQuote } : {}),
+    ...(opts.requireExecutionVenueQuote !== undefined ? { requireExecutionVenueQuote: opts.requireExecutionVenueQuote } : {}),
     ...(opts.readFuturesMarketReference ? { readFuturesMarketReference: opts.readFuturesMarketReference } : {}),
     ...(opts.warmFuturesMarketReference ? { warmFuturesMarketReference: opts.warmFuturesMarketReference } : {}),
     ...(opts.futuresReferenceHealth ? { futuresReferenceHealth: opts.futuresReferenceHealth } : {}),
@@ -1505,6 +1507,54 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(store.getState().baskets).toHaveLength(0);
     expect(client.placed).toHaveLength(0);
     expect(executor.getStatus().entryAttemptAudit.latest?.reason).toContain("SPOTONLYUSDT missing exchange filters");
+  });
+
+  it("[USD-M QUOTE GUARD] rejects the full basket before any order when only Spot quotes are available", async () => {
+    const client = new FakeExecClient();
+    const { executor, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      requireExecutionVenueQuote: true,
+      warmPublicQuote: async () => null,
+      readPublicQuote: (symbol) => ({
+        bid: symbol === "SOLUSDT" ? 99.99 : 0.0999,
+        ask: symbol === "SOLUSDT" ? 100.01 : 0.1001,
+        mid: symbol === "SOLUSDT" ? 100 : 0.1,
+        atMs: NOW_MS,
+        venue: "BINANCE_SPOT_BOOK_TICKER",
+      }),
+    });
+
+    await executor.tick();
+
+    const basket = store.getState().baskets[0]!;
+    expect(client.placed).toHaveLength(0);
+    expect(basket).toMatchObject({ status: "ABORTED" });
+    expect(basket.closeReason).toContain("OPEN_BLOCKED_USDM_QUOTE");
+    expect(basket.legs).toHaveLength(0);
+    expect(basket.plan?.every((leg) => leg.status === "NEVER_ATTEMPTED")).toBe(true);
+  });
+
+  it("[USD-M QUOTE GUARD] permits the same full basket with a fresh USD-M two-sided book", async () => {
+    const client = new FakeExecClient();
+    const { executor, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      requireExecutionVenueQuote: true,
+      warmPublicQuote: async () => null,
+      readPublicQuote: (symbol) => ({
+        bid: symbol === "SOLUSDT" ? 99.99 : 0.0999,
+        ask: symbol === "SOLUSDT" ? 100.01 : 0.1001,
+        mid: symbol === "SOLUSDT" ? 100 : 0.1,
+        atMs: NOW_MS,
+        venue: "BINANCE_USDM_BOOK_TICKER",
+      }),
+    });
+
+    await executor.tick();
+
+    expect(store.getState().baskets[0]).toMatchObject({ status: "COMPLETE" });
+    expect(client.placed.map((order) => order.symbol).sort()).toEqual(["DOGEUSDT", "SOLUSDT"]);
   });
 
   it("[SMART BASKET LIFECYCLE] keeps entry revalidation and provenance for a Plain MOM36 formation", async () => {
