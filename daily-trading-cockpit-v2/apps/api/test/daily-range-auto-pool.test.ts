@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -85,7 +85,12 @@ function makeMarketFetch(symbols: readonly string[], options: MarketOptions = {}
   };
 }
 
-function pool(dataDir: string, fetchImpl: ReturnType<typeof makeMarketFetch>, nowMs: () => number) {
+function pool(
+  dataDir: string,
+  fetchImpl: ReturnType<typeof makeMarketFetch>,
+  nowMs: () => number,
+  venueSymbols: readonly string[],
+) {
   return new DailyRangeAutoPool({
     dataDir,
     env: {
@@ -95,6 +100,7 @@ function pool(dataDir: string, fetchImpl: ReturnType<typeof makeMarketFetch>, no
     nowMs,
     fetchImpl,
     spreadSampleDelayMs: 0,
+    venueSymbols: async () => new Set(venueSymbols),
   });
 }
 
@@ -104,7 +110,7 @@ describe("DailyRangeAutoPool C1-C6", () => {
     const dataDir = mkdtempSync(join(tmpdir(), "daily-range-auto-pool-"));
     let now = NOW;
     const fetchImpl = makeMarketFetch(symbols);
-    const subject = pool(dataDir, fetchImpl, () => now);
+    const subject = pool(dataDir, fetchImpl, () => now, symbols);
 
     const snapshot = await subject.refreshIfDue(resolveDailyRangeAutoPoolInput(
       [symbols[0] as string],
@@ -125,13 +131,13 @@ describe("DailyRangeAutoPool C1-C6", () => {
     expect(durable.audit[symbols[1] as string]?.failures).toContain("C6_STRATEGY_POSITION");
 
     now += 1_000;
-    const reloaded = pool(dataDir, fetchImpl, () => now);
+    const reloaded = pool(dataDir, fetchImpl, () => now, symbols);
     expect(reloaded.getSnapshot(resolveDailyRangeAutoPoolInput([symbols[0] as string], [symbols[1] as string])).activeSymbols)
       .toEqual(symbols.slice(2).sort());
   });
 
   it("rejects exact C1/C3/C4/C5 failures without weakening the remaining pool", async () => {
-    const symbols = Array.from({ length: 16 }, (_, index) => "RULE" + index + "USDT");
+    const symbols = Array.from({ length: 17 }, (_, index) => "RULE" + index + "USDT");
     const hardSpread = symbols[0] as string;
     const medianSpread = symbols[1] as string;
     const gap = symbols[2] as string;
@@ -140,6 +146,7 @@ describe("DailyRangeAutoPool C1-C6", () => {
     const staleFourHour = symbols[5] as string;
     const tooHighMinNotional = symbols[6] as string;
     const tooBigStep = symbols[7] as string;
+    const unavailableAtVenue = symbols[8] as string;
     const dataDir = mkdtempSync(join(tmpdir(), "daily-range-auto-pool-rules-"));
     const subject = pool(dataDir, makeMarketFetch(symbols, {
       spreads: { [hardSpread]: 12, [medianSpread]: 6 },
@@ -149,7 +156,7 @@ describe("DailyRangeAutoPool C1-C6", () => {
       staleFourHour: new Set([staleFourHour]),
       minNotional: { [tooHighMinNotional]: 26 },
       stepSize: { [tooBigStep]: 0.03 },
-    }), () => NOW);
+    }), () => NOW, symbols.filter((symbol) => symbol !== unavailableAtVenue));
 
     const snapshot = await subject.refreshIfDue(resolveDailyRangeAutoPoolInput([]));
 
@@ -166,6 +173,8 @@ describe("DailyRangeAutoPool C1-C6", () => {
     expect(durable.audit[staleFourHour]?.failures).toContain("C4_4H_DATA");
     expect(durable.audit[tooHighMinNotional]?.failures).toContain("C1_MIN_NOTIONAL");
     expect(durable.audit[tooBigStep]?.failures).toContain("C1_STEP_NOTIONAL");
+    expect(durable.audit[unavailableAtVenue]?.failures).toContain("C1_VENUE_UNAVAILABLE");
+    expect(snapshot.reconciliation?.venueUnavailableExcluded).toEqual([unavailableAtVenue]);
   });
 
   it("uses C2 hysteresis only for current members: 22m to enter, 18m to remain", async () => {
@@ -174,7 +183,7 @@ describe("DailyRangeAutoPool C1-C6", () => {
     const volumes: Record<string, number> = Object.fromEntries(symbols.map((symbol) => [symbol, 24_000_000]));
     const dataDir = mkdtempSync(join(tmpdir(), "daily-range-auto-pool-liquidity-"));
     let now = NOW;
-    const subject = pool(dataDir, makeMarketFetch(symbols, { volumes }), () => now);
+    const subject = pool(dataDir, makeMarketFetch(symbols, { volumes }), () => now, symbols);
 
     expect((await subject.refreshIfDue(resolveDailyRangeAutoPoolInput([]))).activeSymbols).toHaveLength(9);
 
@@ -192,7 +201,7 @@ describe("DailyRangeAutoPool C1-C6", () => {
     const dataDir = mkdtempSync(join(tmpdir(), "daily-range-auto-pool-stale-"));
     let now = NOW;
     let fail = false;
-    const subject = pool(dataDir, makeMarketFetch(symbols, { fail: () => fail }), () => now);
+    const subject = pool(dataDir, makeMarketFetch(symbols, { fail: () => fail }), () => now, symbols);
     expect((await subject.refreshIfDue(resolveDailyRangeAutoPoolInput([]))).state).toBe("ACTIVE");
 
     fail = true;
@@ -201,5 +210,28 @@ describe("DailyRangeAutoPool C1-C6", () => {
     expect(snapshot.state).toBe("STALE_DATA");
     expect(snapshot.activeSymbols).toEqual([]);
     expect(snapshot.lastError).toContain("public USD-M request failed");
+  });
+
+  it("fails closed when an older snapshot lacks execution-venue evidence", () => {
+    const symbols = Array.from({ length: 8 }, (_, index) => "LEGACY" + index + "USDT");
+    const dataDir = mkdtempSync(join(tmpdir(), "daily-range-auto-pool-legacy-"));
+    writeFileSync(join(dataDir, "daily-range-auto-pool.json"), JSON.stringify({
+      version: 2,
+      activeSymbols: symbols,
+      updatedAtMs: NOW,
+      lastAttemptAtMs: NOW,
+      lastSuccessAtMs: NOW,
+      lastError: null,
+      // This is the shape persisted before C1 started recording the execution venue.
+      reconciliation: { changed: false, adds: [], drops: [] },
+      spreadSamples: {},
+      audit: {},
+    }), "utf8");
+
+    const subject = pool(dataDir, makeMarketFetch(symbols), () => NOW, symbols);
+    const snapshot = subject.getSnapshot(resolveDailyRangeAutoPoolInput([]));
+
+    expect(snapshot.state).toBe("STALE_DATA");
+    expect(snapshot.activeSymbols).toEqual([]);
   });
 });

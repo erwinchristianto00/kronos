@@ -4,7 +4,9 @@
  * This deliberately does not reuse the Dynamic MOM36/Cross-Sectional pool. Binance USD-M is a
  * one-way netted account, so a symbol that a basket can own must never quietly become eligible for
  * the Daily Range lane as well. The pool is rebuilt from public USD-M perpetual metadata and then
- * filtered by the Daily lane's C1-C6 contract.
+ * filtered by the Daily lane's C1-C6 contract. C1 includes the actual execution venue: a
+ * Mainnet-public candidate is not eligible until Testnet also exposes it as a tradable USD-M
+ * perpetual symbol.
  *
  * Missing public evidence is a rejection, never a default pass. Existing Daily trades retain their
  * immutable UTC-day snapshot and native exchange brackets; this module only affects a later day.
@@ -46,6 +48,7 @@ export type DailyRangePoolFailure =
   | "C1_MIN_QTY_NOTIONAL"
   | "C1_STEP_NOTIONAL"
   | "C1_EXECUTABILITY_UNMEASURED"
+  | "C1_VENUE_UNAVAILABLE"
   | "C2_LIQUIDITY"
   | "C3_SPREAD_UNMEASURED"
   | "C3_MEDIAN_SPREAD"
@@ -111,6 +114,7 @@ export interface DailyRangeAutoPoolSnapshot {
     exchangePerpetualCandidates: number;
     eligibleCount: number;
     rejectionCounts: Partial<Record<DailyRangePoolFailure, number>>;
+    venueUnavailableExcluded: string[];
     crossSectionalExcluded: string[];
     strategyOwnedExcluded: string[];
   } | null;
@@ -263,6 +267,8 @@ export class DailyRangeAutoPool {
   private readonly nowMs: () => number;
   private readonly env: NodeJS.ProcessEnv;
   private readonly sleep: (ms: number) => Promise<void>;
+  /** Tradable USD-M symbols from the environment where the Daily lane can actually submit orders. */
+  private readonly venueSymbols: () => Promise<ReadonlySet<string>>;
   private readonly spreadSampleDelayMs: number;
   private state: PersistedState;
   private inFlight: Promise<DailyRangeAutoPoolSnapshot> | null = null;
@@ -275,12 +281,15 @@ export class DailyRangeAutoPool {
     env?: NodeJS.ProcessEnv;
     spreadSampleDelayMs?: number;
     sleep?: (ms: number) => Promise<void>;
+    venueSymbols?: () => Promise<ReadonlySet<string>>;
   } = {}) {
     this.file = resolve(opts.dataDir ?? "data", opts.fileName ?? "daily-range-auto-pool.json");
     this.fetchImpl = opts.fetchImpl ?? (fetch as unknown as FetchLike);
     this.nowMs = opts.nowMs ?? (() => Date.now());
     this.env = opts.env ?? process.env;
     this.sleep = opts.sleep ?? ((ms) => new Promise<void>((done) => setTimeout(done, ms)));
+    // Without a venue read, Mainnet metadata alone cannot prove that a candidate can execute.
+    this.venueSymbols = opts.venueSymbols ?? (async () => new Set<string>());
     this.spreadSampleDelayMs = Math.max(0, Math.round(opts.spreadSampleDelayMs ?? DEFAULT_SPREAD_SAMPLE_DELAY_MS));
     this.state = this.read();
   }
@@ -359,16 +368,18 @@ export class DailyRangeAutoPool {
   private async refresh(input: DailyRangeAutoPoolInput, now: number): Promise<DailyRangeAutoPoolSnapshot> {
     this.state.lastAttemptAtMs = now;
     try {
-      const results = await Promise.all([
+      const [exchangeInfo, tickerPayload, bookSamples, executionVenueSymbols] = await Promise.all([
         this.fetchJson(MAINNET_USDM + "/fapi/v1/exchangeInfo"),
         this.fetchJson(MAINNET_USDM + "/fapi/v1/ticker/24hr"),
         this.collectBookSamples(),
+        this.venueSymbols(),
       ]);
-      const candidates = this.parseCandidates(results[0], results[1], now);
+      const candidates = this.parseCandidates(exchangeInfo, tickerPayload, now);
       if (candidates.length === 0) throw new Error("Binance USD-M returned no TRADING USDT perpetual candidates");
 
       const crossSet = new Set(normalizeSymbols(input.crossSectionalUniverse));
       const ownedSet = new Set(normalizeSymbols(input.strategyOwnedSymbols));
+      const venueSet = new Set(normalizeSymbols([...executionVenueSymbols]));
       const priorActive = new Set(normalizeSymbols(this.state.activeSymbols));
       const audits = new Map<string, DailyRangePoolSymbolAudit>();
       const preliminary: Candidate[] = [];
@@ -380,6 +391,7 @@ export class DailyRangeAutoPool {
         audit.minQtyNotionalUsd = candidate.minQty !== null && candidate.price !== null ? candidate.minQty * candidate.price : null;
         audit.stepNotionalUsd = candidate.stepSize !== null && candidate.price !== null ? candidate.stepSize * candidate.price : null;
         audit.listedDays = candidate.listedDays;
+        if (!venueSet.has(candidate.symbol)) audit.failures.push("C1_VENUE_UNAVAILABLE");
         if (crossSet.has(candidate.symbol)) audit.failures.push("C6_CROSS_SECTIONAL_OVERLAP");
         if (ownedSet.has(candidate.symbol)) audit.failures.push("C6_STRATEGY_POSITION");
         this.applyC1(audit);
@@ -389,7 +401,7 @@ export class DailyRangeAutoPool {
         audits.set(candidate.symbol, audit);
       }
 
-      this.applySpreadEvidence(preliminary, audits, results[2], now);
+      this.applySpreadEvidence(preliminary, audits, bookSamples, now);
       const qualityCandidates = preliminary.filter((candidate) => (audits.get(candidate.symbol)?.failures.length ?? 1) === 0);
       const qualityRows = await mapLimited(
         qualityCandidates,
@@ -436,6 +448,7 @@ export class DailyRangeAutoPool {
         exchangePerpetualCandidates: candidates.length,
         eligibleCount: eligible.length,
         rejectionCounts,
+        venueUnavailableExcluded: candidates.filter((candidate) => !venueSet.has(candidate.symbol)).map((candidate) => candidate.symbol).sort(),
         crossSectionalExcluded: [...crossSet].filter((symbol) => candidateSet.has(symbol)).sort(),
         strategyOwnedExcluded: [...ownedSet].filter((symbol) => candidateSet.has(symbol)).sort(),
       };
@@ -628,15 +641,19 @@ export class DailyRangeAutoPool {
           return valid ? [[symbol.toUpperCase(), valid]] : [];
         }));
         const reconciliation = asRecord(parsed.reconciliation);
-        const validReconciliation = reconciliation && typeof reconciliation.changed === "boolean" && Array.isArray(reconciliation.adds) && Array.isArray(reconciliation.drops)
+        // A pre-venue-check snapshot must not remain eligible after this C1 hardening. It is
+        // retained on disk for audit, but starts stale so the first scheduler tick re-verifies
+        // against the actual execution venue before Daily can consume the pool again.
+        const hasVenueEvidence = Array.isArray(reconciliation?.venueUnavailableExcluded);
+        const validReconciliation = reconciliation && typeof reconciliation.changed === "boolean" && Array.isArray(reconciliation.adds) && Array.isArray(reconciliation.drops) && hasVenueEvidence
           ? reconciliation as unknown as DailyRangeAutoPoolSnapshot["reconciliation"]
           : null;
         return {
           version: DAILY_RANGE_AUTO_POOL_VERSION,
           activeSymbols: Array.isArray(parsed.activeSymbols) ? normalizeSymbols(parsed.activeSymbols.filter((symbol): symbol is string => typeof symbol === "string")) : [],
           updatedAtMs: asMs(parsed.updatedAtMs),
-          lastAttemptAtMs: asMs(parsed.lastAttemptAtMs),
-          lastSuccessAtMs: asMs(parsed.lastSuccessAtMs),
+          lastAttemptAtMs: hasVenueEvidence ? asMs(parsed.lastAttemptAtMs) : null,
+          lastSuccessAtMs: hasVenueEvidence ? asMs(parsed.lastSuccessAtMs) : null,
           lastError: typeof parsed.lastError === "string" ? parsed.lastError : null,
           reconciliation: validReconciliation,
           spreadSamples,
