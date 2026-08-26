@@ -45,11 +45,16 @@ rolling pool read may block a live entry for safety, but cannot overwrite a
 historical feature row.
 
 A REST BBO is frozen after every symbol has finished C2 evaluation and before
-the batch allocator can submit an order. A BBO observed just after C2 is recorded as
-`NEAR_SIGNAL_AFTER_CLOSE` and `PARTIAL_RECONSTRUCTION`, not silently marked
-full PIT. `FULL_PIT` market quality requires a frozen causal pool read and an
-exchange BBO timestamp at or before the signal. This makes the current
-collector conservative rather than leaking post-signal price information.
+the batch allocator can submit an order. A signal is only knowable after C2
+closes, so a BBO observed in this forward decision phase is causal even when
+its exchange timestamp follows the candle close. It is labelled
+`AT_DECISION_BEFORE_ALLOCATION` and is `FULL_PIT` only when the UTC-day pool
+evidence was already frozen before the signal and the exchange timestamp is
+not later than the local decision capture (with a small clock-skew bound).
+A recovery read after allocation is always `RECOVERY_AFTER_ALLOCATION` and
+cannot upgrade a historical row; a BBO timestamp in the future is explicitly
+`FUTURE_OF_DECISION` / `UNAVAILABLE`. This preserves a usable forward dataset
+without silently leaking a later quote into an old decision.
 
 ### Causal feature schema (v1)
 

@@ -78,8 +78,10 @@ class FakeDailyClient implements DailyRangeExecClient {
   readonly fills: FuturesUserTrade[] = [];
   readonly fiveMinuteReadSymbols = new Set<string>();
   readonly entryCoverageSnapshots: string[][] = [];
+  readonly eventLog: string[] = [];
   beforeEntry: (() => void) | null = null;
   failNextEntry = false;
+  bookTimeOffsetMs = 0;
   /** Simulates a terminal partial MARKET fill: safe handling must bracket the
    * actual quantity rather than treating the requested quantity as fact. */
   nextEntryPartialFill: { qty: number; status: "CANCELED" | "EXPIRED" } | null = null;
@@ -98,8 +100,9 @@ class FakeDailyClient implements DailyRangeExecClient {
     const rows = [...this.algos.values()];
     return symbol ? rows.filter((row) => row.symbol === symbol) : rows;
   }
-  async getBookTicker(_symbol: string): Promise<FuturesExecutionBookTicker> {
-    return { bid: 100, ask: 100, bidQty: 100, askQty: 100, time: this.now };
+  async getBookTicker(symbol: string): Promise<FuturesExecutionBookTicker> {
+    this.eventLog.push(`book:${symbol}`);
+    return { bid: 100, ask: 100, bidQty: 100, askQty: 100, time: this.now + this.bookTimeOffsetMs };
   }
   async getKlines(symbol: string, interval: "1m" | "5m" | "4h", opts: { startTime?: number; endTime?: number } = {}): Promise<FuturesKline[]> {
     if (interval === "5m") this.fiveMinuteReadSymbols.add(symbol);
@@ -114,6 +117,7 @@ class FakeDailyClient implements DailyRangeExecClient {
   }
   async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
     if (!params.reduceOnly) {
+      this.eventLog.push(`entry:${params.symbol}`);
       this.entryCoverageSnapshots.push([...this.fiveMinuteReadSymbols].sort());
       this.beforeEntry?.();
       if (this.failNextEntry) {
@@ -316,9 +320,11 @@ async function runNaturalMainnetBatch(input: {
   controls?: DailyRangeMainnetControls;
   evidence?: DailyRangePoolEvidence;
   signalEvidence?: () => DailyRangePoolEvidence | null;
+  bookTimeOffsetMs?: number;
 }): Promise<{ client: FakeDailyClient; lane: DailyRangeAcceptanceLane; store: DailyRangeLaneStore; now: { value: number } }> {
   const now = { value: AT_0410 };
   const client = new FakeDailyClient();
+  client.bookTimeOffsetMs = input.bookTimeOffsetMs ?? 0;
   const c1Open = DAY + 4 * 3_600_000 + 10 * 60_000;
   const c2Open = DAY + 4 * 3_600_000 + 15 * 60_000;
   const history = researchFiveMinuteHistory(c1Open, c2Open);
@@ -853,7 +859,7 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect(pausedMainnet.getStatus()).toMatchObject({ newEntriesEnabled: false, newEntryReason: "SELECTION_FIX_PENDING_VALIDATION" });
   });
 
-  it("freezes the causal C1-C6 proof, records post-close BBO as partial, and never overwrites either", async () => {
+  it("freezes the causal C1-C6 proof and a decision-time BBO before allocation", async () => {
     const evidence = poolEvidence(["AAAUSDT", "BBBUSDT"]);
     evidence.auditBySymbol.AAAUSDT!.quoteVolume24hUsd = 42_000_000;
     const subject = await runNaturalMainnetBatch({
@@ -862,8 +868,9 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     });
     const aaa = subject.store.getState().signals.find((row) => row.symbol === "AAAUSDT")!;
     expect(aaa.research?.marketQuality).toMatchObject({
-      pitQuality: "PARTIAL_RECONSTRUCTION",
-      bookSnapshotQuality: "NEAR_SIGNAL_AFTER_CLOSE",
+      pitQuality: "FULL_PIT",
+      capturePhase: "FORWARD_BEFORE_ALLOCATION",
+      bookSnapshotQuality: "AT_DECISION_BEFORE_ALLOCATION",
       quoteVolume24hUsd: 42_000_000,
       c1Pass: true,
       c6Pass: true,
@@ -875,8 +882,39 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       relativeVolume: expect.objectContaining({ confirmation2: 1 }),
     });
     expect(aaa.research?.counterfactual).toMatchObject({ status: "PENDING", entryConvention: "C2_CLOSE_PIT_CANONICAL_V1" });
+    expect(Math.max(...subject.client.eventLog.map((event, index) => event.startsWith("book:") ? index : -1)))
+      .toBeLessThan(subject.client.eventLog.findIndex((event) => event.startsWith("entry:")));
     evidence.auditBySymbol.AAAUSDT!.quoteVolume24hUsd = 1;
     expect(aaa.research?.marketQuality?.quoteVolume24hUsd).toBe(42_000_000);
+  });
+
+  it("never upgrades a recovery read or a future exchange timestamp into FULL_PIT", async () => {
+    const evidence = poolEvidence(["AAAUSDT"]);
+    const recovery = await runNaturalMainnetBatch({ universe: ["AAAUSDT"], evidence });
+    const recoverySignal = recovery.store.getState().signals[0]!;
+    recoverySignal.research!.marketQuality = null;
+    recovery.now.value += 60_000;
+    recovery.client.now = recovery.now.value;
+    const day = recovery.store.getState().days["2026-08-26"]!;
+    await (recovery.lane as unknown as {
+      capturePendingResearchSnapshots(day: DailyRangeDayState): Promise<void>;
+    }).capturePendingResearchSnapshots(day);
+    expect(recoverySignal.research?.marketQuality).toMatchObject({
+      pitQuality: "PARTIAL_RECONSTRUCTION",
+      capturePhase: "RECOVERY_AFTER_ALLOCATION",
+      bookSnapshotQuality: "RECOVERY_AFTER_ALLOCATION",
+    });
+
+    const future = await runNaturalMainnetBatch({
+      universe: ["AAAUSDT"],
+      evidence: poolEvidence(["AAAUSDT"]),
+      bookTimeOffsetMs: 60_000,
+    });
+    expect(future.store.getState().signals[0]?.research?.marketQuality).toMatchObject({
+      pitQuality: "UNAVAILABLE",
+      capturePhase: "FORWARD_BEFORE_ALLOCATION",
+      bookSnapshotQuality: "FUTURE_OF_DECISION",
+    });
   });
 
   it("records every selected reservation before the first order POST and never promotes a lower-ranked failure", async () => {

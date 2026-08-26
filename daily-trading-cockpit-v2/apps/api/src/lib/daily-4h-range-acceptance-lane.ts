@@ -48,6 +48,8 @@ const FOUR_HOURS_MS = 4 * 60 * 60_000;
 const DAY_MS = 24 * 60 * 60_000;
 const EPSILON = 1e-9;
 const MAX_FRESH_SIGNAL_AGE_MS = 95_000;
+/** Binance's event clock may lead the local receipt clock by a few milliseconds. */
+const MAX_BOOK_SOURCE_FUTURE_SKEW_MS = 5_000;
 const CONFIRM_RETRIES = 4;
 const DEFAULT_CONFIRM_RETRY_MS = 350;
 const MAX_SIGNAL_COHORTS = 20_000;
@@ -179,12 +181,21 @@ export interface DailyRangeSignalMarketQualitySnapshot {
   capturedAt: string;
   poolCapturedAt: string | null;
   /**
-   * FULL_PIT requires a frozen pool read and an exchange BBO timestamp at or
-   * before C2 close.  A REST BBO read after the close is useful diagnostics,
-   * but is deliberately not promoted into a causal feature sample.
+   * FULL_PIT requires the frozen UTC-day pool evidence plus a BBO captured in
+   * the forward decision phase before allocation. The signal is only knowable
+   * after C2 closes, so a current BBO naturally follows that candle; it is
+   * causal when its exchange timestamp is not after the local decision read.
+   * A recovery read is never allowed to upgrade an old signal to FULL_PIT.
    */
   pitQuality: DailyRangePitQuality;
-  bookSnapshotQuality: "STRICT_AT_OR_BEFORE_SIGNAL" | "NEAR_SIGNAL_AFTER_CLOSE" | "UNAVAILABLE";
+  capturePhase: "FORWARD_BEFORE_ALLOCATION" | "RECOVERY_AFTER_ALLOCATION";
+  bookSnapshotQuality:
+    | "STRICT_AT_OR_BEFORE_SIGNAL"
+    | "AT_DECISION_BEFORE_ALLOCATION"
+    | "NEAR_SIGNAL_AFTER_CLOSE"
+    | "RECOVERY_AFTER_ALLOCATION"
+    | "FUTURE_OF_DECISION"
+    | "UNAVAILABLE";
   bookObservedAt: string | null;
   bookSourceTime: number | null;
   bestBid: number | null;
@@ -1724,10 +1735,10 @@ export class DailyRangeAcceptanceLane {
     this.captureSignalBatches(day, actions);
     // Capture the non-reconstructable BBO immediately after every symbol has
     // finished C2 evaluation and before batch allocation can submit an order.
-    // A REST quote whose source time is after C2 remains explicitly partial;
-    // preserving it now is still materially more faithful than reading a later
-    // rolling quote after entry/finalization.
-    await this.captureSignalTimeMarketQuality(day, actions);
+    // This is the forward decision boundary: a signal cannot be known before
+    // C2 closes, so the just-observed BBO is causal even though it follows the
+    // candle timestamp. Recovery reads below never receive this authority.
+    await this.captureSignalTimeMarketQuality(day, actions, "FORWARD_BEFORE_ALLOCATION");
     await this.finalizePendingSignalBatches(day);
     await this.capturePendingResearchSnapshots(day);
     await this.matureCounterfactualOutcomes();
@@ -1952,6 +1963,7 @@ export class DailyRangeAcceptanceLane {
   private async captureSignalTimeMarketQuality(
     day: DailyRangeDayState,
     signals: readonly DailyRangeSignal[],
+    capturePhase: "FORWARD_BEFORE_ALLOCATION" | "RECOVERY_AFTER_ALLOCATION",
   ): Promise<void> {
     const missing = signals.filter((signal) => !this.researchFor(signal).marketQuality);
     if (missing.length === 0) return;
@@ -1964,12 +1976,14 @@ export class DailyRangeAcceptanceLane {
       let currentSpreadBps: number | null = null;
       let bookSourceTime: number | null = null;
       let bookObservedAt: string | null = null;
+      let bookObservedAtMs: number | null = null;
       try {
         const book = await this.client.getBookTicker(signal.symbol);
         bestBid = book.bid;
         bestAsk = book.ask;
         bookSourceTime = book.time;
-        bookObservedAt = iso(this.nowMs());
+        bookObservedAtMs = this.nowMs();
+        bookObservedAt = iso(bookObservedAtMs);
         currentSpreadBps = spreadBps(book);
       } catch {
         // Preserve a concrete absence at signal time; a later successful BBO
@@ -1980,15 +1994,27 @@ export class DailyRangeAcceptanceLane {
         && poolCapturedAtMs !== null
         && poolCapturedAtMs <= signal.signalTimestampMs;
       const strictBookIsCausal = bookSourceTime !== null && bookSourceTime <= signal.signalTimestampMs;
-      const bookSnapshotQuality = bookObservedAt === null
+      const bookIsAtDecision = bookObservedAtMs !== null
+        && bookSourceTime !== null
+        && bestBid !== null
+        && bestBid > 0
+        && bestAsk !== null
+        && bestAsk > 0
+        && bookSourceTime <= bookObservedAtMs + MAX_BOOK_SOURCE_FUTURE_SKEW_MS;
+      const forwardDecisionBookIsCausal = capturePhase === "FORWARD_BEFORE_ALLOCATION" && bookIsAtDecision;
+      const bookSnapshotQuality = bookObservedAt === null || bookSourceTime === null
         ? "UNAVAILABLE" as const
-        : strictBookIsCausal ? "STRICT_AT_OR_BEFORE_SIGNAL" as const : "NEAR_SIGNAL_AFTER_CLOSE" as const;
+        : !bookIsAtDecision ? "FUTURE_OF_DECISION" as const
+          : capturePhase === "RECOVERY_AFTER_ALLOCATION" ? "RECOVERY_AFTER_ALLOCATION" as const
+            : strictBookIsCausal ? "STRICT_AT_OR_BEFORE_SIGNAL" as const
+              : "AT_DECISION_BEFORE_ALLOCATION" as const;
       research.marketQuality = {
         capturedAt: iso(this.nowMs()),
         poolCapturedAt: day.poolEvidence?.capturedAt ?? null,
-        pitQuality: frozenPoolIsCausal && strictBookIsCausal
+        pitQuality: frozenPoolIsCausal && forwardDecisionBookIsCausal
           ? "FULL_PIT"
-          : poolAudit && bookObservedAt !== null ? "PARTIAL_RECONSTRUCTION" : "UNAVAILABLE",
+          : poolAudit && bookIsAtDecision ? "PARTIAL_RECONSTRUCTION" : "UNAVAILABLE",
+        capturePhase,
         bookSnapshotQuality,
         bookObservedAt,
         bookSourceTime,
@@ -2288,7 +2314,9 @@ export class DailyRangeAcceptanceLane {
         .filter((signal): signal is DailyRangeSignal => signal !== null);
       if (signals.length === 0) continue;
       // Recovery path only: normal forward flow captured this before allocation.
-      await this.captureSignalTimeMarketQuality(day, signals);
+      // A post-allocation read may document a missing snapshot but can never
+      // turn it into causal training evidence.
+      await this.captureSignalTimeMarketQuality(day, signals, "RECOVERY_AFTER_ALLOCATION");
       const needsCapture = signals.some((signal) => {
         const research = signal.research;
         return !research?.marketQuality || !research.features || !research.counterfactual;
