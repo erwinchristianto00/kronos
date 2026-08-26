@@ -45,6 +45,32 @@ describe("GET /api/live/open-basket-chart", () => {
     }
   });
 
+  it.each([
+    ["15m", 192],
+    ["1h", 168],
+    ["4h", 18],
+    ["1d", 120],
+  ] as const)("serves the selectable %s historical window", async (interval, limit) => {
+    const marketCandles = vi.fn(async () => [{
+      openTime: 1_700_000_000_000,
+      open: 100,
+      high: 102,
+      low: 99,
+      close: 101,
+      volume: 12,
+    }]);
+    const app = Fastify();
+    await registerLiveRoutes(app, null, { marketCandles });
+    try {
+      const response = await app.inject({ method: "GET", url: `/api/live/open-basket-chart?symbol=SOLUSDT&interval=${interval}` });
+      expect(response.statusCode).toBe(200);
+      expect(marketCandles).toHaveBeenCalledWith("SOLUSDT", interval, limit);
+      expect(response.json()).toMatchObject({ ok: true, symbol: "SOLUSDT", interval, completedOnly: true });
+    } finally {
+      await app.close();
+    }
+  });
+
   it("returns completed 1d and 5m history plus yesterday's exact UTC 00:00 4h range", async () => {
     const nowMs = Date.UTC(2026, 7, 26, 12, 0, 0);
     const previousUtcDayStartMs = Date.UTC(2026, 7, 25, 0, 0, 0);

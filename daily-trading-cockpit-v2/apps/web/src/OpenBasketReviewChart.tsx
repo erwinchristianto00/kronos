@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   CandlestickSeries,
   ColorType,
@@ -21,6 +21,13 @@ const C = {
 };
 
 const REFRESH_MS = 30_000;
+const HISTORICAL_INTERVALS = [
+  { value: '15m', label: '15m' },
+  { value: '1h', label: '1H' },
+  { value: '4h', label: '4H' },
+  { value: '1d', label: '1D' },
+] as const;
+type HistoricalInterval = typeof HISTORICAL_INTERVALS[number]['value'];
 
 export type OpenBasketReviewLeg = {
   key: string;
@@ -72,6 +79,17 @@ type ChartResponse = {
   reason?: string;
 };
 
+type IntervalChartResponse = {
+  ok: boolean;
+  symbol: string;
+  interval: HistoricalInterval;
+  source: 'BINANCE_USDM_PUBLIC';
+  completedOnly: boolean;
+  asOf: string;
+  candles: Candle[];
+  reason?: string;
+};
+
 type PriceLevel = {
   price: number;
   label: string;
@@ -107,6 +125,10 @@ function formatUtc(value: number): string {
     year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
     hour12: false, timeZone: 'UTC',
   }).format(new Date(value)).replace(',', '');
+}
+
+function historicalIntervalLabel(interval: HistoricalInterval): string {
+  return HISTORICAL_INTERVALS.find((item) => item.value === interval)?.label ?? interval;
 }
 
 function findAcceptanceEvents(candles: Candle[], high: number, low: number): AcceptanceEvent[] {
@@ -153,11 +175,15 @@ function CandlePane({
   candles,
   levels,
   ariaLabel,
+  headerRight,
+  error,
 }: {
   title: string;
   candles: Candle[];
   levels: PriceLevel[];
   ariaLabel: string;
+  headerRight?: ReactNode;
+  error?: string | null;
 }) {
   const host = useRef<HTMLDivElement | null>(null);
 
@@ -213,8 +239,12 @@ function CandlePane({
   }, [candles, levels]);
 
   return <div style={{ minWidth: 0, border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden', background: C.sub }}>
-    <div style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}`, color: C.text, fontSize: 12, fontWeight: 700 }}>{title}</div>
-    {candles.length === 0
+    <div style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}`, color: C.text, fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+      <span>{title}</span>{headerRight}
+    </div>
+    {error
+      ? <div style={{ padding: 12, color: C.bad, fontSize: 12 }}>Candle chart unavailable: {error}</div>
+      : candles.length === 0
       ? <div style={{ padding: 12, color: C.dim, fontSize: 12 }}>Tidak ada completed candle dari USD-M untuk chart ini.</div>
       : <div ref={host} aria-label={ariaLabel} />}
   </div>;
@@ -224,8 +254,18 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   const [data, setData] = useState<ChartResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [historicalInterval, setHistoricalInterval] = useState<HistoricalInterval>('1d');
+  const [historicalSeries, setHistoricalSeries] = useState<IntervalChartResponse | null>(null);
+  const [historicalSeriesError, setHistoricalSeriesError] = useState<string | null>(null);
+  const [historicalLoading, setHistoricalLoading] = useState(false);
   const chartEndpoint = leg
     ? leg.chartEndpoint ?? `${apiPrefix}/live/open-basket-chart?symbol=${encodeURIComponent(leg.symbol)}`
+    : null;
+  // The full response remains the source of the frozen range reference.  The timeframe selector
+  // only changes its historical candle series, using the same bounded public USD-M route on both
+  // Testnet and Live.  Daily Range therefore never falls back to a recalculated reference range.
+  const historicalEndpoint = leg
+    ? `${apiPrefix}/live/open-basket-chart?symbol=${encodeURIComponent(leg.symbol)}&interval=${historicalInterval}`
     : null;
 
   useEffect(() => {
@@ -262,6 +302,39 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     };
   }, [chartEndpoint, leg?.key]);
 
+  useEffect(() => {
+    if (!leg || historicalInterval === '1d') {
+      setHistoricalSeries(null);
+      setHistoricalSeriesError(null);
+      setHistoricalLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    const load = async () => {
+      setHistoricalLoading(true);
+      setHistoricalSeriesError(null);
+      setHistoricalSeries(null);
+      try {
+        const response = await fetch(historicalEndpoint!, { cache: 'no-store' });
+        const body = await response.json() as IntervalChartResponse;
+        if (!response.ok || body.ok !== true || body.interval !== historicalInterval || !Array.isArray(body.candles)) {
+          throw new Error(body.reason ?? `candle request failed (${response.status})`);
+        }
+        if (!cancelled) setHistoricalSeries(body);
+      } catch (loadError) {
+        if (!cancelled) setHistoricalSeriesError(loadError instanceof Error ? loadError.message : 'Candle data unavailable');
+      } finally {
+        if (!cancelled) setHistoricalLoading(false);
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [historicalEndpoint, historicalInterval, leg?.key]);
+
   if (!leg) {
     return <section className="testnet-panel testnet-wide-panel" id="open-basket-review-chart">
       <header><div><span>Basket candle review</span><strong>Menunggu basket aktif</strong></div></header>
@@ -271,6 +344,11 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
 
   const isDailyRange = leg.reviewKind === 'daily-range';
   const reference = data?.reference4h ?? data?.previousUtcReference4h ?? null;
+  const historicalCandles = historicalInterval === '1d'
+    ? data?.daily.candles ?? []
+    : historicalSeries?.candles ?? [];
+  const historicalAsOf = historicalInterval === '1d' ? data?.asOf : historicalSeries?.asOf ?? data?.asOf;
+  const historicalError = historicalInterval === '1d' ? null : historicalSeriesError;
   const tradeLevels: PriceLevel[] = isDailyRange ? [
     { price: leg.entryPrice, label: 'Entry', color: C.measure },
     ...(leg.stopPrice != null && Number.isFinite(leg.stopPrice)
@@ -281,13 +359,13 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
       : []),
   ] : [];
   const dailyLevels: PriceLevel[] = reference ? [
-    { price: reference.rangeHigh, label: 'Resistance', color: C.accent },
-    { price: reference.rangeLow, label: 'Support', color: C.good },
+    { price: reference.rangeHigh, label: '4H range high · resistance', color: C.accent },
+    { price: reference.rangeLow, label: '4H range low · support', color: C.good },
     ...tradeLevels,
   ] : tradeLevels;
   const fiveMinuteLevels: PriceLevel[] = reference ? [
-    { price: reference.rangeHigh, label: 'Breakout + acceptance long', color: C.accent },
-    { price: reference.rangeLow, label: 'Breakdown + acceptance short', color: C.bad },
+    { price: reference.rangeHigh, label: '4H range high · breakout + acceptance long', color: C.accent },
+    { price: reference.rangeLow, label: '4H range low · breakdown + acceptance short', color: C.bad },
     ...tradeLevels,
   ] : tradeLevels;
   // A Daily Range trade cannot be accepted before its source 4h candle has closed.  Keep the
@@ -303,6 +381,18 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   const latestShortAcceptance = acceptanceEvents.filter((event) => event.side === 'SHORT').at(-1);
   const reviewTitle = isDailyRange ? 'Daily Range 4H candle review · klik trade' : 'Basket candle review · klik leg di tabel';
   const ownerNoun = isDailyRange ? 'trade' : 'basket';
+  const historicalTitle = `${historicalIntervalLabel(historicalInterval)} · historical candles + ${isDailyRange ? 'fixed 4H range / trade levels' : 'fixed 4H range high / low'}`;
+  const historicalControl = <label style={{ color: C.dim, fontSize: 10, fontWeight: 500, whiteSpace: 'nowrap' }}>
+    candle{' '}
+    <select
+      aria-label="Historical candle timeframe"
+      value={historicalInterval}
+      onChange={(event) => setHistoricalInterval(event.target.value as HistoricalInterval)}
+      style={{ background: '#0a151b', color: C.text, border: `1px solid ${C.border}`, borderRadius: 4, padding: '3px 5px', fontSize: 11 }}
+    >
+      {HISTORICAL_INTERVALS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+    </select>
+  </label>;
 
   return <section className="testnet-panel testnet-wide-panel" id={isDailyRange ? 'daily-range-review-chart' : 'open-basket-review-chart'}>
     <header>
@@ -310,7 +400,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
         <span>{reviewTitle}</span>
         <strong style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.symbol} · {leg.side}</strong>
       </div>
-      <span style={{ color: C.dim, fontSize: 11 }}>{loading ? 'memperbarui completed candles…' : data?.asOf ? `as of ${formatTaipei(data.asOf)} Taipei` : 'memuat…'}</span>
+      <span style={{ color: C.dim, fontSize: 11 }}>{loading || historicalLoading ? 'memperbarui completed candles…' : historicalAsOf ? `as of ${formatTaipei(historicalAsOf)} Taipei` : 'memuat…'}</span>
     </header>
     <div style={{ padding: '8px 12px', display: 'flex', gap: 14, flexWrap: 'wrap', color: C.dim, fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
       <span>{ownerNoun} <strong style={{ color: C.text }}>{leg.basketId}</strong></span>
@@ -328,10 +418,11 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
             : <>Referensi: candle 4H <strong style={{ color: C.text }}>{reference.dateUtc} 00:00–04:00 UTC</strong> (hari kalender sebelum hari ini UTC).</>}
           Resistance <strong style={{ color: C.accent }}>{formatPrice(reference.rangeHigh)}</strong> · support <strong style={{ color: C.good }}>{formatPrice(reference.rangeLow)}</strong>.
           Acceptance memakai <strong style={{ color: C.text }}>dua close 5m selesai berturut-turut</strong> di luar level tersebut.
+          {' '}Garisnya horizontal karena ini harga high/low range 4H yang tetap, bukan trendline diagonal.
         </> : <span>Level 4H UTC belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
       </div>
       <div style={{ padding: 12, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 12 }}>
-        <CandlePane title={isDailyRange ? '1D · historical candles + range / trade levels' : '1D · historical candles + resistance / support'} candles={data?.daily.candles ?? []} levels={dailyLevels} ariaLabel={`${leg.symbol} 1d candle chart`} />
+        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} />
         <CandlePane title={isDailyRange ? '5m · breakout / breakdown + acceptance + native bracket' : '5m · breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} />
       </div>
       {reference && <div style={{ padding: '0 12px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55 }}>
