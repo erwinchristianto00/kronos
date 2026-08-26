@@ -213,68 +213,68 @@
           "why": "Exact source identity for the Live-only Plain MOM36 policy fence. Every new basket fingerprint records this immutable commit, rather than inheriting the prior Dynamic release SHA."
         },
         "CROSS_SECTIONAL_POLICY_VERSION": {
-          "value": "plain-mom36-filtered-3l3s-slowfast-36h-usdm-v1",
-          "why": "Live-only policy fence after the audited Dynamic MOM36 breadth drift. New LIVE evidence is a separate Plain MOM36 3L/3S cohort; Testnet remains unchanged on its existing V5 runtime."
+          "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+          "why": "Operator-authorized LIVE parity with the active TESTNET Dynamic MOM36 V5 architecture. New LIVE evidence is a separate V5 cohort; existing baskets retain their frozen policy."
         },
         "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-          "value": "2026-08-26T13:30:00Z",
-          "why": "Forward-cohort boundary for the restored LIVE Plain MOM36 policy. Prior Dynamic and legacy baskets remain historical and cannot be mixed into this cohort."
+          "value": "2026-08-26T14:08:52Z",
+          "why": "Forward-cohort boundary for the LIVE Dynamic MOM36 V5 parity policy. Prior Plain, Dynamic V1, and legacy baskets remain historical and cannot be mixed into this cohort."
         },
         "CROSS_SECTIONAL_STRATEGY_VERSION": {
-          "value": "plain-mom36-filtered-3l3s-slowfast-36h-usdm-v1",
-          "why": "Select the canonical balanced Plain MOM36 production path for LIVE: filtered universe, exactly three long and three short legs, no Dynamic breadth allocation."
+          "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+          "why": "Use the same V5 breadth, frozen continuation, MOM36 rank walk, SLOW_AND_FAST preference/fallback, and exact-six-leg formation as active TESTNET."
         },
         "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
-          "value": "2026-08-26T13:30:00Z",
-          "why": "Deployment identity frozen into every new LIVE basket fingerprint under the restored Plain MOM36 policy."
+          "value": "2026-08-26T14:08:52Z",
+          "why": "Deployment identity frozen into every new LIVE Dynamic MOM36 V5 basket fingerprint."
         },
         "CROSS_SECTIONAL_EXEC_VARIANT": {
-          "value": "FILTERED",
-          "why": "The executor must consume only canonical FILTERED Plain MOM36 signals. A Dynamic variant/strategy mismatch now fail-closes new basket admission."
+          "value": "DYNAMIC_MOM36_SHOCK",
+          "why": "The LIVE executor must consume the same Dynamic MOM36 V5 signal as TESTNET. A variant/strategy mismatch remains fail-closed."
         },
         "CROSS_SECTIONAL_K": {
           "value": "3",
-          "why": "Pin LIVE to exactly 3L/3S. Any other K makes the selection runtime CONFIG_INEFFECTIVE and blocks new baskets."
+          "why": "Matches TESTNET's V5 base configuration. Dynamic V5 owns the final breadth allocation while preserving the exact six-leg total."
         },
         "CROSS_SECTIONAL_REGIME_SKEW_ENABLED": {
           "value": "0",
-          "why": "Live restored policy is market-neutral 3L/3S; regime skew cannot alter its geometry."
+          "why": "Matches TESTNET. Dynamic V5 uses its own frozen MOM36 breadth plus continuation mechanism rather than the retired generic regime-skew switch."
         },
         "CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT": {
           "value": "1",
-          "why": "Hard slow-MOM36 plus fast-confirmation eligibility. In a one-direction market, LIVE does not force the least-negative names into longs or the least-positive names into shorts; it emits NO_TRADE instead."
+          "why": "Matches TESTNET. V5 itself owns SLOW_AND_FAST in PREFER mode: it uses strict aligned selection when complete, otherwise the complete same-snapshot raw MOM36 selection."
         },
         "CROSS_SECTIONAL_FILTERED_WEIGHTING": {
           "value": "CAPPED_SCORE_RANK",
-          "why": "Canonical capped score-rank weighting for Plain MOM36, frozen separately from Dynamic equal-notional sizing."
+          "why": "Retained to match TESTNET configuration; Dynamic V5 freezes its actual execution sizing separately at six equal 25 USDT legs."
         },
         "CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP": {
           "value": "0.058",
-          "why": "Canonical production score-gap floor for the restored LIVE Plain MOM36 policy."
+          "why": "Same Dynamic V5 formation admission floor as TESTNET."
         },
         "CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER": {
           "value": "2",
-          "why": "Concentration guardrail retained exactly for the restored LIVE Plain MOM36 policy."
+          "why": "Same Dynamic V5 concentration guardrail as TESTNET."
         },
         "CROSS_SECTIONAL_SMART_FORMATION_RERANK": {
           "value": "0",
-          "why": "Plain MOM36 rank only. Smart Basket lifecycle remains available but cannot utility-rerank LIVE symbol selection."
+          "why": "Matches TESTNET: Dynamic V5's own versioned formation owns selection; Smart Formation utility reranking stays off."
         },
         "CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS": {
           "value": "36",
-          "why": "Keep the existing hard 36-hour execution cap for new LIVE baskets; the 48-hour value remains a measurement horizon only."
+          "why": "Matches TESTNET V5's fixed 36-hour execution cap; the separate report horizon remains non-execution metadata."
         },
         "CROSS_SECTIONAL_EXEC_TP_DISABLED": {
           "value": "1",
-          "why": "No ordinary TP for new LIVE Plain MOM36 baskets; Hold-to-36h remains the production comparator. Existing baskets retain their frozen policy."
+          "why": "Matches TESTNET V5: ordinary TP stays off. V5's frozen -2% hard cut and +3% MFE / 30% giveback exit are separate from ordinary TP."
         },
         "CROSS_SECTIONAL_EXEC_STOP_NET_RETURN": {
           "value": "0",
-          "why": "No new ordinary stop-loss policy is introduced by this selector repair. Existing basket exits remain frozen."
+          "why": "Matches TESTNET V5: ordinary stop stays off. The V5 frozen basket-level -2% hard cut remains active for newly admitted V5 baskets."
         },
         "CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED": {
           "value": "0",
-          "why": "Adaptive exits stay OFF for the restored LIVE Plain MOM36 cohort; the change is selection-only."
+          "why": "Matches TESTNET V5: generic adaptive exits stay off; the separate frozen V5 -2% / MFE-giveback state machine remains active."
         },
         "DAILY_RANGE_AUTO_POOL_ENABLED": {
           "value": "1",

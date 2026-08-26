@@ -246,4 +246,50 @@ describe("cross-sectional effective runtime policy", () => {
       horizonHours: 36,
     });
   });
+
+  it("treats the TESTNET V5 contract as effective Dynamic breadth, not a mislabeled Plain 3L/3S basket", () => {
+    const env = {
+      CROSS_SECTIONAL_STRATEGY_VERSION: "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+      CROSS_SECTIONAL_POLICY_VERSION: "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+      CROSS_SECTIONAL_EXEC_VARIANT: "DYNAMIC_MOM36_SHOCK",
+      CROSS_SECTIONAL_K: "3",
+      CROSS_SECTIONAL_REGIME_SKEW_ENABLED: "0",
+      CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "1",
+      CROSS_SECTIONAL_INTERVAL: "1h",
+      CROSS_SECTIONAL_MOMENTUM_BARS: "36",
+      CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+      CROSS_SECTIONAL_EXEC_TICK_MS: "60000",
+    } as NodeJS.ProcessEnv;
+
+    expect(crossSectionalSelectionRuntime(env)).toMatchObject({
+      strategyVersion: "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+      configuredVariant: "DYNAMIC_MOM36_SHOCK",
+      effectiveVariant: "DYNAMIC_MOM36_SHOCK",
+      selectionMode: "DYNAMIC_MOM36_BREADTH",
+      geometry: "BREADTH_6_TOTAL",
+      state: "EFFECTIVE",
+    });
+    expect(effectiveCrossSectionalRuntime(true, env).selection).toMatchObject({
+      selectionMode: "DYNAMIC_MOM36_BREADTH",
+      geometry: "BREADTH_6_TOTAL",
+      state: "EFFECTIVE",
+    });
+    expect(buildCurrentCrossSectionalPolicyFingerprint("2026-08-26T14:08:52.000Z", env)).toMatchObject({
+      strategy: {
+        strategyVersion: "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
+        signal: "DYNAMIC_MOM36_SHOCK_36H",
+        selectionMode: "DYNAMIC_MOM36_BREADTH",
+        selectionState: "EFFECTIVE",
+      },
+      formation: { weighting: "EQUAL_NOTIONAL", entryRevalidationEnabled: false },
+      execution: {
+        executionCapHours: 36,
+        dynamicV3Exit: {
+          hardCutLossNetReturn: -0.02,
+          mfeArmNetReturn: 0.03,
+          mfeGivebackFraction: 0.30,
+        },
+      },
+    });
+  });
 });
