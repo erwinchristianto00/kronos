@@ -4,8 +4,10 @@ import {
   BinanceFuturesPrivateClient,
   BinanceFuturesPrivateError,
   buildQueryString,
+  resolveAccountReadCacheTtlMs,
   resolveLiveBinanceBaseUrl,
   resolveLiveBinanceEnv,
+  resolveNonCriticalMutationMinIntervalMs,
   resolvePublicKlineMinIntervalMs,
   resolveSignedReadMinIntervalMs,
   signQueryString,
@@ -40,18 +42,24 @@ describe("binance-futures-private signing", () => {
   });
 
   it("keeps the protective Testnet read budgets when optional env values are missing or blank", () => {
-    expect(resolveSignedReadMinIntervalMs("testnet", undefined)).toBe(4_000);
-    expect(resolveSignedReadMinIntervalMs("testnet", "")).toBe(4_000);
-    expect(resolveSignedReadMinIntervalMs("testnet", "  ")).toBe(4_000);
+    expect(resolveSignedReadMinIntervalMs("testnet", undefined)).toBe(6_000);
+    expect(resolveSignedReadMinIntervalMs("testnet", "")).toBe(6_000);
+    expect(resolveSignedReadMinIntervalMs("testnet", "  ")).toBe(6_000);
     expect(resolveSignedReadMinIntervalMs("testnet", "1500")).toBe(1_500);
     expect(resolveSignedReadMinIntervalMs("testnet", "0")).toBe(0);
     expect(resolveSignedReadMinIntervalMs("mainnet", undefined)).toBe(0);
-    expect(resolvePublicKlineMinIntervalMs("testnet", undefined)).toBe(750);
-    expect(resolvePublicKlineMinIntervalMs("testnet", "")).toBe(750);
-    expect(resolvePublicKlineMinIntervalMs("testnet", "  ")).toBe(750);
+    expect(resolvePublicKlineMinIntervalMs("testnet", undefined)).toBe(1_500);
+    expect(resolvePublicKlineMinIntervalMs("testnet", "")).toBe(1_500);
+    expect(resolvePublicKlineMinIntervalMs("testnet", "  ")).toBe(1_500);
     expect(resolvePublicKlineMinIntervalMs("testnet", "1250")).toBe(1_250);
     expect(resolvePublicKlineMinIntervalMs("testnet", "0")).toBe(0);
     expect(resolvePublicKlineMinIntervalMs("mainnet", undefined)).toBe(0);
+    expect(resolveAccountReadCacheTtlMs("testnet", undefined)).toBe(15_000);
+    expect(resolveAccountReadCacheTtlMs("testnet", "0")).toBe(0);
+    expect(resolveAccountReadCacheTtlMs("mainnet", undefined)).toBe(0);
+    expect(resolveNonCriticalMutationMinIntervalMs("testnet", undefined)).toBe(750);
+    expect(resolveNonCriticalMutationMinIntervalMs("testnet", "0")).toBe(0);
+    expect(resolveNonCriticalMutationMinIntervalMs("mainnet", undefined)).toBe(0);
   });
 
   it("reads the public book ticker from the same selected execution base", async () => {
@@ -327,6 +335,76 @@ describe("binance-futures-private signing", () => {
       expect.objectContaining({ readBudgetWaitMs: 0, outcome: "OK" }),
       expect.objectContaining({ readBudgetWaitMs: 750, outcome: "OK" }),
     ]);
+  });
+
+  it("coalesces short-lived account-wide snapshots but never reuses them after a mutation", async () => {
+    let nowMs = 1_700_000_000_000;
+    let positions = 0;
+    let algos = 0;
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      if (value.includes("/fapi/v1/time")) return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+      if (value.includes("/fapi/v2/positionRisk")) {
+        positions += 1;
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (value.includes("/fapi/v1/openAlgoOrders")) {
+        algos += 1;
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (value.includes("/fapi/v1/leverage")) return new Response(JSON.stringify({ leverage: 1 }), { status: 200 });
+      throw new Error(`unexpected URL ${value}`);
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl,
+      nowMs: () => nowMs,
+      accountReadCacheTtlMs: 15_000,
+    });
+
+    await Promise.all([client.getPositions(), client.getPositions(), client.getOpenAlgoOrders(), client.getOpenAlgoOrders()]);
+    expect({ positions, algos }).toEqual({ positions: 1, algos: 1 });
+
+    nowMs += 14_999;
+    await client.getPositions();
+    expect(positions).toBe(1);
+
+    await client.setLeverage("BTCUSDT", 1);
+    await client.getPositions();
+    expect(positions).toBe(2);
+  });
+
+  it("paces parallel leverage setup without delaying order-mutating safety paths", async () => {
+    let nowMs = 1_700_000_000_000;
+    const leverageDispatches: number[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      if (value.includes("/fapi/v1/time")) return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+      if (value.includes("/fapi/v1/leverage")) {
+        leverageDispatches.push(nowMs);
+        return new Response(JSON.stringify({ leverage: 1 }), { status: 200 });
+      }
+      if (value.includes("/fapi/v1/allOpenOrders")) return new Response(JSON.stringify({ code: 200 }), { status: 200 });
+      throw new Error(`unexpected URL ${value}`);
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl,
+      nowMs: () => nowMs,
+      nonCriticalMutationMinIntervalMs: 750,
+      sleep: async (ms) => { nowMs += ms; },
+    });
+
+    await Promise.all([
+      client.setLeverage("BTCUSDT", 1),
+      client.setLeverage("ETHUSDT", 1),
+      client.setLeverage("SOLUSDT", 1),
+    ]);
+    expect(leverageDispatches).toEqual([1_700_000_000_000, 1_700_000_000_750, 1_700_000_001_500]);
+
+    await client.cancelAllOrders("BTCUSDT");
+    expect(client.getRateLimitStatus().recentRequests.at(-1)).toMatchObject({
+      path: "/fapi/v1/allOpenOrders",
+      readBudgetWaitMs: 0,
+    });
   });
 
   it("measures server-time skew at actual dispatch rather than time spent queued", async () => {

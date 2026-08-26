@@ -2386,9 +2386,10 @@ export class LiveExecutionEngine {
     const flattenOrderIdBySymbol = new Map<string, string | null>();
 
     const [positions, openOrders, openAlgoOrders] = await Promise.all([
-      this.client.getPositions(),
+      // An account-wide emergency flatten must never act on the short observability cache.
+      this.client.getPositions(undefined, { forceFresh: true }),
       this.client.getOpenOrders(),
-      this.client.getOpenAlgoOrders(),
+      this.client.getOpenAlgoOrders(undefined, { forceFresh: true }),
     ]);
     const symbols = new Set<string>();
     for (const pos of positions) {

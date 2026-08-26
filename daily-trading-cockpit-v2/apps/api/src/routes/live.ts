@@ -237,12 +237,12 @@ export function scheduledOpenBasketDeadline(
 }
 
 const DASHBOARD_ACCOUNT_CACHE_TTL_MS = 15_000;
-const TESTNET_DASHBOARD_ACCOUNT_CACHE_TTL_MS = 30_000;
+const TESTNET_DASHBOARD_ACCOUNT_CACHE_TTL_MS = 60_000;
 const DASHBOARD_ACCOUNT_RATE_LIMIT_BACKOFF_MS = 60_000;
 
 /**
  * The dashboard is observability-only. Testnet's private REST path repeatedly hit 418 when a 15s
- * account snapshot ran beside active reconciliation loops, so retain a fresh-enough 30s view there
+ * account snapshot ran beside active reconciliation loops, so retain a fresh-enough 60s view there
  * while keeping Live's existing 15s display cadence unchanged. A bounded env override is provided
  * for an incident response, but cannot accidentally turn this into a sub-second poller.
  */

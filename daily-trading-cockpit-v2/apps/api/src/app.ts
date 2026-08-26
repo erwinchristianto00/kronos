@@ -26,8 +26,11 @@ import { registerShadowRoutes } from "./routes/shadow.js";
 import { registerTradingAssistantRoutes } from "./routes/trading-assistant.js";
 import {
   BinanceFuturesPrivateClient,
+  resolveAccountReadCacheTtlMs,
+  resolveNonCriticalMutationMinIntervalMs,
   resolvePublicKlineMinIntervalMs,
   resolveSignedReadMinIntervalMs,
+  withBinanceTransportSource,
   type BinanceFuturesRateLimitStatus,
 } from "./lib/binance-futures-private.js";
 import { FuturesMarketReferenceCache } from "./lib/futures-market-reference-cache.js";
@@ -1359,6 +1362,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       liveConfig.env,
       process.env.LIVE_BINANCE_PUBLIC_KLINE_MIN_INTERVAL_MS,
     );
+    const accountReadCacheTtlMs = resolveAccountReadCacheTtlMs(
+      liveConfig.env,
+      process.env.LIVE_BINANCE_ACCOUNT_READ_CACHE_TTL_MS,
+    );
+    const nonCriticalMutationMinIntervalMs = resolveNonCriticalMutationMinIntervalMs(
+      liveConfig.env,
+      process.env.LIVE_BINANCE_NONCRITICAL_MUTATION_MIN_INTERVAL_MS,
+    );
     const liveClient = new BinanceFuturesPrivateClient({
       apiKey: liveConfig.apiKey,
       apiSecret: liveConfig.apiSecret,
@@ -1366,11 +1377,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       fetchImpl: options.fetchImpl,
       signedReadMinIntervalMs,
       publicKlineMinIntervalMs,
+      accountReadCacheTtlMs,
+      nonCriticalMutationMinIntervalMs,
     });
     binanceTransportStatusGetter = () => liveClient.getRateLimitStatus();
     console.log(
       `[binance-transport] env=${liveConfig.env} signedReadMinIntervalMs=${signedReadMinIntervalMs} ` +
-      `publicKlineMinIntervalMs=${publicKlineMinIntervalMs}`,
+      `publicKlineMinIntervalMs=${publicKlineMinIntervalMs} accountReadCacheTtlMs=${accountReadCacheTtlMs} ` +
+      `nonCriticalMutationMinIntervalMs=${nonCriticalMutationMinIntervalMs}`,
     );
     // RECORDING-ONLY (2026-07-27). Keep the existing SPOT mid as the entry-quality gate input, while
     // prewarming an independent book reference from the SAME USD-M testnet/mainnet base used for
@@ -1531,7 +1545,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     const ensureCachedPositions = (): { at: number; promise: ReturnType<typeof liveClient.getPositions> } => {
       const now = Date.now();
       if (!cachedPositions || now - cachedPositions.at > 30_000) {
-        const promise = liveClient.getPositions();
+        // This is a shared monitoring snapshot, not an order-time recheck.  Give it an explicit
+        // transport owner so a future rate incident can distinguish it from lifecycle reconciliation.
+        const promise = withBinanceTransportSource("shared-account.positions", () => liveClient.getPositions());
         // Piggyback the account-exposure coordinator's manual/external-position snapshot onto this
         // SAME promise — ZERO new Binance calls (see AccountExposureCoordinator.updatePositionSnapshot's
         // doc comment). Attached only here, at the point a NEW promise is created, not on every
@@ -2559,11 +2575,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // had no automatic executor tick at all.  A testnet deployment is now a real smoke of the
       // same runtime behaviour, not a manual-only approximation.
       const crossSectionalTickMs = crossSectionalExecTickMs();
-      const scheduleCrossSectionalTick = (delayMs: number, tick: () => void) => {
-        setTimeout(tick, Math.min(delayMs, crossSectionalTickMs));
-        setInterval(tick, crossSectionalTickMs);
+      const scheduleCrossSectionalTick = (phaseMs: number, tick: () => void) => {
+        // Register the interval only after its first tick. The old `setTimeout` + immediate
+        // `setInterval` pair collapsed all three initial delays to the same 60s moment whenever
+        // CROSS_SECTIONAL_EXEC_TICK_MS=60000, producing a needless Testnet request/entry burst.
+        const boundedPhaseMs = Math.max(0, Math.min(crossSectionalTickMs - 1, Math.floor(phaseMs)));
+        setTimeout(() => {
+          tick();
+          setInterval(tick, crossSectionalTickMs);
+        }, crossSectionalTickMs + boundedPhaseMs);
       };
-      scheduleCrossSectionalTick(90_000, () => void crossSectionalExecutor?.tick());
+      scheduleCrossSectionalTick(0, () => void crossSectionalExecutor?.tick());
 
       // 2026-07-08 (operator: "wire lane baru ke allocation selection, jangan sampe ada blocker"):
       // two ADDITIONAL executor instances, one per newly-wired cross-sectional variant. Unlike the
@@ -2689,8 +2711,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       });
       // Staggered starts avoid three Binance bursts, while the interval stays the single effective
       // CROSS_SECTIONAL_EXEC_TICK_MS source of truth for every cross-sectional executor.
-      scheduleCrossSectionalTick(120_000, () => void crossSectionalTrendExecutor?.tick());
-      scheduleCrossSectionalTick(150_000, () => void crossSectionalMixedExecutor?.tick());
+      scheduleCrossSectionalTick(Math.floor(crossSectionalTickMs / 3), () => void crossSectionalTrendExecutor?.tick());
+      scheduleCrossSectionalTick(Math.floor((crossSectionalTickMs * 2) / 3), () => void crossSectionalMixedExecutor?.tick());
     }
 
     // Directional cross-sectional sublanes (testnet only). The selector is mutually exclusive:

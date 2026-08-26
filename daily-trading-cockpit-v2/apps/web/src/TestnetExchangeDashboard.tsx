@@ -2331,9 +2331,9 @@ export default function TestnetExchangeDashboard() {
 
       {status?.health?.lastTickError && (
         <section className="testnet-panel testnet-warning">
-          <span>Live engine warning</span>
+          <span>Binance Testnet transport warning</span>
           <strong>{status.health.lastTickError}</strong>
-          <p>The page is still exchange-only; this warning is from the Binance mirror engine, not diagnostics.</p>
+          <p>This is a shared USD-M transport alarm. It can originate from account reconciliation or another Testnet lane; endpoint details are available in transport telemetry.</p>
         </section>
       )}
 

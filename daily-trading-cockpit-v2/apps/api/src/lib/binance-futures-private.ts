@@ -76,18 +76,27 @@ const HTTP_429_FALLBACK_COOLDOWN_MS = 5_000;
 /**
  * Testnet has a materially tighter and less predictable REST envelope than mainnet.  The active
  * account has several independent reconciliation loops, so merely serialising reads still lets a
- * steady 15s dashboard refresh + lane ticks accumulate into an IP ban.  Signed account reads and
- * high-fan-out public Kline scans have separate budgets; ordinary public quotes remain unaffected
- * and risk-reducing POST/DELETE requests bypass both budgets entirely.
+ * steady dashboard refresh + lane ticks accumulate into an IP ban.  Testnet therefore uses a
+ * conservative signed-read cadence, a short account-snapshot cache, and a separate pace for
+ * non-critical setup mutations.  Risk-reducing POST/DELETE requests still bypass these budgets.
  */
-export const DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS = 4_000;
+export const DEFAULT_TESTNET_SIGNED_READ_MIN_INTERVAL_MS = 6_000;
 /**
  * A Daily Range catch-up reads one 5m Kline range per monitored symbol.  Testnet has returned
  * HTTP 418 after a fast serial 20-symbol scan even though signed reads were already paced.  Keep
  * these heavier public reads at a conservative, independently observable cadence.  Twenty symbols
- * finish in about fifteen seconds, comfortably inside the lane's 30-second scheduler interval.
+ * finish in about thirty seconds; the lane processes only completed 5m bars, so this does not
+ * change the decision candle or bypass the normal freshness gates.
  */
-export const DEFAULT_TESTNET_PUBLIC_KLINE_MIN_INTERVAL_MS = 750;
+export const DEFAULT_TESTNET_PUBLIC_KLINE_MIN_INTERVAL_MS = 1_500;
+/**
+ * The dashboard, mirror engine, and Daily Range lane all observe the same account.  Reusing a
+ * verified account-wide positions/algo snapshot for this short period removes redundant Testnet
+ * REST calls.  Symbol-specific reads and explicit fresh reads are never cached.
+ */
+export const DEFAULT_TESTNET_ACCOUNT_READ_CACHE_TTL_MS = 15_000;
+/** `setLeverage`/margin setup is not an exit.  Pace it so a six-leg basket cannot burst six POSTs. */
+export const DEFAULT_TESTNET_NONCRITICAL_MUTATION_MIN_INTERVAL_MS = 750;
 const DEFAULT_MAX_RECENT_TRANSPORT_EVENTS = 40;
 
 /**
@@ -124,6 +133,36 @@ export function resolvePublicKlineMinIntervalMs(
     }
   }
   return env === "testnet" ? DEFAULT_TESTNET_PUBLIC_KLINE_MIN_INTERVAL_MS : 0;
+}
+
+/** Short TTL for reusable account-wide snapshots. Explicit zero is an intentional opt-out. */
+export function resolveAccountReadCacheTtlMs(
+  env: LiveBinanceEnv,
+  configuredRaw: string | undefined,
+): number {
+  const value = configuredRaw?.trim();
+  if (value) {
+    const configured = Number(value);
+    if (Number.isFinite(configured) && configured >= 0 && configured <= 60_000) {
+      return Math.floor(configured);
+    }
+  }
+  return env === "testnet" ? DEFAULT_TESTNET_ACCOUNT_READ_CACHE_TTL_MS : 0;
+}
+
+/** Pace setup-only signed mutations without ever delaying order placement/cancellation. */
+export function resolveNonCriticalMutationMinIntervalMs(
+  env: LiveBinanceEnv,
+  configuredRaw: string | undefined,
+): number {
+  const value = configuredRaw?.trim();
+  if (value) {
+    const configured = Number(value);
+    if (Number.isFinite(configured) && configured >= 0 && configured <= 60_000) {
+      return Math.floor(configured);
+    }
+  }
+  return env === "testnet" ? DEFAULT_TESTNET_NONCRITICAL_MUTATION_MIN_INTERVAL_MS : 0;
 }
 // Re-fetch exchange filters (tickSize/stepSize/minQty/minNotional) periodically instead of caching
 // them for the process lifetime. Binance occasionally updates a symbol's LOT_SIZE/PRICE_FILTER/
@@ -543,6 +582,10 @@ export interface BinanceFuturesPrivateClientOptions {
   signedReadMinIntervalMs?: number;
   /** Global minimum spacing for public USD-M Kline reads. Testnet uses a safe default. */
   publicKlineMinIntervalMs?: number;
+  /** Reuse only account-wide positions/algo snapshots for this bounded period; mainnet defaults to 0. */
+  accountReadCacheTtlMs?: number;
+  /** Pace setup-only signed mutations such as leverage changes; orders/cancels remain immediate. */
+  nonCriticalMutationMinIntervalMs?: number;
   /** Test hook for deterministic budget waits. */
   sleep?: (ms: number) => Promise<void>;
   /** Bounded diagnostic history. Never contains API keys, signatures, or query parameters. */
@@ -566,9 +609,12 @@ export interface BinanceFuturesRateLimitStatus {
   readBudget: {
     signedReadMinIntervalMs: number;
     publicKlineMinIntervalMs: number;
+    accountReadCacheTtlMs: number;
+    nonCriticalMutationMinIntervalMs: number;
     queuedReads: number;
     nextEligibleAt: string | null;
     nextPublicKlineEligibleAt: string | null;
+    nextNonCriticalMutationEligibleAt: string | null;
   };
   recentRequests: BinanceFuturesTransportEvent[];
 }
@@ -591,7 +637,9 @@ export interface BinanceFuturesTransportEvent {
   retryAt: string | null;
 }
 
-type ReadBudgetKind = "none" | "signed" | "public-kline";
+type TransportBudgetKind = "none" | "signed" | "public-kline" | "noncritical-mutation";
+type FreshnessOptions = { forceFresh?: boolean };
+type AccountReadCacheEntry<T> = { atMs: number; promise: Promise<T> };
 
 /**
  * Annotates outbound Binance work with a high-level owner (dashboard, lifecycle, lane, etc.).
@@ -641,6 +689,8 @@ export class BinanceFuturesPrivateClient {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly signedReadMinIntervalMs: number;
   private readonly publicKlineMinIntervalMs: number;
+  private readonly accountReadCacheTtlMs: number;
+  private readonly nonCriticalMutationMinIntervalMs: number;
   private readonly maxRecentTransportEvents: number;
   readonly env: LiveBinanceEnv;
 
@@ -657,7 +707,11 @@ export class BinanceFuturesPrivateClient {
   private nextSignedReadAtMs = 0;
   /** Next reserved dispatch time for public Kline scans sharing this same transport. */
   private nextPublicKlineAtMs = 0;
+  /** Next reserved dispatch time for setup-only POSTs such as setLeverage. */
+  private nextNonCriticalMutationAtMs = 0;
   private queuedReads = 0;
+  private cachedAccountPositions: AccountReadCacheEntry<FuturesPosition[]> | null = null;
+  private cachedAccountOpenAlgoOrders: AccountReadCacheEntry<FuturesAlgoOrder[]> | null = null;
   /**
    * Public time synchronisation can carry a venue weight header too, but is not
    * part of the signed-read budget this telemetry is meant to measure.
@@ -678,6 +732,8 @@ export class BinanceFuturesPrivateClient {
     this.sleep = options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     this.signedReadMinIntervalMs = Math.max(0, Math.floor(options.signedReadMinIntervalMs ?? 0));
     this.publicKlineMinIntervalMs = Math.max(0, Math.floor(options.publicKlineMinIntervalMs ?? 0));
+    this.accountReadCacheTtlMs = Math.max(0, Math.floor(options.accountReadCacheTtlMs ?? 0));
+    this.nonCriticalMutationMinIntervalMs = Math.max(0, Math.floor(options.nonCriticalMutationMinIntervalMs ?? 0));
     this.maxRecentTransportEvents = Math.max(1, Math.floor(options.maxRecentTransportEvents ?? DEFAULT_MAX_RECENT_TRANSPORT_EVENTS));
   }
 
@@ -717,7 +773,7 @@ export class BinanceFuturesPrivateClient {
    */
   private async withTransportSlot<T>(
     operation: (readBudgetWaitMs: number) => Promise<T>,
-    budget: ReadBudgetKind,
+    budget: TransportBudgetKind,
   ): Promise<T> {
     this.queuedReads += 1;
     const previous = this.transportTail;
@@ -733,6 +789,8 @@ export class BinanceFuturesPrivateClient {
           ? await this.waitForSignedReadBudget()
           : budget === "public-kline"
             ? await this.waitForPublicKlineBudget()
+            : budget === "noncritical-mutation"
+              ? await this.waitForNonCriticalMutationBudget()
             : 0;
       return await operation(readBudgetWaitMs);
     } finally {
@@ -764,6 +822,50 @@ export class BinanceFuturesPrivateClient {
     this.nextPublicKlineAtMs = scheduledAt + this.publicKlineMinIntervalMs;
     if (waitMs > 0) await this.sleep(waitMs);
     return waitMs;
+  }
+
+  /** `setLeverage` and margin-mode setup can wait; placement/cancel/close never call this path. */
+  private async waitForNonCriticalMutationBudget(): Promise<number> {
+    if (this.nonCriticalMutationMinIntervalMs <= 0) return 0;
+    const now = this.nowMs();
+    const scheduledAt = Math.max(now, this.nextNonCriticalMutationAtMs);
+    const waitMs = Math.max(0, scheduledAt - now);
+    this.nextNonCriticalMutationAtMs = scheduledAt + this.nonCriticalMutationMinIntervalMs;
+    if (waitMs > 0) await this.sleep(waitMs);
+    return waitMs;
+  }
+
+  private clearAccountReadCache(): void {
+    this.cachedAccountPositions = null;
+    this.cachedAccountOpenAlgoOrders = null;
+  }
+
+  /**
+   * Cache only complete, account-wide snapshots. Symbol-specific reads are used immediately after
+   * fills/cancels and must remain exact. A rate-limit circuit is checked before any reuse so a
+   * stale in-memory row cannot make reconciliation look healthy during a known Binance cooldown.
+   */
+  private readCachedAccountSnapshot<T>(
+    key: "positions" | "openAlgoOrders",
+    options: FreshnessOptions,
+    load: () => Promise<T>,
+  ): Promise<T> {
+    this.assertRateLimitCircuitClosed();
+    if (this.accountReadCacheTtlMs <= 0 || options.forceFresh) return load();
+    const current = key === "positions" ? this.cachedAccountPositions : this.cachedAccountOpenAlgoOrders;
+    const now = this.nowMs();
+    if (current && now - current.atMs < this.accountReadCacheTtlMs) return current.promise as Promise<T>;
+    const entry: AccountReadCacheEntry<T> = { atMs: now, promise: load() };
+    if (key === "positions") this.cachedAccountPositions = entry as AccountReadCacheEntry<FuturesPosition[]>;
+    else this.cachedAccountOpenAlgoOrders = entry as AccountReadCacheEntry<FuturesAlgoOrder[]>;
+    entry.promise.catch(() => {
+      const stillCurrent = key === "positions" ? this.cachedAccountPositions : this.cachedAccountOpenAlgoOrders;
+      if (stillCurrent?.promise === entry.promise) {
+        if (key === "positions") this.cachedAccountPositions = null;
+        else this.cachedAccountOpenAlgoOrders = null;
+      }
+    });
+    return entry.promise;
   }
 
   private assertRateLimitCircuitClosed(): void {
@@ -938,7 +1040,7 @@ export class BinanceFuturesPrivateClient {
   private async requestPublic(
     path: string,
     params: Record<string, string | number | boolean | undefined> = {},
-    budget: ReadBudgetKind = "none",
+    budget: TransportBudgetKind = "none",
   ): Promise<unknown> {
     return (await this.requestPublicWithTiming(path, params, budget)).value;
   }
@@ -951,7 +1053,7 @@ export class BinanceFuturesPrivateClient {
   private async requestPublicWithTiming(
     path: string,
     params: Record<string, string | number | boolean | undefined> = {},
-    budget: ReadBudgetKind = "none",
+    budget: TransportBudgetKind = "none",
   ): Promise<{ value: unknown; dispatchedAtMs: number; completedAtMs: number }> {
     const qs = buildQueryString(params);
     const url = `${this.baseUrl}${path}${qs ? `?${qs}` : ""}`;
@@ -976,6 +1078,7 @@ export class BinanceFuturesPrivateClient {
     method: "GET" | "POST" | "DELETE",
     path: string,
     params: Record<string, string | number | boolean | undefined> = {},
+    options: { paceMutation?: boolean } = {},
   ): Promise<unknown> {
     await this.ensureTimeSync();
     this.assertClockSkewOk();
@@ -1018,7 +1121,16 @@ export class BinanceFuturesPrivateClient {
       throw lastError;
     }
     // POST/DELETE: exactly one attempt — the engine owns retries via idempotent client ids.
+    // Setup-only mutations may be paced, but exits/cancels stay immediate. Any mutation invalidates
+    // cached account-wide snapshots before it reaches Binance and again after its outcome.
+    this.clearAccountReadCache();
     try {
+      if (options.paceMutation) {
+        return await this.withTransportSlot(
+          (readBudgetWaitMs) => this.dispatchRawRequest(method, buildSignedUrl(), true, readBudgetWaitMs),
+          "noncritical-mutation",
+        );
+      }
       return await this.rawRequest(method, buildSignedUrl(), true);
     } catch (error) {
       if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021) {
@@ -1031,6 +1143,8 @@ export class BinanceFuturesPrivateClient {
         }
       }
       throw error;
+    } finally {
+      this.clearAccountReadCache();
     }
   }
 
@@ -1074,9 +1188,14 @@ export class BinanceFuturesPrivateClient {
       readBudget: {
         signedReadMinIntervalMs: this.signedReadMinIntervalMs,
         publicKlineMinIntervalMs: this.publicKlineMinIntervalMs,
+        accountReadCacheTtlMs: this.accountReadCacheTtlMs,
+        nonCriticalMutationMinIntervalMs: this.nonCriticalMutationMinIntervalMs,
         queuedReads: this.queuedReads,
         nextEligibleAt: this.nextSignedReadAtMs > now ? new Date(this.nextSignedReadAtMs).toISOString() : null,
         nextPublicKlineEligibleAt: this.nextPublicKlineAtMs > now ? new Date(this.nextPublicKlineAtMs).toISOString() : null,
+        nextNonCriticalMutationEligibleAt: this.nextNonCriticalMutationAtMs > now
+          ? new Date(this.nextNonCriticalMutationAtMs).toISOString()
+          : null,
       },
       recentRequests: this.recentTransportEvents.map((event) => ({ ...event })),
     };
@@ -1243,19 +1362,22 @@ export class BinanceFuturesPrivateClient {
     }));
   }
 
-  async getPositions(symbol?: string): Promise<FuturesPosition[]> {
-    const parsed = await this.requestSigned("GET", "/fapi/v2/positionRisk", symbol ? { symbol } : {});
-    if (!Array.isArray(parsed)) return [];
-    return parsed.map((p) => ({
-      symbol: String((p as { symbol?: unknown }).symbol ?? ""),
-      positionAmt: toNum((p as { positionAmt?: unknown }).positionAmt),
-      entryPrice: toNum((p as { entryPrice?: unknown }).entryPrice),
-      markPrice: toNum((p as { markPrice?: unknown }).markPrice),
-      liquidationPrice: toNum((p as { liquidationPrice?: unknown }).liquidationPrice),
-      unRealizedProfit: toNum((p as { unRealizedProfit?: unknown }).unRealizedProfit),
-      leverage: toNum((p as { leverage?: unknown }).leverage),
-      marginType: String((p as { marginType?: unknown }).marginType ?? ""),
-    }));
+  async getPositions(symbol?: string, options: FreshnessOptions = {}): Promise<FuturesPosition[]> {
+    const load = async (): Promise<FuturesPosition[]> => {
+      const parsed = await this.requestSigned("GET", "/fapi/v2/positionRisk", symbol ? { symbol } : {});
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((p) => ({
+        symbol: String((p as { symbol?: unknown }).symbol ?? ""),
+        positionAmt: toNum((p as { positionAmt?: unknown }).positionAmt),
+        entryPrice: toNum((p as { entryPrice?: unknown }).entryPrice),
+        markPrice: toNum((p as { markPrice?: unknown }).markPrice),
+        liquidationPrice: toNum((p as { liquidationPrice?: unknown }).liquidationPrice),
+        unRealizedProfit: toNum((p as { unRealizedProfit?: unknown }).unRealizedProfit),
+        leverage: toNum((p as { leverage?: unknown }).leverage),
+        marginType: String((p as { marginType?: unknown }).marginType ?? ""),
+      }));
+    };
+    return symbol ? load() : this.readCachedAccountSnapshot("positions", options, load);
   }
 
   /** True when the account is in hedge (dual-side) mode — the engine refuses to arm. */
@@ -1265,13 +1387,23 @@ export class BinanceFuturesPrivateClient {
   }
 
   async setLeverage(symbol: string, leverage: number): Promise<void> {
-    await this.requestSigned("POST", "/fapi/v1/leverage", { symbol, leverage: Math.max(1, Math.floor(leverage)) });
+    await this.requestSigned(
+      "POST",
+      "/fapi/v1/leverage",
+      { symbol, leverage: Math.max(1, Math.floor(leverage)) },
+      { paceMutation: true },
+    );
   }
 
   /** Best-effort ISOLATED margin; Binance code -4046 = "No need to change margin type". */
   async setIsolatedMargin(symbol: string): Promise<void> {
     try {
-      await this.requestSigned("POST", "/fapi/v1/marginType", { symbol, marginType: "ISOLATED" });
+      await this.requestSigned(
+        "POST",
+        "/fapi/v1/marginType",
+        { symbol, marginType: "ISOLATED" },
+        { paceMutation: true },
+      );
     } catch (error) {
       if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -4046) return;
       throw error;
@@ -1283,9 +1415,12 @@ export class BinanceFuturesPrivateClient {
     return Array.isArray(parsed) ? parsed.map((o) => this.mapOrder(o)) : [];
   }
 
-  async getOpenAlgoOrders(symbol?: string): Promise<FuturesAlgoOrder[]> {
-    const parsed = await this.requestSigned("GET", "/fapi/v1/openAlgoOrders", symbol ? { symbol } : {});
-    return Array.isArray(parsed) ? parsed.map((order) => this.mapAlgoOrder(order)) : [];
+  async getOpenAlgoOrders(symbol?: string, options: FreshnessOptions = {}): Promise<FuturesAlgoOrder[]> {
+    const load = async (): Promise<FuturesAlgoOrder[]> => {
+      const parsed = await this.requestSigned("GET", "/fapi/v1/openAlgoOrders", symbol ? { symbol } : {});
+      return Array.isArray(parsed) ? parsed.map((order) => this.mapAlgoOrder(order)) : [];
+    };
+    return symbol ? load() : this.readCachedAccountSnapshot("openAlgoOrders", options, load);
   }
 
   async queryAlgoOrder(algoId: string): Promise<FuturesAlgoOrder> {

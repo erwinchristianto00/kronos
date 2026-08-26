@@ -126,7 +126,7 @@ afterEach(async () => {
 
 describe("dashboard account cache policy", () => {
   it("uses a slower observability-only cache on Testnet without changing Live", () => {
-    expect(resolveDashboardAccountCacheTtlMs({ LIVE_BINANCE_ENV: "testnet" } as NodeJS.ProcessEnv)).toBe(30_000);
+    expect(resolveDashboardAccountCacheTtlMs({ LIVE_BINANCE_ENV: "testnet" } as NodeJS.ProcessEnv)).toBe(60_000);
     expect(resolveDashboardAccountCacheTtlMs({ LIVE_BINANCE_ENV: "mainnet" } as NodeJS.ProcessEnv)).toBe(15_000);
     expect(resolveDashboardAccountCacheTtlMs({
       LIVE_BINANCE_ENV: "testnet",
@@ -143,11 +143,14 @@ describe("private Binance transport telemetry route", () => {
       lastHttpStatus: 418,
       lastFailure: "rate limited (HTTP 418)",
       readBudget: {
-        signedReadMinIntervalMs: 4_000,
-        publicKlineMinIntervalMs: 750,
+        signedReadMinIntervalMs: 6_000,
+        publicKlineMinIntervalMs: 1_500,
+        accountReadCacheTtlMs: 15_000,
+        nonCriticalMutationMinIntervalMs: 750,
         queuedReads: 0,
         nextEligibleAt: null,
         nextPublicKlineEligibleAt: null,
+        nextNonCriticalMutationEligibleAt: null,
       },
       recentRequests: [{
         at: "2026-08-26T07:00:00.000Z", source: "cross-sectional.CROSS_SECTIONAL_MARKET_NEUTRAL",
@@ -164,7 +167,12 @@ describe("private Binance transport telemetry route", () => {
     expect(response.json()).toMatchObject({
       available: true,
       coolingDown: false,
-      readBudget: { signedReadMinIntervalMs: 4_000, publicKlineMinIntervalMs: 750 },
+      readBudget: {
+        signedReadMinIntervalMs: 6_000,
+        publicKlineMinIntervalMs: 1_500,
+        accountReadCacheTtlMs: 15_000,
+        nonCriticalMutationMinIntervalMs: 750,
+      },
       recentRequests: [expect.objectContaining({
         source: "cross-sectional.CROSS_SECTIONAL_MARKET_NEUTRAL",
         path: "/fapi/v2/positionRisk",
