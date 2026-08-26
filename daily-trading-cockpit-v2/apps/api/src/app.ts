@@ -1615,6 +1615,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         dataDir: "data",
         fileName: "daily-range-auto-pool.json",
         fetchImpl: options.fetchImpl,
+        // Mainnet public data supplies liquidity, spread, and history. C1 also proves this
+        // exact symbol exists on the Testnet venue where the Daily lane submits orders.
+        venueSymbols: async () => new Set((await liveClient.getExchangeFilters()).keys()),
       });
       const currentDailyRangePool = () => dailyRangeAutoPool.getSnapshot(dailyRangePoolInput());
       dailyRangeAutoPoolSnapshot = () => currentDailyRangePool();
