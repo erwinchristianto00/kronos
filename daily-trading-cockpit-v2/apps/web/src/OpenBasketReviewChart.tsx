@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type MutableRefObject, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   CandlestickSeries,
   ColorType,
@@ -123,6 +123,46 @@ type AcceptanceEvent = {
 
 type CandleViewport = { from: number; to: number };
 
+// Daily Range refreshes its trade card every 15 seconds, while this component refreshes its
+// completed candles every 30 seconds.  A ref inside the component disappears if React remounts
+// the card during either refresh, so retain the operator's viewport for this browser tab instead.
+const viewportMemory = new Map<string, CandleViewport>();
+const VIEWPORT_STORAGE_PREFIX = 'dtc-candle-viewport:v1:';
+
+function validViewport(value: unknown): value is CandleViewport {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as { from?: unknown; to?: unknown };
+  return typeof candidate.from === 'number' && Number.isFinite(candidate.from)
+    && typeof candidate.to === 'number' && Number.isFinite(candidate.to)
+    && candidate.to > candidate.from;
+}
+
+function readViewport(viewportKey: string): CandleViewport | null {
+  const inMemory = viewportMemory.get(viewportKey);
+  if (inMemory) return inMemory;
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.sessionStorage.getItem(`${VIEWPORT_STORAGE_PREFIX}${viewportKey}`);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!validViewport(parsed)) return null;
+    viewportMemory.set(viewportKey, parsed);
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function persistViewport(viewportKey: string, viewport: CandleViewport): void {
+  viewportMemory.set(viewportKey, viewport);
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(`${VIEWPORT_STORAGE_PREFIX}${viewportKey}`, JSON.stringify(viewport));
+  } catch {
+    // Storage is an operator convenience only; retain the in-memory viewport if it is unavailable.
+  }
+}
+
 function formatPrice(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return '—';
   const digits = value < 0.0001 ? 10 : value < 0.01 ? 8 : value < 1 ? 6 : value < 100 ? 4 : 2;
@@ -228,7 +268,6 @@ function CandlePane({
   showStructuralTrendlines = false,
   executionMarker,
   viewportKey,
-  viewportStore,
 }: {
   title: string;
   candles: Candle[];
@@ -240,9 +279,8 @@ function CandlePane({
   showStructuralTrendlines?: boolean;
   /** Only used by Daily Range's 5m panel, where the entry fill is persisted. */
   executionMarker?: ExecutionMarker | null;
-  /** Per leg/timeframe state survives the 30s completed-candle refresh. */
+  /** Per leg/timeframe state survives card remounts and completed-candle refreshes. */
   viewportKey: string;
-  viewportStore: MutableRefObject<Map<string, CandleViewport>>;
 }) {
   const host = useRef<HTMLDivElement | null>(null);
 
@@ -326,10 +364,10 @@ function CandlePane({
     const saveViewport = () => {
       const range = chart.timeScale().getVisibleLogicalRange();
       if (range && Number.isFinite(range.from) && Number.isFinite(range.to)) {
-        viewportStore.current.set(viewportKey, { from: range.from, to: range.to });
+        persistViewport(viewportKey, { from: range.from, to: range.to });
       }
     };
-    const savedViewport = viewportStore.current.get(viewportKey);
+    const savedViewport = readViewport(viewportKey);
     if (savedViewport) chart.timeScale().setVisibleLogicalRange(savedViewport);
     else chart.timeScale().fitContent();
     chart.timeScale().subscribeVisibleLogicalRangeChange(saveViewport);
@@ -344,7 +382,7 @@ function CandlePane({
       window.removeEventListener('resize', resize);
       chart.remove();
     };
-  }, [candles, executionMarker, levels, showMovingAverages, showStructuralTrendlines, viewportKey, viewportStore]);
+  }, [candles, executionMarker, levels, showMovingAverages, showStructuralTrendlines, viewportKey]);
 
   return <div style={{ minWidth: 0, border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden', background: C.sub }}>
     <div style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}`, color: C.text, fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
@@ -366,7 +404,6 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   const [historicalSeries, setHistoricalSeries] = useState<IntervalChartResponse | null>(null);
   const [historicalSeriesError, setHistoricalSeriesError] = useState<string | null>(null);
   const [historicalLoading, setHistoricalLoading] = useState(false);
-  const viewportStore = useRef<Map<string, CandleViewport>>(new Map());
   const chartEndpoint = leg
     ? leg.chartEndpoint ?? `${apiPrefix}/live/open-basket-chart?symbol=${encodeURIComponent(leg.symbol)}`
     : null;
@@ -444,21 +481,17 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     };
   }, [historicalEndpoint, historicalInterval, leg?.key]);
 
-  if (!leg) {
-    return <section className="testnet-panel testnet-wide-panel candle-review-card" id="open-basket-review-chart">
-      <header><div><span>Basket candle review</span><strong>Menunggu basket aktif</strong></div></header>
-      <div style={{ padding: 12, color: C.dim, fontSize: 12 }}>Saat ada basket aktif, klik simbolnya di tabel untuk membuka candle 1D dan 5m. Tidak ada dropdown simbol.</div>
-    </section>;
-  }
-
-  const isDailyRange = leg.reviewKind === 'daily-range';
+  const isDailyRange = leg?.reviewKind === 'daily-range';
   const reference = data?.reference4h ?? data?.previousUtcReference4h ?? null;
   const historicalCandles = historicalInterval === '1d'
     ? data?.daily.candles ?? []
     : historicalSeries?.candles ?? [];
   const historicalAsOf = historicalInterval === '1d' ? data?.asOf : historicalSeries?.asOf ?? data?.asOf;
   const historicalError = historicalInterval === '1d' ? null : historicalSeriesError;
-  const tradeLevels: PriceLevel[] = isDailyRange ? [
+  // These props feed the imperative chart effect.  Keep their identities stable through the
+  // parent card's 15s status refresh, otherwise React tears down and redraws the chart despite
+  // no candle data changing.
+  const tradeLevels = useMemo<PriceLevel[]>(() => !isDailyRange || !leg ? [] : [
     { price: leg.entryPrice, label: 'Entry', color: C.measure },
     ...(leg.stopPrice != null && Number.isFinite(leg.stopPrice)
       ? [{ price: leg.stopPrice, label: 'Native SL', color: C.bad }]
@@ -466,25 +499,32 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     ...(leg.takeProfitPrice != null && Number.isFinite(leg.takeProfitPrice)
       ? [{ price: leg.takeProfitPrice, label: 'Native 2R TP', color: C.good }]
       : []),
-  ] : [];
-  const dailyLevels: PriceLevel[] = reference ? [
+  ], [isDailyRange, leg?.entryPrice, leg?.stopPrice, leg?.takeProfitPrice]);
+  const dailyLevels = useMemo<PriceLevel[]>(() => reference ? [
     { price: reference.rangeHigh, label: '4H range high · execution breakout', color: C.accent },
     { price: reference.rangeLow, label: '4H range low · execution breakdown', color: C.good },
     ...tradeLevels,
-  ] : tradeLevels;
-  const fiveMinuteLevels: PriceLevel[] = reference ? [
+  ] : tradeLevels, [reference?.rangeHigh, reference?.rangeLow, tradeLevels]);
+  const fiveMinuteLevels = useMemo<PriceLevel[]>(() => reference ? [
     { price: reference.rangeHigh, label: '4H range high · breakout + acceptance long', color: C.accent },
     { price: reference.rangeLow, label: '4H range low · breakdown + acceptance short', color: C.bad },
     ...tradeLevels,
-  ] : tradeLevels;
-  const dailyRangeEntryMarker: ExecutionMarker | null = isDailyRange && leg.openedAt && leg.entryPrice > 0
+  ] : tradeLevels, [reference?.rangeHigh, reference?.rangeLow, tradeLevels]);
+  const dailyRangeEntryMarker = useMemo<ExecutionMarker | null>(() => isDailyRange && leg?.openedAt && (leg.entryPrice ?? 0) > 0
     ? {
       at: leg.openedAt,
       price: leg.entryPrice,
       side: leg.side,
       label: `ENTRY ${leg.side}`,
     }
-    : null;
+    : null, [isDailyRange, leg?.openedAt, leg?.entryPrice, leg?.side]);
+
+  if (!leg) {
+    return <section className="testnet-panel testnet-wide-panel candle-review-card" id="open-basket-review-chart">
+      <header><div><span>Basket candle review</span><strong>Menunggu basket aktif</strong></div></header>
+      <div style={{ padding: 12, color: C.dim, fontSize: 12 }}>Saat ada basket aktif, klik simbolnya di tabel untuk membuka candle 1D dan 5m. Tidak ada dropdown simbol.</div>
+    </section>;
+  }
   // A Daily Range trade cannot be accepted before its source 4h candle has closed.  Keep the
   // existing cross-sectional review's historical display semantics unchanged.
   const acceptanceCandles = reference && data
@@ -542,8 +582,8 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
         </> : <span>Level 4H UTC belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
       </div>
       <div className="candle-review-chart-stack">
-        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines viewportKey={`${leg.key}:historical:${historicalInterval}`} viewportStore={viewportStore} />
-        <CandlePane title={isDailyRange ? '5m · EMA20/EMA50 + breakout / breakdown + acceptance + native bracket' : '5m · EMA20/EMA50 + breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages executionMarker={dailyRangeEntryMarker} viewportKey={`${leg.key}:5m`} viewportStore={viewportStore} />
+        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines viewportKey={`${apiPrefix}:${leg.key}:historical:${historicalInterval}`} />
+        <CandlePane title={isDailyRange ? '5m · EMA20/EMA50 + breakout / breakdown + acceptance + native bracket' : '5m · EMA20/EMA50 + breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages executionMarker={dailyRangeEntryMarker} viewportKey={`${apiPrefix}:${leg.key}:5m`} />
       </div>
       {reference && <div style={{ padding: '0 12px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55 }}>
         Status acceptance sekarang: <strong style={{ color: latestAcceptance === 'LONG' ? C.good : latestAcceptance === 'SHORT' ? C.bad : C.text }}>{latestAcceptance ? `${latestAcceptance} confirmed` : 'belum ada dua close 5m berturut-turut'}</strong>.
