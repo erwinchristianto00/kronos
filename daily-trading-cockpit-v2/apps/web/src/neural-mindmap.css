@@ -2377,12 +2377,20 @@ i.health-diagnostic {
   font-size: 16px;
 }
 
-/* Historical structure and 5m execution context need their own full-width canvas. */
+/* Compare historical structure and 5m execution context side by side on a normal
+   dashboard. Collapse only when a narrow viewport would make either chart unreadable. */
 .candle-review-chart-stack {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 14px;
   padding: 14px;
+}
+
+@media (max-width: 1120px) {
+  .candle-review-chart-stack {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .cross-open-basket-table th,

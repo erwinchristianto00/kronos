@@ -115,7 +115,6 @@ type PriceLevel = {
 type ExecutionMarker = {
   at: string;
   price: number;
-  side: 'LONG' | 'SHORT';
   label: string;
 };
 
@@ -255,7 +254,9 @@ function entryMarkerForCompletedFiveMinuteCandle(
     price: marker.price,
     shape: 'circle',
     size: 2,
-    color: marker.side === 'LONG' ? C.good : C.bad,
+    // Entry is a factual fill point, not a directional signal. Keep it neutral so it
+    // remains distinguishable from long/short candles and the SL/TP level colours.
+    color: C.text,
     text: marker.label,
   };
 }
@@ -520,7 +521,6 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     ? {
       at: leg.openedAt,
       price: leg.entryPrice,
-      side: leg.side,
       label: `ENTRY ${leg.side}`,
     }
     : null, [isDailyRange, leg?.openedAt, leg?.entryPrice, leg?.side]);
@@ -586,7 +586,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
               ? <>Router: close 5m tetap di luar dan <strong style={{ color: C.text }}>meluas lebih jauh</strong> → <strong style={{ color: C.text }}>CONTINUATION</strong> mengikuti arah breakout.</>
               : <>Acceptance memakai <strong style={{ color: C.text }}>dua close 5m selesai berturut-turut</strong> di luar level tersebut.</>}
           {' '}Garis putus-putus ini tetap horizontal karena ini harga high/low range 4H yang dibekukan untuk eksekusi.
-          {isDailyRange && <> Titik <strong style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>ENTRY {leg.side}</strong> di panel 5m adalah fill entry aktual pada waktu fill yang tersimpan.</>}
+          {isDailyRange && <> Titik <strong style={{ color: C.text }}>ENTRY {leg.side}</strong> di panel 5m adalah fill entry aktual pada waktu fill yang tersimpan.</>}
           {' '}Garis penuh oranye/biru di panel historis adalah resistance/support struktural: masing-masing menghubungkan dua pivot peak/trough selesai paling baru dan hanya untuk review visual.
           {' '}EMA20/EMA50 juga memakai completed candle saja; tidak mengubah formation, entry, sizing, atau exit.
         </> : <span>Level Daily Range belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
