@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
+  BaselineSeries,
   CandlestickSeries,
   ColorType,
   createChart,
@@ -88,6 +89,15 @@ type ChartResponse = {
   daily: { interval: '1d'; candles: Candle[] };
   fiveMinute: { interval: '5m'; candles: Candle[] };
   entryPolicy?: 'LEGACY_CONTINUATION' | 'CONTINUATION' | 'FADE';
+  /** Immutable execution lineage from the Daily Range trade record, never reconstructed in the UI. */
+  entryEvidence?: {
+    entryPolicy: 'LEGACY_CONTINUATION' | 'CONTINUATION' | 'FADE';
+    breakoutDirection: 'UP' | 'DOWN' | null;
+    breakoutExtreme: number | null;
+    signalTimestamp: string | null;
+    confirmationBar1: Candle | null;
+    confirmationBar2: Candle | null;
+  };
   previousUtcReference4h?: ChartReference | null;
   reference4h?: ChartReference | null;
   referenceReason: string | null;
@@ -111,16 +121,22 @@ type PriceLevel = {
   color: string;
 };
 
-/** A real execution marker, anchored to the completed candle that contains its fill timestamp. */
-type ExecutionMarker = {
-  at: string;
+/** Marker attached only to a completed 5m candle whose time is explicitly stored in lineage. */
+type CandleChartMarker = {
+  at: number;
   price: number;
   label: string;
+  position: 'aboveBar' | 'belowBar' | 'atPriceMiddle';
+  shape: 'arrowUp' | 'arrowDown' | 'circle';
+  color: string;
 };
 
-type AcceptanceEvent = {
-  at: number;
-  side: 'LONG' | 'SHORT';
+/** The shaded bands are visualizations of the already-persisted native bracket, not a new policy. */
+type TradeRiskZones = {
+  entryPrice: number;
+  stopPrice: number | null | undefined;
+  takeProfitPrice: number | null | undefined;
+  startsAt: string;
 };
 
 type CandleViewport = { from: number; to: number };
@@ -184,81 +200,42 @@ function formatTaipei(value: string | number): string {
   }).format(new Date(ms));
 }
 
-function formatUtc(value: number): string {
-  return new Intl.DateTimeFormat('en-GB', {
-    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
-    hour12: false, timeZone: 'UTC',
-  }).format(new Date(value)).replace(',', '');
-}
-
 function historicalIntervalLabel(interval: HistoricalInterval): string {
   return HISTORICAL_INTERVALS.find((item) => item.value === interval)?.label ?? interval;
 }
 
-function findAcceptanceEvents(candles: Candle[], high: number, low: number): AcceptanceEvent[] {
-  const events: AcceptanceEvent[] = [];
-  let longCount = 0;
-  let shortCount = 0;
-  let longLocked = false;
-  let shortLocked = false;
-  for (const candle of candles) {
-    if (candle.close >= high) {
-      longCount += 1;
-      if (longCount >= 2 && !longLocked) {
-        longLocked = true;
-        events.push({ at: candle.openTime + 5 * 60_000, side: 'LONG' });
-      }
-    } else {
-      longCount = 0;
-      longLocked = false;
-    }
-    if (candle.close <= low) {
-      shortCount += 1;
-      if (shortCount >= 2 && !shortLocked) {
-        shortLocked = true;
-        events.push({ at: candle.openTime + 5 * 60_000, side: 'SHORT' });
-      }
-    } else {
-      shortCount = 0;
-      shortLocked = false;
-    }
-  }
-  return events;
-}
-
-function currentAcceptance(candles: Candle[], high: number, low: number): 'LONG' | 'SHORT' | null {
-  const lastTwo = candles.slice(-2);
-  if (lastTwo.length !== 2) return null;
-  if (lastTwo.every((candle) => candle.close >= high)) return 'LONG';
-  if (lastTwo.every((candle) => candle.close <= low)) return 'SHORT';
-  return null;
-}
-
-/**
- * Lightweight Charts markers must attach to an actual bar time.  Daily Range has an exact
- * exchange fill timestamp, so bind it only to the completed 5m candle that contains that fill.
- * Do not attach it to the nearest bar outside that window: a missing/not-yet-completed candle
- * must result in no marker rather than a misleading visual entry.
- */
-function entryMarkerForCompletedFiveMinuteCandle(
+function markerForCompletedFiveMinuteCandle(
   candles: Candle[],
-  marker: ExecutionMarker,
+  marker: CandleChartMarker,
 ): SeriesMarker<UTCTimestamp> | null {
-  const fillAt = Date.parse(marker.at);
-  if (!Number.isFinite(fillAt) || !(marker.price > 0)) return null;
-  const matchingCandle = candles.find((candle) => fillAt >= candle.openTime && fillAt < candle.openTime + 5 * 60_000);
+  if (!Number.isFinite(marker.at) || !(marker.price > 0)) return null;
+  const matchingCandle = candles.find((candle) => candle.openTime === marker.at);
   if (!matchingCandle) return null;
   return {
     time: Math.floor(matchingCandle.openTime / 1000) as UTCTimestamp,
-    position: 'atPriceMiddle',
+    position: marker.position,
     price: marker.price,
-    shape: 'circle',
+    shape: marker.shape,
     size: 2,
-    // Entry is a factual fill point, not a directional signal. Keep it neutral so it
-    // remains distinguishable from long/short candles and the SL/TP level colours.
-    color: C.text,
+    color: marker.color,
     text: marker.label,
   };
+}
+
+function priceDecimalPlaces(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  const text = Math.abs(value).toString().toLowerCase();
+  const match = text.match(/(?:\.(\d+))?(?:e([+-]?\d+))?$/);
+  if (!match) return 0;
+  return Math.max(0, (match[1]?.length ?? 0) - Number(match[2] ?? 0));
+}
+
+function chartPricePrecision(candles: Candle[], levels: PriceLevel[]): number {
+  const values = [
+    ...candles.flatMap((candle) => [candle.open, candle.high, candle.low, candle.close]),
+    ...levels.map((level) => level.price),
+  ];
+  return Math.min(10, Math.max(2, ...values.map(priceDecimalPlaces)));
 }
 
 function CandlePane({
@@ -270,7 +247,8 @@ function CandlePane({
   error,
   showMovingAverages = false,
   showStructuralTrendlines = false,
-  executionMarker,
+  markers = [],
+  riskZones,
   viewportKey,
 }: {
   title: string;
@@ -281,8 +259,10 @@ function CandlePane({
   error?: string | null;
   showMovingAverages?: boolean;
   showStructuralTrendlines?: boolean;
-  /** Only used by Daily Range's 5m panel, where the entry fill is persisted. */
-  executionMarker?: ExecutionMarker | null;
+  /** Only used by Daily Range's 5m panel and built from persisted C1/C2/fill evidence. */
+  markers?: CandleChartMarker[];
+  /** Only used by Daily Range's 5m panel for its existing native SL/TP bracket. */
+  riskZones?: TradeRiskZones | null;
   /** Per leg/timeframe state survives card remounts and completed-candle refreshes. */
   viewportKey: string;
 }) {
@@ -301,16 +281,54 @@ function CandlePane({
       timeScale: { borderColor: '#29414c', timeVisible: true, secondsVisible: false },
       crosshair: { vertLine: { color: 'rgba(143, 165, 174, 0.28)' }, horzLine: { color: 'rgba(143, 165, 174, 0.28)' } },
     });
+    const pricePrecision = chartPricePrecision(candles, levels);
+    const toSeriesTime = (candle: Candle) => toTime(candle.openTime);
+    if (riskZones && riskZones.entryPrice > 0) {
+      const fillAt = Date.parse(riskZones.startsAt);
+      const firstRiskCandle = candles.find((candle) => fillAt >= candle.openTime && fillAt < candle.openTime + 5 * 60_000);
+      const riskCandles = firstRiskCandle
+        ? candles.filter((candle) => candle.openTime >= firstRiskCandle.openTime)
+        : [];
+      const addRiskZone = (price: number | null | undefined, color: string) => {
+        if (price == null || !Number.isFinite(price) || !(price > 0) || price === riskZones.entryPrice || riskCandles.length === 0) return;
+        const aboveEntry = price > riskZones.entryPrice;
+        const transparent = 'rgba(0, 0, 0, 0)';
+        const zone = chart.addSeries(BaselineSeries, {
+          baseValue: { type: 'price', price: riskZones.entryPrice },
+          topFillColor1: aboveEntry ? color : transparent,
+          topFillColor2: aboveEntry ? color : transparent,
+          bottomFillColor1: aboveEntry ? transparent : color,
+          bottomFillColor2: aboveEntry ? transparent : color,
+          topLineColor: transparent,
+          bottomLineColor: transparent,
+          lineVisible: false,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+        });
+        zone.setData(riskCandles.map((candle) => ({ time: toSeriesTime(candle), value: price })));
+      };
+      // Green = favorable 2R path; red = adverse 1R path.  Both begin on the factual fill candle.
+      addRiskZone(riskZones.takeProfitPrice, 'rgba(70, 211, 154, 0.15)');
+      addRiskZone(riskZones.stopPrice, 'rgba(255, 107, 107, 0.15)');
+    }
     const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#5ce4a6', downColor: '#ff777d', borderVisible: false,
       wickUpColor: '#5ce4a6', wickDownColor: '#ff777d',
+      priceFormat: {
+        type: 'price',
+        precision: pricePrecision,
+        minMove: 1 / 10 ** pricePrecision,
+      },
     });
     candleSeries.setData(candles.map((candle) => ({
       time: toTime(candle.openTime), open: candle.open, high: candle.high, low: candle.low, close: candle.close,
     })));
-    if (executionMarker) {
-      const marker = entryMarkerForCompletedFiveMinuteCandle(candles, executionMarker);
-      if (marker) createSeriesMarkers(candleSeries, [marker]);
+    if (markers.length > 0) {
+      const completedMarkers = markers
+        .map((marker) => markerForCompletedFiveMinuteCandle(candles, marker))
+        .filter((marker): marker is SeriesMarker<UTCTimestamp> => marker !== null);
+      if (completedMarkers.length > 0) createSeriesMarkers(candleSeries, completedMarkers);
     }
     const volumeSeries = chart.addSeries(HistogramSeries, {
       priceFormat: { type: 'volume' }, lastValueVisible: false, priceLineVisible: false,
@@ -386,7 +404,7 @@ function CandlePane({
       window.removeEventListener('resize', resize);
       chart.remove();
     };
-  }, [candles, executionMarker, levels, showMovingAverages, showStructuralTrendlines, viewportKey]);
+  }, [candles, levels, markers, riskZones, showMovingAverages, showStructuralTrendlines, viewportKey]);
 
   return <div style={{ minWidth: 0, border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden', background: C.sub }}>
     <div style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}`, color: C.text, fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
@@ -401,6 +419,7 @@ function CandlePane({
 }
 
 export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: string; leg: OpenBasketReviewLeg | null }) {
+  const isDailyRange = leg?.reviewKind === 'daily-range';
   const [data, setData] = useState<ChartResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -408,6 +427,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   const [historicalSeries, setHistoricalSeries] = useState<IntervalChartResponse | null>(null);
   const [historicalSeriesError, setHistoricalSeriesError] = useState<string | null>(null);
   const [historicalLoading, setHistoricalLoading] = useState(false);
+  const historicalDisplayInterval: HistoricalInterval = isDailyRange ? historicalInterval : '1d';
   const chartEndpoint = leg
     ? leg.chartEndpoint ?? `${apiPrefix}/live/open-basket-chart?symbol=${encodeURIComponent(leg.symbol)}`
     : null;
@@ -415,8 +435,15 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   // only changes its historical candle series, using the same bounded public USD-M route on both
   // Testnet and Live.  Daily Range therefore never falls back to a recalculated reference range.
   const historicalEndpoint = leg
-    ? `${apiPrefix}/live/open-basket-chart?symbol=${encodeURIComponent(leg.symbol)}&interval=${historicalInterval}`
+    ? `${apiPrefix}/live/open-basket-chart?symbol=${encodeURIComponent(leg.symbol)}&interval=${historicalDisplayInterval}`
     : null;
+
+  // Cross-sectional review is deliberately one 1D chart.  A Daily Range trade keeps its two
+  // purpose-specific views and opens its historical review at 4H by default.
+  useEffect(() => {
+    if (!leg) return;
+    setHistoricalInterval(isDailyRange ? '4h' : '1d');
+  }, [isDailyRange, leg?.key]);
 
   useEffect(() => {
     if (!leg) {
@@ -453,7 +480,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   }, [chartEndpoint, leg?.key]);
 
   useEffect(() => {
-    if (!leg || historicalInterval === '1d') {
+    if (!leg || historicalDisplayInterval === '1d') {
       setHistoricalSeries(null);
       setHistoricalSeriesError(null);
       setHistoricalLoading(false);
@@ -467,7 +494,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
       try {
         const response = await fetch(historicalEndpoint!, { cache: 'no-store' });
         const body = await response.json() as IntervalChartResponse;
-        if (!response.ok || body.ok !== true || body.interval !== historicalInterval || !Array.isArray(body.candles)) {
+        if (!response.ok || body.ok !== true || body.interval !== historicalDisplayInterval || !Array.isArray(body.candles)) {
           throw new Error(body.reason ?? `candle request failed (${response.status})`);
         }
         if (!cancelled) setHistoricalSeries(body);
@@ -483,18 +510,16 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [historicalEndpoint, historicalInterval, leg?.key]);
+  }, [historicalDisplayInterval, historicalEndpoint, leg?.key]);
 
-  const isDailyRange = leg?.reviewKind === 'daily-range';
   const reference = data?.reference4h ?? data?.previousUtcReference4h ?? null;
-  const entryPolicy = data?.entryPolicy ?? leg?.entryPolicy ?? 'LEGACY_CONTINUATION';
-  const isAutoRouterTrade = entryPolicy === 'CONTINUATION' || entryPolicy === 'FADE';
+  const entryPolicy = data?.entryEvidence?.entryPolicy ?? data?.entryPolicy ?? leg?.entryPolicy ?? 'LEGACY_CONTINUATION';
   const referenceSession = reference?.timezone === 'America/New_York' ? '00:00–04:00 New York' : '00:00–04:00 UTC';
-  const historicalCandles = historicalInterval === '1d'
+  const historicalCandles = historicalDisplayInterval === '1d'
     ? data?.daily.candles ?? []
     : historicalSeries?.candles ?? [];
-  const historicalAsOf = historicalInterval === '1d' ? data?.asOf : historicalSeries?.asOf ?? data?.asOf;
-  const historicalError = historicalInterval === '1d' ? null : historicalSeriesError;
+  const historicalAsOf = historicalDisplayInterval === '1d' ? data?.asOf : historicalSeries?.asOf ?? data?.asOf;
+  const historicalError = historicalDisplayInterval === '1d' ? null : historicalSeriesError;
   // These props feed the imperative chart effect.  Keep their identities stable through the
   // parent card's 15s status refresh, otherwise React tears down and redraws the chart despite
   // no candle data changing.
@@ -517,13 +542,69 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     { price: reference.rangeLow, label: '4H range low · breakdown', color: C.bad },
     ...tradeLevels,
   ] : tradeLevels, [reference?.rangeHigh, reference?.rangeLow, tradeLevels]);
-  const dailyRangeEntryMarker = useMemo<ExecutionMarker | null>(() => isDailyRange && leg?.openedAt && (leg.entryPrice ?? 0) > 0
-    ? {
-      at: leg.openedAt,
-      price: leg.entryPrice,
-      label: `ENTRY ${leg.side}`,
+  const dailyRangeMarkers = useMemo<CandleChartMarker[]>(() => {
+    if (!isDailyRange || !leg || !data) return [];
+    const markers: CandleChartMarker[] = [];
+    const evidence = data.entryEvidence;
+    const direction = evidence?.breakoutDirection;
+    const breakoutUp = direction === 'UP';
+    const breakoutDown = direction === 'DOWN';
+    const breakoutPosition = breakoutUp ? 'belowBar' : 'aboveBar';
+    const breakoutShape = breakoutUp ? 'arrowUp' : 'arrowDown';
+    if (evidence?.confirmationBar1 && (breakoutUp || breakoutDown)) {
+      markers.push({
+        at: evidence.confirmationBar1.openTime,
+        price: evidence.confirmationBar1.close,
+        label: `C1 BREAKOUT ${breakoutUp ? '↑' : '↓'} · close ${formatPrice(evidence.confirmationBar1.close)}`,
+        position: breakoutPosition,
+        shape: breakoutShape,
+        color: C.accent,
+      });
     }
-    : null, [isDailyRange, leg?.openedAt, leg?.entryPrice, leg?.side]);
+    if (evidence?.confirmationBar2) {
+      const policyLabel = entryPolicy === 'FADE'
+        ? `C2 RE-ENTRY → FADE ${leg.side}`
+        : entryPolicy === 'CONTINUATION'
+          ? `C2 CONTINUATION ${leg.side}`
+          : `C2 CONFIRMATION ${leg.side}`;
+      markers.push({
+        at: evidence.confirmationBar2.openTime,
+        price: evidence.confirmationBar2.close,
+        label: `${policyLabel} · close ${formatPrice(evidence.confirmationBar2.close)}`,
+        position: leg.side === 'LONG' ? 'belowBar' : 'aboveBar',
+        shape: leg.side === 'LONG' ? 'arrowUp' : 'arrowDown',
+        color: leg.side === 'LONG' ? C.good : C.bad,
+      });
+    }
+    const fillAt = Date.parse(leg.openedAt);
+    const fillCandle = data.fiveMinute.candles.find((candle) => fillAt >= candle.openTime && fillAt < candle.openTime + 5 * 60_000);
+    if (fillCandle && leg.entryPrice > 0) {
+      markers.push({
+        at: fillCandle.openTime,
+        price: leg.entryPrice,
+        label: `FILL ${leg.side} · ${formatPrice(leg.entryPrice)}`,
+        position: 'atPriceMiddle',
+        shape: 'circle',
+        color: C.text,
+      });
+    }
+    return markers;
+  }, [
+    data,
+    entryPolicy,
+    isDailyRange,
+    leg?.entryPrice,
+    leg?.openedAt,
+    leg?.side,
+  ]);
+  const dailyRangeRiskZones = useMemo<TradeRiskZones | null>(() => isDailyRange && leg?.openedAt && leg.entryPrice > 0
+    ? {
+      entryPrice: leg.entryPrice,
+      stopPrice: leg.stopPrice,
+      takeProfitPrice: leg.takeProfitPrice,
+      startsAt: leg.openedAt,
+    }
+    : null, [isDailyRange, leg?.entryPrice, leg?.openedAt, leg?.stopPrice, leg?.takeProfitPrice]);
 
   if (!leg) {
     return <section className="testnet-panel testnet-wide-panel candle-review-card" id="open-basket-review-chart">
@@ -531,21 +612,10 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
       <div style={{ padding: 12, color: C.dim, fontSize: 12 }}>Saat ada basket aktif, klik simbolnya di tabel untuk membuka candle 1D dan 5m. Tidak ada dropdown simbol.</div>
     </section>;
   }
-  // A Daily Range trade cannot be accepted before its source 4h candle has closed.  Keep the
-  // existing cross-sectional review's historical display semantics unchanged.
-  const acceptanceCandles = reference && data
-    ? isDailyRange
-      ? data.fiveMinute.candles.filter((candle) => candle.openTime >= reference.fourHourCloseTime)
-      : data.fiveMinute.candles
-    : [];
-  const acceptanceEvents = reference ? findAcceptanceEvents(acceptanceCandles, reference.rangeHigh, reference.rangeLow) : [];
-  const latestAcceptance = reference ? currentAcceptance(acceptanceCandles, reference.rangeHigh, reference.rangeLow) : null;
-  const latestLongAcceptance = acceptanceEvents.filter((event) => event.side === 'LONG').at(-1);
-  const latestShortAcceptance = acceptanceEvents.filter((event) => event.side === 'SHORT').at(-1);
   const reviewTitle = isDailyRange ? 'Daily Range 4H candle review · klik trade' : 'Basket candle review · klik leg di tabel';
   const ownerNoun = isDailyRange ? 'trade' : 'basket';
-  const historicalTitle = `${historicalIntervalLabel(historicalInterval)} · EMA20/EMA50 + structural support / resistance`;
-  const historicalControl = <label style={{ color: C.dim, fontSize: 10, fontWeight: 500, whiteSpace: 'nowrap' }}>
+  const historicalTitle = `${historicalIntervalLabel(historicalDisplayInterval)} · EMA20/EMA50 + structural support / resistance`;
+  const historicalControl = isDailyRange ? <label style={{ color: C.dim, fontSize: 10, fontWeight: 500, whiteSpace: 'nowrap' }}>
     candle{' '}
     <select
       aria-label="Historical candle timeframe"
@@ -555,7 +625,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
     >
       {HISTORICAL_INTERVALS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
     </select>
-  </label>;
+  </label> : undefined;
 
   return <section className="testnet-panel testnet-wide-panel candle-review-card" id={isDailyRange ? 'daily-range-review-chart' : 'open-basket-review-chart'}>
     <header>
@@ -584,23 +654,19 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
             ? <>Router: satu close 5m selesai di luar, lalu close kembali masuk range → <strong style={{ color: C.text }}>FADE</strong> berlawanan arah dengan SL di extreme breakout.</>
             : isDailyRange && entryPolicy === 'CONTINUATION'
               ? <>Router: close 5m tetap di luar dan <strong style={{ color: C.text }}>meluas lebih jauh</strong> → <strong style={{ color: C.text }}>CONTINUATION</strong> mengikuti arah breakout.</>
-              : <>Acceptance memakai <strong style={{ color: C.text }}>dua close 5m selesai berturut-turut</strong> di luar level tersebut.</>}
+              : <>Chart ini memakai candle selesai saja; tidak ada wick-only trigger.</>}
           {' '}Garis putus-putus ini tetap horizontal karena ini harga high/low range 4H yang dibekukan untuk eksekusi.
-          {isDailyRange && <> Titik <strong style={{ color: C.text }}>ENTRY {leg.side}</strong> di panel 5m adalah fill entry aktual pada waktu fill yang tersimpan.</>}
+          {isDailyRange && <> Panel 5m menandai <strong style={{ color: C.accent }}>C1 breakout</strong>, <strong style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>C2 {entryPolicy === 'FADE' ? 're-entry / fade' : 'continuation'}</strong>, lalu <strong style={{ color: C.text }}>fill exchange aktual</strong> secara terpisah. Arsiran hijau = jalur TP 2R; merah = risiko sampai native SL, keduanya dimulai pada candle fill.</>}
           {' '}Garis penuh oranye/biru di panel historis adalah resistance/support struktural: masing-masing menghubungkan dua pivot peak/trough selesai paling baru dan hanya untuk review visual.
           {' '}EMA20/EMA50 juga memakai completed candle saja; tidak mengubah formation, entry, sizing, atau exit.
         </> : <span>Level Daily Range belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
       </div>
       <div className="candle-review-chart-stack">
-        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines viewportKey={`${apiPrefix}:${leg.key}:historical:${historicalInterval}`} />
-        <CandlePane title={isDailyRange ? '5m · EMA20/EMA50 + breakout / breakdown + router + native bracket' : '5m · EMA20/EMA50 + breakout / breakdown + acceptance threshold'} candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages executionMarker={dailyRangeEntryMarker} viewportKey={`${apiPrefix}:${leg.key}:5m`} />
+        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalDisplayInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines viewportKey={`${apiPrefix}:${leg.key}:historical:${historicalDisplayInterval}`} />
+        {isDailyRange && <CandlePane title="5m · EMA20/EMA50 + C1/C2 router + native TP/SL" candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages markers={dailyRangeMarkers} riskZones={dailyRangeRiskZones} viewportKey={`${apiPrefix}:${leg.key}:5m`} />}
       </div>
-      {reference && <div style={{ padding: '0 12px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55 }}>
-        {isAutoRouterTrade
-          ? <>Policy entry trade ini: <strong style={{ color: entryPolicy === 'FADE' ? C.accent : C.good }}>{entryPolicy}</strong>. Satu breakout event hanya menghasilkan satu kandidat; router tidak membalik posisi continuation yang sudah terbentuk.</>
-          : <>Status acceptance sekarang: <strong style={{ color: latestAcceptance === 'LONG' ? C.good : latestAcceptance === 'SHORT' ? C.bad : C.text }}>{latestAcceptance ? `${latestAcceptance} confirmed` : 'belum ada dua close 5m berturut-turut'}</strong>.
-            {' '}Terakhir long {latestLongAcceptance ? formatUtc(latestLongAcceptance.at) + ' UTC' : '—'} · terakhir short {latestShortAcceptance ? formatUtc(latestShortAcceptance.at) + ' UTC' : '—'}.
-            {' '}Garis acceptance sama dengan level breakout/breakdown—yang membedakan adalah dua close 5m, bukan harga baru—jadi tidak dibuat garis harga palsu kedua.</>}
+      {reference && isDailyRange && <div style={{ padding: '0 12px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55 }}>
+        Policy entry trade ini: <strong style={{ color: entryPolicy === 'FADE' ? C.accent : C.good }}>{entryPolicy}</strong>. C1/C2 ditampilkan dari record trade yang sama dengan entry; tidak diganti oleh candle yang datang setelah posisi dibuka.
       </div>}
     </>}
   </section>;

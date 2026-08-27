@@ -131,6 +131,18 @@ describe("GET /api/live/open-basket-chart", () => {
         symbol: "OPUSDT",
         rangeHigh: 0.1102,
         rangeLow: 0.0984,
+        entryPolicy: "CONTINUATION",
+        breakoutDirection: "DOWN",
+        breakoutExtreme: 0.0979,
+        signalTimestamp: "2026-08-24T04:15:00.000Z",
+        confirmationBar1: {
+          openTime: Date.UTC(2026, 7, 24, 4, 5, 0), closeTime: Date.UTC(2026, 7, 24, 4, 9, 59, 999),
+          open: 0.101, high: 0.1015, low: 0.0979, close: 0.0982, volume: 12,
+        },
+        confirmationBar2: {
+          openTime: Date.UTC(2026, 7, 24, 4, 10, 0), closeTime: Date.UTC(2026, 7, 24, 4, 14, 59, 999),
+          open: 0.0982, high: 0.0987, low: 0.0977, close: 0.098, volume: 15,
+        },
       } : null),
     } as unknown as DailyRangeAcceptanceLane;
     const app = Fastify();
@@ -151,6 +163,18 @@ describe("GET /api/live/open-basket-chart", () => {
         tradeId: "drra-opusdt-example",
         symbol: "OPUSDT",
         completedOnly: true,
+        entryEvidence: {
+          entryPolicy: "CONTINUATION",
+          breakoutDirection: "DOWN",
+          breakoutExtreme: 0.0979,
+          signalTimestamp: "2026-08-24T04:15:00.000Z",
+          confirmationBar1: {
+            openTime: Date.UTC(2026, 7, 24, 4, 5, 0), close: 0.0982,
+          },
+          confirmationBar2: {
+            openTime: Date.UTC(2026, 7, 24, 4, 10, 0), close: 0.098,
+          },
+        },
         reference4h: {
           dateUtc: "2026-08-24",
           fourHourOpenTime: Date.UTC(2026, 7, 24, 0, 0, 0),

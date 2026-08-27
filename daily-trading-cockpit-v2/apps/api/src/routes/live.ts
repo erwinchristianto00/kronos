@@ -146,6 +146,19 @@ function cleanOpenBasketChartCandles(candles: readonly Candle[]): OpenBasketChar
     .sort((a, b) => a.openTime - b.openTime);
 }
 
+/**
+ * Daily Range stores the two completed 5m bars that caused a trade.  Expose a
+ * sanitized copy of those persisted bars to the read-only chart feed so the UI
+ * can show the exact C1/C2 lineage without trying to infer it from a rolling
+ * public candle window later.
+ */
+function cleanDailyRangeChartCandle(
+  candle: DailyRangeTrade["confirmationBar1"] | null | undefined,
+): OpenBasketChartCandle | null {
+  const [clean] = cleanOpenBasketChartCandles(candle ? [candle] : []);
+  return clean ?? null;
+}
+
 function previousUtcDayStartMs(nowMs: number): number {
   const now = new Date(nowMs);
   return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 0, 0, 0, 0);
@@ -2278,6 +2291,16 @@ export async function registerLiveRoutes(
         chartKind: "DAILY_RANGE_TRADE" as const,
         tradeId: trade.tradeId,
         entryPolicy: trade.entryPolicy ?? "LEGACY_CONTINUATION",
+        entryEvidence: {
+          entryPolicy: trade.entryPolicy ?? "LEGACY_CONTINUATION",
+          breakoutDirection: trade.breakoutDirection ?? null,
+          breakoutExtreme: typeof trade.breakoutExtreme === "number" && Number.isFinite(trade.breakoutExtreme)
+            ? trade.breakoutExtreme
+            : null,
+          signalTimestamp: trade.signalTimestamp ?? null,
+          confirmationBar1: cleanDailyRangeChartCandle(trade.confirmationBar1),
+          confirmationBar2: cleanDailyRangeChartCandle(trade.confirmationBar2),
+        },
         symbol: trade.symbol,
         source: "BINANCE_USDM_PUBLIC" as const,
         completedOnly: true,
