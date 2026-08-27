@@ -69,6 +69,12 @@ The final run has 13,823 candidates, 13,765 complete 1m labels, 5 ambiguous labe
 
 The research artifact is `daily-range-rcpit-f84b16b3`; historical gate is `FAIL`, forward Full-PIT is `PENDING 0/20`, Testnet parity is `PENDING`, approval is `NOT_APPROVED`, and `executionAuthority=false`.
 
+## Completed deployment evidence
+
+The Testnet and Live releases were built from `b07dcd2` with source implementation `da3b6cc7c87281011e79ce0fb99c212db0cf864d`, passed their respective 3102/3103 required-environment checks, and were cut over one process at a time against the durable state ledger. Both are re-armed after clean reconciliation and retain `ECONOMIC_QUALITY_BASELINE`.
+
+Testnet's one pre-existing `OPUSDT` Daily position and its native TP/SL IDs survived unchanged; both Testnet and Live Cross baskets were reconciled exact in symbol, direction, quantity, entry price, and owner lane. The new environment-specific friction artifacts carry the amended formula/version, contract-path streams are connected, and the rejected selector registry loads only as a fallback/status record. Full evidence is in `DAILY_RANGE_V3_COMPLETION_DEPLOY_REPORT.md`.
+
 ## Result
 
-All originally PARTIAL/MISSING source and research requirements are complete. The only ongoing item is passive forward Full-PIT collection; it cannot change allocation authority automatically. Production remains `ECONOMIC_QUALITY_BASELINE`, alpha remains shadow, and Cross remains untouched.
+All originally PARTIAL/MISSING source, research, and deployment requirements are complete. The only ongoing item is passive forward Full-PIT collection; it cannot change allocation authority automatically. Production remains `ECONOMIC_QUALITY_BASELINE`, alpha remains shadow, and Cross remains untouched.

@@ -45,6 +45,17 @@ The decision reference is the causal executable BBO: ask for a Long and bid for 
 
 The values use the then-current 1.25 safety multiplier. The Live arithmetic is `10 + 1.25 × 18.7866 = 33.4833 bps`; it is correct only because the 18.7866 bps statistic is already all-in path adverse friction. It is not a bare `trigger → fill` stop gap.
 
+## Post-cutover frozen artifacts
+
+The cutover created a new, versioned artifact per environment before any post-cutover Daily decision. The environments are not interchangeable.
+
+| Environment | Artifact | Cutoff | Ledger N | Exact / legacy fee rows | Entry adverse p95 | all-in loss-path p95 | Safe loss |
+| --- | --- | --- | ---: | --- | ---: | ---: | ---: |
+| Testnet | `daily-friction-v1-20260827072500-19663d6d340a` | 2026-08-27 15:25 Taipei | 43 | 2 / 41 | 0.0000 bps | 1.8734 bps | 12.3417 bps |
+| Live | `daily-friction-v1-20260827073500-70470f6332b9` | 2026-08-27 15:35 Taipei | 28 | 2 / 26 | 2.9459 bps | 18.7866 bps | 33.4833 bps |
+
+Both carry `definitionVersion = daily-loss-friction-decomposition-v1`, the exact formula text, an environment-specific source sample hash, source trade count, source fill count, known-fill trade count, and training cutoff. `sourceFillCount=0` is explicit provenance for the older terminal rows; it is not silently converted into exact fills. The newly added exact fee evidence is counted as two fee-evidence rows in each artifact, while its exact per-order fill-count field remains unavailable for those legacy-shaped records.
+
 ## Evidence quality and environment isolation
 
 - Historical pre-V3 totals are genuine exchange commissions but cannot be defensibly split by entry/exit; they remain `LEGACY_COMBINED_FEE_ALLOCATION`.
@@ -65,4 +76,4 @@ The targeted economics tests prove a loss sample with disjoint high entry advers
 
 ## Completion state
 
-Source changes are complete and targeted tests pass. Deployment provenance and the post-cutover artifact identifiers are recorded in `DAILY_RANGE_V3_COMPLETION_DEPLOY_REPORT.md` after the Testnet-then-Live cutover.
+Source, targeted regression coverage, and Testnet-then-Live deployment are complete. The exact post-cutover artifact identifiers and preservation evidence are recorded in `DAILY_RANGE_V3_COMPLETION_DEPLOY_REPORT.md`. No friction artifact has allocation authority beyond its own environment and UTC decision date.

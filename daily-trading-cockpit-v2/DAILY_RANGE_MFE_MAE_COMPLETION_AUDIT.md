@@ -56,6 +56,12 @@ Tests cover:
 3. malformed aggregate-trade input being ignored rather than inventing an extrema point; and
 4. terminal 1m recovery only when every included candle is fully contained and contiguous.
 
+## Deployment validation
+
+The observer is deployed in both environments and logged `DAILY_RANGE_PATH_STREAM_OPEN` after each API restart: 50 subscribed symbols on Testnet and 51 on Live at the final health check. The API status reports `triggerWorkingType=CONTRACT_PRICE`, `collection=BINANCE_USDM_AGG_TRADE_STREAM`, and `fallback=COMPLETE_1M_OHLC_ONLY`.
+
+The pre-existing Testnet `OPUSDT` trade now receives current contract-stream observations, but its quality is correctly `INCOMPLETE` because its actual entry occurred before the observer began. Its original quantity, entry, TP, SL, native algo IDs, and exit behavior were unchanged. Live had no Daily position during cutover, so no artificial test trade was opened.
+
 ## Completion state
 
-The source-side measurement path, status summary, and dashboard quality label are complete. Deployment validation will confirm stream connection health and record the post-cutover observability state; it will not force a test trade.
+The source-side measurement path, status summary, dashboard quality label, and Testnet-then-Live stream health validation are complete. The ongoing work is passive collection of future entry-to-terminal paths; it has no control over stop, TP, allocation, or closing.
