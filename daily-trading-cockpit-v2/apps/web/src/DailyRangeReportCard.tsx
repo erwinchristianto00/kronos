@@ -19,6 +19,11 @@ const C = {
   measure: '#6fb3d6',
 };
 
+// The operator dashboard is for active trades and their execution path.  Keep the research,
+// allocator, and promotion telemetry available to the API/research workflow, but do not show it
+// on either exchange dashboard.
+const SHOW_DAILY_RANGE_RESEARCH_TELEMETRY = false;
+
 const REFRESH_MS = 15_000;
 const HISTORY_LIMIT = 100;
 const REVIEWABLE_STATUSES = new Set(['PROTECTING', 'OPEN', 'EXIT_RECONCILING']);
@@ -530,7 +535,7 @@ export default function DailyRangeReportCard({
         Range <strong>{usesAutoRouter ? '00:00–04:00 New York' : '00:00–04:00 UTC'}</strong> → {usesAutoRouter ? 'breakout bertahan = Continuation; kembali masuk range = Breakout Fade.' : 'dua close 5m selesai di luar range → native structural SL + fixed 2R TP.'}
         Klik simbol trade untuk membuka candle; level range selalu memakai data trade yang dibekukan saat entry.
       </div>
-      {usesAutoRouter ? <>
+      {usesAutoRouter && SHOW_DAILY_RANGE_RESEARCH_TELEMETRY ? <>
         <div className="daily-range-ops-summary">
           <section className="daily-range-ops-section" title="V3 mengurutkan hanya kandidat yang sudah lolos stop economics. Router, arah, structural stop, 2R, dan native bracket tidak berubah.">
             <div className="daily-range-ops-heading">Routing &amp; approval</div>

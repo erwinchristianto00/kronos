@@ -5,7 +5,6 @@ import './neural-mindmap.css';
 import { Disclosure, LaneMaturityTable, laneEdgeBadge, type LaneMaturityRow } from './LaneMaturityTable';
 import CrossSectionalReportCard from './CrossSectionalReportCard';
 import DailyRangeReportCard from './DailyRangeReportCard';
-import ContinuationLifecycleCard from './ContinuationLifecycleCard';
 
 const REFRESH_MS = 5_000;
 // Mainnet account reads fan out to signed USD-M endpoints. Keep the familiar faster testnet
@@ -2662,7 +2661,6 @@ export default function TestnetExchangeDashboard() {
           it follow whichever page it is rendered on. */}
       <CrossSectionalReportCard apiPrefix={pageApiPrefix} />
       <DailyRangeReportCard apiPrefix={pageApiPrefix} />
-      <ContinuationLifecycleCard apiPrefix={pageApiPrefix} />
 
       <main className="testnet-grid">
         {/* ===== Composite 3: Open Positions (2026-07-23 dashboard consolidation) =====
