@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import OpenBasketReviewChart, { type OpenBasketReviewLeg } from './OpenBasketReviewChart';
 import {
   summarizeDailyRangeHeadline,
@@ -278,6 +278,24 @@ function toneForValue(value: number | null | undefined): string {
   return !finite(value) ? C.dim : value >= 0 ? C.good : C.bad;
 }
 
+function DailyRangeInfoCard({
+  label,
+  value,
+  detail,
+  title,
+}: {
+  label: string;
+  value: ReactNode;
+  detail?: ReactNode;
+  title?: string;
+}) {
+  return <article className="daily-range-info-card" title={title}>
+    <span className="daily-range-info-card-label">{label}</span>
+    <strong>{value}</strong>
+    {detail ? <p>{detail}</p> : null}
+  </article>;
+}
+
 function closeReason(reason: string | null): string {
   if (reason === 'TAKE_PROFIT') return 'TAKE PROFIT';
   if (reason === 'STOP_LOSS') return 'STOP LOSS';
@@ -513,26 +531,83 @@ export default function DailyRangeReportCard({
         Klik simbol trade untuk membuka candle; level range selalu memakai data trade yang dibekukan saat entry.
       </div>
       {usesAutoRouter ? <>
-        <div className="daily-range-breakdown" title="V3 mengurutkan hanya kandidat yang sudah lolos stop economics. Router, arah, structural stop, 2R, dan native bracket tidak berubah.">
-          <span>Allocator {data?.allocatorMode ?? '—'} → efektif {data?.effectiveAllocatorMode ?? '—'} · alpha {data?.alphaSelector?.status ?? data?.selectorStatus ?? '—'} (tanpa authority)</span>
-          <span>{friction ? `friction ${friction.source}/${friction.environment ?? '—'} · N trade ${friction.sourceTradeCount ?? friction.sampleCount ?? 0} · fill ${friction.sourceFillCount ?? '—'} · ${friction.id ?? '—'}` : 'friction model belum tersedia: entry baru fail-closed'}</span>
-          <span>Artifact alpha {data?.selectorArtifact?.activeSelectorId ?? 'belum ada'} · status {data?.selectorArtifact?.activeStatus ?? 'MISSING'} · fallback {data?.selectorArtifact?.fallback ?? 'ECONOMIC_QUALITY_BASELINE'}</span>
-          {alphaGates ? <span>Gate alpha: historical {alphaGates.historical?.status ?? '—'} · forward {alphaGates.forwardFullPit?.matureOversubscribedBatches ?? 0}/{alphaGates.forwardFullPit?.requiredMatureOversubscribedBatches ?? 20} ({alphaGates.forwardFullPit?.status ?? 'PENDING'}) · Testnet {alphaGates.testnetParity?.status ?? 'PENDING'} · approval {alphaGates.operatorApproval?.status ?? 'NOT_APPROVED'} · authority {alphaGates.executionAuthority ? 'ON' : 'OFF'}</span> : null}
-        </div>
-        <div className="daily-range-breakdown" title="Angka ini adalah pagar biaya/risk V3, bukan sinyal arah atau optimasi threshold.">
-          <span>Cap: {formatUnsignedMoney(data?.economics?.maxNotionalUsd)} notional · {formatUnsignedMoney(data?.economics?.maxPlannedRiskUsd)} planned risk · cost ≤ {finite(maxCostRatio) ? formatPercent(maxCostRatio * 100) : '—'} · BBO ≤ {bboMaxAgeMs == null ? '—' : `${Math.round(bboMaxAgeMs / 1000)}s`}</span>
-          <span>{finite(safeLossFrictionBps)
-            ? `safe loss ${formatBps(safeLossFrictionBps)} → structural stop minimum ${formatBps(impliedMinimumStopRiskBps)}`
-            : 'safe loss belum tersedia: entry baru fail-closed'}</span>
-          <span>{friction
-            ? `fee p50 ${formatBps(friction.entryFeeP50Bps)}+${formatBps(friction.exitFeeP50Bps)} · loss-path p95 ${formatBps(friction.lossAdverseP95Bps)} (sudah termasuk adverse entry/exit/gap secara per-loss; tidak dijumlah dua kali)`
-            : '—'}</span>
-        </div>
-        <div className="daily-range-breakdown" title="Ringkasan ini hanya menghitung kandidat V3 yang sudah memiliki snapshot ekonomi; legacy trade tetap diberi label legacy.">
-          <span>Batch terakhir: {data?.lastBatchCandidateCount ?? 0} kandidat · {data?.lastBatchSelectedCount ?? 0} dipilih · reject ekonomi {data?.lastCompletedBatch?.economicRejects ?? candidateSummary?.economicsRejected ?? 0}</span>
-          <span>Snapshot V3: {candidateSummary?.evaluated ?? 0} · avg stop {formatBps(candidateSummary?.averageStopRiskBps)} · avg cost {finite(candidateSummary?.averageCostRatio) ? formatPercent(candidateSummary.averageCostRatio * 100) : '—'}</span>
-          <span>Forward Full PIT {data?.dataHealth?.fullPITSignals ?? 0} · mature {data?.dataHealth?.matureFullPITSignals ?? 0} · mature complete scarce batch {data?.alphaSelector?.forwardGate?.matureFullPITOversubscribedBatches ?? data?.dataHealth?.matureFullPITOversubscribedBatches ?? 0}/{data?.alphaSelector?.forwardGate?.requiredMatureFullPITOversubscribedBatches ?? 20} ({data?.alphaSelector?.forwardGate?.status ?? 'COLLECTING'}) · feature age {data?.lastCompletedBatch?.minFeatureAgeMs == null ? '—' : `${Math.round(data.lastCompletedBatch.minFeatureAgeMs)}–${Math.round(data.lastCompletedBatch.maxFeatureAgeMs ?? data.lastCompletedBatch.minFeatureAgeMs)}ms`}</span>
-          <span>Path native {data?.mfeMae?.triggerWorkingType ?? '—'} · {data?.mfeMae?.collection ?? '—'} · open {Object.entries(data?.mfeMae?.openPathQuality ?? {}).map(([key, count]) => `${key}:${count}`).join(', ') || '—'}</span>
+        <div className="daily-range-ops-summary">
+          <section className="daily-range-ops-section" title="V3 mengurutkan hanya kandidat yang sudah lolos stop economics. Router, arah, structural stop, 2R, dan native bracket tidak berubah.">
+            <div className="daily-range-ops-heading">Routing &amp; approval</div>
+            <div className="daily-range-ops-grid daily-range-ops-grid--four">
+              <DailyRangeInfoCard
+                label="Allocator"
+                value={data?.allocatorMode ?? '—'}
+                detail={<>Effective: {data?.effectiveAllocatorMode ?? '—'}<br />Alpha: {data?.alphaSelector?.status ?? data?.selectorStatus ?? '—'} · authority OFF</>}
+              />
+              <DailyRangeInfoCard
+                label="Friction model"
+                value={friction ? `${friction.source}/${friction.environment ?? '—'}` : 'Unavailable'}
+                detail={friction
+                  ? <>N trade {friction.sourceTradeCount ?? friction.sampleCount ?? 0} · fill {friction.sourceFillCount ?? '—'}<br />{friction.id ?? '—'}</>
+                  : 'Entry baru fail-closed sampai model tersedia.'}
+              />
+              <DailyRangeInfoCard
+                label="Artifact alpha"
+                value={data?.selectorArtifact?.activeSelectorId ?? 'Belum ada'}
+                detail={<>Status: {data?.selectorArtifact?.activeStatus ?? 'MISSING'}<br />Fallback: {data?.selectorArtifact?.fallback ?? 'ECONOMIC_QUALITY_BASELINE'}</>}
+              />
+              <DailyRangeInfoCard
+                label="Promotion gate"
+                value={`Historical: ${alphaGates?.historical?.status ?? '—'}`}
+                detail={alphaGates
+                  ? <>Forward: {alphaGates.forwardFullPit?.matureOversubscribedBatches ?? 0}/{alphaGates.forwardFullPit?.requiredMatureOversubscribedBatches ?? 20} ({alphaGates.forwardFullPit?.status ?? 'PENDING'})<br />Testnet: {alphaGates.testnetParity?.status ?? 'PENDING'} · approval: {alphaGates.operatorApproval?.status ?? 'NOT_APPROVED'} · authority: {alphaGates.executionAuthority ? 'ON' : 'OFF'}</>
+                  : 'Gate belum tersedia.'}
+              />
+            </div>
+          </section>
+          <section className="daily-range-ops-section" title="Angka ini adalah pagar biaya/risk V3, bukan sinyal arah atau optimasi threshold.">
+            <div className="daily-range-ops-heading">Risk &amp; cost guardrails</div>
+            <div className="daily-range-ops-grid daily-range-ops-grid--three">
+              <DailyRangeInfoCard
+                label="Capital cap"
+                value={`${formatUnsignedMoney(data?.economics?.maxNotionalUsd)} notional`}
+                detail={<>Planned risk: {formatUnsignedMoney(data?.economics?.maxPlannedRiskUsd)}<br />Cost ≤ {finite(maxCostRatio) ? formatPercent(maxCostRatio * 100) : '—'} · BBO ≤ {bboMaxAgeMs == null ? '—' : `${Math.round(bboMaxAgeMs / 1000)}s`}</>}
+              />
+              <DailyRangeInfoCard
+                label="Loss protection"
+                value={finite(safeLossFrictionBps) ? `Safe loss ${formatBps(safeLossFrictionBps)}` : 'Unavailable'}
+                detail={finite(safeLossFrictionBps)
+                  ? `Structural stop minimum: ${formatBps(impliedMinimumStopRiskBps)}`
+                  : 'Entry baru fail-closed sampai friction lengkap.'}
+              />
+              <DailyRangeInfoCard
+                label="Modeled cost"
+                value={friction ? `Fee p50 ${formatBps(friction.entryFeeP50Bps)} + ${formatBps(friction.exitFeeP50Bps)}` : '—'}
+                detail={friction ? `Loss-path p95: ${formatBps(friction.lossAdverseP95Bps)} · sudah termasuk adverse entry/exit/gap per-loss.` : '—'}
+              />
+            </div>
+          </section>
+          <section className="daily-range-ops-section" title="Ringkasan ini hanya menghitung kandidat V3 yang sudah memiliki snapshot ekonomi; legacy trade tetap diberi label legacy.">
+            <div className="daily-range-ops-heading">Evidence &amp; data health</div>
+            <div className="daily-range-ops-grid daily-range-ops-grid--four">
+              <DailyRangeInfoCard
+                label="Last batch"
+                value={`${data?.lastBatchCandidateCount ?? 0} candidate · ${data?.lastBatchSelectedCount ?? 0} selected`}
+                detail={`Economic rejects: ${data?.lastCompletedBatch?.economicRejects ?? candidateSummary?.economicsRejected ?? 0}`}
+              />
+              <DailyRangeInfoCard
+                label="V3 economics snapshot"
+                value={`${candidateSummary?.evaluated ?? 0} evaluated`}
+                detail={<>Avg stop: {formatBps(candidateSummary?.averageStopRiskBps)}<br />Avg cost: {finite(candidateSummary?.averageCostRatio) ? formatPercent(candidateSummary.averageCostRatio * 100) : '—'}</>}
+              />
+              <DailyRangeInfoCard
+                label="Forward Full PIT"
+                value={`${data?.dataHealth?.fullPITSignals ?? 0} full · ${data?.dataHealth?.matureFullPITSignals ?? 0} mature`}
+                detail={<>Mature batches: {data?.alphaSelector?.forwardGate?.matureFullPITOversubscribedBatches ?? data?.dataHealth?.matureFullPITOversubscribedBatches ?? 0}/{data?.alphaSelector?.forwardGate?.requiredMatureFullPITOversubscribedBatches ?? 20} ({data?.alphaSelector?.forwardGate?.status ?? 'COLLECTING'})<br />Feature age: {data?.lastCompletedBatch?.minFeatureAgeMs == null ? '—' : `${Math.round(data.lastCompletedBatch.minFeatureAgeMs)}–${Math.round(data.lastCompletedBatch.maxFeatureAgeMs ?? data.lastCompletedBatch.minFeatureAgeMs)}ms`}</>}
+              />
+              <DailyRangeInfoCard
+                label="Native price path"
+                value={data?.mfeMae?.triggerWorkingType ?? '—'}
+                detail={<>Collection: {data?.mfeMae?.collection ?? '—'}<br />Open: {Object.entries(data?.mfeMae?.openPathQuality ?? {}).map(([key, count]) => `${key}: ${count}`).join(' · ') || '—'}</>}
+              />
+            </div>
+          </section>
         </div>
       </> : null}
       {error ? <div className="daily-range-message tone-warning">Daily Range status unavailable: {error}</div> : null}

@@ -2440,6 +2440,87 @@ i.health-diagnostic {
   color: #6fb3d6;
 }
 
+/* The V3 operational detail is intentionally grouped into readable cards. The
+   older flex rows put several long machine-facing values on one line, making
+   the page difficult to scan on a live decision screen. */
+.daily-range-ops-summary {
+  display: grid;
+  gap: 14px;
+  padding: 12px;
+  border-bottom: 1px solid #20313a;
+  background: #0b151a;
+}
+
+.daily-range-ops-section {
+  min-width: 0;
+}
+
+.daily-range-ops-heading {
+  margin: 0 0 7px;
+  color: #6fb3d6;
+  font: 700 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.daily-range-ops-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.daily-range-ops-grid--four {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.daily-range-ops-grid--three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.daily-range-info-card {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid #20313a;
+  border-radius: 6px;
+  background: #0f1c23;
+}
+
+.daily-range-info-card-label {
+  display: block;
+  margin-bottom: 5px;
+  color: #718791;
+  font: 700 9px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.daily-range-info-card strong {
+  display: block;
+  color: #dbe7ec;
+  font: 700 11px/1.4 "IBM Plex Mono", "Cascadia Code", monospace;
+  overflow-wrap: anywhere;
+}
+
+.daily-range-info-card p {
+  margin: 6px 0 0;
+  color: #8da5ae;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 1500px) {
+  .daily-range-ops-grid--four {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .daily-range-ops-grid--three,
+  .daily-range-ops-grid--four {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .daily-range-table {
   min-width: 1420px !important;
 }
