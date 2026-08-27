@@ -225,7 +225,7 @@ function markerForCompletedFiveMinuteCandle(
 function priceDecimalPlaces(value: number): number {
   if (!Number.isFinite(value)) return 0;
   const text = Math.abs(value).toString().toLowerCase();
-  const match = text.match(/(?:\.(\d+))?(?:e([+-]?\d+))?$/);
+  const match = text.match(/^\d+(?:\.(\d+))?(?:e([+-]?\d+))?$/);
   if (!match) return 0;
   return Math.max(0, (match[1]?.length ?? 0) - Number(match[2] ?? 0));
 }
