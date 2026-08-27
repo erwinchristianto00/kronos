@@ -59,3 +59,12 @@ solely `DAILY_4H_RANGE_ACCEPTANCE`, while Live `OPUSDT` was solely
 
 Every retained row reports a clean post-migration reconciliation; both
 environments finished with zero pending Daily reservations.
+
+## Post-migration admission proof
+
+After the one-time migration, both lanes accepted fresh Daily entries under the
+same immutable gate. A later status check at `2026-08-27T11:11Z` found three
+open passing rows in Testnet and three in Live, all with geometry snapshots and
+both native bracket IDs. These are post-migration entries, not legacy rows;
+they require no migration action and demonstrate that the new guard does not
+block valid geometry.

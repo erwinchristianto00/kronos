@@ -100,3 +100,14 @@ all three limits, candidate geometry, and the six requested reject counters.
 - Full API suite: **8,244 passed, 11 failed, 3 skipped**. All 11 failures are
   pre-existing non-Daily tests in the execution-fill, Four-Brain, lane-reason,
   and position-path areas; no Daily Range geometry test failed.
+
+### Post-cutover runtime validation — 2026-08-27T11:11Z
+
+The lane admitted new entries only after re-arm, which independently confirms
+that the gate is executable rather than merely observational. Testnet had three
+open Daily positions (`AKEUSDT`, `HYPEUSDT`, and a new `XMRUSDT` trade), and
+Live had three (`1000BONKUSDT`, `TRUMPUSDT`, and `PYTHUSDT`). All six recorded
+`daily-trade-geometry-v1` as PASS, had no runtime/reconciliation error, had no
+pending reservation, and retained both native stop and take-profit algorithmic
+order IDs. The pre-cutover XMR trade described above remains closed at its
+native TP; the later XMR row is a separate post-cutover admission.
