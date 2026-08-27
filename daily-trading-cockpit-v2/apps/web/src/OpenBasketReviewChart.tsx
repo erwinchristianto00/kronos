@@ -295,6 +295,11 @@ function CandlePane({
         const transparent = 'rgba(0, 0, 0, 0)';
         const zone = chart.addSeries(BaselineSeries, {
           baseValue: { type: 'price', price: riskZones.entryPrice },
+          priceFormat: {
+            type: 'price',
+            precision: pricePrecision,
+            minMove: 1 / 10 ** pricePrecision,
+          },
           topFillColor1: aboveEntry ? color : transparent,
           topFillColor2: aboveEntry ? color : transparent,
           bottomFillColor1: aboveEntry ? transparent : color,
