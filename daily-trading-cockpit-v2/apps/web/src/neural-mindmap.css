@@ -2528,6 +2528,73 @@ i.health-diagnostic {
   font-size: 12px;
 }
 
+.daily-range-message strong {
+  color: #dbe7ec;
+}
+
+.daily-range-message small {
+  display: block;
+  margin-top: 4px;
+  color: #f0b54b;
+  font: 700 10px/1.4 "IBM Plex Mono", "Cascadia Code", monospace;
+  overflow-wrap: anywhere;
+}
+
+.daily-range-geometry-candidates {
+  padding: 10px 12px 12px;
+  border-bottom: 1px solid #20313a;
+  background: #0b151a;
+}
+
+.daily-range-geometry-candidates > span {
+  display: block;
+  margin-bottom: 7px;
+  color: #6fb3d6;
+  font: 700 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.daily-range-geometry-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 7px;
+}
+
+.daily-range-geometry-grid > div {
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid #20313a;
+  border-radius: 5px;
+  background: #0f1c23;
+}
+
+.daily-range-geometry-grid > div.is-pass {
+  border-color: rgba(70, 211, 154, 0.35);
+}
+
+.daily-range-geometry-grid > div.is-fail {
+  border-color: rgba(255, 107, 107, 0.4);
+}
+
+.daily-range-geometry-grid strong,
+.daily-range-geometry-grid small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.daily-range-geometry-grid strong {
+  margin-bottom: 3px;
+  color: #dbe7ec;
+  font: 700 11px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.daily-range-geometry-grid small {
+  color: #8da5ae;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 .daily-range-breakdown {
   display: flex;
   justify-content: space-between;

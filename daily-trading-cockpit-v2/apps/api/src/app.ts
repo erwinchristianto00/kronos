@@ -1686,6 +1686,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // cross-sectional short blocklist that was designed for different symbols/risk.
         getShortBlocklist: () => new Set<string>(),
         entryClaims: singleSymbolEntryClaims,
+        // Geometry migration may close only a position that remains exclusively
+        // owned by Daily Range.  This is a read-only check over Cross,
+        // directional and legacy mirror ownership; any overlap blocks the
+        // migration before it can submit a reduce-only order.
+        foreignOwnershipForSymbol: (symbol) => dailyRangeForeignStrategySymbols()
+          .filter((owned) => owned === symbol.trim().toUpperCase()),
         environment: liveConfig.env,
         mainnetControls: dailyRangeMainnetControls,
         testnetMaxOpenTrades: liveConfig.env === "testnet"

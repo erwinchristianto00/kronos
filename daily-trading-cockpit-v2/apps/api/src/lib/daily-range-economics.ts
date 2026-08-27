@@ -15,6 +15,17 @@ import type { FuturesSymbolFilters } from "./binance-futures-private.js";
 export const DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID = "daily-range-execution-economics-v1";
 export const DAILY_RANGE_ECONOMIC_ALLOCATOR_POLICY_ID = "daily-range-economic-quality-baseline-v1";
 export const DAILY_RANGE_ALPHA_SELECTOR_POLICY_ID = "daily-range-route-selector-v1";
+/**
+ * Trade geometry is independent from execution friction.  A wide structural
+ * stop can look cheaper as a percentage of R while still implying a target
+ * that is not a reasonable 4h move, so it gets its own immutable policy.
+ */
+export const DAILY_RANGE_TRADE_GEOMETRY_POLICY_ID = "daily-trade-geometry-v1";
+export const DAILY_RANGE_MAX_STRUCTURAL_STOP_PCT = 0.03;
+export const DAILY_RANGE_MAX_TARGET_DISTANCE_PCT = 0.06;
+export const DAILY_RANGE_MAX_TARGET_ATR4H_MULTIPLE = 2;
+export const DAILY_RANGE_ATR4H_PERIOD = 14;
+const FOUR_HOURS_MS = 4 * 60 * 60_000;
 
 export const DAILY_RANGE_MAX_NOTIONAL_USD = 25;
 export const DAILY_RANGE_MAX_PLANNED_RISK_USD = 0.25;
@@ -34,6 +45,45 @@ export type DailyRangeEconomicsSide = "LONG" | "SHORT";
 export type DailyRangeFrictionModelSource = "EMPIRICAL_LEDGER" | "CONSERVATIVE_FALLBACK";
 export type DailyRangeFeeEvidence = "EXACT_FILL_COMMISSION" | "LEGACY_COMBINED_FEE_ALLOCATION" | "CONFIGURED_CONSERVATIVE";
 export type DailyRangeFrictionEnvironment = "testnet" | "mainnet";
+export type DailyRangeGeometryRejectReason =
+  | "STRUCTURAL_STOP_TOO_WIDE"
+  | "TARGET_DISTANCE_TOO_WIDE"
+  | "TARGET_REACHABILITY_FAIL"
+  | "TARGET_REACHABILITY_DATA_UNAVAILABLE";
+
+/** The causal 4h feature supplied by the lane before allocation. */
+export interface DailyRangeAtr4hFeature {
+  atr4h: number;
+  /** ISO close boundary of the latest completed 4h candle used by ATR. */
+  atrSourceLastClosedAt: string;
+  /** Original decision timestamp; no candle closed after this may contribute. */
+  atrFeatureTimestamp: string;
+}
+
+/** Immutable entry-time geometry snapshot, retained for admitted and rejected candidates. */
+export interface DailyRangeTradeGeometry {
+  geometryPolicyId: typeof DAILY_RANGE_TRADE_GEOMETRY_POLICY_ID;
+  maxStopPct: number;
+  maxTargetPct: number;
+  maxTargetAtrMultiple: number;
+  stopDistancePct: number | null;
+  tpDistancePct: number | null;
+  atr4h: number | null;
+  atr4hPct: number | null;
+  atrSourceLastClosedAt: string | null;
+  atrFeatureTimestamp: string | null;
+  targetAtrMultiple: number | null;
+  geometryPass: boolean;
+  geometryRejectReason: DailyRangeGeometryRejectReason | null;
+}
+
+export interface DailyRangeAtr4hCandle {
+  openTime: number;
+  closeTime: number;
+  high: number;
+  low: number;
+  close: number;
+}
 
 export interface DailyRangeFrictionSample {
   tradeId: string;
@@ -145,11 +195,23 @@ export interface DailyRangePreTradeEconomics {
   netLossR: number;
   breakEvenWinRate: number;
   qualityTieBreakHash: string;
+  /** Frozen before allocation; never recomputed from a later quote or candle. */
+  geometry: DailyRangeTradeGeometry;
 }
 
 export type DailyRangeEconomicsPreparation =
   | { ok: true; economics: DailyRangePreTradeEconomics }
-  | { ok: false; reason: "BBO_STALE" | "FRICTION_MODEL_UNAVAILABLE" | "STOP_ECONOMICS_FAIL" | "RISK_BUDGET_UNEXECUTABLE" };
+  | {
+    ok: false;
+    reason:
+      | "BBO_STALE"
+      | "FRICTION_MODEL_UNAVAILABLE"
+      | "STOP_ECONOMICS_FAIL"
+      | "RISK_BUDGET_UNEXECUTABLE"
+      | DailyRangeGeometryRejectReason;
+    /** Present only after the execution-economics gate has passed. */
+    geometry?: DailyRangeTradeGeometry | null;
+  };
 
 export interface DailyRangeActualFillEconomics {
   actualStopRiskPrice: number;
@@ -162,6 +224,122 @@ export interface DailyRangeActualFillEconomics {
 
 function finite(value: number | null | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function finitePositive(value: number | null | undefined): value is number {
+  return finite(value) && value > 0;
+}
+
+function geometryBase(input: {
+  expectedEntryPrice: number;
+  expectedStopPrice: number;
+  expectedTakeProfitPrice: number;
+  atr4hFeature: DailyRangeAtr4hFeature | null;
+}): Omit<DailyRangeTradeGeometry, "geometryPass" | "geometryRejectReason"> {
+  const entry = input.expectedEntryPrice;
+  const stopDistancePct = finitePositive(entry) && finite(input.expectedStopPrice)
+    ? Math.abs(entry - input.expectedStopPrice) / entry
+    : null;
+  const tpDistancePct = finitePositive(entry) && finite(input.expectedTakeProfitPrice)
+    ? Math.abs(input.expectedTakeProfitPrice - entry) / entry
+    : null;
+  const atr4h = finitePositive(input.atr4hFeature?.atr4h) ? input.atr4hFeature!.atr4h : null;
+  const atr4hPct = atr4h !== null && finitePositive(entry) ? atr4h / entry : null;
+  const targetAtrMultiple = tpDistancePct !== null && atr4hPct !== null && atr4hPct > 0
+    ? tpDistancePct / atr4hPct
+    : null;
+  return {
+    geometryPolicyId: DAILY_RANGE_TRADE_GEOMETRY_POLICY_ID,
+    maxStopPct: DAILY_RANGE_MAX_STRUCTURAL_STOP_PCT,
+    maxTargetPct: DAILY_RANGE_MAX_TARGET_DISTANCE_PCT,
+    maxTargetAtrMultiple: DAILY_RANGE_MAX_TARGET_ATR4H_MULTIPLE,
+    stopDistancePct,
+    tpDistancePct,
+    atr4h,
+    atr4hPct,
+    atrSourceLastClosedAt: input.atr4hFeature?.atrSourceLastClosedAt ?? null,
+    atrFeatureTimestamp: input.atr4hFeature?.atrFeatureTimestamp ?? null,
+    targetAtrMultiple,
+  };
+}
+
+/**
+ * Evaluate an already-formed structural stop and exact 2R target.  This does
+ * not move either level: a bad geometry is rejected, never repaired by a
+ * discretionary clamp.
+ */
+export function evaluateDailyRangeTradeGeometry(input: {
+  expectedEntryPrice: number;
+  expectedStopPrice: number;
+  expectedTakeProfitPrice: number;
+  atr4hFeature: DailyRangeAtr4hFeature | null;
+}): DailyRangeTradeGeometry {
+  const base = geometryBase(input);
+  if (base.stopDistancePct === null || base.stopDistancePct > DAILY_RANGE_MAX_STRUCTURAL_STOP_PCT + 1e-12) {
+    return { ...base, geometryPass: false, geometryRejectReason: "STRUCTURAL_STOP_TOO_WIDE" };
+  }
+  if (base.tpDistancePct === null || base.tpDistancePct > DAILY_RANGE_MAX_TARGET_DISTANCE_PCT + 1e-12) {
+    return { ...base, geometryPass: false, geometryRejectReason: "TARGET_DISTANCE_TOO_WIDE" };
+  }
+  if (base.atr4h === null || base.atr4hPct === null || base.targetAtrMultiple === null) {
+    return { ...base, geometryPass: false, geometryRejectReason: "TARGET_REACHABILITY_DATA_UNAVAILABLE" };
+  }
+  if (base.targetAtrMultiple > DAILY_RANGE_MAX_TARGET_ATR4H_MULTIPLE + 1e-12) {
+    return { ...base, geometryPass: false, geometryRejectReason: "TARGET_REACHABILITY_FAIL" };
+  }
+  return { ...base, geometryPass: true, geometryRejectReason: null };
+}
+
+/**
+ * Build a strictly causal Wilder ATR(14) from completed UTC-anchored 4h bars.
+ * The latest source bar must have closed before the decision, and every bar in
+ * the retained tail must be continuous.  A partial/gapped history returns
+ * null; callers must fail closed for a fresh entry rather than interpolate it.
+ */
+export function calculateCausalAtr14(input: {
+  candles: readonly DailyRangeAtr4hCandle[];
+  decisionAtMs: number;
+}): DailyRangeAtr4hFeature | null {
+  if (!Number.isFinite(input.decisionAtMs) || input.decisionAtMs <= 0) return null;
+  const expectedLastOpen = Math.floor((input.decisionAtMs - 1) / FOUR_HOURS_MS) * FOUR_HOURS_MS - FOUR_HOURS_MS;
+  if (expectedLastOpen < 0) return null;
+  const byOpen = new Map<number, DailyRangeAtr4hCandle>();
+  for (const candle of input.candles) {
+    if (!Number.isFinite(candle.openTime) || !Number.isFinite(candle.closeTime)
+      || !finitePositive(candle.high) || !finitePositive(candle.low) || !finitePositive(candle.close)
+      || candle.high < candle.low || candle.closeTime >= input.decisionAtMs
+      || candle.closeTime !== candle.openTime + FOUR_HOURS_MS - 1) continue;
+    byOpen.set(candle.openTime, candle);
+  }
+  const tail: DailyRangeAtr4hCandle[] = [];
+  for (let openTime = expectedLastOpen; openTime >= 0; openTime -= FOUR_HOURS_MS) {
+    const candle = byOpen.get(openTime);
+    if (!candle) break;
+    tail.unshift(candle);
+  }
+  if (tail.length < DAILY_RANGE_ATR4H_PERIOD + 1) return null;
+  const trueRanges: number[] = [];
+  for (let index = 1; index < tail.length; index++) {
+    const candle = tail[index]!;
+    const previousClose = tail[index - 1]!.close;
+    trueRanges.push(Math.max(
+      candle.high - candle.low,
+      Math.abs(candle.high - previousClose),
+      Math.abs(candle.low - previousClose),
+    ));
+  }
+  if (trueRanges.length < DAILY_RANGE_ATR4H_PERIOD || trueRanges.some((value) => !finitePositive(value))) return null;
+  let atr = trueRanges.slice(0, DAILY_RANGE_ATR4H_PERIOD).reduce((sum, value) => sum + value, 0) / DAILY_RANGE_ATR4H_PERIOD;
+  for (let index = DAILY_RANGE_ATR4H_PERIOD; index < trueRanges.length; index++) {
+    atr = ((atr * (DAILY_RANGE_ATR4H_PERIOD - 1)) + trueRanges[index]!) / DAILY_RANGE_ATR4H_PERIOD;
+  }
+  if (!finitePositive(atr)) return null;
+  const last = tail.at(-1)!;
+  return {
+    atr4h: atr,
+    atrSourceLastClosedAt: new Date(last.closeTime + 1).toISOString(),
+    atrFeatureTimestamp: new Date(input.decisionAtMs).toISOString(),
+  };
 }
 
 function nonNegative(value: number | null | undefined): number | null {
@@ -407,6 +585,8 @@ export function prepareDailyRangeEconomics(input: {
   frictionModel: DailyRangeFrictionModel | null;
   bboMaxAgeMs: number;
   allocationAtMs: number;
+  /** Null is an explicit fail-closed condition for a fresh entry. */
+  atr4hFeature: DailyRangeAtr4hFeature | null;
 }): DailyRangeEconomicsPreparation {
   if (!input.frictionModel) return { ok: false, reason: "FRICTION_MODEL_UNAVAILABLE" };
   if (!input.bbo || !finite(input.bbo.bid) || input.bbo.bid <= 0 || !finite(input.bbo.ask) || input.bbo.ask <= 0 || input.bbo.ask < input.bbo.bid) {
@@ -434,6 +614,19 @@ export function prepareDailyRangeEconomics(input: {
   if (!(stopRiskBps > 0) || !finite(safeLossFrictionBps)) return { ok: false, reason: "STOP_ECONOMICS_FAIL" };
   const costRatio = safeLossFrictionBps / stopRiskBps;
   if (costRatio > DAILY_RANGE_MAX_COST_RATIO + 1e-12) return { ok: false, reason: "STOP_ECONOMICS_FAIL" };
+  // Geometry is deliberately evaluated after the existing narrow-stop
+  // economics check and before any quantity/rank/allocation work.  Both gates
+  // are independent: a stop can be too narrow for friction or too wide for a
+  // realistic 2R target.
+  const geometry = evaluateDailyRangeTradeGeometry({
+    expectedEntryPrice: expectedEntry,
+    expectedStopPrice: roundedBracket.stop,
+    expectedTakeProfitPrice: roundedBracket.takeProfit,
+    atr4hFeature: input.atr4hFeature,
+  });
+  if (!geometry.geometryPass) {
+    return { ok: false, reason: geometry.geometryRejectReason!, geometry };
+  }
   const rawQty = Math.min(
     DAILY_RANGE_MAX_NOTIONAL_USD / expectedEntry,
     DAILY_RANGE_MAX_PLANNED_RISK_USD / roundedBracket.risk,
@@ -494,6 +687,7 @@ export function prepareDailyRangeEconomics(input: {
         side: input.side,
         route: input.route,
       }),
+      geometry,
     },
   };
 }

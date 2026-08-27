@@ -95,7 +95,12 @@ class FakeDailyClient implements DailyRangeExecClient {
   private algoNo = 1;
 
   async getExchangeFilters(): Promise<Map<string, FuturesSymbolFilters>> {
-    return new Map(symbols.map((symbol) => [symbol, filter(symbol)]));
+    const known = new Set([
+      ...symbols,
+      ...[...this.klines.keys()].map((key) => key.split("|")[0]!),
+      ...this.positions.keys(),
+    ]);
+    return new Map([...known].map((symbol) => [symbol, filter(symbol)]));
   }
   async getPositions(symbol?: string): Promise<FuturesPosition[]> {
     // Real REST responses are snapshots. Returning clones matters for the
@@ -203,6 +208,25 @@ function referenceFourHour(): FuturesKline {
   return { openTime: DAY, closeTime: DAY + 4 * 3_600_000 - 1, open: 96, high: 100, low: 90, close: 95, volume: 1 };
 }
 
+/** Completed, UTC-aligned 4h history for the causal ATR14 gate. */
+function atrFourHourHistory(decisionAtMs: number, price = 100): FuturesKline[] {
+  const fourHours = 4 * 3_600_000;
+  const lastOpen = Math.floor((decisionAtMs - 1) / fourHours) * fourHours - fourHours;
+  const firstOpen = lastOpen - 63 * fourHours;
+  return Array.from({ length: 64 }, (_, index) => {
+    const openTime = firstOpen + index * fourHours;
+    return {
+      openTime,
+      closeTime: openTime + fourHours - 1,
+      open: price,
+      high: price + 1,
+      low: price - 1,
+      close: price,
+      volume: 1,
+    };
+  });
+}
+
 function researchFiveMinuteHistory(c1Open: number, c2Open: number): FuturesKline[] {
   const rows: FuturesKline[] = [];
   for (let offset = 59; offset >= 0; offset--) {
@@ -220,6 +244,7 @@ function makeLane(
   claim = { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
   strategyMode: DailyRangeStrategyMode = "LEGACY_CONTINUATION",
   evidence: DailyRangePoolEvidence | null = null,
+  foreignOwnershipForSymbol: (symbol: string) => readonly string[] = () => [],
 ) {
   const dir = dataDir();
   const store = new DailyRangeLaneStore(dir, "state.json", nowRef.value);
@@ -229,6 +254,7 @@ function makeLane(
     getUniverse: () => ({ symbols: universe, source: "TEST", poolEvidence: evidence }),
     getShortBlocklist: () => new Set<string>(),
     entryClaims: claim,
+    foreignOwnershipForSymbol,
     environment: "testnet",
     strategyMode,
     nowMs: () => nowRef.value,
@@ -744,6 +770,111 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect(client.cancelledAlgos).toHaveLength(2);
     expect((await client.getOpenAlgoOrders("AAAUSDT"))).toHaveLength(0);
     expect((await client.getPositions("AAAUSDT")).some((position) => Math.abs(position.positionAmt) > 0)).toBe(false);
+  });
+
+  it("migrates an absolute geometry failure through the owned reduce-only close path", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeLane(client, now);
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value, "LONG");
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    const trade = store.getState().trades[0]!;
+    // This is the frozen, actual geometry to be migrated—not a symbol rule.
+    trade.stopPrice = 95.2;
+    trade.takeProfitPrice = 109.6;
+    trade.structuralStopRaw = 95.2;
+    trade.initialRiskPrice = 4.8;
+    trade.initialRiskPct = 0.048;
+    trade.initialRiskDollar = 4.8 * trade.entryQty!;
+
+    await (lane as unknown as { migrateOpenTradesToGeometryPolicy(): Promise<void> }).migrateOpenTradesToGeometryPolicy();
+
+    expect(trade.geometryMigration).toMatchObject({
+      status: "FAIL",
+      reason: "STRUCTURAL_STOP_TOO_WIDE",
+      action: "FLATTENED",
+    });
+    expect(trade.geometryMigration?.geometry.stopDistancePct).toBeCloseTo(0.048, 10);
+    expect(trade.geometryMigration?.geometry.tpDistancePct).toBeCloseTo(0.096, 10);
+    expect(trade.status).toBe("CLOSED");
+    expect(client.placed.filter((order) => order.reduceOnly)).toHaveLength(1);
+    expect((await client.getPositions("AAAUSDT")).some((position) => Math.abs(position.positionAmt) > 0)).toBe(false);
+    expect((await client.getOpenAlgoOrders("AAAUSDT"))).toHaveLength(0);
+  });
+
+  it("keeps an absolute-pass open position when its original entry-time ATR is unavailable", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeLane(client, now);
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value, "LONG");
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    const trade = store.getState().trades[0]!;
+
+    await (lane as unknown as { migrateOpenTradesToGeometryPolicy(): Promise<void> }).migrateOpenTradesToGeometryPolicy();
+
+    expect(trade.geometryMigration).toMatchObject({
+      status: "UNKNOWN",
+      reason: "OPEN_POSITION_ATR_MIGRATION_UNKNOWN",
+      action: "KEPT",
+      geometry: { stopDistancePct: 0.02, tpDistancePct: 0.04 },
+    });
+    expect(trade.status).toBe("OPEN");
+    expect(client.placed.filter((order) => order.reduceOnly)).toHaveLength(0);
+    expect((await client.getOpenAlgoOrders("AAAUSDT"))).toHaveLength(2);
+  });
+
+  it("closes the explicitly owned Testnet OPUSDT Daily position and no native siblings remain", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    client.klines.set("OPUSDT|4h", atrFourHourHistory(now.value));
+    const { lane, store } = makeLane(client, now, ["OPUSDT"]);
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("OPUSDT", now.value, "SHORT");
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    const trade = store.getState().trades[0]!;
+
+    await (lane as unknown as { migrateOpenTradesToGeometryPolicy(): Promise<void> }).migrateOpenTradesToGeometryPolicy();
+
+    expect(trade.geometryMigration).toMatchObject({
+      reason: "OPERATOR_REQUESTED_CLOSE_GEOMETRY_PATCH",
+      action: "FLATTENED",
+    });
+    expect(trade.exitReason).toBe("OPERATOR_REQUESTED_CLOSE_GEOMETRY_PATCH");
+    expect(trade.status).toBe("CLOSED");
+    expect((await client.getPositions("OPUSDT")).some((position) => Math.abs(position.positionAmt) > 0)).toBe(false);
+    expect((await client.getOpenAlgoOrders("OPUSDT"))).toHaveLength(0);
+  });
+
+  it("refuses the explicit OPUSDT close when a foreign Cross owner is reported", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    client.klines.set("OPUSDT|4h", atrFourHourHistory(now.value));
+    const { lane, store } = makeLane(
+      client,
+      now,
+      ["OPUSDT"],
+      { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+      "LEGACY_CONTINUATION",
+      null,
+      () => ["CROSS_SECTIONAL_MARKET_NEUTRAL"],
+    );
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("OPUSDT", now.value, "SHORT");
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    const trade = store.getState().trades[0]!;
+
+    await (lane as unknown as { migrateOpenTradesToGeometryPolicy(): Promise<void> }).migrateOpenTradesToGeometryPolicy();
+
+    expect(trade.geometryMigration).toMatchObject({ status: "BLOCKED", reason: "OPUSDT_OWNERSHIP_CONFLICT", action: "BLOCKED" });
+    expect(trade.status).toBe("OPEN");
+    expect(client.placed.filter((order) => order.reduceOnly)).toHaveLength(0);
+    expect((await client.getOpenAlgoOrders("OPUSDT"))).toHaveLength(2);
   });
 
   it("measures MFE/MAE from contract-price events through the terminal fill and freezes post-exit events", async () => {
@@ -1378,9 +1509,10 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       reference.push(candle(openTime, 95, 90, 100));
     }
     const inside = candle(window.rangeCloseTime, 99, 95, 100);
-    const firstOutside = candle(window.rangeCloseTime + 5 * 60_000, 101, 100.5, 103);
-    const reentryInside = candle(window.rangeCloseTime + 10 * 60_000, 99, 98, 104);
+    const firstOutside = candle(window.rangeCloseTime + 5 * 60_000, 101, 100.5, 101.5);
+    const reentryInside = candle(window.rangeCloseTime + 10 * 60_000, 99, 98, 101.5);
     client.klines.set("AAAUSDT|5m", [...reference, inside, firstOutside, reentryInside]);
+    client.klines.set("AAAUSDT|4h", atrFourHourHistory(window.rangeCloseTime + 16 * 60_000));
     const { lane, store } = makeLane(
       client,
       now,
@@ -1416,7 +1548,7 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       entryPolicy: "FADE",
       breakoutDirection: "UP",
       direction: "SHORT",
-      breakoutExtreme: 104,
+      breakoutExtreme: 101.5,
       referenceTimezone: "America/New_York",
       referenceRangeOpenTime: window.rangeOpenTime,
       referenceRangeCloseTime: window.rangeCloseTime,
@@ -1455,9 +1587,9 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       entryPolicy: "FADE",
       direction: "SHORT",
       status: "OPEN",
-      structuralStopRaw: 104,
-      stopPrice: 104,
-      takeProfitPrice: 92,
+      structuralStopRaw: 101.5,
+      stopPrice: 101.5,
+      takeProfitPrice: 97,
       referenceTimezone: "America/New_York",
       referenceRangeOpenTime: window.rangeOpenTime,
       referenceRangeCloseTime: window.rangeCloseTime,
@@ -1475,7 +1607,7 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect(trade.postFillEconomicsStatus).toBe("PASS");
     expect(client.placed.filter((row) => !row.reduceOnly)).toMatchObject([{ symbol: "AAAUSDT", side: "SELL", type: "MARKET" }]);
     expect(client.algoPlaced.map((row) => [row.type, row.side, row.triggerPrice]))
-      .toEqual(expect.arrayContaining([["STOP_MARKET", "BUY", 104], ["TAKE_PROFIT_MARKET", "BUY", 92]]));
+      .toEqual(expect.arrayContaining([["STOP_MARKET", "BUY", 101.5], ["TAKE_PROFIT_MARKET", "BUY", 97]]));
     expect(client.fiveMinuteReadSymbols.has("AAAUSDT")).toBe(true);
     expect(store.getState().signalCohorts[0]?.candidates[0]).toMatchObject({
       breakoutDistancePrice: -1,
@@ -1483,6 +1615,58 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       economics: expect.objectContaining({ frictionModelSource: "CONSERVATIVE_FALLBACK" }),
       alphaSelector: expect.objectContaining({ status: "SHADOW_ONLY", reason: "ALPHA_SELECTOR_SHADOW_ONLY" }),
     });
+  });
+
+  it("filters wide V3 geometry before allocation, so it cannot consume a slot or rank ahead of a valid route", async () => {
+    const window = newYorkDailyRangeWindow(Date.UTC(2026, 7, 26, 12));
+    const now = { value: window.rangeCloseTime + 60_000 };
+    const client = new FakeDailyClient();
+    client.now = now.value;
+    const universe = ["AAAUSDT", "BBBUSDT"];
+    for (const symbol of universe) {
+      const reference: FuturesKline[] = [];
+      for (let openTime = window.rangeOpenTime; openTime < window.rangeCloseTime; openTime += 5 * 60_000) {
+        reference.push(candle(openTime, 95, 90, 100));
+      }
+      const inside = candle(window.rangeCloseTime, 99, 95, 100);
+      // Both rows are breakout fades.  AAA keeps the same valid 1.5% stop
+      // geometry as the route fixture above; BBB's frozen breakout extreme
+      // makes its structural stop 5% away from the executable BBO.
+      const firstOutside = symbol === "AAAUSDT"
+        ? candle(window.rangeCloseTime + 5 * 60_000, 101, 100.5, 101.5)
+        : candle(window.rangeCloseTime + 5 * 60_000, 104, 100.5, 105);
+      const reentryInside = candle(window.rangeCloseTime + 10 * 60_000, 99, 98, firstOutside.high);
+      client.klines.set(`${symbol}|5m`, [...reference, inside, firstOutside, reentryInside]);
+      client.klines.set(`${symbol}|4h`, atrFourHourHistory(window.rangeCloseTime + 16 * 60_000));
+    }
+    const { lane, store } = makeLane(
+      client,
+      now,
+      universe,
+      { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+      "AUTO_ROUTE_NY_V2",
+      poolEvidence(universe),
+    );
+
+    await lane.tick();
+    store.arm(new Date(now.value).toISOString());
+    now.value = window.rangeCloseTime + 16 * 60_000;
+    client.now = now.value;
+    await lane.tick();
+
+    const cohort = store.getState().signalCohorts[0]!;
+    const valid = cohort.candidates.find((candidate) => candidate.symbol === "AAAUSDT")!;
+    const wide = cohort.candidates.find((candidate) => candidate.symbol === "BBBUSDT")!;
+    expect(valid.geometry).toMatchObject({ geometryPass: true });
+    expect(wide.geometry).toMatchObject({
+      geometryPass: false,
+      geometryRejectReason: "STRUCTURAL_STOP_TOO_WIDE",
+    });
+    expect(wide.skipReason).toBe("STRUCTURAL_STOP_TOO_WIDE");
+    expect(wide.actuallySelected).toBe(false);
+    expect(wide.selectorRank).toBeNull();
+    expect(cohort.allocation?.selectedSignalIds).toEqual([valid.signalId]);
+    expect(client.placed.filter((order) => !order.reduceOnly).map((order) => order.symbol)).toEqual(["AAAUSDT"]);
   });
 
   it("never lets a pending V1 signal cross the V2 cutover boundary into an order", async () => {

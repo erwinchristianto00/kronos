@@ -40,15 +40,24 @@ import {
   DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID,
   DAILY_RANGE_FRICTION_DEFINITION_VERSION,
   DAILY_RANGE_MAX_COST_RATIO,
+  DAILY_RANGE_MAX_STRUCTURAL_STOP_PCT,
+  DAILY_RANGE_MAX_TARGET_ATR4H_MULTIPLE,
+  DAILY_RANGE_MAX_TARGET_DISTANCE_PCT,
   DAILY_RANGE_MAX_NOTIONAL_USD,
   DAILY_RANGE_MAX_PLANNED_RISK_USD,
+  DAILY_RANGE_TRADE_GEOMETRY_POLICY_ID,
   buildEmpiricalFrictionModel,
+  calculateCausalAtr14,
   conservativeFallbackFrictionModel,
+  evaluateDailyRangeTradeGeometry,
   evaluateActualFillEconomics,
   prepareDailyRangeEconomics,
+  type DailyRangeAtr4hFeature,
   type DailyRangeFrictionModel,
   type DailyRangeFrictionSample,
+  type DailyRangeGeometryRejectReason,
   type DailyRangePreTradeEconomics,
+  type DailyRangeTradeGeometry,
 } from "./daily-range-economics.js";
 import {
   type DailyRangeContractPathEvent,
@@ -119,6 +128,7 @@ export type DailyRangeTradeStatus =
   | "EXIT_RECONCILING"
   | "CLOSED"
   | "ENTRY_ABORT_INVALID_RISK"
+  | "ENTRY_ABORT_POST_FILL_GEOMETRY_FAIL"
   | "ENTRY_ABORT_POST_FILL_ECONOMICS_FAIL"
   | "ENTRY_ABORT_POST_FILL_RISK_FAIL"
   | "ENTRY_ABORT_PROTECTION_FAILED"
@@ -148,6 +158,10 @@ export type DailyRangeSignalReason =
   | "SPREAD_HARD_REJECT"
   | "SELECTOR_NOT_READY"
   | "STOP_ECONOMICS_FAIL"
+  | "STRUCTURAL_STOP_TOO_WIDE"
+  | "TARGET_DISTANCE_TOO_WIDE"
+  | "TARGET_REACHABILITY_FAIL"
+  | "TARGET_REACHABILITY_DATA_UNAVAILABLE"
   | "RISK_BUDGET_UNEXECUTABLE"
   | "BBO_STALE"
   | "FRICTION_MODEL_UNAVAILABLE"
@@ -242,6 +256,8 @@ export interface DailyRangeSignal {
   selectorRank?: number | null;
   /** Frozen pre-allocation V3 economic decision. Absent is legacy evidence. */
   economics?: DailyRangePreTradeEconomics | null;
+  /** Snapshot is retained even when geometry rejects before allocation. */
+  geometry?: DailyRangeTradeGeometry | null;
   alphaSelector?: DailyRangeAlphaSelectorSnapshot | null;
   actuallySelected?: boolean;
   actuallyExecuted?: boolean;
@@ -444,6 +460,7 @@ export interface DailyRangeSignalCohortCandidate {
   selectorRank?: number | null;
   tieBreakHash?: string | null;
   economics?: DailyRangePreTradeEconomics | null;
+  geometry?: DailyRangeTradeGeometry | null;
   alphaSelector?: DailyRangeAlphaSelectorSnapshot | null;
   actuallySelected?: boolean;
   actuallyExecuted?: boolean;
@@ -498,6 +515,29 @@ export interface DailyRangeSignalCohort {
 
 export type DailyRangeHistoryKind = "levels" | "signals" | "trades" | "cohorts" | "batches" | "pool-evidence";
 
+export type DailyRangeOpenPositionGeometryMigrationStatus = "PASS" | "FAIL" | "UNKNOWN" | "BLOCKED";
+export type DailyRangeOpenPositionGeometryMigrationReason =
+  | DailyRangeGeometryRejectReason
+  | "OPEN_POSITION_ATR_MIGRATION_UNKNOWN"
+  | "OPERATOR_REQUESTED_CLOSE_GEOMETRY_PATCH"
+  | "OPUSDT_OWNERSHIP_CONFLICT"
+  | "OPEN_POSITION_OWNERSHIP_CONFLICT";
+
+/**
+ * Durable one-time evaluation for a trade opened before geometry-v1.  It keeps
+ * the original entry/SL/TP untouched for PASS/UNKNOWN rows and records every
+ * safe flatten attempt explicitly for audit/restart recovery.
+ */
+export interface DailyRangeOpenPositionGeometryMigration {
+  geometryPolicyId: typeof DAILY_RANGE_TRADE_GEOMETRY_POLICY_ID;
+  evaluatedAt: string;
+  originalDecisionAt: string | null;
+  status: DailyRangeOpenPositionGeometryMigrationStatus;
+  reason: DailyRangeOpenPositionGeometryMigrationReason | null;
+  action: "KEPT" | "FLATTEN_PENDING" | "FLATTENED" | "BLOCKED";
+  geometry: DailyRangeTradeGeometry;
+}
+
 export interface DailyRangeTrade {
   tradeId: string;
   signalId: string;
@@ -523,12 +563,17 @@ export interface DailyRangeTrade {
   signalReferencePrice: number | null;
   /** Immutable V3 decision facts, persisted before the market POST. */
   economics?: DailyRangePreTradeEconomics | null;
+  /** Immutable candidate-time geometry; actual fills never rewrite it. */
+  geometry?: DailyRangeTradeGeometry | null;
   alphaSelector?: DailyRangeAlphaSelectorSnapshot | null;
   actualStopRiskBps?: number | null;
   actualCostRatio?: number | null;
   /** Explicitly distinguish economics from a material dollar-risk breach. */
   actualInitialRiskUsd?: number | null;
   postFillEconomicsStatus?: "PASS" | "POST_FILL_ECONOMICS_FAIL" | "POST_FILL_RISK_FAIL" | null;
+  postFillGeometryStatus?: "PASS" | DailyRangeGeometryRejectReason | null;
+  /** One-time upgrade audit for a position that existed before geometry-v1. */
+  geometryMigration?: DailyRangeOpenPositionGeometryMigration | null;
   rangeHigh: number;
   rangeLow: number;
   /** V2 route + reference lineage; absent fields identify untouched legacy trades. */
@@ -1077,6 +1122,11 @@ export interface DailyRangeAcceptanceLaneOptions {
   getSignalPoolEvidence?: (symbols: readonly string[]) => DailyRangePoolEvidence | null;
   getShortBlocklist: () => ReadonlySet<string>;
   entryClaims: DailyRangeEntryClaims;
+  /**
+   * Read-only ownership view of every non-Daily lane.  Geometry migration uses
+   * it as an additional stop condition before it can send a reduce-only close.
+   */
+  foreignOwnershipForSymbol?: (symbol: string) => readonly string[];
   environment: "testnet" | "mainnet";
   /** Omitted means Mainnet is observation-only and structurally cannot enter. */
   mainnetControls?: DailyRangeMainnetControls;
@@ -1422,6 +1472,7 @@ export class DailyRangeAcceptanceLane {
   private readonly getSignalPoolEvidence: (symbols: readonly string[]) => DailyRangePoolEvidence | null;
   private readonly getShortBlocklist: () => ReadonlySet<string>;
   private readonly entryClaims: DailyRangeEntryClaims;
+  private readonly foreignOwnershipForSymbol: (symbol: string) => readonly string[];
   private readonly environment: "testnet" | "mainnet";
   private readonly mainnetControls: DailyRangeMainnetControls | null;
   private readonly testnetMaxOpenTrades: number;
@@ -1447,6 +1498,7 @@ export class DailyRangeAcceptanceLane {
     this.getSignalPoolEvidence = opts.getSignalPoolEvidence ?? (() => null);
     this.getShortBlocklist = opts.getShortBlocklist;
     this.entryClaims = opts.entryClaims;
+    this.foreignOwnershipForSymbol = opts.foreignOwnershipForSymbol ?? (() => []);
     this.environment = opts.environment;
     this.mainnetControls = opts.mainnetControls ?? null;
     const testnetCap = Math.floor(opts.testnetMaxOpenTrades ?? DAILY_RANGE_TESTNET_MAX_OPEN_TRADES_DEFAULT);
@@ -1894,7 +1946,20 @@ export class DailyRangeAcceptanceLane {
       "FRICTION_MODEL_UNAVAILABLE",
       "NEGATIVE_EXPECTED_VALUE",
     ]);
+    const executionRejectReasons: DailyRangeSignalReason[] = [
+      "STOP_ECONOMICS_FAIL",
+      "STRUCTURAL_STOP_TOO_WIDE",
+      "TARGET_DISTANCE_TOO_WIDE",
+      "TARGET_REACHABILITY_FAIL",
+      "TARGET_REACHABILITY_DATA_UNAVAILABLE",
+      "RISK_BUDGET_UNEXECUTABLE",
+    ];
+    const geometryRejectCounts = Object.fromEntries(executionRejectReasons.map((reason) => [
+      reason,
+      state.signals.filter((signal) => signal.reason === reason).length,
+    ]));
     const economicRejectCount = state.signals.filter((signal) => signal.reason !== null && economicRejectReasons.has(signal.reason)).length;
+    const geometrySignals = state.signals.filter((signal) => signal.geometry !== null && signal.geometry !== undefined);
     const mean = (values: number[]): number | null => values.length
       ? values.reduce((sum, value) => sum + value, 0) / values.length
       : null;
@@ -2013,6 +2078,20 @@ export class DailyRangeAcceptanceLane {
           },
         },
       },
+      geometry: {
+        policyId: DAILY_RANGE_TRADE_GEOMETRY_POLICY_ID,
+        maxStructuralStopPct: DAILY_RANGE_MAX_STRUCTURAL_STOP_PCT,
+        maxTargetDistancePct: DAILY_RANGE_MAX_TARGET_DISTANCE_PCT,
+        maxTargetAtr4hMultiple: DAILY_RANGE_MAX_TARGET_ATR4H_MULTIPLE,
+        atrDefinition: "WILDER_ATR14_COMPLETED_4H_CAUSAL",
+        candidateSummary: {
+          evaluated: geometrySignals.length,
+          passed: geometrySignals.filter((signal) => signal.geometry!.geometryPass).length,
+          rejected: geometrySignals.filter((signal) => !signal.geometry!.geometryPass).length,
+          rejectCounts: geometryRejectCounts,
+        },
+        rejectCounts: geometryRejectCounts,
+      },
       availableSlots: capacity.displaySlots,
       maxDailyPositions: capacity.maxOpenTrades,
       openDailyPositions: openTrades.filter((trade) => ["PROTECTING", "OPEN", "EXIT_RECONCILING"].includes(trade.status)).length,
@@ -2035,6 +2114,7 @@ export class DailyRangeAcceptanceLane {
           economicRank: candidate.selectorRank ?? null,
           selected: candidate.actuallySelected ?? false,
           skipReason: candidate.skipReason ?? null,
+          geometry: candidate.geometry ?? candidate.economics?.geometry ?? null,
         })),
       } : null,
       lastBatchCandidateCount: lastBatch?.allocation?.candidateCount ?? 0,
@@ -2244,7 +2324,8 @@ export class DailyRangeAcceptanceLane {
     state.runtime.lastTickAt = iso(startedAt);
     try {
       if (!this.startupReconciled) await this.reconcileOnStartup();
-      await this.reconcileOpenTrades();
+      const exchangeReconciled = await this.reconcileOpenTrades();
+      if (exchangeReconciled) await this.migrateOpenTradesToGeometryPolicy();
       // Research labels mature independently from entry mode. A paused/disarmed
       // lane must never abandon already-recorded counterfactual outcomes.
       await this.matureCounterfactualOutcomes();
@@ -2627,6 +2708,7 @@ export class DailyRangeAcceptanceLane {
       selectorScore: null,
       selectorRank: null,
       economics: null,
+      geometry: null,
       alphaSelector: null,
       actuallySelected: false,
       actuallyExecuted: false,
@@ -2675,6 +2757,7 @@ export class DailyRangeAcceptanceLane {
       selectorRank: signal.selectorRank ?? null,
       tieBreakHash: null,
       economics: signal.economics ?? null,
+      geometry: signal.geometry ?? signal.economics?.geometry ?? null,
       alphaSelector: signal.alphaSelector ?? null,
       actuallySelected: signal.actuallySelected ?? false,
       actuallyExecuted: signal.actuallyExecuted ?? false,
@@ -2942,6 +3025,24 @@ export class DailyRangeAcceptanceLane {
     };
   }
 
+  /**
+   * Fetch enough strictly pre-decision 4h history to calculate ATR14.  The
+   * pure calculator rejects an incomplete tail, so this helper never fills a
+   * gap with a newer bar or an interpolation.
+   */
+  private async causalAtr4hForDecision(symbol: string, decisionAtMs: number): Promise<DailyRangeAtr4hFeature | null> {
+    try {
+      const rows = await this.client.getKlines(symbol, "4h", {
+        startTime: Math.max(0, decisionAtMs - 128 * FOUR_HOURS_MS),
+        endTime: decisionAtMs - 1,
+        limit: 128,
+      });
+      return calculateCausalAtr14({ candles: rows, decisionAtMs });
+    } catch {
+      return null;
+    }
+  }
+
   private async finalizeSignalBatch(batch: DailyRangeSignalCohort): Promise<void> {
     const allocation = batch.allocation;
     if (!allocation || allocation.finalizedAt !== null) return;
@@ -2995,6 +3096,7 @@ export class DailyRangeAcceptanceLane {
               receivedAt: quality.bookReceivedAt ?? quality.bookObservedAt,
             }
             : null;
+          const atr4hFeature = await this.causalAtr4hForDecision(signal.symbol, batch.signalTimestampMs);
           const prepared = prepareDailyRangeEconomics({
             side: signal.direction,
             route: signal.entryPolicy ?? "LEGACY_CONTINUATION",
@@ -3006,10 +3108,13 @@ export class DailyRangeAcceptanceLane {
             frictionModel,
             bboMaxAgeMs: MAX_DECISION_BBO_AGE_MS,
             allocationAtMs,
+            atr4hFeature,
           });
           signal.economics = prepared.ok ? prepared.economics : null;
+          signal.geometry = prepared.ok ? prepared.economics.geometry : prepared.geometry ?? null;
           signal.alphaSelector = this.alphaSnapshotForSignal(signal);
           candidate.economics = signal.economics;
+          candidate.geometry = signal.geometry;
           candidate.alphaSelector = signal.alphaSelector;
           candidate.selectorMode = this.allocatorMode;
           candidate.selectorId = this.selectorId;
@@ -3636,11 +3741,14 @@ export class DailyRangeAcceptanceLane {
         ? signal.direction === "LONG" ? signal.economics.decisionAsk : signal.economics.decisionBid
         : null,
       economics: signal.economics ?? null,
+      geometry: signal.geometry ?? signal.economics?.geometry ?? null,
       alphaSelector: signal.alphaSelector ?? null,
       actualStopRiskBps: null,
       actualCostRatio: null,
       actualInitialRiskUsd: null,
       postFillEconomicsStatus: null,
+      postFillGeometryStatus: null,
+      geometryMigration: null,
       rangeHigh: signal.rangeHigh,
       rangeLow: signal.rangeLow,
       entryPolicy: signal.entryPolicy ?? "LEGACY_CONTINUATION",
@@ -4034,6 +4142,42 @@ export class DailyRangeAcceptanceLane {
       await this.emergencyFlatten(trade, "ENTRY_ABORT_INVALID_RISK", "ENTRY_ABORT_INVALID_RISK");
       return;
     }
+    if (trade.geometry) {
+      const actualGeometry = evaluateDailyRangeTradeGeometry({
+        expectedEntryPrice: entry,
+        expectedStopPrice: bracket.stop,
+        expectedTakeProfitPrice: bracket.takeProfit,
+        atr4hFeature: trade.geometry.atr4h !== null
+          && trade.geometry.atrSourceLastClosedAt !== null
+          && trade.geometry.atrFeatureTimestamp !== null
+          ? {
+            atr4h: trade.geometry.atr4h,
+            atrSourceLastClosedAt: trade.geometry.atrSourceLastClosedAt,
+            atrFeatureTimestamp: trade.geometry.atrFeatureTimestamp,
+          }
+          : null,
+      });
+      trade.postFillGeometryStatus = actualGeometry.geometryPass
+        ? "PASS"
+        : actualGeometry.geometryRejectReason;
+      if (!actualGeometry.geometryPass) {
+        const reason = actualGeometry.geometryRejectReason ?? "TARGET_REACHABILITY_DATA_UNAVAILABLE";
+        trade.lastReconcileError = `POST_FILL_GEOMETRY_FAIL: ${reason}`;
+        trade.status = "PROTECTING";
+        this.store.save();
+        try {
+          // Preserve the exact structural bracket while the idempotent
+          // reduce-only close settles; never repair a bad fill by moving either
+          // level.
+          await this.placeAndVerifyBrackets(trade);
+        } catch (error) {
+          trade.lastReconcileError = `POST_FILL_GEOMETRY_FAIL: protective bracket setup failed: ${error instanceof Error ? error.message : String(error)}`;
+          this.store.save();
+        }
+        await this.emergencyFlatten(trade, "ENTRY_ABORT_POST_FILL_GEOMETRY_FAIL", `POST_FILL_GEOMETRY_FAIL:${reason}`);
+        return;
+      }
+    }
     if (trade.economics) {
       const fillEconomics = evaluateActualFillEconomics({
         side: trade.direction,
@@ -4245,11 +4389,11 @@ export class DailyRangeAcceptanceLane {
     }
   }
 
-  private async reconcileOpenTrades(): Promise<void> {
+  private async reconcileOpenTrades(): Promise<boolean> {
     const active = this.store.getState().trades.filter((trade) =>
       ["PROTECTING", "OPEN", "EXIT_RECONCILING"].includes(trade.status),
     );
-    if (active.length === 0) return;
+    if (active.length === 0) return true;
     let positions: FuturesPosition[];
     let algos: FuturesAlgoOrder[];
     try {
@@ -4262,12 +4406,12 @@ export class DailyRangeAcceptanceLane {
         // not relabel healthy trades as reconciliation failures while no
         // exchange read is permitted, and do not keep an older 418 attached.
         if (clearTransientRateLimitReconciliationDiagnostics(state, active)) this.store.save();
-        return;
+        return false;
       }
       for (const trade of active) trade.lastReconcileError = `account reconciliation unavailable: ${message}`;
       state.runtime.reconciliationError = message;
       this.store.save();
-      return;
+      return false;
     }
     for (const trade of active) {
       const position = positions.find((row) => row.symbol === trade.symbol && Math.abs(row.positionAmt) > EPSILON) ?? null;
@@ -4303,7 +4447,7 @@ export class DailyRangeAcceptanceLane {
           if (isRateLimitedTransportFailure(error)) {
             const state = this.store.getState();
             if (clearTransientRateLimitReconciliationDiagnostics(state, active)) this.store.save();
-            return;
+            return false;
           }
           trade.lastReconcileError = `bracket transition recheck unavailable: ${message}`;
           this.store.save();
@@ -4360,6 +4504,155 @@ export class DailyRangeAcceptanceLane {
     state.runtime.reconciledAt = iso(this.nowMs());
     state.runtime.reconciliationError = null;
     this.store.save();
+    return true;
+  }
+
+  private openTradeGeometry(trade: DailyRangeTrade, atr4hFeature: DailyRangeAtr4hFeature | null): DailyRangeTradeGeometry {
+    return evaluateDailyRangeTradeGeometry({
+      expectedEntryPrice: trade.entryFillPrice ?? Number.NaN,
+      expectedStopPrice: trade.stopPrice ?? Number.NaN,
+      expectedTakeProfitPrice: trade.takeProfitPrice ?? Number.NaN,
+      atr4hFeature,
+    });
+  }
+
+  private foreignOwnersForSymbol(symbol: string): string[] {
+    try {
+      return [...new Set(this.foreignOwnershipForSymbol(symbol).map((owner) => owner.trim()).filter(Boolean))].sort();
+    } catch {
+      // A missing external ownership snapshot is a conflict, not permission to
+      // alter a netted exchange position during migration.
+      return ["FOREIGN_OWNERSHIP_LOOKUP_UNAVAILABLE"];
+    }
+  }
+
+  private recordGeometryMigration(
+    trade: DailyRangeTrade,
+    migration: DailyRangeOpenPositionGeometryMigration,
+  ): void {
+    trade.geometryMigration = migration;
+    this.store.save();
+  }
+
+  private migrationIsSettled(trade: DailyRangeTrade): boolean {
+    const migration = trade.geometryMigration;
+    return migration?.geometryPolicyId === DAILY_RANGE_TRADE_GEOMETRY_POLICY_ID
+      && (migration.status === "PASS" || migration.status === "UNKNOWN" || migration.status === "BLOCKED" || migration.action === "FLATTENED");
+  }
+
+  /**
+   * Safe one-time migration for positions that predate the geometry policy.
+   * It runs only after a fresh exchange reconciliation, preserves all passing
+   * brackets verbatim, and delegates every flatten to the lane's existing
+   * exact-quantity ownership-checked emergency path.
+   */
+  private async migrateOpenTradesToGeometryPolicy(): Promise<void> {
+    const active = this.store.getState().trades
+      .filter((trade) => ["PROTECTING", "OPEN", "EXIT_RECONCILING"].includes(trade.status))
+      .sort((left, right) => left.entrySubmittedAt.localeCompare(right.entrySubmittedAt) || left.tradeId.localeCompare(right.tradeId));
+    for (const trade of active) {
+      if (this.migrationIsSettled(trade)) continue;
+      if (this.closingTradeIds.has(trade.tradeId)) continue;
+
+      const foreignOwners = this.foreignOwnersForSymbol(trade.symbol);
+      const explicitOpusdtClose = this.environment === "testnet" && trade.symbol === "OPUSDT";
+      const decisionAtMs = toMs(trade.signalTimestamp);
+      const absoluteGeometry = this.openTradeGeometry(trade, null);
+      const baseMigration = (input: {
+        status: DailyRangeOpenPositionGeometryMigrationStatus;
+        reason: DailyRangeOpenPositionGeometryMigrationReason | null;
+        action: DailyRangeOpenPositionGeometryMigration["action"];
+        geometry: DailyRangeTradeGeometry;
+      }): DailyRangeOpenPositionGeometryMigration => ({
+        geometryPolicyId: DAILY_RANGE_TRADE_GEOMETRY_POLICY_ID,
+        evaluatedAt: iso(this.nowMs()),
+        originalDecisionAt: decisionAtMs === null ? null : iso(decisionAtMs),
+        ...input,
+      });
+
+      if (foreignOwners.length > 0) {
+        this.recordGeometryMigration(trade, baseMigration({
+          status: "BLOCKED",
+          reason: explicitOpusdtClose ? "OPUSDT_OWNERSHIP_CONFLICT" : "OPEN_POSITION_OWNERSHIP_CONFLICT",
+          action: "BLOCKED",
+          geometry: absoluteGeometry,
+        }));
+        console.warn(`[daily-range-lane] GEOMETRY_MIGRATION_BLOCKED trade=${trade.tradeId} symbol=${trade.symbol} foreign=${foreignOwners.join(",")}`);
+        continue;
+      }
+
+      // The explicit operator request is independent of pass/fail geometry, but
+      // still records the best causal geometry evidence available for audit.
+      if (explicitOpusdtClose) {
+        const atr4hFeature = decisionAtMs === null ? null : await this.causalAtr4hForDecision(trade.symbol, decisionAtMs);
+        const geometry = this.openTradeGeometry(trade, atr4hFeature);
+        const status: DailyRangeOpenPositionGeometryMigrationStatus = geometry.geometryPass
+          ? "PASS"
+          : geometry.geometryRejectReason === "TARGET_REACHABILITY_DATA_UNAVAILABLE" ? "UNKNOWN" : "FAIL";
+        const migration = baseMigration({
+          status,
+          reason: "OPERATOR_REQUESTED_CLOSE_GEOMETRY_PATCH",
+          action: "FLATTEN_PENDING",
+          geometry,
+        });
+        this.recordGeometryMigration(trade, migration);
+        await this.emergencyFlatten(trade, "CLOSED", "OPERATOR_REQUESTED_CLOSE_GEOMETRY_PATCH");
+        migration.evaluatedAt = iso(this.nowMs());
+        migration.action = trade.status === "CLOSED" ? "FLATTENED" : "FLATTEN_PENDING";
+        this.recordGeometryMigration(trade, migration);
+        continue;
+      }
+
+      // A hard absolute failure is enough to flatten even if historical ATR is
+      // unavailable.  No current/open position is force-closed for ATR alone.
+      if (absoluteGeometry.geometryRejectReason === "STRUCTURAL_STOP_TOO_WIDE"
+        || absoluteGeometry.geometryRejectReason === "TARGET_DISTANCE_TOO_WIDE") {
+        const migration = baseMigration({
+          status: "FAIL",
+          reason: absoluteGeometry.geometryRejectReason,
+          action: "FLATTEN_PENDING",
+          geometry: absoluteGeometry,
+        });
+        this.recordGeometryMigration(trade, migration);
+        await this.emergencyFlatten(trade, "CLOSED", `GEOMETRY_MIGRATION:${absoluteGeometry.geometryRejectReason}`);
+        migration.evaluatedAt = iso(this.nowMs());
+        migration.action = trade.status === "CLOSED" ? "FLATTENED" : "FLATTEN_PENDING";
+        this.recordGeometryMigration(trade, migration);
+        continue;
+      }
+
+      const atr4hFeature = decisionAtMs === null ? null : await this.causalAtr4hForDecision(trade.symbol, decisionAtMs);
+      if (!atr4hFeature) {
+        this.recordGeometryMigration(trade, baseMigration({
+          status: "UNKNOWN",
+          reason: "OPEN_POSITION_ATR_MIGRATION_UNKNOWN",
+          action: "KEPT",
+          geometry: absoluteGeometry,
+        }));
+        continue;
+      }
+      const geometry = this.openTradeGeometry(trade, atr4hFeature);
+      if (geometry.geometryPass) {
+        this.recordGeometryMigration(trade, baseMigration({
+          status: "PASS",
+          reason: null,
+          action: "KEPT",
+          geometry,
+        }));
+        continue;
+      }
+      const migration = baseMigration({
+        status: "FAIL",
+        reason: geometry.geometryRejectReason!,
+        action: "FLATTEN_PENDING",
+        geometry,
+      });
+      this.recordGeometryMigration(trade, migration);
+      await this.emergencyFlatten(trade, "CLOSED", `GEOMETRY_MIGRATION:${geometry.geometryRejectReason}`);
+      migration.evaluatedAt = iso(this.nowMs());
+      migration.action = trade.status === "CLOSED" ? "FLATTENED" : "FLATTEN_PENDING";
+      this.recordGeometryMigration(trade, migration);
+    }
   }
 
   private updateReconciledMark(trade: DailyRangeTrade, markPrice: number): void {

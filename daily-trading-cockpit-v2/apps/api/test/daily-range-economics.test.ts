@@ -4,7 +4,9 @@ import type { FuturesSymbolFilters } from "../src/lib/binance-futures-private.js
 import {
   DAILY_RANGE_MAX_COST_RATIO,
   buildEmpiricalFrictionModel,
+  calculateCausalAtr14,
   conservativeFallbackFrictionModel,
+  evaluateDailyRangeTradeGeometry,
   evaluateActualFillEconomics,
   prepareDailyRangeEconomics,
 } from "../src/lib/daily-range-economics.js";
@@ -33,6 +35,11 @@ function baseInput(overrides: Partial<Parameters<typeof prepareDailyRangeEconomi
     frictionModel: conservativeFallbackFrictionModel(at),
     bboMaxAgeMs: 30_000,
     allocationAtMs: Date.parse(at) + 2_000,
+    atr4hFeature: {
+      atr4h: 2.5,
+      atrSourceLastClosedAt: "2026-08-27T08:00:00.000Z",
+      atrFeatureTimestamp: at,
+    },
     ...overrides,
   };
 }
@@ -60,7 +67,6 @@ describe("Daily Range V3 economics", () => {
   it("fails closed when the capped risk plan cannot meet min notional", () => {
     const result = prepareDailyRangeEconomics(baseInput({
       filter: { ...filter, minNotional: 20 },
-      rawStructuralStop: 50,
     }));
     expect(result).toEqual({ ok: false, reason: "RISK_BUDGET_UNEXECUTABLE" });
   });
@@ -153,5 +159,72 @@ describe("Daily Range V3 economics", () => {
     expect(result.economics.safeLossExitFeeComponentBps).toBe(5);
     expect(result.economics.safeLossPathAdverseComponentBps).toBe(25);
     expect(result.economics.safeLossFrictionBps).toBe(35);
+  });
+
+  it("keeps the absolute stop and target boundaries inclusive, then rejects the next tick", () => {
+    const geometry = (stopPct: number, targetPct: number) => evaluateDailyRangeTradeGeometry({
+      expectedEntryPrice: 100,
+      expectedStopPrice: 100 * (1 - stopPct),
+      expectedTakeProfitPrice: 100 * (1 + targetPct),
+      atr4hFeature: {
+        atr4h: 4,
+        atrSourceLastClosedAt: "2026-08-27T08:00:00.000Z",
+        atrFeatureTimestamp: at,
+      },
+    });
+    expect(geometry(0.025, 0.05)).toMatchObject({ geometryPass: true });
+    expect(geometry(0.03, 0.06)).toMatchObject({ geometryPass: true });
+    expect(geometry(0.0301, 0.05)).toMatchObject({ geometryPass: false, geometryRejectReason: "STRUCTURAL_STOP_TOO_WIDE" });
+    expect(geometry(0.025, 0.0601)).toMatchObject({ geometryPass: false, geometryRejectReason: "TARGET_DISTANCE_TOO_WIDE" });
+  });
+
+  it("requires a target no farther than two completed-4h ATRs", () => {
+    const geometry = (targetPct: number) => evaluateDailyRangeTradeGeometry({
+      expectedEntryPrice: 100,
+      expectedStopPrice: 98,
+      expectedTakeProfitPrice: 100 * (1 + targetPct),
+      atr4hFeature: {
+        atr4h: 2,
+        atrSourceLastClosedAt: "2026-08-27T08:00:00.000Z",
+        atrFeatureTimestamp: at,
+      },
+    });
+    expect(geometry(0.03)).toMatchObject({ geometryPass: true, targetAtrMultiple: 1.5 });
+    expect(geometry(0.04)).toMatchObject({ geometryPass: true, targetAtrMultiple: 2 });
+    const tooFar = geometry(0.042);
+    expect(tooFar).toMatchObject({ geometryPass: false, geometryRejectReason: "TARGET_REACHABILITY_FAIL" });
+    expect(tooFar.targetAtrMultiple).toBeCloseTo(2.1, 10);
+  });
+
+  it("rejects the BMT-style 4.8% structural stop before risk sizing can make it look cheap", () => {
+    const bmtFilter: FuturesSymbolFilters = {
+      symbol: "BMTUSDT", tickSize: 0.00001, stepSize: 1, minQty: 1, minNotional: 5, pricePrecision: 5, quantityPrecision: 0,
+    };
+    const result = prepareDailyRangeEconomics(baseInput({
+      symbol: "BMTUSDT",
+      rawStructuralStop: 0.02012,
+      bbo: { bid: 0.02113, ask: 0.02114, observedAt: at, receivedAt: at, sourceTime: Date.parse(at) },
+      filter: bmtFilter,
+      atr4hFeature: {
+        atr4h: 0.0015,
+        atrSourceLastClosedAt: "2026-08-27T08:00:00.000Z",
+        atrFeatureTimestamp: at,
+      },
+    }));
+    expect(result).toMatchObject({ ok: false, reason: "STRUCTURAL_STOP_TOO_WIDE" });
+  });
+
+  it("calculates ATR only from a continuous tail of completed 4h candles", () => {
+    const decisionAtMs = Date.UTC(2026, 7, 27, 12, 5);
+    const firstOpen = Date.UTC(2026, 7, 24, 20);
+    const rows = Array.from({ length: 16 }, (_, index) => {
+      const openTime = firstOpen + index * 4 * 60 * 60_000;
+      const close = 100 + index;
+      return { openTime, closeTime: openTime + 4 * 60 * 60_000 - 1, high: close + 1, low: close - 1, close };
+    });
+    const atr = calculateCausalAtr14({ candles: rows, decisionAtMs });
+    expect(atr?.atr4h).toBeCloseTo(2, 10);
+    expect(atr?.atrSourceLastClosedAt).toBe(new Date(rows.at(-1)!.closeTime + 1).toISOString());
+    expect(calculateCausalAtr14({ candles: rows.filter((row) => row.openTime !== rows.at(-2)!.openTime), decisionAtMs })).toBeNull();
   });
 });

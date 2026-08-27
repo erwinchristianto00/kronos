@@ -73,10 +73,35 @@ type DailyRangeTrade = DailyRangeHeadlineTrade & {
     plannedRiskUsd: number;
     costRatio: number;
     breakEvenWinRate: number;
+    geometry?: DailyRangeTradeGeometry | null;
+  } | null;
+  geometry?: DailyRangeTradeGeometry | null;
+  geometryMigration?: {
+    status: 'PASS' | 'FAIL' | 'UNKNOWN' | 'BLOCKED';
+    reason: string | null;
+    action: 'KEPT' | 'FLATTEN_PENDING' | 'FLATTENED' | 'BLOCKED';
+    geometry: DailyRangeTradeGeometry;
   } | null;
   actualStopRiskBps?: number | null;
   actualCostRatio?: number | null;
   postFillEconomicsStatus?: 'PASS' | 'POST_FILL_ECONOMICS_FAIL' | 'POST_FILL_RISK_FAIL' | null;
+  postFillGeometryStatus?: 'PASS' | string | null;
+};
+
+type DailyRangeTradeGeometry = {
+  geometryPolicyId: string;
+  maxStopPct: number;
+  maxTargetPct: number;
+  maxTargetAtrMultiple: number;
+  stopDistancePct: number | null;
+  tpDistancePct: number | null;
+  atr4h: number | null;
+  atr4hPct: number | null;
+  atrSourceLastClosedAt: string | null;
+  atrFeatureTimestamp: string | null;
+  targetAtrMultiple: number | null;
+  geometryPass: boolean;
+  geometryRejectReason: string | null;
 };
 
 type DailyRangePerformance = {
@@ -161,6 +186,20 @@ type DailyRangeStatus = {
       actualInitialRiskUsd?: { count?: number; average?: number | null; maximum?: number | null };
     } | null;
   } | null;
+  geometry?: {
+    policyId?: string;
+    maxStructuralStopPct?: number;
+    maxTargetDistancePct?: number;
+    maxTargetAtr4hMultiple?: number;
+    atrDefinition?: string;
+    candidateSummary?: {
+      evaluated?: number;
+      passed?: number;
+      rejected?: number;
+      rejectCounts?: Record<string, number>;
+    } | null;
+    rejectCounts?: Record<string, number>;
+  } | null;
   lastBatchCandidateCount?: number;
   lastBatchSelectedCount?: number;
   lastCompletedBatch?: {
@@ -168,6 +207,12 @@ type DailyRangeStatus = {
     minFeatureAgeMs?: number | null;
     maxFeatureAgeMs?: number | null;
     featureAgeSpreadMs?: number | null;
+    candidates?: Array<{
+      symbol: string;
+      selected?: boolean;
+      skipReason?: string | null;
+      geometry?: DailyRangeTradeGeometry | null;
+    }>;
   } | null;
   mfeMae?: { triggerWorkingType?: string; collection?: string; fallback?: string; openPathQuality?: Record<string, number> } | null;
   dataHealth?: {
@@ -275,6 +320,23 @@ function currentR(trade: DailyRangeTrade): number | null {
 function targetGapPct(trade: DailyRangeTrade): number | null {
   if (!finite(trade.takeProfitPrice) || !finite(trade.lastMarkPrice) || trade.lastMarkPrice <= 0) return null;
   return ((trade.takeProfitPrice - trade.lastMarkPrice) / trade.lastMarkPrice) * (trade.direction === 'LONG' ? 1 : -1) * 100;
+}
+
+function geometryForTrade(trade: DailyRangeTrade): DailyRangeTradeGeometry | null {
+  return trade.geometry ?? trade.economics?.geometry ?? trade.geometryMigration?.geometry ?? null;
+}
+
+function geometryPct(value: number | null | undefined): string {
+  return finite(value) ? formatPercent(value * 100) : '—';
+}
+
+function geometrySummary(trade: DailyRangeTrade): string {
+  const geometry = geometryForTrade(trade);
+  if (!geometry) return 'legacy / belum dievaluasi';
+  const status = trade.geometryMigration?.status
+    ?? (geometry.geometryPass ? 'PASS' : `FAIL ${geometry.geometryRejectReason ?? ''}`.trim());
+  const atr = finite(geometry.targetAtrMultiple) ? `${geometry.targetAtrMultiple.toFixed(2)}× ATR` : 'ATR —';
+  return `SL ${geometryPct(geometry.stopDistancePct)} · TP ${geometryPct(geometry.tpDistancePct)} · ${atr} · ${status}`;
 }
 
 function tradeNotional(trade: DailyRangeTrade): number | null {
@@ -515,6 +577,10 @@ export default function DailyRangeReportCard({
   const usesAutoRouter = data?.strategyVersion === 'daily-4h-range-auto-route-ny-2r-v2';
   const friction = data?.economics?.frictionModel ?? null;
   const candidateSummary = data?.economics?.candidateSummary ?? null;
+  const geometryPolicy = data?.geometry ?? null;
+  const geometryCandidateSummary = geometryPolicy?.candidateSummary ?? null;
+  const geometryRejects = geometryPolicy?.rejectCounts ?? geometryCandidateSummary?.rejectCounts ?? {};
+  const latestGeometryCandidates = (data?.lastCompletedBatch?.candidates ?? []).filter((candidate) => candidate.geometry != null);
   const maxCostRatio = data?.economics?.maxCostRatio ?? null;
   const bboMaxAgeMs = data?.economics?.bboMaxAgeMs ?? null;
   const alphaGates = data?.selectorArtifact?.promotionGates ?? null;
@@ -543,6 +609,24 @@ export default function DailyRangeReportCard({
         Range <strong>{usesAutoRouter ? '00:00–04:00 New York' : '00:00–04:00 UTC'}</strong> → {usesAutoRouter ? 'breakout bertahan = Continuation; kembali masuk range = Breakout Fade.' : 'dua close 5m selesai di luar range → native structural SL + fixed 2R TP.'}
         Klik simbol trade untuk membuka candle; level range selalu memakai data trade yang dibekukan saat entry.
       </div>
+      {geometryPolicy ? <div className="daily-range-message" title={geometryPolicy.atrDefinition ?? 'ATR14 dari candle 4H yang sudah selesai pada waktu keputusan.'}>
+        <strong>Geometry policy</strong> · structural stop ≤ {geometryPct(geometryPolicy.maxStructuralStopPct)} · target 2R ≤ {geometryPct(geometryPolicy.maxTargetDistancePct)} · target ≤ {finite(geometryPolicy.maxTargetAtr4hMultiple) ? `${geometryPolicy.maxTargetAtr4hMultiple.toFixed(2)}× ATR14(4H)` : '—'}
+        {geometryCandidateSummary ? <> · kandidat {geometryCandidateSummary.passed ?? 0} pass / {geometryCandidateSummary.rejected ?? 0} reject</> : null}
+        {Object.entries(geometryRejects).some(([, count]) => count > 0) ? <small>reject: {Object.entries(geometryRejects).filter(([, count]) => count > 0).map(([reason, count]) => `${reason} ${count}`).join(' · ')}</small> : null}
+      </div> : null}
+      {latestGeometryCandidates.length > 0 ? <div className="daily-range-geometry-candidates">
+        <span>Latest candidate geometry</span>
+        <div className="daily-range-geometry-grid">
+          {latestGeometryCandidates.map((candidate) => {
+            const geometry = candidate.geometry!;
+            const verdict = geometry.geometryPass ? 'PASS' : `FAIL · ${geometry.geometryRejectReason ?? candidate.skipReason ?? '—'}`;
+            return <div key={candidate.symbol} className={geometry.geometryPass ? 'is-pass' : 'is-fail'}>
+              <strong>{candidate.symbol}</strong>
+              <small>SL {geometryPct(geometry.stopDistancePct)} · TP {geometryPct(geometry.tpDistancePct)} · {finite(geometry.targetAtrMultiple) ? `${geometry.targetAtrMultiple.toFixed(2)}× ATR` : 'ATR —'} · {verdict}</small>
+            </div>;
+          })}
+        </div>
+      </div> : null}
       {usesAutoRouter && SHOW_DAILY_RANGE_RESEARCH_TELEMETRY ? <>
         <div className="daily-range-ops-summary">
           <section className="daily-range-ops-section" title="V3 mengurutkan hanya kandidat yang sudah lolos stop economics. Router, arah, structural stop, 2R, dan native bracket tidak berubah.">
@@ -640,6 +724,7 @@ export default function DailyRangeReportCard({
               const gross = grossMarkPnl(trade);
               const nowR = currentR(trade);
               const gap = targetGapPct(trade);
+              const geometry = geometryForTrade(trade);
               const reconcileError = reconcileErrorForDisplay(trade.lastReconcileError);
               return <tr key={trade.tradeId} className={selected ? 'is-selected' : undefined}>
                 <td>Daily range</td>
@@ -660,7 +745,10 @@ export default function DailyRangeReportCard({
                 <td>{trade.economics ? <small title={`model ${trade.economics.frictionModelId}; break-even ${formatPercent(trade.economics.breakEvenWinRate * 100)}`}>
                   risk {formatUnsignedMoney(trade.economics.plannedRiskUsd)} · cost {formatPercent((trade.actualCostRatio ?? trade.economics.costRatio) * 100)} · BE {formatPercent(trade.economics.breakEvenWinRate * 100)}
                   {trade.postFillEconomicsStatus ? <><br />fill {trade.postFillEconomicsStatus}</> : null}
-                </small> : <span className="tone-measure">legacy</span>}</td>
+                  {trade.postFillGeometryStatus ? <><br />fill geometry {trade.postFillGeometryStatus}</> : null}
+                  {geometry ? <><br /><span className={geometry.geometryPass ? 'tone-good' : 'tone-warning'}>{geometrySummary(trade)}</span></> : null}
+                  {trade.geometryMigration ? <><br />migration {trade.geometryMigration.action}{trade.geometryMigration.reason ? ` · ${trade.geometryMigration.reason}` : ''}</> : null}
+                </small> : geometry ? <small className={geometry.geometryPass ? 'tone-good' : 'tone-warning'}>{geometrySummary(trade)}</small> : <span className="tone-measure">legacy</span>}</td>
                 <td>{formatPrice(trade.rangeHigh)} / {formatPrice(trade.rangeLow)}</td>
                 <td>{formatTaipei(trade.entryFilledAt ?? trade.entrySubmittedAt)}</td>
                 <td><span className="daily-range-state">{trade.status}</span>{reconcileError ? <small className="tone-warning daily-range-reconcile">reconcile: {reconcileError}</small> : null}</td>
