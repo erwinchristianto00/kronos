@@ -376,6 +376,29 @@ async function runNaturalMainnetBatch(input: {
 }
 
 describe("daily-4h-range-acceptance-2r-v1", () => {
+  it("freezes the V3 Testnet friction model on a completed 5m boundary before the NY range is ready", async () => {
+    const window = newYorkDailyRangeWindow(Date.UTC(2026, 7, 26, 5));
+    const now = { value: window.rangeOpenTime + 10 * 60_000 };
+    const client = new FakeDailyClient();
+    client.now = now.value;
+    const { lane, store } = makeLane(
+      client,
+      now,
+      ["AAAUSDT"],
+      { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
+      "AUTO_ROUTE_NY_V2",
+    );
+
+    await lane.tick();
+
+    expect(store.getState().frictionModels).toMatchObject([
+      { source: "CONSERVATIVE_FALLBACK", sampleCount: 0 },
+    ]);
+    expect(lane.getStatus()).toMatchObject({
+      economics: { frictionModel: { source: "CONSERVATIVE_FALLBACK" } },
+    });
+  });
+
   it("uses UTC 00:00–04:00 futures reference only and does not catch up a disarmed day", async () => {
     const now = { value: AT_0410 };
     const client = new FakeDailyClient();

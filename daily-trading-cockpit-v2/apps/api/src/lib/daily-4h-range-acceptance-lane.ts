@@ -2007,6 +2007,16 @@ export class DailyRangeAcceptanceLane {
       // If a process ended between the order attempt and the passive cohort
       // snapshot, recover the outcome from the durable signal record only.
       this.syncSignalCohortDecisions();
+      if (this.isAutoRoute()) {
+        // Freeze the V3 daily friction model at the most recent completed
+        // five-minute boundary even before the NY 00:00-04:00 reference range
+        // is ready.  Otherwise a safe, fresh deployment at 00:xx New York
+        // would misleadingly remain FRICTION_MODEL_UNAVAILABLE for hours.
+        // This has no entry authority: it only creates an immutable model
+        // snapshot from terminal records already known at that boundary.
+        const completedBoundary = lastClosedFiveMinuteOpenTime(startedAt);
+        if (completedBoundary !== null) this.ensureFrictionModel(completedBoundary + FIVE_MIN_MS);
+      }
       await this.ensureTodayRange();
       if (state.control.mode !== "ARMED") {
         state.runtime.lastError = null;
