@@ -11,6 +11,7 @@
 import { createHash } from "node:crypto";
 
 import type { FuturesSymbolFilters } from "./binance-futures-private.js";
+import { dailyRangeTpMultipleForRoute } from "./daily-range-route-exit.js";
 
 export const DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID = "daily-range-execution-economics-v1";
 export const DAILY_RANGE_ECONOMIC_ALLOCATOR_POLICY_ID = "daily-range-economic-quality-baseline-v1";
@@ -63,6 +64,8 @@ export interface DailyRangeAtr4hFeature {
 /** Immutable entry-time geometry snapshot, retained for admitted and rejected candidates. */
 export interface DailyRangeTradeGeometry {
   geometryPolicyId: typeof DAILY_RANGE_TRADE_GEOMETRY_POLICY_ID;
+  /** Frozen route-specific reward multiple used to form this exact target. Absent only on persisted pre-V1 geometry. */
+  tpMultipleR?: number;
   maxStopPct: number;
   maxTargetPct: number;
   maxTargetAtrMultiple: number;
@@ -175,6 +178,10 @@ export interface DailyRangePreTradeEconomics {
   expectedEntryPrice: number;
   expectedStopPrice: number;
   expectedTakeProfitPrice: number;
+  /** Route and reward used for the executable target, not a global 2R proxy. */
+  route: string;
+  tpMultipleR: number;
+  grossWinR: number;
   rawStructuralStop: number;
   stopRiskPrice: number;
   stopRiskBps: number;
@@ -234,6 +241,7 @@ function geometryBase(input: {
   expectedEntryPrice: number;
   expectedStopPrice: number;
   expectedTakeProfitPrice: number;
+  tpMultipleR?: number;
   atr4hFeature: DailyRangeAtr4hFeature | null;
 }): Omit<DailyRangeTradeGeometry, "geometryPass" | "geometryRejectReason"> {
   const entry = input.expectedEntryPrice;
@@ -250,6 +258,7 @@ function geometryBase(input: {
     : null;
   return {
     geometryPolicyId: DAILY_RANGE_TRADE_GEOMETRY_POLICY_ID,
+    tpMultipleR: finitePositive(input.tpMultipleR) ? input.tpMultipleR : 2,
     maxStopPct: DAILY_RANGE_MAX_STRUCTURAL_STOP_PCT,
     maxTargetPct: DAILY_RANGE_MAX_TARGET_DISTANCE_PCT,
     maxTargetAtrMultiple: DAILY_RANGE_MAX_TARGET_ATR4H_MULTIPLE,
@@ -264,7 +273,7 @@ function geometryBase(input: {
 }
 
 /**
- * Evaluate an already-formed structural stop and exact 2R target.  This does
+ * Evaluate an already-formed structural stop and frozen route-specific target. This does
  * not move either level: a bad geometry is rejected, never repaired by a
  * discretionary clamp.
  */
@@ -272,6 +281,8 @@ export function evaluateDailyRangeTradeGeometry(input: {
   expectedEntryPrice: number;
   expectedStopPrice: number;
   expectedTakeProfitPrice: number;
+  /** Optional only for legacy/migration records whose frozen target was 2R. */
+  tpMultipleR?: number;
   atr4hFeature: DailyRangeAtr4hFeature | null;
 }): DailyRangeTradeGeometry {
   const base = geometryBase(input);
@@ -543,7 +554,7 @@ function clampQtyDown(raw: number, filter: FuturesSymbolFilters): number | null 
   return qty + 1e-12 >= filter.minQty ? qty : null;
 }
 
-function bracket(input: { side: DailyRangeEconomicsSide; entry: number; rawStop: number; tickSize: number }): {
+function bracket(input: { side: DailyRangeEconomicsSide; entry: number; rawStop: number; tickSize: number; tpMultipleR: number }): {
   stop: number;
   takeProfit: number;
   risk: number;
@@ -554,12 +565,15 @@ function bracket(input: { side: DailyRangeEconomicsSide; entry: number; rawStop:
     : roundToStep(input.rawStop, input.tickSize, "up");
   const risk = input.side === "LONG" ? input.entry - stop : stop - input.entry;
   if (!(risk > 1e-12)) return null;
-  const rawTakeProfit = input.side === "LONG" ? input.entry + 2 * risk : input.entry - 2 * risk;
+  if (!finitePositive(input.tpMultipleR)) return null;
+  const rawTakeProfit = input.side === "LONG"
+    ? input.entry + input.tpMultipleR * risk
+    : input.entry - input.tpMultipleR * risk;
   const takeProfit = input.side === "LONG"
     ? roundToStep(rawTakeProfit, input.tickSize, "up")
     : roundToStep(rawTakeProfit, input.tickSize, "down");
   const reward = input.side === "LONG" ? takeProfit - input.entry : input.entry - takeProfit;
-  return takeProfit > 0 && reward + 1e-12 >= 2 * risk ? { stop, takeProfit, risk } : null;
+  return takeProfit > 0 && reward + 1e-12 >= input.tpMultipleR * risk ? { stop, takeProfit, risk } : null;
 }
 
 export function dailyRangeEconomicTieBreakHash(input: {
@@ -598,11 +612,18 @@ export function prepareDailyRangeEconomics(input: {
   }
   if (!input.filter) return { ok: false, reason: "RISK_BUDGET_UNEXECUTABLE" };
   const model = input.frictionModel;
+  const tpMultipleR = dailyRangeTpMultipleForRoute(input.route);
   const sideBook = input.side === "LONG" ? input.bbo.ask : input.bbo.bid;
   const expectedEntry = input.side === "LONG"
     ? sideBook * (1 + model.entryAdverseP95Bps / 10_000)
     : sideBook * (1 - model.entryAdverseP95Bps / 10_000);
-  const roundedBracket = bracket({ side: input.side, entry: expectedEntry, rawStop: input.rawStructuralStop, tickSize: input.filter.tickSize });
+  const roundedBracket = bracket({
+    side: input.side,
+    entry: expectedEntry,
+    rawStop: input.rawStructuralStop,
+    tickSize: input.filter.tickSize,
+    tpMultipleR,
+  });
   if (!roundedBracket) return { ok: false, reason: "STOP_ECONOMICS_FAIL" };
   const stopRiskBps = (roundedBracket.risk / expectedEntry) * 10_000;
   const medianWinFrictionBps = model.entryFeeP50Bps + model.exitFeeP50Bps + model.winAdverseP50Bps;
@@ -617,11 +638,12 @@ export function prepareDailyRangeEconomics(input: {
   // Geometry is deliberately evaluated after the existing narrow-stop
   // economics check and before any quantity/rank/allocation work.  Both gates
   // are independent: a stop can be too narrow for friction or too wide for a
-  // realistic 2R target.
+  // realistic route-specific target.
   const geometry = evaluateDailyRangeTradeGeometry({
     expectedEntryPrice: expectedEntry,
     expectedStopPrice: roundedBracket.stop,
     expectedTakeProfitPrice: roundedBracket.takeProfit,
+    tpMultipleR,
     atr4hFeature: input.atr4hFeature,
   });
   if (!geometry.geometryPass) {
@@ -637,7 +659,7 @@ export function prepareDailyRangeEconomics(input: {
   if (!qty || plannedNotionalUsd + 1e-12 < input.filter.minNotional || plannedRiskUsd > DAILY_RANGE_MAX_PLANNED_RISK_USD + 1e-9 || plannedNotionalUsd > DAILY_RANGE_MAX_NOTIONAL_USD + 1e-9) {
     return { ok: false, reason: "RISK_BUDGET_UNEXECUTABLE" };
   }
-  const netWinR = 2 - medianWinFrictionBps / stopRiskBps;
+  const netWinR = tpMultipleR - medianWinFrictionBps / stopRiskBps;
   const netLossR = -1 - medianLossFrictionBps / stopRiskBps;
   const denominator = netWinR + Math.abs(netLossR);
   if (!(netWinR > 0) || !(denominator > 0)) return { ok: false, reason: "STOP_ECONOMICS_FAIL" };
@@ -661,6 +683,9 @@ export function prepareDailyRangeEconomics(input: {
       expectedEntryPrice: expectedEntry,
       expectedStopPrice: roundedBracket.stop,
       expectedTakeProfitPrice: roundedBracket.takeProfit,
+      route: input.route,
+      tpMultipleR,
+      grossWinR: tpMultipleR,
       rawStructuralStop: input.rawStructuralStop,
       stopRiskPrice: roundedBracket.risk,
       stopRiskBps,

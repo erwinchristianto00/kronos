@@ -60,6 +60,9 @@ export type OpenBasketReviewLeg = {
   stopPrice?: number | null;
   takeProfitPrice?: number | null;
   entryPolicy?: 'LEGACY_CONTINUATION' | 'CONTINUATION' | 'FADE';
+  tpMultipleR?: number | null;
+  exitPolicyId?: string | null;
+  thesisInvalidationType?: 'RANGE_REENTRY' | 'ORIGINAL_BREAKOUT_REACCEPTANCE' | null;
 };
 
 type Candle = {
@@ -597,9 +600,9 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
       ? [{ price: leg.stopPrice, label: 'Native SL', color: C.bad }]
       : []),
     ...(leg.takeProfitPrice != null && Number.isFinite(leg.takeProfitPrice)
-      ? [{ price: leg.takeProfitPrice, label: 'Native 2R TP', color: C.good }]
+      ? [{ price: leg.takeProfitPrice, label: `Native ${leg.tpMultipleR ?? 2}R TP`, color: C.good }]
       : []),
-  ], [isDailyRange, leg?.entryPrice, leg?.stopPrice, leg?.takeProfitPrice]);
+  ], [isDailyRange, leg?.entryPrice, leg?.stopPrice, leg?.takeProfitPrice, leg?.tpMultipleR]);
   const dailyLevels = useMemo<PriceLevel[]>(() => reference ? [
     { price: reference.rangeHigh, label: '4H range high · execution breakout', color: C.accent },
     { price: reference.rangeLow, label: '4H range low · execution breakdown', color: C.good },
@@ -664,7 +667,8 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
       <span><b>entry</b> {formatPrice(leg.entryPrice)}</span>
       <span><b>live mark</b> {formatPrice(leg.markPrice)}</span>
       <span style={{ color: leg.grossUnrealizedUsd == null ? C.dim : leg.grossUnrealizedUsd >= 0 ? C.good : C.bad }}><b>{isDailyRange ? 'gross mark P&L' : 'leg P&L'}</b> {formatMoney(leg.grossUnrealizedUsd)}</span>
-      {isDailyRange && <span><b>native bracket</b> SL {formatPrice(leg.stopPrice)} · TP 2R {formatPrice(leg.takeProfitPrice)}</span>}
+      {isDailyRange && <span><b>native bracket</b> SL {formatPrice(leg.stopPrice)} · TP {leg.tpMultipleR ?? 2}R {formatPrice(leg.takeProfitPrice)}</span>}
+      {isDailyRange && leg.thesisInvalidationType && <span><b>logic exit</b> {leg.thesisInvalidationType === 'RANGE_REENTRY' ? '5m range re-entry' : '5m breakout re-acceptance'}</span>}
       <span><b>open</b> {formatTaipei(leg.openedAt)} Taipei</span>
     </div>
     {error ? <div style={{ padding: 12, color: C.bad, fontSize: 12 }}>Candle chart unavailable: {error}</div> : <>

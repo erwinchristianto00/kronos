@@ -1117,6 +1117,10 @@ export function annotateDailyRangeAccount(
     row.dailyRangeTakeProfitPrice = claim.takeProfitPrice;
     row.dailyRangeOpenedAt = claim.openedAt;
     row.dailyRangeStatus = claim.status;
+    row.dailyRangeEntryPolicy = claim.entryPolicy;
+    row.dailyRangeExitPolicyId = claim.exitPolicyId;
+    row.dailyRangeTpMultipleR = claim.tpMultipleR;
+    row.dailyRangeThesisInvalidationType = claim.thesisInvalidationType;
     row.dailyRangeLastReconcileError = claim.lastReconcileError;
 
     laneRow.sourceOrderCount += 1;

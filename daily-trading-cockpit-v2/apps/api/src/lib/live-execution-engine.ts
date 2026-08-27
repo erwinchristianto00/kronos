@@ -3035,6 +3035,10 @@ export class LiveExecutionEngine {
       dailyRangeTakeProfitPrice: number | null;
       dailyRangeOpenedAt: string | null;
       dailyRangeStatus: string | null;
+      dailyRangeEntryPolicy: string | null;
+      dailyRangeExitPolicyId: string | null;
+      dailyRangeTpMultipleR: number | null;
+      dailyRangeThesisInvalidationType: string | null;
       dailyRangeLastReconcileError: string | null;
     }>;
     lanes: Array<{
@@ -3145,6 +3149,10 @@ export class LiveExecutionEngine {
         dailyRangeTakeProfitPrice: null,
         dailyRangeOpenedAt: null,
         dailyRangeStatus: null,
+        dailyRangeEntryPolicy: null,
+        dailyRangeExitPolicyId: null,
+        dailyRangeTpMultipleR: null,
+        dailyRangeThesisInvalidationType: null,
         dailyRangeLastReconcileError: null,
       };
     });

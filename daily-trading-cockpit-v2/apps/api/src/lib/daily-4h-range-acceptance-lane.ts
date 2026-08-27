@@ -69,6 +69,16 @@ import {
   blankDailyRangeAutoRouteState,
   type DailyRangeAutoRouteState,
 } from "./daily-range-auto-route.js";
+import {
+  DAILY_RANGE_ROUTE_EXIT_POLICY_ID,
+  dailyRangeRouteExitPolicyForSignal,
+  dailyRangeTpMultipleForRoute,
+  evaluateDailyRangeThesisInvalidation,
+  isDailyRangeRouteExitV1,
+  type DailyRangeRouteExitPolicySnapshot,
+  type DailyRangeThesisInvalidationDecision,
+  type DailyRangeThesisInvalidationReason,
+} from "./daily-range-route-exit.js";
 import type { DailyRangeSelectorArtifactRegistryStatus } from "./daily-range-selector-artifacts.js";
 
 export const DAILY_RANGE_LANE_ID = "DAILY_4H_RANGE_ACCEPTANCE";
@@ -270,6 +280,8 @@ export interface DailyRangeSignal {
   referenceTimezone?: "UTC" | "America/New_York";
   referenceRangeOpenTime?: number | null;
   referenceRangeCloseTime?: number | null;
+  /** Present only for new route-specific-exit candidates; legacy rows remain frozen. */
+  routeExitPolicy?: DailyRangeRouteExitPolicySnapshot | null;
 }
 
 export type DailyRangePitQuality = "FULL_PIT" | "PARTIAL_RECONSTRUCTION" | "UNAVAILABLE";
@@ -393,6 +405,10 @@ export interface DailyRangeCounterfactualOutcome {
   entryPrice: number;
   structuralStop: number;
   takeProfit: number;
+  /** Labels prevent a future 1R continuation record from blending with legacy 2R. */
+  exitPolicyId?: string | null;
+  tpMultipleR?: number | null;
+  thesisInvalidationType?: string | null;
   tickSize: number | null;
   quantity: number | null;
   modeledEntryFeeBps: number;
@@ -425,6 +441,11 @@ export interface DailyRangeAlphaSelectorSnapshot {
   pTp: number | null;
   expectedNetR: number | null;
   expectedNetUsd: number | null;
+  /** Read-only route-aware payoff facts. Alpha remains non-authoritative. */
+  tpMultipleR?: number | null;
+  netWinR?: number | null;
+  netLossR?: number | null;
+  breakEvenWinRate?: number | null;
   reason: "ALPHA_SELECTOR_SHADOW_ONLY" | "SELECTOR_NOT_READY" | "NEGATIVE_EXPECTED_VALUE" | null;
   featureSnapshotAt: string | null;
 }
@@ -461,6 +482,7 @@ export interface DailyRangeSignalCohortCandidate {
   tieBreakHash?: string | null;
   economics?: DailyRangePreTradeEconomics | null;
   geometry?: DailyRangeTradeGeometry | null;
+  routeExitPolicy?: DailyRangeRouteExitPolicySnapshot | null;
   alphaSelector?: DailyRangeAlphaSelectorSnapshot | null;
   actuallySelected?: boolean;
   actuallyExecuted?: boolean;
@@ -584,16 +606,24 @@ export interface DailyRangeTrade {
   referenceTimezone?: "UTC" | "America/New_York";
   referenceRangeOpenTime?: number | null;
   referenceRangeCloseTime?: number | null;
+  /** Frozen for new route-specific exits; absence is the immutable legacy policy. */
+  routeExitPolicy?: DailyRangeRouteExitPolicySnapshot | null;
+  /** Durable completed-bar watermark for the logical exit watcher. */
+  lastThesisInvalidationBarOpenTime?: number | null;
+  thesisInvalidation?: DailyRangeThesisInvalidationRecord | null;
   confirmationBar1: DailyRangeCandle;
   confirmationBar2: DailyRangeCandle;
   structuralStopRaw: number;
   stopPrice: number | null;
   takeProfitRaw: number | null;
   takeProfitPrice: number | null;
+  /** Frozen rounded 2R target for post-logical-exit research only. */
+  oldPolicyTakeProfitPrice?: number | null;
   initialRiskPrice: number | null;
   initialRiskPct: number | null;
   initialRiskDollar: number | null;
-  rrTarget: typeof DAILY_RANGE_RR;
+  /** Retained for legacy reporting; new V1 rows equal routeExitPolicy.tpMultipleR. */
+  rrTarget: number;
   stopAlgoOrderId: string | null;
   stopClientAlgoId: string;
   takeProfitAlgoOrderId: string | null;
@@ -646,6 +676,37 @@ export interface DailyRangeTrade {
   lastReconcileError: string | null;
 }
 
+export interface DailyRangeOldPolicyCounterfactual {
+  status: "PENDING" | "MATURE_TP" | "MATURE_SL" | "OUTCOME_AMBIGUOUS" | "UNAVAILABLE";
+  exitPolicyId: "legacy-global-2r-bracket";
+  tpMultipleR: 2;
+  structuralStop: number;
+  takeProfit: number;
+  startedAt: string;
+  lastCheckedBarOpenTime: number | null;
+  maturedAt: string | null;
+  exitPrice: number | null;
+  grossR: number | null;
+  ambiguityReason: string | null;
+}
+
+/** Immutable evidence captured before the canonical logical flatten begins. */
+export interface DailyRangeThesisInvalidationRecord {
+  reason: DailyRangeThesisInvalidationReason;
+  invalidationCandleOpenTime: number;
+  invalidationCandleCloseTime: number;
+  invalidationClose: number;
+  referenceBoundary: number;
+  distanceFromBoundary: number;
+  mfeAtThesisInvalidation: number | null;
+  maeAtThesisInvalidation: number | null;
+  actualExitFill: number | null;
+  exitSlippageBps: number | null;
+  oldStructuralStop: number | null;
+  oldNativeTakeProfit: number | null;
+  oldPolicyCounterfactual: DailyRangeOldPolicyCounterfactual | null;
+}
+
 /**
  * The only account-level claim this isolated lane is allowed to publish.  It
  * exists for reconciliation/reporting; it never carries permission for another
@@ -662,6 +723,10 @@ export interface DailyRangeOpenPositionClaim {
   status: Extract<DailyRangeTradeStatus, "PROTECTING" | "OPEN" | "EXIT_RECONCILING">;
   stopPrice: number | null;
   takeProfitPrice: number | null;
+  entryPolicy: DailyRangeEntryPolicy;
+  exitPolicyId: string | null;
+  tpMultipleR: number;
+  thesisInvalidationType: string | null;
   lastReconcileError: string | null;
 }
 
@@ -1180,6 +1245,8 @@ export function roundDailyRangeBracket(input: {
   entry: number;
   rawStop: number;
   tickSize: number;
+  /** Explicit for V1 route exits; omitted only by frozen legacy 2R callers. */
+  tpMultipleR?: number;
 }): {
   stop: number;
   takeProfitRaw: number;
@@ -1192,14 +1259,15 @@ export function roundDailyRangeBracket(input: {
     : roundToStep(input.rawStop, input.tickSize, "up");
   const riskPrice = input.direction === "LONG" ? input.entry - stop : stop - input.entry;
   if (!(riskPrice > EPSILON)) return null;
+  const tpMultipleR = finitePositive(input.tpMultipleR) ? input.tpMultipleR : DAILY_RANGE_RR;
   const takeProfitRaw = input.direction === "LONG"
-    ? input.entry + DAILY_RANGE_RR * riskPrice
-    : input.entry - DAILY_RANGE_RR * riskPrice;
+    ? input.entry + tpMultipleR * riskPrice
+    : input.entry - tpMultipleR * riskPrice;
   const takeProfit = input.direction === "LONG"
     ? roundToStep(takeProfitRaw, input.tickSize, "up")
     : roundToStep(takeProfitRaw, input.tickSize, "down");
   const roundedReward = input.direction === "LONG" ? takeProfit - input.entry : input.entry - takeProfit;
-  if (!(takeProfit > 0) || roundedReward + EPSILON < DAILY_RANGE_RR * riskPrice) return null;
+  if (!(takeProfit > 0) || roundedReward + EPSILON < tpMultipleR * riskPrice) return null;
   return { stop, takeProfitRaw, takeProfit, riskPrice };
 }
 
@@ -1654,6 +1722,10 @@ export class DailyRangeAcceptanceLane {
         status,
         stopPrice: trade.stopPrice,
         takeProfitPrice: trade.takeProfitPrice,
+        entryPolicy: trade.entryPolicy ?? "LEGACY_CONTINUATION",
+        exitPolicyId: trade.routeExitPolicy?.exitPolicyId ?? null,
+        tpMultipleR: trade.routeExitPolicy?.tpMultipleR ?? trade.rrTarget,
+        thesisInvalidationType: trade.routeExitPolicy?.thesisInvalidationType ?? null,
         lastReconcileError: trade.lastReconcileError,
       }];
     });
@@ -1983,6 +2055,21 @@ export class DailyRangeAcceptanceLane {
       laneId: DAILY_RANGE_LANE_ID,
       strategyVersion: this.strategyVersion,
       strategyMode: this.strategyMode,
+      routeExitPolicy: {
+        policyId: DAILY_RANGE_ROUTE_EXIT_POLICY_ID,
+        appliesTo: "NEW_AUTO_ROUTE_ENTRIES_ONLY",
+        completedCandleInterval: "5m",
+        continuation: {
+          tpMultipleR: dailyRangeTpMultipleForRoute("CONTINUATION"),
+          hardStop: "FROZEN_STRUCTURAL_STOP",
+          thesisInvalidationType: "RANGE_REENTRY",
+        },
+        fade: {
+          tpMultipleR: dailyRangeTpMultipleForRoute("FADE"),
+          hardStop: "FROZEN_STRUCTURAL_STOP",
+          thesisInvalidationType: "ORIGINAL_BREAKOUT_REACCEPTANCE",
+        },
+      },
       utcNow: iso(now),
       control: state.control,
       reconciled: this.startupReconciled,
@@ -2115,6 +2202,7 @@ export class DailyRangeAcceptanceLane {
           selected: candidate.actuallySelected ?? false,
           skipReason: candidate.skipReason ?? null,
           geometry: candidate.geometry ?? candidate.economics?.geometry ?? null,
+          routeExitPolicy: candidate.routeExitPolicy ?? null,
         })),
       } : null,
       lastBatchCandidateCount: lastBatch?.allocation?.candidateCount ?? 0,
@@ -2230,6 +2318,48 @@ export class DailyRangeAcceptanceLane {
       add(bySymbol, trade.symbol);
       add(byDate, trade.dateUtc);
     }
+    // Policy cohorts are intentionally immutable.  A legacy 2R continuation
+    // must never blend into the new 1R continuation headline merely because
+    // both happen to share an entry route name.
+    const routeCohortKey = (trade: DailyRangeTrade): string => {
+      const policyId = trade.routeExitPolicy?.exitPolicyId ?? "legacy-global-2r-bracket";
+      const route = trade.routeExitPolicy?.route ?? trade.entryPolicy ?? "LEGACY_CONTINUATION";
+      const tpMultipleR = trade.routeExitPolicy?.tpMultipleR ?? trade.rrTarget ?? DAILY_RANGE_RR;
+      return `${policyId}:${route}:${tpMultipleR}R`;
+    };
+    const summarizeRouteCohort = (rows: DailyRangeTrade[]) => {
+      const cohortWins = rows.filter((trade) => (trade.netPnlUsd ?? 0) > 0);
+      const cohortLosses = rows.filter((trade) => (trade.netPnlUsd ?? 0) < 0);
+      const cohortGrossProfit = cohortWins.reduce((sum, trade) => sum + Math.max(0, trade.netPnlUsd ?? 0), 0);
+      const cohortGrossLoss = cohortLosses.reduce((sum, trade) => sum + Math.abs(Math.min(0, trade.netPnlUsd ?? 0)), 0);
+      const average = (values: Array<number | null | undefined>): number | null => {
+        const usable = values.filter(finiteNumber);
+        return usable.length ? usable.reduce((sum, value) => sum + value, 0) / usable.length : null;
+      };
+      return {
+        trades: rows.length,
+        wins: cohortWins.length,
+        losses: cohortLosses.length,
+        logicalInvalidations: rows.filter((trade) => trade.exitReason === "CONTINUATION_RANGE_REENTRY_EXIT" || trade.exitReason === "FADE_BREAKOUT_REACCEPTANCE_EXIT").length,
+        grossPnlUsd: rows.reduce((sum, trade) => sum + (trade.grossPnlUsd ?? 0), 0),
+        feesUsd: rows.reduce((sum, trade) => sum + (trade.feesUsd ?? 0), 0),
+        fundingUsd: rows.reduce((sum, trade) => sum + (trade.fundingUsd ?? 0), 0),
+        netPnlUsd: rows.reduce((sum, trade) => sum + (trade.netPnlUsd ?? 0), 0),
+        grossR: rows.reduce((sum, trade) => sum + (trade.grossR ?? 0), 0),
+        netR: rows.reduce((sum, trade) => sum + (trade.realizedR ?? 0), 0),
+        averageMfeR: average(rows.map((trade) => trade.mfeR)),
+        averageMaeR: average(rows.map((trade) => trade.maeR)),
+        winRate: rows.length ? cohortWins.length / rows.length : null,
+        profitFactor: cohortGrossLoss > 0 ? cohortGrossProfit / cohortGrossLoss : cohortGrossProfit > 0 ? null : null,
+        averageHoldingDurationMs: average(rows.map((trade) => trade.holdingDurationMs)),
+      };
+    };
+    const routeCohorts: Record<string, ReturnType<typeof summarizeRouteCohort>> = {};
+    for (const trade of closed) {
+      const key = routeCohortKey(trade);
+      const rows = closed.filter((candidate) => routeCohortKey(candidate) === key);
+      if (!routeCohorts[key]) routeCohorts[key] = summarizeRouteCohort(rows);
+    }
     return {
       totalSignals: this.store.getState().signals.length,
       executedTrades: executed.length,
@@ -2252,8 +2382,11 @@ export class DailyRangeAcceptanceLane {
       short: byDirection("SHORT"),
       bySymbol,
       byUtcDate: byDate,
+      routeCohorts,
       takeProfitCount: closed.filter((trade) => trade.exitReason === "TAKE_PROFIT").length,
       stopLossCount: closed.filter((trade) => trade.exitReason === "STOP_LOSS").length,
+      continuationRangeReentryExitCount: closed.filter((trade) => trade.exitReason === "CONTINUATION_RANGE_REENTRY_EXIT").length,
+      fadeBreakoutReacceptanceExitCount: closed.filter((trade) => trade.exitReason === "FADE_BREAKOUT_REACCEPTANCE_EXIT").length,
       executionAbortCount: this.store.getState().trades.filter((trade) => trade.status.startsWith("ENTRY_ABORT_")).length,
     };
   }
@@ -2325,10 +2458,17 @@ export class DailyRangeAcceptanceLane {
     try {
       if (!this.startupReconciled) await this.reconcileOnStartup();
       const exchangeReconciled = await this.reconcileOpenTrades();
-      if (exchangeReconciled) await this.migrateOpenTradesToGeometryPolicy();
+      if (exchangeReconciled) {
+        await this.migrateOpenTradesToGeometryPolicy();
+        // Logical exits are independent from the entry window. A disarmed lane
+        // still retains its native safety, and a protected V1 position still
+        // receives its completed-5m thesis check without enabling any entry.
+        await this.processRouteSpecificThesisInvalidations();
+      }
       // Research labels mature independently from entry mode. A paused/disarmed
       // lane must never abandon already-recorded counterfactual outcomes.
       await this.matureCounterfactualOutcomes();
+      await this.matureThesisInvalidationCounterfactuals();
       // If a process ended between the order attempt and the passive cohort
       // snapshot, recover the outcome from the durable signal record only.
       this.syncSignalCohortDecisions();
@@ -2584,6 +2724,180 @@ export class DailyRangeAcceptanceLane {
     this.syncSignalCohortDecisions();
   }
 
+  /**
+   * Replays only completed, contiguous 5m candles after a V1 trade's frozen
+   * decision bar. It has no entry path and never interprets websocket ticks or
+   * intra-bar wicks as a thesis failure.
+   */
+  private async processRouteSpecificThesisInvalidations(): Promise<void> {
+    const now = this.nowMs();
+    const latestCompletedOpen = lastClosedFiveMinuteOpenTime(now);
+    if (latestCompletedOpen === null) return;
+    const active = this.store.getState().trades
+      .filter((trade) => trade.status === "OPEN" && isDailyRangeRouteExitV1(trade.routeExitPolicy))
+      .sort((left, right) => left.entrySubmittedAt.localeCompare(right.entrySubmittedAt) || left.tradeId.localeCompare(right.tradeId));
+    for (const trade of active) {
+      if (this.closingTradeIds.has(trade.tradeId) || trade.thesisInvalidation) continue;
+      const policy = trade.routeExitPolicy;
+      if (!policy) continue;
+      const entryFilledAt = toMs(trade.entryFilledAt) ?? toMs(trade.entrySubmittedAt);
+      if (entryFilledAt === null) continue;
+      // The thesis watcher starts with the first *whole completed* 5m candle
+      // after the real entry.  It must not retrospectively turn a pre-fill C2
+      // or a candle already in progress at fill time into a logical exit.
+      const firstEligibleOpen = Math.ceil(entryFilledAt / FIVE_MIN_MS) * FIVE_MIN_MS;
+      let nextOpen = Math.max(
+        (trade.lastThesisInvalidationBarOpenTime ?? trade.confirmationBar2.openTime) + FIVE_MIN_MS,
+        trade.confirmationBar2.openTime + FIVE_MIN_MS,
+        firstEligibleOpen,
+      );
+      let complete = true;
+      while (nextOpen <= latestCompletedOpen && trade.status === "OPEN" && !trade.thesisInvalidation) {
+        const endOpen = Math.min(latestCompletedOpen, nextOpen + 499 * FIVE_MIN_MS);
+        let rows: DailyRangeCandle[];
+        try {
+          rows = (await this.client.getKlines(trade.symbol, "5m", {
+            startTime: nextOpen,
+            endTime: endOpen + FIVE_MIN_MS - 1,
+            limit: 500,
+          }))
+            .map(asDailyCandle)
+            .filter((candle) => candle.openTime >= nextOpen && candle.openTime <= endOpen
+              && candle.closeTime === candle.openTime + FIVE_MIN_MS - 1
+              && candle.closeTime < now)
+            .sort((left, right) => left.openTime - right.openTime);
+        } catch {
+          complete = false;
+          break;
+        }
+        const expectedCount = Math.floor((endOpen - nextOpen) / FIVE_MIN_MS) + 1;
+        if (rows.length !== expectedCount || rows.some((row, index) => row.openTime !== nextOpen + index * FIVE_MIN_MS)) {
+          // Do not leap a missing close and silently manufacture an invalidation.
+          complete = false;
+          break;
+        }
+        for (const candle of rows) {
+          const decision = evaluateDailyRangeThesisInvalidation({ policy, candle });
+          trade.lastThesisInvalidationBarOpenTime = candle.openTime;
+          if (!decision) continue;
+          this.store.save();
+          await this.flattenOnRouteThesisInvalidation(trade, decision);
+          break;
+        }
+        nextOpen = endOpen + FIVE_MIN_MS;
+      }
+      if (complete || trade.lastThesisInvalidationBarOpenTime !== null) this.store.save();
+    }
+  }
+
+  private oldPolicyCounterfactualForThesisExit(trade: DailyRangeTrade, at: string): DailyRangeOldPolicyCounterfactual | null {
+    if (!finitePositive(trade.stopPrice) || !finitePositive(trade.oldPolicyTakeProfitPrice ?? null)) return null;
+    return {
+      status: "PENDING",
+      exitPolicyId: "legacy-global-2r-bracket",
+      tpMultipleR: 2,
+      structuralStop: trade.stopPrice,
+      takeProfit: trade.oldPolicyTakeProfitPrice!,
+      startedAt: at,
+      lastCheckedBarOpenTime: null,
+      maturedAt: null,
+      exitPrice: null,
+      grossR: null,
+      ambiguityReason: null,
+    };
+  }
+
+  /**
+   * Reconcile immediately before creating the single logical-exit intent. If a
+   * native TP/SL already won the race, reconciliation makes it terminal and no
+   * market exit or second P&L record is created.
+   */
+  private async flattenOnRouteThesisInvalidation(
+    trade: DailyRangeTrade,
+    decision: DailyRangeThesisInvalidationDecision,
+  ): Promise<void> {
+    if (trade.status !== "OPEN" || trade.thesisInvalidation || this.closingTradeIds.has(trade.tradeId)) return;
+    const reconciled = await this.reconcileOpenTrades();
+    if (!reconciled || trade.status !== "OPEN" || trade.thesisInvalidation || this.closingTradeIds.has(trade.tradeId)) return;
+    const at = iso(decision.candleCloseTime + 1);
+    trade.thesisInvalidation = {
+      reason: decision.reason,
+      invalidationCandleOpenTime: decision.candleOpenTime,
+      invalidationCandleCloseTime: decision.candleCloseTime,
+      invalidationClose: decision.candleClose,
+      referenceBoundary: decision.referenceBoundary,
+      distanceFromBoundary: decision.distanceFromBoundary,
+      mfeAtThesisInvalidation: trade.mfeR ?? null,
+      maeAtThesisInvalidation: trade.maeR ?? null,
+      actualExitFill: null,
+      exitSlippageBps: null,
+      oldStructuralStop: trade.stopPrice,
+      oldNativeTakeProfit: trade.oldPolicyTakeProfitPrice ?? trade.takeProfitPrice,
+      oldPolicyCounterfactual: this.oldPolicyCounterfactualForThesisExit(trade, at),
+    };
+    this.store.save();
+    await this.emergencyFlatten(trade, "CLOSED", decision.reason);
+    if ((trade.status as DailyRangeTradeStatus) === "CLOSED" && trade.exitReason === decision.reason && trade.thesisInvalidation) {
+      trade.thesisInvalidation.actualExitFill = trade.exitPrice;
+      trade.thesisInvalidation.exitSlippageBps = trade.exitSlippageBps;
+      this.store.save();
+    }
+  }
+
+  /** Continue research-only tracking of the legacy global-2R bracket after a logical exit. */
+  private async matureThesisInvalidationCounterfactuals(): Promise<void> {
+    const pending = this.store.getState().trades
+      .filter((trade) => trade.status === "CLOSED" && trade.thesisInvalidation?.oldPolicyCounterfactual?.status === "PENDING")
+      .sort((left, right) => (left.exitTimestamp ?? left.entrySubmittedAt).localeCompare(right.exitTimestamp ?? right.entrySubmittedAt))
+      .slice(0, MAX_COUNTERFACTUAL_MATURATION_PER_TICK);
+    if (pending.length === 0) return;
+    const now = this.nowMs();
+    const latestCompletedMinuteOpen = Math.floor(now / 60_000) * 60_000 - 60_000;
+    if (latestCompletedMinuteOpen < 0) return;
+    await Promise.all(pending.map(async (trade) => {
+      const record = trade.thesisInvalidation;
+      const outcome = record?.oldPolicyCounterfactual;
+      if (!record || !outcome || outcome.status !== "PENDING" || !finitePositive(trade.entryFillPrice) || !finitePositive(trade.stopPrice)) return;
+      const startTime = outcome.lastCheckedBarOpenTime ?? Math.floor((record.invalidationCandleCloseTime + 1) / 60_000) * 60_000;
+      try {
+        const rows = await this.client.getKlines(trade.symbol, "1m", {
+          startTime,
+          endTime: latestCompletedMinuteOpen + 60_000 - 1,
+          limit: 1_500,
+        });
+        const candles = rows.map(asDailyCandle)
+          .filter((candle) => candle.openTime >= startTime && candle.closeTime < now)
+          .sort((left, right) => left.openTime - right.openTime);
+        for (const candle of candles) {
+          const tpHit = trade.direction === "LONG" ? candle.high >= outcome.takeProfit : candle.low <= outcome.takeProfit;
+          const slHit = trade.direction === "LONG" ? candle.low <= outcome.structuralStop : candle.high >= outcome.structuralStop;
+          if (!tpHit && !slHit) continue;
+          outcome.maturedAt = iso(candle.closeTime + 1);
+          if (tpHit && slHit) {
+            outcome.status = "OUTCOME_AMBIGUOUS";
+            outcome.ambiguityReason = "1m OHLC touched legacy TP and structural SL in the same candle";
+            return;
+          }
+          const exitPrice = tpHit ? outcome.takeProfit : outcome.structuralStop;
+          const risk = trade.direction === "LONG"
+            ? trade.entryFillPrice - trade.stopPrice
+            : trade.stopPrice - trade.entryFillPrice;
+          outcome.status = tpHit ? "MATURE_TP" : "MATURE_SL";
+          outcome.exitPrice = exitPrice;
+          outcome.grossR = risk > EPSILON
+            ? (trade.direction === "LONG" ? exitPrice - trade.entryFillPrice : trade.entryFillPrice - exitPrice) / risk
+            : null;
+          return;
+        }
+        const last = candles.at(-1);
+        if (last) outcome.lastCheckedBarOpenTime = last.openTime + 60_000;
+      } catch {
+        // Leave the shadow record pending rather than inventing a path result.
+      }
+    }));
+    this.store.save();
+  }
+
   private applyCandle(
     day: DailyRangeDayState,
     level: DailyRangeLevel,
@@ -2682,6 +2996,18 @@ export class DailyRangeAcceptanceLane {
       ? confirmationBar1
       : null;
     const window = this.currentReferenceWindow(confirmationBar2.closeTime + 1);
+    // The policy becomes effective only at this clean completed-5m decision
+    // boundary. Existing durable signals/trades have no such snapshot and stay
+    // on their original global-2R exit lineage.
+    const routeExitPolicy = this.isAutoRoute()
+      ? dailyRangeRouteExitPolicyForSignal({
+        route: route?.entryPolicy ?? null,
+        originalBreakoutDirection: route?.breakoutDirection ?? null,
+        rangeHigh: level.rangeHigh,
+        rangeLow: level.rangeLow,
+        effectiveAt: iso(confirmationBar2.closeTime + 1),
+      })
+      : null;
     const signal: DailyRangeSignal = {
       signalId: signalId(this.strategyVersion, day.dateUtc, level.symbol, direction, confirmationBar2.closeTime),
       strategyVersion: this.strategyVersion,
@@ -2720,6 +3046,7 @@ export class DailyRangeAcceptanceLane {
       referenceTimezone: day.referenceTimezone ?? window.referenceTimezone,
       referenceRangeOpenTime: day.referenceRangeOpenTime ?? level.fourHourOpenTime,
       referenceRangeCloseTime: day.referenceRangeCloseTime ?? level.fourHourCloseTime,
+      routeExitPolicy,
     };
     state.signals.push(signal);
     console.log(`[daily-range-lane] ${signal.entryPolicy}_${direction}_CONFIRMED symbol=${signal.symbol} signal=${signal.signalId} breakout=${signal.breakoutId ?? "legacy"}`);
@@ -2758,6 +3085,7 @@ export class DailyRangeAcceptanceLane {
       tieBreakHash: null,
       economics: signal.economics ?? null,
       geometry: signal.geometry ?? signal.economics?.geometry ?? null,
+      routeExitPolicy: signal.routeExitPolicy ?? null,
       alphaSelector: signal.alphaSelector ?? null,
       actuallySelected: signal.actuallySelected ?? false,
       actuallyExecuted: signal.actuallyExecuted ?? false,
@@ -2955,6 +3283,22 @@ export class DailyRangeAcceptanceLane {
     return { slots, displaySlots: slots, pendingReservations, maxOpenTrades };
   }
 
+  /**
+   * Re-arming creates a fresh observation boundary. A V1 candidate generated
+   * before that boundary must never be filled later from a durable cohort or
+   * recovery path. Legacy records intentionally retain their historical
+   * behavior; only the new route-specific policy gets this cutover guard.
+   */
+  private v1SignalArmEpochBlockReason(signal: DailyRangeSignal): DailyRangeSignalReason | null {
+    if (!isDailyRangeRouteExitV1(signal.routeExitPolicy)) return null;
+    const armedAt = toMs(this.store.getState().control.armedAt);
+    const effectiveAt = toMs(signal.routeExitPolicy.effectiveAt) ?? signal.signalTimestampMs;
+    if (armedAt !== null && Math.max(signal.signalTimestampMs, effectiveAt) < armedAt) {
+      return "MISSED_SIGNAL_RECOVERY";
+    }
+    return null;
+  }
+
   private batchCandidateBlockReason(signal: DailyRangeSignal): DailyRangeSignalReason | null {
     const state = this.store.getState();
     if (signal.strategyVersion !== this.strategyVersion) return "RETIRED_STRATEGY_VERSION";
@@ -2972,6 +3316,8 @@ export class DailyRangeAcceptanceLane {
       accountGate = { allowed: false, reason: error instanceof Error ? error.message : String(error) };
     }
     if (!accountGate.allowed) return "ACCOUNT_ENTRY_BLOCKED";
+    const armEpochBlock = this.v1SignalArmEpochBlockReason(signal);
+    if (armEpochBlock) return armEpochBlock;
     if (!this.inEntryWindow(signal.signalTimestampMs)) return "OUTSIDE_ENTRY_WINDOW";
     if (this.nowMs() - signal.signalTimestampMs > MAX_FRESH_SIGNAL_AGE_MS) return "MISSED_SIGNAL_RECOVERY";
     if (!signal.confirmationBar1 || signal.reason === "STALE_DATA") return "STALE_DATA";
@@ -3001,6 +3347,7 @@ export class DailyRangeAcceptanceLane {
 
   private alphaSnapshotForSignal(signal: DailyRangeSignal): DailyRangeAlphaSelectorSnapshot {
     const featureSnapshotAt = signal.research?.features?.capturedAt ?? null;
+    const economics = signal.economics ?? null;
     if (this.allocatorMode === "SHADOW_ALPHA_SELECTOR" || this.allocatorMode === "SHADOW_SELECTOR" || this.allocatorMode === "ECONOMIC_QUALITY_BASELINE") {
       return {
         policyId: DAILY_RANGE_ALPHA_SELECTOR_POLICY_ID,
@@ -3009,6 +3356,10 @@ export class DailyRangeAcceptanceLane {
         pTp: null,
         expectedNetR: null,
         expectedNetUsd: null,
+        tpMultipleR: economics?.tpMultipleR ?? null,
+        netWinR: economics?.netWinR ?? null,
+        netLossR: economics?.netLossR ?? null,
+        breakEvenWinRate: economics?.breakEvenWinRate ?? null,
         reason: "ALPHA_SELECTOR_SHADOW_ONLY",
         featureSnapshotAt,
       };
@@ -3020,6 +3371,10 @@ export class DailyRangeAcceptanceLane {
       pTp: null,
       expectedNetR: null,
       expectedNetUsd: null,
+      tpMultipleR: economics?.tpMultipleR ?? null,
+      netWinR: economics?.netWinR ?? null,
+      netLossR: economics?.netLossR ?? null,
+      breakEvenWinRate: economics?.breakEvenWinRate ?? null,
       reason: "SELECTOR_NOT_READY",
       featureSnapshotAt,
     };
@@ -3586,6 +3941,8 @@ export class DailyRangeAcceptanceLane {
 
   private initializeCounterfactual(signal: DailyRangeSignal, filter: FuturesSymbolFilters | null): DailyRangeCounterfactualOutcome {
     const entryPrice = signal.confirmationBar2.close;
+    const routeExitPolicy = signal.routeExitPolicy ?? null;
+    const tpMultipleR = routeExitPolicy?.tpMultipleR ?? DAILY_RANGE_RR;
     const structuralStop = structuralStopForDailyRangeSignal({
       ...signal,
       confirmationBar1: signal.confirmationBar1 ?? signal.confirmationBar2,
@@ -3595,11 +3952,12 @@ export class DailyRangeAcceptanceLane {
       entry: entryPrice,
       rawStop: structuralStop,
       tickSize: filter.tickSize,
+      tpMultipleR,
     }) : null;
     const risk = signal.direction === "LONG" ? entryPrice - (rounded?.stop ?? structuralStop) : (rounded?.stop ?? structuralStop) - entryPrice;
     const takeProfit = rounded?.takeProfit ?? (signal.direction === "LONG"
-      ? entryPrice + DAILY_RANGE_RR * risk
-      : entryPrice - DAILY_RANGE_RR * risk);
+      ? entryPrice + tpMultipleR * risk
+      : entryPrice - tpMultipleR * risk);
     const quantity = filter ? clampQty(DAILY_RANGE_TRADE_NOTIONAL_USD / entryPrice, filter) : null;
     return {
       status: "PENDING",
@@ -3609,6 +3967,9 @@ export class DailyRangeAcceptanceLane {
       entryPrice,
       structuralStop: rounded?.stop ?? structuralStop,
       takeProfit,
+      exitPolicyId: routeExitPolicy?.exitPolicyId ?? "legacy-global-2r-bracket",
+      tpMultipleR,
+      thesisInvalidationType: routeExitPolicy?.thesisInvalidationType ?? null,
       tickSize: filter?.tickSize ?? null,
       quantity,
       modeledEntryFeeBps: RESEARCH_ENTRY_FEE_BPS,
@@ -3758,16 +4119,20 @@ export class DailyRangeAcceptanceLane {
       referenceTimezone: signal.referenceTimezone ?? "UTC",
       referenceRangeOpenTime: signal.referenceRangeOpenTime ?? null,
       referenceRangeCloseTime: signal.referenceRangeCloseTime ?? null,
+      routeExitPolicy: signal.routeExitPolicy ?? null,
+      lastThesisInvalidationBarOpenTime: signal.routeExitPolicy ? signal.confirmationBar2.openTime : null,
+      thesisInvalidation: null,
       confirmationBar1: signal.confirmationBar1,
       confirmationBar2: signal.confirmationBar2,
       structuralStopRaw: rawStop,
       stopPrice: null,
       takeProfitRaw: null,
       takeProfitPrice: null,
+      oldPolicyTakeProfitPrice: null,
       initialRiskPrice: null,
       initialRiskPct: null,
       initialRiskDollar: null,
-      rrTarget: DAILY_RANGE_RR,
+      rrTarget: signal.routeExitPolicy?.tpMultipleR ?? DAILY_RANGE_RR,
       stopAlgoOrderId: null,
       stopClientAlgoId: algoClientId(tradeId, "sl"),
       takeProfitAlgoOrderId: null,
@@ -3841,6 +4206,11 @@ export class DailyRangeAcceptanceLane {
     }
     if (!accountGate?.allowed) {
       this.markSignal(signal, { eligible: false, reason: "ACCOUNT_ENTRY_BLOCKED" });
+      return;
+    }
+    const armEpochBlock = this.v1SignalArmEpochBlockReason(signal);
+    if (armEpochBlock) {
+      this.markSignal(signal, { eligible: false, reason: armEpochBlock });
       return;
     }
     const limitReason = this.entryLimitReason();
@@ -4109,12 +4479,23 @@ export class DailyRangeAcceptanceLane {
       this.store.save();
       return;
     }
+    const tpMultipleR = trade.routeExitPolicy?.tpMultipleR ?? trade.rrTarget ?? DAILY_RANGE_RR;
     const bracket = roundDailyRangeBracket({
       direction: trade.direction,
       entry,
       rawStop: trade.structuralStopRaw,
       tickSize: filter.tickSize,
+      tpMultipleR,
     });
+    const oldPolicyBracket = isDailyRangeRouteExitV1(trade.routeExitPolicy)
+      ? roundDailyRangeBracket({
+        direction: trade.direction,
+        entry,
+        rawStop: trade.structuralStopRaw,
+        tickSize: filter.tickSize,
+        tpMultipleR: DAILY_RANGE_RR,
+      })
+      : null;
     trade.entryOrderId = order.orderId;
     trade.entryFilledAt = iso(order.updateTime > 0 ? order.updateTime : this.nowMs());
     trade.entryFillPrice = entry;
@@ -4132,9 +4513,11 @@ export class DailyRangeAcceptanceLane {
     trade.stopPrice = bracket.stop;
     trade.takeProfitRaw = bracket.takeProfitRaw;
     trade.takeProfitPrice = bracket.takeProfit;
+    trade.oldPolicyTakeProfitPrice = oldPolicyBracket?.takeProfit ?? trade.takeProfitPrice;
     trade.initialRiskPrice = bracket.riskPrice;
     trade.initialRiskPct = bracket.riskPrice / entry;
     trade.initialRiskDollar = bracket.riskPrice * qty;
+    trade.rrTarget = tpMultipleR;
     trade.actualInitialRiskUsd = trade.initialRiskDollar;
     if (!(trade.initialRiskDollar > 0)) {
       trade.lastReconcileError = "initial dollar risk is not positive";
@@ -4147,6 +4530,7 @@ export class DailyRangeAcceptanceLane {
         expectedEntryPrice: entry,
         expectedStopPrice: bracket.stop,
         expectedTakeProfitPrice: bracket.takeProfit,
+        tpMultipleR,
         atr4hFeature: trade.geometry.atr4h !== null
           && trade.geometry.atrSourceLastClosedAt !== null
           && trade.geometry.atrFeatureTimestamp !== null
@@ -4194,7 +4578,7 @@ export class DailyRangeAcceptanceLane {
         trade.status = "PROTECTING";
         this.store.save();
         try {
-          // Keep the structural native stop/2R protection live while the
+          // Keep the frozen structural native protection live while the
           // exact reduce-only flatten is being reconciled. The failure never
           // widens or rewrites either bracket.
           await this.placeAndVerifyBrackets(trade);
@@ -4512,6 +4896,7 @@ export class DailyRangeAcceptanceLane {
       expectedEntryPrice: trade.entryFillPrice ?? Number.NaN,
       expectedStopPrice: trade.stopPrice ?? Number.NaN,
       expectedTakeProfitPrice: trade.takeProfitPrice ?? Number.NaN,
+      tpMultipleR: trade.routeExitPolicy?.tpMultipleR ?? trade.rrTarget ?? DAILY_RANGE_RR,
       atr4hFeature,
     });
   }

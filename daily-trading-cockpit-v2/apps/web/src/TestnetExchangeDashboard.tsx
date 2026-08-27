@@ -299,6 +299,10 @@ interface LiveAccount {
     dailyRangeTakeProfitPrice?: number | null;
     dailyRangeOpenedAt?: string | null;
     dailyRangeStatus?: string | null;
+    dailyRangeEntryPolicy?: string | null;
+    dailyRangeExitPolicyId?: string | null;
+    dailyRangeTpMultipleR?: number | null;
+    dailyRangeThesisInvalidationType?: string | null;
     dailyRangeLastReconcileError?: string | null;
   }>;
   lanes: Array<{
@@ -2684,7 +2688,7 @@ export default function TestnetExchangeDashboard() {
           <header><span>Open Positions</span><strong>{openPositionsCount} pos</strong></header>
           <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
             Directional (operator-controlled, engine mirror) + Basket (cross-sectional hedge, automatic exit only) +
-            Daily range (native SL / 2R TP, lane-managed) + Single-symbol (stop-protected, own exchange-side stop)
+            Daily range (native structural SL / route-specific TP, lane-managed) + Single-symbol (stop-protected, own exchange-side stop)
             {unattributedExchangePositions.length > 0
               ? <> + Exchange tak terikat in one table. Posisi tak terikat tetap ditampilkan agar total exchange dan uPnL tidak terlihat bertentangan; dashboard tidak mengklaim pemiliknya dan tidak memberi tombol close.</>
               : <>. Semua posisi exchange saat ini memiliki pemilik lane yang terverifikasi.</>}
@@ -3068,6 +3072,13 @@ export default function TestnetExchangeDashboard() {
                       const entry = p.dailyRangeEntryPrice ?? p.entryPrice;
                       const stop = p.dailyRangeStopPrice ?? null;
                       const target = p.dailyRangeTakeProfitPrice ?? null;
+                      const tpMultipleR = p.dailyRangeTpMultipleR ?? 2;
+                      const route = p.dailyRangeEntryPolicy ?? 'LEGACY_CONTINUATION';
+                      const logicExit = p.dailyRangeThesisInvalidationType === 'RANGE_REENTRY'
+                        ? '5m range re-entry'
+                        : p.dailyRangeThesisInvalidationType === 'ORIGINAL_BREAKOUT_REACCEPTANCE'
+                          ? '5m breakout re-acceptance'
+                          : '—';
                       const risk = stop != null ? Math.abs(entry - stop) : 0;
                       const dirSign = side === 'LONG' ? 1 : -1;
                       const currentR = p.markPrice != null && risk > 0 ? ((p.markPrice - entry) / risk) * dirSign : null;
@@ -3085,12 +3096,12 @@ export default function TestnetExchangeDashboard() {
                           <td>{Number(qty.toFixed(8))}</td>
                           <td>{price(entry)}</td>
                           <td>{price(p.markPrice)}</td>
-                          <td>{target == null ? 'native 2R pending' : price(target)}</td>
+                          <td>{target == null ? `native ${tpMultipleR}R pending` : `${price(target)} · ${tpMultipleR}R`}</td>
                           <td className={tone(targetGap)}>{percent(targetGap)}</td>
                           <td className="tone-critical">{price(p.liquidationPrice)}</td>
                           <td>{price(stop)}</td>
                           <td className={tone(currentR ?? 0)}>{currentR == null ? '—' : `${currentR.toFixed(2)}R`}</td>
-                          <td>native SL / 2R TP</td>
+                          <td>route {route} · SL structural / TP {tpMultipleR}R<br /><small>{logicExit}</small></td>
                           <td className={tone(unreal)}>{signed(unreal)}</td>
                           <td className={tone(afterCost)}>{signed(afterCost)}</td>
                           <td>{p.leverage}x</td>
@@ -3098,7 +3109,7 @@ export default function TestnetExchangeDashboard() {
                           <td>{compactLane('DAILY_4H_RANGE_ACCEPTANCE')}</td>
                           <td>{p.dailyRangeOpenedAt ? taipeiDateTime(p.dailyRangeOpenedAt) ?? '—' : '—'}</td>
                           <td>{p.dailyRangeStatus ?? '—'}{reconcileError ? <small className="tone-warning" style={{ display: 'block' }}>reconcile: {reconcileError}</small> : null}</td>
-                          <td className="tone-measure" title="Milik lane daily-range dengan native stop dan target 2R. Penutupan harus melalui lifecycle lane, bukan close net position generik.">lane-managed</td>
+                          <td className="tone-measure" title={`Milik lane Daily Range; ${p.dailyRangeExitPolicyId ?? 'legacy 2R'} · native structural stop tetap aktif. Penutupan harus melalui lifecycle lane, bukan close net position generik.`}>lane-managed</td>
                         </tr>
                       );
                     })}

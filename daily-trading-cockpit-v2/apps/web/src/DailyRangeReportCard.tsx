@@ -41,6 +41,17 @@ type DailyRangeTrade = DailyRangeHeadlineTrade & {
   rangeHigh: number;
   rangeLow: number;
   entryPolicy?: 'LEGACY_CONTINUATION' | 'CONTINUATION' | 'FADE';
+  routeExitPolicy?: {
+    exitPolicyId: string;
+    route: 'CONTINUATION' | 'FADE';
+    tpMultipleR: number;
+    thesisInvalidationType: 'RANGE_REENTRY' | 'ORIGINAL_BREAKOUT_REACCEPTANCE';
+    effectiveAt: string;
+    originalBreakoutDirection: 'UP' | 'DOWN';
+    originalBreakoutBoundary: number;
+    referenceRangeHigh: number;
+    referenceRangeLow: number;
+  } | null;
   referenceTimezone?: 'UTC' | 'America/New_York';
   stopPrice: number | null;
   takeProfitPrice: number | null;
@@ -90,6 +101,7 @@ type DailyRangeTrade = DailyRangeHeadlineTrade & {
 
 type DailyRangeTradeGeometry = {
   geometryPolicyId: string;
+  tpMultipleR?: number;
   maxStopPct: number;
   maxTargetPct: number;
   maxTargetAtrMultiple: number;
@@ -212,6 +224,7 @@ type DailyRangeStatus = {
       selected?: boolean;
       skipReason?: string | null;
       geometry?: DailyRangeTradeGeometry | null;
+      routeExitPolicy?: DailyRangeTrade['routeExitPolicy'];
     }>;
   } | null;
   mfeMae?: { triggerWorkingType?: string; collection?: string; fallback?: string; openPathQuality?: Record<string, number> } | null;
@@ -336,7 +349,8 @@ function geometrySummary(trade: DailyRangeTrade): string {
   const status = trade.geometryMigration?.status
     ?? (geometry.geometryPass ? 'PASS' : `FAIL ${geometry.geometryRejectReason ?? ''}`.trim());
   const atr = finite(geometry.targetAtrMultiple) ? `${geometry.targetAtrMultiple.toFixed(2)}× ATR` : 'ATR —';
-  return `SL ${geometryPct(geometry.stopDistancePct)} · TP ${geometryPct(geometry.tpDistancePct)} · ${atr} · ${status}`;
+  const tpMultipleR = finite(geometry.tpMultipleR) ? geometry.tpMultipleR : trade.routeExitPolicy?.tpMultipleR ?? trade.rrTarget ?? 2;
+  return `SL ${geometryPct(geometry.stopDistancePct)} · TP ${tpMultipleR}R ${geometryPct(geometry.tpDistancePct)} · ${atr} · ${status}`;
 }
 
 function tradeNotional(trade: DailyRangeTrade): number | null {
@@ -393,6 +407,17 @@ function entryPolicyClass(policy: DailyRangeTrade['entryPolicy']): string {
   return policy === 'FADE' ? 'is-fade' : policy === 'CONTINUATION' ? 'is-continuation' : 'is-legacy';
 }
 
+function logicExitLabel(trade: DailyRangeTrade): string {
+  if (trade.routeExitPolicy?.thesisInvalidationType === 'RANGE_REENTRY') return '5m range re-entry';
+  if (trade.routeExitPolicy?.thesisInvalidationType === 'ORIGINAL_BREAKOUT_REACCEPTANCE') return '5m original breakout re-acceptance';
+  return '—';
+}
+
+function routeExitPolicyLabel(trade: DailyRangeTrade): string {
+  if (!trade.routeExitPolicy) return 'legacy global 2R';
+  return `${trade.routeExitPolicy.exitPolicyId} · TP ${trade.routeExitPolicy.tpMultipleR}R`;
+}
+
 function latestFirst(left: DailyRangeTrade, right: DailyRangeTrade): number {
   return Date.parse(right.exitTimestamp ?? '') - Date.parse(left.exitTimestamp ?? '');
 }
@@ -438,7 +463,10 @@ function ClosedDailyRangeReport({
         <tbody>{closedTrades.map((trade) => <tr key={trade.tradeId}>
           <td><strong>{trade.symbol}</strong></td>
           <td style={{ color: toneForSide(trade.direction), fontWeight: 700 }}>{trade.direction}</td>
-          <td><span className={`daily-range-state ${entryPolicyClass(trade.entryPolicy)}`} title={entryPolicyDescription(trade.entryPolicy)}>{entryPolicyLabel(trade.entryPolicy)}</span></td>
+          <td>
+            <span className={`daily-range-state ${entryPolicyClass(trade.entryPolicy)}`} title={entryPolicyDescription(trade.entryPolicy)}>{entryPolicyLabel(trade.entryPolicy)}</span>
+            <small>{routeExitPolicyLabel(trade)}<br />logic: {logicExitLabel(trade)}</small>
+          </td>
           <td>{formatTaipei(trade.entryFilledAt ?? trade.entrySubmittedAt)}</td>
           <td>{formatPrice(trade.entryFillPrice)}</td>
           <td>{formatPrice(trade.exitPrice)}</td>
@@ -564,6 +592,9 @@ export default function DailyRangeReportCard({
     stopPrice: selectedTrade.stopPrice,
     takeProfitPrice: selectedTrade.takeProfitPrice,
     entryPolicy: selectedTrade.entryPolicy,
+    tpMultipleR: selectedTrade.routeExitPolicy?.tpMultipleR ?? selectedTrade.rrTarget,
+    exitPolicyId: selectedTrade.routeExitPolicy?.exitPolicyId ?? null,
+    thesisInvalidationType: selectedTrade.routeExitPolicy?.thesisInvalidationType ?? null,
   } : null;
 
   const notional = openTrades.reduce((sum, trade) => sum + (tradeNotional(trade) ?? 0), 0);
@@ -606,11 +637,11 @@ export default function DailyRangeReportCard({
         <span className="tone-measure">{runtimeLabel}</span>
       </header>
       <div className="daily-range-report-note">
-        Range <strong>{usesAutoRouter ? '00:00–04:00 New York' : '00:00–04:00 UTC'}</strong> → {usesAutoRouter ? 'breakout bertahan = Continuation; kembali masuk range = Breakout Fade.' : 'dua close 5m selesai di luar range → native structural SL + fixed 2R TP.'}
+        Range <strong>{usesAutoRouter ? '00:00–04:00 New York' : '00:00–04:00 UTC'}</strong> → {usesAutoRouter ? 'breakout bertahan = Continuation (TP 1R); kembali masuk range = Breakout Fade (TP 2R). Hard SL tetap structural; logic exit memakai close 5m selesai.' : 'dua close 5m selesai di luar range → native structural SL + fixed 2R TP.'}
         Klik simbol trade untuk membuka candle; level range selalu memakai data trade yang dibekukan saat entry.
       </div>
       {geometryPolicy ? <div className="daily-range-message" title={geometryPolicy.atrDefinition ?? 'ATR14 dari candle 4H yang sudah selesai pada waktu keputusan.'}>
-        <strong>Geometry policy</strong> · structural stop ≤ {geometryPct(geometryPolicy.maxStructuralStopPct)} · target 2R ≤ {geometryPct(geometryPolicy.maxTargetDistancePct)} · target ≤ {finite(geometryPolicy.maxTargetAtr4hMultiple) ? `${geometryPolicy.maxTargetAtr4hMultiple.toFixed(2)}× ATR14(4H)` : '—'}
+        <strong>Geometry policy</strong> · structural stop ≤ {geometryPct(geometryPolicy.maxStructuralStopPct)} · route target (Continuation 1R / Fade 2R) ≤ {geometryPct(geometryPolicy.maxTargetDistancePct)} · target ≤ {finite(geometryPolicy.maxTargetAtr4hMultiple) ? `${geometryPolicy.maxTargetAtr4hMultiple.toFixed(2)}× ATR14(4H)` : '—'}
         {geometryCandidateSummary ? <> · kandidat {geometryCandidateSummary.passed ?? 0} pass / {geometryCandidateSummary.rejected ?? 0} reject</> : null}
         {Object.entries(geometryRejects).some(([, count]) => count > 0) ? <small>reject: {Object.entries(geometryRejects).filter(([, count]) => count > 0).map(([reason, count]) => `${reason} ${count}`).join(' · ')}</small> : null}
       </div> : null}
@@ -620,16 +651,17 @@ export default function DailyRangeReportCard({
           {latestGeometryCandidates.map((candidate) => {
             const geometry = candidate.geometry!;
             const verdict = geometry.geometryPass ? 'PASS' : `FAIL · ${geometry.geometryRejectReason ?? candidate.skipReason ?? '—'}`;
+            const tpMultipleR = finite(geometry.tpMultipleR) ? geometry.tpMultipleR : candidate.routeExitPolicy?.tpMultipleR ?? 2;
             return <div key={candidate.symbol} className={geometry.geometryPass ? 'is-pass' : 'is-fail'}>
               <strong>{candidate.symbol}</strong>
-              <small>SL {geometryPct(geometry.stopDistancePct)} · TP {geometryPct(geometry.tpDistancePct)} · {finite(geometry.targetAtrMultiple) ? `${geometry.targetAtrMultiple.toFixed(2)}× ATR` : 'ATR —'} · {verdict}</small>
+              <small>{candidate.routeExitPolicy?.route ?? 'legacy'} · TP {tpMultipleR}R {geometryPct(geometry.tpDistancePct)} · SL {geometryPct(geometry.stopDistancePct)} · {finite(geometry.targetAtrMultiple) ? `${geometry.targetAtrMultiple.toFixed(2)}× ATR` : 'ATR —'} · {verdict}</small>
             </div>;
           })}
         </div>
       </div> : null}
       {usesAutoRouter && SHOW_DAILY_RANGE_RESEARCH_TELEMETRY ? <>
         <div className="daily-range-ops-summary">
-          <section className="daily-range-ops-section" title="V3 mengurutkan hanya kandidat yang sudah lolos stop economics. Router, arah, structural stop, 2R, dan native bracket tidak berubah.">
+          <section className="daily-range-ops-section" title="V3 mengurutkan hanya kandidat yang sudah lolos stop economics. Router, arah, structural stop, dan native bracket tidak berubah; target mengikuti route (Continuation 1R, Fade 2R).">
             <div className="daily-range-ops-heading">Routing &amp; approval</div>
             <div className="daily-range-ops-grid daily-range-ops-grid--four">
               <DailyRangeInfoCard
@@ -730,7 +762,10 @@ export default function DailyRangeReportCard({
                 <td>Daily range</td>
                 <td><button type="button" className="daily-range-symbol-button" onClick={() => setSelectedTradeId(trade.tradeId)} aria-pressed={selected} title={`Buka candle ${trade.symbol}`}>{trade.symbol}</button></td>
                 <td style={{ color: toneForSide(trade.direction), fontWeight: 700 }}>{trade.direction}</td>
-                <td><span className={`daily-range-state ${entryPolicyClass(trade.entryPolicy)}`} title={entryPolicyDescription(trade.entryPolicy)}>{entryPolicyLabel(trade.entryPolicy)}</span></td>
+                <td>
+                  <span className={`daily-range-state ${entryPolicyClass(trade.entryPolicy)}`} title={entryPolicyDescription(trade.entryPolicy)}>{entryPolicyLabel(trade.entryPolicy)}</span>
+                  <small>{routeExitPolicyLabel(trade)}<br />hard SL structural · logic {logicExitLabel(trade)}</small>
+                </td>
                 <td>{finite(trade.entryQty) ? Number(trade.entryQty.toFixed(8)) : '—'}</td>
                 <td>{formatPrice(trade.entryFillPrice)}</td>
                 <td>{formatPrice(trade.lastMarkPrice)}</td>

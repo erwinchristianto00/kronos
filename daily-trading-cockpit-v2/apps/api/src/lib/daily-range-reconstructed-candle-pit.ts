@@ -12,6 +12,13 @@ import {
   type DailyRangeAutoRouteCandle,
   type DailyRangeAutoRouteDecision,
 } from "./daily-range-auto-route.js";
+import {
+  DAILY_RANGE_ROUTE_EXIT_POLICY_ID,
+  dailyRangeRouteExitPolicyForSignal,
+  evaluateDailyRangeThesisInvalidation,
+  type DailyRangeRouteExitPolicySnapshot,
+  type DailyRangeThesisInvalidationReason,
+} from "./daily-range-route-exit.js";
 
 export const DAILY_RANGE_RECONSTRUCTED_CANDLE_PIT_DATASET_CLASS = "RECONSTRUCTED_CANDLE_PIT" as const;
 export type DailyRangeReconstructedOutcome = "TP" | "SL" | "OUTCOME_AMBIGUOUS" | "UNRESOLVED";
@@ -28,6 +35,11 @@ export interface DailyRangeReconstructedCandidate {
   decisionTimestampMs: number;
   structuralStop: number;
   takeProfit: number;
+  exitPolicyId: typeof DAILY_RANGE_ROUTE_EXIT_POLICY_ID;
+  tpMultipleR: 1 | 2;
+  thesisInvalidationType: DailyRangeRouteExitPolicySnapshot["thesisInvalidationType"];
+  originalBreakoutDirection: DailyRangeRouteExitPolicySnapshot["originalBreakoutDirection"];
+  originalBreakoutBoundary: number;
   features: Record<string, number | null>;
 }
 
@@ -37,6 +49,34 @@ export interface DailyRangeReconstructedResolvedCandidate extends DailyRangeReco
   mfeR: number | null;
   maeR: number | null;
   holdingDurationMs: number | null;
+}
+
+/** Research-only terminal labels for an explicit V1-vs-legacy replay. */
+export type DailyRangeRouteExitReplayOutcome =
+  | "TAKE_PROFIT"
+  | "STOP_LOSS"
+  | DailyRangeThesisInvalidationReason
+  | "OUTCOME_AMBIGUOUS"
+  | "UNRESOLVED"
+  | "UNAVAILABLE";
+
+export interface DailyRangeRouteExitReplayLeg {
+  exitPolicyId: "daily-route-exit-v1" | "legacy-global-2r-bracket";
+  tpMultipleR: 1 | 2;
+  outcome: DailyRangeRouteExitReplayOutcome;
+  exitTimestampMs: number | null;
+  /** Completed-5m close only for a logic-exit proxy; bracket exits use their barrier price. */
+  exitPrice: number | null;
+  grossR: number | null;
+  ambiguityReason: string | null;
+}
+
+export interface DailyRangeRouteExitReplayDiagnostic {
+  datasetClass: typeof DAILY_RANGE_RECONSTRUCTED_CANDLE_PIT_DATASET_CLASS;
+  symbol: string;
+  route: DailyRangeRouteExitPolicySnapshot["route"];
+  newPolicy: DailyRangeRouteExitReplayLeg;
+  legacyGlobal2R: DailyRangeRouteExitReplayLeg;
 }
 
 function finite(value: number | null | undefined): value is number {
@@ -226,7 +266,17 @@ export function replayReconstructedDailyRangeAutoRoute(input: {
     const entry = decision.confirmationBar2.close;
     const risk = decision.direction === "LONG" ? entry - structuralStop : structuralStop - entry;
     if (!(risk > 0) || !(entry > 0)) continue;
-    const takeProfit = decision.direction === "LONG" ? entry + 2 * risk : entry - 2 * risk;
+    const routeExitPolicy = dailyRangeRouteExitPolicyForSignal({
+      route: decision.entryPolicy,
+      originalBreakoutDirection: decision.breakoutDirection,
+      rangeHigh: input.rangeHigh,
+      rangeLow: input.rangeLow,
+      effectiveAt: new Date(decisionTimestampMs).toISOString(),
+    });
+    if (!routeExitPolicy) continue;
+    const takeProfit = decision.direction === "LONG"
+      ? entry + routeExitPolicy.tpMultipleR * risk
+      : entry - routeExitPolicy.tpMultipleR * risk;
     const candidate: DailyRangeReconstructedCandidate = {
       datasetClass: DAILY_RANGE_RECONSTRUCTED_CANDLE_PIT_DATASET_CLASS,
       researchEligibilityQuality: "CANDLE_ELIGIBLE_CURRENT_UNIVERSE",
@@ -238,6 +288,11 @@ export function replayReconstructedDailyRangeAutoRoute(input: {
       decisionTimestampMs,
       structuralStop,
       takeProfit,
+      exitPolicyId: routeExitPolicy.exitPolicyId,
+      tpMultipleR: routeExitPolicy.tpMultipleR,
+      thesisInvalidationType: routeExitPolicy.thesisInvalidationType,
+      originalBreakoutDirection: routeExitPolicy.originalBreakoutDirection,
+      originalBreakoutBoundary: routeExitPolicy.originalBreakoutBoundary,
       features: {},
     };
     candidate.features = buildReconstructedDailyRangeFeatures({
@@ -253,7 +308,7 @@ export function replayReconstructedDailyRangeAutoRoute(input: {
 }
 
 /**
- * Resolve 2R/structural-stop paths with 1m OHLC. A candle touching both is
+ * Resolve the frozen route-specific target/structural-stop paths with 1m OHLC. A candle touching both is
  * deliberately ambiguous: we never assume the favorable barrier won first.
  */
 export function resolveReconstructedDailyRangeOutcome(
@@ -294,5 +349,174 @@ export function resolveReconstructedDailyRangeOutcome(
     mfeR: Number.isFinite(mfeR) ? mfeR : null,
     maeR: Number.isFinite(maeR) ? maeR : null,
     holdingDurationMs: null,
+  };
+}
+
+const ONE_MINUTE_MS = 60_000;
+const FIVE_MINUTES_MS = 5 * ONE_MINUTE_MS;
+
+function replayBracketHit(input: {
+  direction: "LONG" | "SHORT";
+  candle: DailyRangeAutoRouteCandle;
+  takeProfit: number;
+  structuralStop: number;
+}): "TAKE_PROFIT" | "STOP_LOSS" | "OUTCOME_AMBIGUOUS" | null {
+  const tpHit = input.direction === "LONG"
+    ? input.candle.high >= input.takeProfit
+    : input.candle.low <= input.takeProfit;
+  const slHit = input.direction === "LONG"
+    ? input.candle.low <= input.structuralStop
+    : input.candle.high >= input.structuralStop;
+  if (!tpHit && !slHit) return null;
+  return tpHit && slHit ? "OUTCOME_AMBIGUOUS" : tpHit ? "TAKE_PROFIT" : "STOP_LOSS";
+}
+
+function replayLeg(input: {
+  policyId: "daily-route-exit-v1" | "legacy-global-2r-bracket";
+  tpMultipleR: 1 | 2;
+  direction: "LONG" | "SHORT";
+  entry: number;
+  structuralStop: number;
+  takeProfit: number;
+  minuteCandles: readonly DailyRangeAutoRouteCandle[];
+  logicCandles?: readonly DailyRangeAutoRouteCandle[];
+  routeExitPolicy?: DailyRangeRouteExitPolicySnapshot;
+}): DailyRangeRouteExitReplayLeg {
+  const risk = Math.abs(input.entry - input.structuralStop);
+  const unresolved = (outcome: "UNRESOLVED" | "UNAVAILABLE", ambiguityReason: string | null = null): DailyRangeRouteExitReplayLeg => ({
+    exitPolicyId: input.policyId,
+    tpMultipleR: input.tpMultipleR,
+    outcome,
+    exitTimestampMs: null,
+    exitPrice: null,
+    grossR: null,
+    ambiguityReason,
+  });
+  if (!(risk > 0) || !finite(input.entry) || !finite(input.takeProfit) || !finite(input.structuralStop)) return unresolved("UNAVAILABLE", "invalid frozen bracket");
+  const minutes = [...input.minuteCandles]
+    .filter((candle) => candle.openTime >= 0 && candle.closeTime === candle.openTime + ONE_MINUTE_MS - 1)
+    .sort((left, right) => left.openTime - right.openTime);
+  if (minutes.length === 0) return unresolved("UNRESOLVED");
+  if (!contiguous(minutes, ONE_MINUTE_MS)) return unresolved("UNAVAILABLE", "gapped 1m native-bracket path");
+  if (input.logicCandles && !input.routeExitPolicy) return unresolved("UNAVAILABLE", "missing route policy for completed 5m logical-exit path");
+  if (input.logicCandles && !contiguous([...input.logicCandles].sort((left, right) => left.openTime - right.openTime), FIVE_MINUTES_MS)) {
+    return unresolved("UNAVAILABLE", "gapped completed 5m logical-exit path");
+  }
+  const expectedMinutesByFive = new Map<number, DailyRangeAutoRouteCandle[]>();
+  for (const minute of minutes) {
+    const fiveOpen = Math.floor(minute.openTime / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
+    const rows = expectedMinutesByFive.get(fiveOpen) ?? [];
+    rows.push(minute);
+    expectedMinutesByFive.set(fiveOpen, rows);
+  }
+  const logicRows = input.logicCandles ? [...input.logicCandles].sort((left, right) => left.openTime - right.openTime) : [];
+  const logicByOpenTime = new Map(logicRows.map((candle) => [candle.openTime, candle]));
+  const finish = (outcome: "TAKE_PROFIT" | "STOP_LOSS" | "OUTCOME_AMBIGUOUS" | DailyRangeThesisInvalidationReason, exitTimestampMs: number, exitPrice: number | null, ambiguityReason: string | null = null): DailyRangeRouteExitReplayLeg => ({
+    exitPolicyId: input.policyId,
+    tpMultipleR: input.tpMultipleR,
+    outcome,
+    exitTimestampMs,
+    exitPrice,
+    grossR: exitPrice === null ? null : (input.direction === "LONG" ? exitPrice - input.entry : input.entry - exitPrice) / risk,
+    ambiguityReason,
+  });
+
+  // The legacy policy is a 1m native-bracket path only. It must not depend on
+  // whether the final minute happens to complete a 5m logical-exit candle.
+  if (!input.logicCandles) {
+    for (const minute of minutes) {
+      const hit = replayBracketHit({ direction: input.direction, candle: minute, takeProfit: input.takeProfit, structuralStop: input.structuralStop });
+      if (!hit) continue;
+      if (hit === "OUTCOME_AMBIGUOUS") return finish(hit, minute.closeTime + 1, null, "1m OHLC touched TP and structural SL in the same candle");
+      return finish(hit, minute.closeTime + 1, hit === "TAKE_PROFIT" ? input.takeProfit : input.structuralStop);
+    }
+    return unresolved("UNRESOLVED");
+  }
+
+  // New V1 evaluates every native barrier opportunity first. A thesis exit is
+  // considered only after a full, post-entry, canonical 5m candle completes.
+  // A trailing partial group can still hit native protection, but cannot emit a
+  // logical exit because it has not closed yet.
+  const groups = [...expectedMinutesByFive.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([openTime, rows]) => ({ openTime, rows: rows.sort((left, right) => left.openTime - right.openTime) }));
+
+  for (const five of groups) {
+    for (const minute of five.rows) {
+      const hit = replayBracketHit({ direction: input.direction, candle: minute, takeProfit: input.takeProfit, structuralStop: input.structuralStop });
+      if (!hit) continue;
+      if (hit === "OUTCOME_AMBIGUOUS") return finish(hit, minute.closeTime + 1, null, "1m OHLC touched TP and structural SL in the same candle");
+      return finish(hit, minute.closeTime + 1, hit === "TAKE_PROFIT" ? input.takeProfit : input.structuralStop);
+    }
+    const hasFullCanonicalFiveMinutePath = five.rows.length === 5
+      && five.rows.every((row, index) => row.openTime === five.openTime + index * ONE_MINUTE_MS);
+    if (!hasFullCanonicalFiveMinutePath) continue;
+    const logicCandle = logicByOpenTime.get(five.openTime);
+    if (!logicCandle) return unresolved("UNAVAILABLE", `missing canonical completed 5m logical candle ${five.openTime}`);
+    const decision = evaluateDailyRangeThesisInvalidation({ policy: input.routeExitPolicy!, candle: logicCandle });
+    if (decision) return finish(decision.reason, logicCandle.closeTime + 1, logicCandle.close);
+  }
+  return unresolved("UNRESOLVED");
+}
+
+/**
+ * Diagnostic-only causal replay of one frozen candidate. It evaluates the
+ * deployed V1 route hypothesis and the former global-2R bracket separately;
+ * it neither trains a selector nor searches alternative targets.
+ */
+export function replayRouteSpecificExitDiagnostic(input: {
+  candidate: DailyRangeReconstructedCandidate;
+  completedFiveMinuteCandles: readonly DailyRangeAutoRouteCandle[];
+  completedOneMinuteCandles: readonly DailyRangeAutoRouteCandle[];
+  /** The original frozen legacy 2R bracket, if the source episode retained it. */
+  legacyTakeProfit?: number | null;
+}): DailyRangeRouteExitReplayDiagnostic {
+  const { candidate } = input;
+  const entry = candidate.decision.confirmationBar2.close;
+  const risk = Math.abs(entry - candidate.structuralStop);
+  const legacyTarget = finite(input.legacyTakeProfit)
+    ? input.legacyTakeProfit
+    : candidate.decision.direction === "LONG" ? entry + 2 * risk : entry - 2 * risk;
+  const policy: DailyRangeRouteExitPolicySnapshot = {
+    exitPolicyId: candidate.exitPolicyId,
+    route: candidate.decision.entryPolicy,
+    tpMultipleR: candidate.tpMultipleR,
+    thesisInvalidationType: candidate.thesisInvalidationType,
+    effectiveAt: new Date(candidate.decisionTimestampMs).toISOString(),
+    originalBreakoutDirection: candidate.originalBreakoutDirection,
+    originalBreakoutBoundary: candidate.originalBreakoutBoundary,
+    referenceRangeHigh: candidate.rangeHigh,
+    referenceRangeLow: candidate.rangeLow,
+  };
+  const afterDecision5m = input.completedFiveMinuteCandles
+    .filter((candle) => candle.openTime >= candidate.decisionTimestampMs && candle.closeTime < Number.MAX_SAFE_INTEGER)
+    .sort((left, right) => left.openTime - right.openTime);
+  const afterDecision1m = input.completedOneMinuteCandles
+    .filter((candle) => candle.openTime >= candidate.decisionTimestampMs && candle.closeTime < Number.MAX_SAFE_INTEGER)
+    .sort((left, right) => left.openTime - right.openTime);
+  return {
+    datasetClass: candidate.datasetClass,
+    symbol: candidate.symbol,
+    route: policy.route,
+    newPolicy: replayLeg({
+      policyId: "daily-route-exit-v1",
+      tpMultipleR: policy.tpMultipleR,
+      direction: candidate.decision.direction,
+      entry,
+      structuralStop: candidate.structuralStop,
+      takeProfit: candidate.takeProfit,
+      minuteCandles: afterDecision1m,
+      logicCandles: afterDecision5m,
+      routeExitPolicy: policy,
+    }),
+    legacyGlobal2R: replayLeg({
+      policyId: "legacy-global-2r-bracket",
+      tpMultipleR: 2,
+      direction: candidate.decision.direction,
+      entry,
+      structuralStop: candidate.structuralStop,
+      takeProfit: legacyTarget,
+      minuteCandles: afterDecision1m,
+    }),
   };
 }

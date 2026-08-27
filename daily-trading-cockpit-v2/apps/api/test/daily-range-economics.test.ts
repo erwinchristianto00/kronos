@@ -59,6 +59,21 @@ describe("Daily Range V3 economics", () => {
     expect(result.economics.breakEvenWinRate).toBeLessThan(1);
   });
 
+  it("uses the real route target in geometry and economic payoff instead of a global 2R proxy", () => {
+    const continuation = prepareDailyRangeEconomics(baseInput({ route: "CONTINUATION" }));
+    const fade = prepareDailyRangeEconomics(baseInput({ route: "FADE" }));
+    expect(continuation.ok).toBe(true);
+    expect(fade.ok).toBe(true);
+    if (!continuation.ok || !fade.ok) return;
+    expect(continuation.economics).toMatchObject({ tpMultipleR: 1, grossWinR: 1 });
+    expect(fade.economics).toMatchObject({ tpMultipleR: 2, grossWinR: 2 });
+    const continuationRiskPct = continuation.economics.geometry.stopDistancePct!;
+    expect(continuation.economics.geometry.tpDistancePct).toBeCloseTo(continuationRiskPct, 10);
+    expect(fade.economics.geometry.tpDistancePct).toBeCloseTo(2 * continuationRiskPct, 10);
+    expect(continuation.economics.netWinR).toBeLessThan(fade.economics.netWinR);
+    expect(continuation.economics.breakEvenWinRate).toBeGreaterThan(fade.economics.breakEvenWinRate);
+  });
+
   it("rejects a too-tight structural stop instead of widening it", () => {
     const result = prepareDailyRangeEconomics(baseInput({ rawStructuralStop: 99.9 }));
     expect(result).toEqual({ ok: false, reason: "STOP_ECONOMICS_FAIL" });

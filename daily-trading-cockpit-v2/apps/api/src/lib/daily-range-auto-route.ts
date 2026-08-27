@@ -12,6 +12,8 @@ export const DAILY_RANGE_AUTO_ROUTE_EPSILON = 1e-9;
 export type DailyRangeAutoRouteDirection = "UP" | "DOWN";
 export type DailyRangeAutoRouteTradeDirection = "LONG" | "SHORT";
 export type DailyRangeAutoRoutePolicy = "CONTINUATION" | "FADE";
+/** Canonical close-only relationship to the frozen reference range. */
+export type DailyRangeAutoRouteRangePosition = "ABOVE" | "BELOW" | "INSIDE";
 
 export interface DailyRangeAutoRouteCandle {
   openTime: number;
@@ -75,10 +77,24 @@ function cloneState(state: DailyRangeAutoRouteState | null | undefined): DailyRa
   };
 }
 
-function positionFor(candle: DailyRangeAutoRouteCandle, rangeHigh: number, rangeLow: number): "ABOVE" | "BELOW" | "INSIDE" {
-  return candle.close > rangeHigh + DAILY_RANGE_AUTO_ROUTE_EPSILON
+/**
+ * Shared boundary semantics for AUTO_ROUTE_NY_V2. Equality is inside the
+ * reference range. Both router and route-exit invalidation call this helper so
+ * a later policy cannot silently reinterpret a close at the boundary.
+ */
+export function dailyRangeAutoRouteRangePosition(
+  close: number,
+  rangeHigh: number,
+  rangeLow: number,
+): DailyRangeAutoRouteRangePosition {
+  if (!Number.isFinite(close) || !Number.isFinite(rangeHigh) || !Number.isFinite(rangeLow) || rangeHigh < rangeLow) return "INSIDE";
+  return close > rangeHigh + DAILY_RANGE_AUTO_ROUTE_EPSILON
     ? "ABOVE"
-    : candle.close < rangeLow - DAILY_RANGE_AUTO_ROUTE_EPSILON ? "BELOW" : "INSIDE";
+    : close < rangeLow - DAILY_RANGE_AUTO_ROUTE_EPSILON ? "BELOW" : "INSIDE";
+}
+
+function positionFor(candle: DailyRangeAutoRouteCandle, rangeHigh: number, rangeLow: number): DailyRangeAutoRouteRangePosition {
+  return dailyRangeAutoRouteRangePosition(candle.close, rangeHigh, rangeLow);
 }
 
 function directionFor(position: "ABOVE" | "BELOW"): DailyRangeAutoRouteDirection {
