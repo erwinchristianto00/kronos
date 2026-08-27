@@ -413,6 +413,7 @@ function InlineSymbolList({ symbols, color = C.dim, empty = 'Tidak ada' }: { sym
    The one list that genuinely has no criterion — the short blocklist — is labelled as exactly that
    rather than sharing a heading with the criteria-derived pools. */
 type PoolReport = {
+  generatedAt: string;
   measured: boolean;
   leg: { baseUsd: number; multiplier: number; effectiveUsd: number | null; oneLotCeilingUsd: number | null };
   thresholds: { minLiquidityUsdPerHour: number; maxLotFractionOfLeg: number; minListedDays: number; maxFundingCarryBps: number; maxCorrelation: number };
@@ -422,6 +423,7 @@ type PoolReport = {
   /** The actionable verdict, hysteresis-aware. `mismatch` above is the RAW threshold comparison —
    *  true per symbol, but not a reason to change anything on its own. */
   reconciliation?: { changed: boolean; adds: string[]; drops: string[]; held: Array<{ symbol: string; action: string; reason: string }>; unmeasured: boolean };
+  refresh?: { activePoolUpdatedAt: string | null; nextAutoRefreshAt: string | null };
   /** Same durable C1/C2 membership consumed by the backend for new Dynamic baskets. */
   autoPool?: {
     enabled: boolean;
@@ -429,6 +431,8 @@ type PoolReport = {
     source: 'BINANCE_USDM_MAINNET_PUBLIC' | null;
     activeSymbols: string[];
     updatedAt: string | null;
+    lastAttemptAt: string | null;
+    lastSuccessAt: string | null;
     lastError: string | null;
     refreshEveryMs: number;
   } | null;
@@ -467,8 +471,9 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
       }
     }
     void loadPool();
-    // The report is cached 15 min on the API; polling faster only burns requests for the same bytes.
-    const timer = window.setInterval(() => void loadPool(), 5 * 60_000);
+    // The API cache is snapshot-keyed. Polling lets the dashboard reflect a heartbeat-applied
+    // membership change promptly, without causing public metadata reads on every request.
+    const timer = window.setInterval(() => void loadPool(), 30_000);
     return () => { alive = false; window.clearInterval(timer); };
   }, [apiPrefix]);
 
@@ -479,6 +484,8 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
   // a membership source the formation path is not using, which must never pass silently.
   const countDrift = pool && (pool.counts.poolLong !== executionLong.length || pool.counts.poolShort !== executionShort.length);
   const refreshMinutes = pool?.autoPool?.refreshEveryMs ? Math.round(pool.autoPool.refreshEveryMs / 60_000) : null;
+  const activeSnapshotAt = pool?.refresh?.activePoolUpdatedAt ?? pool?.autoPool?.updatedAt ?? null;
+  const nextRefreshAt = pool?.refresh?.nextAutoRefreshAt ?? null;
 
   const label = (text: string, n: number, color: string) => <strong style={{ color }}>{text} ({n})</strong>;
 
@@ -496,18 +503,19 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
     {poolError && <Banner tone="warn">Kriteria tidak bisa dibaca (endpoint pool gagal). Daftar di bawah tetap yang dipakai executor, tapi belum diuji terhadap kriteria apa pun.</Banner>}
     {pool && !pool.measured && <Banner tone="warn">⚠ Kriteria tidak bisa diukur sekarang — pembacaan exchange gagal. Ini <b>bukan</b> berarti simbol-simbolnya gagal kriteria; belum ada yang diuji.</Banner>}
     {pool?.autoPool?.state === 'ACTIVE' && <Banner tone="ok">
-      ✓ Auto-pool aktif · refresh C1/C2 tiap {refreshMinutes ?? 15} menit dari USD-M mainnet · berlaku untuk basket baru saja.
+      ✓ Pool executor aktif: {pool.autoPool.activeSymbols.length} simbol dari snapshot {formatDate(activeSnapshotAt)} Taipei ·
+      cek C1/C2 berikutnya {nextRefreshAt ? formatDate(nextRefreshAt) : `tiap ${refreshMinutes ?? 15} menit`} · berlaku untuk basket baru saja.
     </Banner>}
     {pool?.autoPool?.state === 'STALE_FALLBACK' && <Banner tone="warn">
       ⚠ Auto-pool belum punya snapshot valid; sementara memakai fallback terakhir tanpa memperlebar universe. Refresh otomatis akan mencoba lagi. Basket terbuka tidak disentuh.
     </Banner>}
-    {/* Reads the hysteresis-aware reconciliation, never the raw mismatch. The action is executed
-        automatically by the shared runtime pool; this panel is only reporting the next refresh. */}
+    {/* This is a fresh, hysteresis-aware preview against the durable executor snapshot. It must
+        never be worded as if membership has already changed. */}
     {pool?.measured && pool.reconciliation?.changed && <Banner tone="warn">
-      ⚠ Pool auto akan memperbarui: {[
+      ● Preview evaluasi {formatDate(pool.generatedAt)}: bila angka ini masih sama saat cek executor {nextRefreshAt ? formatDate(nextRefreshAt) : 'berikutnya'}, pool baru akan {[
         ...pool.reconciliation.adds.map((s) => `tambah ${s.replace('USDT', '')}`),
         ...pool.reconciliation.drops.map((s) => `keluarkan ${s.replace('USDT', '')}`),
-      ].join(' · ')}. Berlaku pada refresh berikutnya untuk basket baru; basket terbuka tidak disentuh.
+      ].join(' · ')}. Belum diterapkan sekarang; basket terbuka tidak disentuh.
     </Banner>}
     {pool?.measured && pool.reconciliation && !pool.reconciliation.changed && pool.reconciliation.held.length > 0 && <Banner tone="ok">
       ● Tidak ada yang perlu diubah. {pool.reconciliation.held.map((d) => d.symbol.replace('USDT', '')).join(', ')} di bawah ambang mentah tetapi <strong style={{ color: C.text }}>di dalam pita histeresis ±10%</strong>, jadi keanggotaannya sengaja dipertahankan — tanpa pita, simbol di garis batas keluar-masuk tiap beberapa jam dan menulis ulang pool yang dibandingkan overlap guard.

@@ -1388,6 +1388,13 @@ interface PoolReport {
     held: Array<{ symbol: string; action: string; reason: string }>;
     unmeasured: boolean;
   };
+  /** The active executor snapshot and when it will next re-evaluate C1/C2.  `reconciliation`
+   * above is only a fresh preview against that active membership; it is not proof that a change
+   * has already been applied. */
+  refresh: {
+    activePoolUpdatedAt: string | null;
+    nextAutoRefreshAt: string | null;
+  };
   /** Runtime membership used for NEW FILTERED baskets. Existing baskets retain frozen legs. */
   autoPool: CrossSectionalAutoPoolSnapshot | null;
   /** Compatibility contract for the currently served dashboard overlay. Keep this alias until the
@@ -1395,7 +1402,33 @@ interface PoolReport {
   automation: CrossSectionalAutoPoolSnapshot | null;
   unevaluatedCriteria: Array<{ code: string; why: string }>;
 }
-let poolReportCache: { atMs: number; report: PoolReport } | null = null;
+const POOL_REPORT_CACHE_MS = 60_000;
+let poolReportCache: { atMs: number; poolSnapshotKey: string; report: PoolReport } | null = null;
+
+function poolSnapshotKey(pool: CrossSectionalAutoPoolSnapshot | null): string {
+  if (!pool) return "NO_AUTO_POOL";
+  return [
+    pool.enabled ? "1" : "0",
+    pool.state,
+    pool.updatedAt ?? "",
+    pool.lastAttemptAt ?? "",
+    pool.lastSuccessAt ?? "",
+    pool.lastError ?? "",
+    pool.activeSymbols.join(","),
+  ].join("|");
+}
+
+function autoPoolRefreshDue(pool: CrossSectionalAutoPoolSnapshot | null, nowMs: number): boolean {
+  if (!pool?.enabled) return false;
+  const attemptedAt = Date.parse(pool.lastAttemptAt ?? "");
+  return !Number.isFinite(attemptedAt) || nowMs - attemptedAt >= pool.refreshEveryMs;
+}
+
+function nextAutoPoolRefreshAt(pool: CrossSectionalAutoPoolSnapshot | null, nowMs: number): string | null {
+  if (!pool?.enabled) return null;
+  const attemptedAt = Date.parse(pool.lastAttemptAt ?? "");
+  return new Date(Number.isFinite(attemptedAt) ? attemptedAt + pool.refreshEveryMs : nowMs).toISOString();
+}
 
 export async function registerLiveRoutes(
   app: FastifyInstance,
@@ -2669,7 +2702,6 @@ export async function registerLiveRoutes(
    */
   const buildPoolReport = async (): Promise<PoolReport> => {
     const now = Date.now();
-    if (poolReportCache && now - poolReportCache.atMs < 15 * 60_000) return poolReportCache.report;
     const list = (k: string): string[] => (process.env[k] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
     const universe = list("CROSS_SECTIONAL_UNIVERSE");
     const configuredLong = list("CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST");
@@ -2689,6 +2721,17 @@ export async function registerLiveRoutes(
       sizeMultiplier: mult,
     };
     const autoPoolManager = symmetricConfiguredPool ? opts.crossSectionalAutoPool?.() ?? null : null;
+    // The heartbeat can update membership between dashboard polls. Cache only while the exact
+    // executor snapshot is unchanged; otherwise the panel can keep saying "will update" after
+    // the runtime already applied the change.
+    const snapshotBeforeRefresh = autoPoolManager ? autoPoolManager.getSnapshot(autoPoolInput) : null;
+    const snapshotBeforeRefreshKey = poolSnapshotKey(snapshotBeforeRefresh);
+    if (
+      poolReportCache
+      && now - poolReportCache.atMs < POOL_REPORT_CACHE_MS
+      && poolReportCache.poolSnapshotKey === snapshotBeforeRefreshKey
+      && !autoPoolRefreshDue(snapshotBeforeRefresh, now)
+    ) return poolReportCache.report;
     // The endpoint can safely await this bounded public-metadata refresh: it is cadence-gated and
     // gives the operator the actual membership immediately after a process restart, not a static
     // fallback that happens to be cached for fifteen minutes.
@@ -2816,6 +2859,10 @@ export async function registerLiveRoutes(
           unmeasured: pl.unmeasured,
         };
       })(),
+      refresh: {
+        activePoolUpdatedAt: autoPool?.updatedAt ?? null,
+        nextAutoRefreshAt: nextAutoPoolRefreshAt(autoPool, now),
+      },
       autoPool,
       automation: autoPool,
       unevaluatedCriteria: [
@@ -2824,7 +2871,7 @@ export async function registerLiveRoutes(
         { code: "C5_CORRELATION", why: "butuh riwayat harga seluruh pool" },
       ],
     };
-    poolReportCache = { atMs: now, report };
+    poolReportCache = { atMs: now, poolSnapshotKey: poolSnapshotKey(autoPool), report };
     return report;
   };
 
@@ -2938,6 +2985,11 @@ th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;le
     const { measured, leg: legInfo, counts, blockedInPool } = report;
     const autoPool = report.autoPool;
     const autoPoolEnabled = autoPool?.enabled === true;
+    const taipei = (value: string | null): string => value
+      ? new Intl.DateTimeFormat("id-ID", { dateStyle: "medium", timeStyle: "medium", timeZone: "Asia/Taipei" }).format(new Date(value)) + " Taipei"
+      : "belum ada snapshot";
+    const activeSnapshotText = taipei(report.refresh.activePoolUpdatedAt);
+    const nextRefreshText = report.refresh.nextAutoRefreshAt ? taipei(report.refresh.nextAutoRefreshAt) : "saat scheduler berikutnya";
     const leg = legInfo.effectiveUsd;
     const baseLeg = legInfo.baseUsd;
     const mult = legInfo.multiplier;
@@ -2955,7 +3007,7 @@ th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;le
         <td class="num">${r.oneLotUsd === null ? "—" : "$" + r.oneLotUsd.toFixed(2)}</td>
         <td>${!measured ? '<span class="muted">tidak terukur</span>' : r.failures.length ? `<span class="bad">${r.failures.map((f) => esc(f.detail)).join("; ")}</span>` : `<span class="ok">memenuhi C1 &amp; C2</span>`}</td>
         <td>${r.inPool ? "<b>di pool</b>" : "<span class=\"muted\">di luar</span>"}${
-        needsAction.has(r.symbol) ? ' <span class="warn">&#9888; perlu diubah</span>'
+        needsAction.has(r.symbol) ? ' <span class="warn">&#9679; preview cek berikutnya</span>'
         : (actionFor.get(r.symbol)?.action ?? "").startsWith("HOLD") ? ' <span class="muted">&#9679; dalam pita, dipertahankan</span>'
         : ""}</td>
         <td>${r.shortBlocked ? '<span class="warn">short diblokir</span>' : ""}</td>
@@ -2989,12 +3041,14 @@ th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;le
   <div><span>pool aktif (long)</span><b>${counts.poolLong}</b></div>
 </div>
 
+${autoPoolEnabled ? `<p class="muted">&#10003; <b>Pool executor aktif</b>: ${counts.poolLong} simbol dari snapshot ${esc(activeSnapshotText)}. C1/C2 berikutnya dijadwalkan sekitar ${esc(nextRefreshText)}; hanya basket baru yang memakai hasilnya.</p>` : ""}
+
 ${!measured
   ? `<div class="note">&#9888; <b>Kriteria tidak bisa diukur sekarang</b> &mdash; pembacaan exchange gagal, jadi kolom likuiditas, satu lot dan status di bawah kosong. Ini BUKAN berarti simbol-simbol itu gagal kriteria; belum ada yang diuji. Pool aktif tetap ditampilkan apa adanya.</div>`
   : autoPool?.state === "STALE_FALLBACK"
     ? `<div class="note">&#9888; <b>Auto-pool belum memiliki snapshot C1/C2 yang valid.</b> Sementara memakai fallback terakhir dan tidak memperlebar universe. Refresh otomatis akan mencoba lagi; basket yang sudah terbuka tidak disentuh.</div>`
   : plan.changed
-    ? `<div class="note">&#9888; <b>Pool auto akan merekonsiliasi</b>: ${[...plan.adds.map((x) => "tambah " + esc(x.replace("USDT", ""))), ...plan.drops.map((x) => "keluarkan " + esc(x.replace("USDT", "")))].join(" &middot; ")}. Berlaku otomatis pada refresh berikutnya untuk basket baru; basket terbuka tidak disentuh.</div>`
+    ? `<div class="note">&#9679; <b>Preview evaluasi ${esc(taipei(report.generatedAt))}</b>: bila angka masih sama pada cek executor ${esc(nextRefreshText)}, pool baru akan ${[...plan.adds.map((x) => "tambah " + esc(x.replace("USDT", ""))), ...plan.drops.map((x) => "keluarkan " + esc(x.replace("USDT", "")))].join(" &middot; ")}. <b>Belum diterapkan sekarang.</b> Basket terbuka tidak disentuh.</div>`
     : plan.held.length
       ? `<div class="note">&#9679; <b>Tidak ada yang perlu diubah.</b> ${plan.held.map((d) => esc(d.symbol.replace("USDT", ""))).join(", ")} berada di bawah ambang mentah tetapi <b>di dalam pita histeresis</b>, jadi keanggotaannya sengaja dipertahankan &mdash; tanpa pita, simbol di garis batas akan keluar-masuk tiap beberapa jam. Kolom status di bawah tetap menampilkan vonis kriteria mentahnya, karena itu memang fakta.</div>`
       : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; ${autoPoolEnabled ? "Auto-pool aktif; " : ""}pool aktif sama persis dengan hasil kriteria.</div>`}
@@ -3006,9 +3060,9 @@ ${!measured
 
 ${(() => {
   const act = [...plan.adds.map((x) => ({ symbol: x, action: "ADD", reason: "melewati batas masuk" })), ...plan.drops.map((x) => ({ symbol: x, action: "DROP", reason: "di bawah batas keluar" })), ...plan.held];
-  if (plan.unmeasured) return `<h2>Rekonsiliasi pool</h2><div class="note">Tidak ada simbol yang terukur — tidak ada keputusan yang bisa dipercaya, dan rencana ini TIDAK boleh diterapkan.</div>`;
-  return `<h2>Rekonsiliasi pool</h2>
-<p class="muted">Pita histeresis <b>&plusmn;10%</b>: masuk perlu &ge; $${Math.round(report.thresholds.minLiquidityUsdPerHour * 1.1).toLocaleString("en-US")}/jam, keluar baru di bawah $${Math.round(report.thresholds.minLiquidityUsdPerHour * 0.9).toLocaleString("en-US")}/jam. Simbol di antara keduanya <b>mempertahankan keanggotaannya</b>. ${autoPoolEnabled ? `Auto-pool menyegarkan C1/C2 tiap ${Math.round((autoPool?.refreshEveryMs ?? 900000) / 60000)} menit dari USD-M mainnet dan hanya berlaku untuk basket baru.` : "Auto-pool tidak aktif; daftar statis ditampilkan apa adanya."}</p>
+  if (plan.unmeasured) return `<h2>Preview rekonsiliasi</h2><div class="note">Tidak ada simbol yang terukur — tidak ada keputusan yang bisa dipercaya, dan preview ini TIDAK boleh diterapkan.</div>`;
+  return `<h2>Preview rekonsiliasi berikutnya</h2>
+<p class="muted">Ini perbandingan harga terbaru terhadap <b>pool executor yang aktif</b>, bukan bukti perubahan sudah terjadi. Pita histeresis <b>&plusmn;10%</b>: masuk perlu &ge; $${Math.round(report.thresholds.minLiquidityUsdPerHour * 1.1).toLocaleString("en-US")}/jam, keluar baru di bawah $${Math.round(report.thresholds.minLiquidityUsdPerHour * 0.9).toLocaleString("en-US")}/jam. Simbol di antara keduanya <b>mempertahankan keanggotaan</b>. ${autoPoolEnabled ? `Cek executor berikutnya sekitar ${esc(nextRefreshText)} dan hanya berlaku untuk basket baru.` : "Auto-pool tidak aktif; daftar statis ditampilkan apa adanya."}</p>
 ${act.length ? `<div class="wrapx"><table><thead><tr><th>simbol</th><th>tindakan</th><th>alasan</th></tr></thead><tbody>${act.map((d) => `<tr><td class="sym">${esc(d.symbol.replace("USDT", ""))}</td><td class="mono">${esc(d.action)}</td><td class="muted">${esc(d.reason)}</td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">Tidak ada simbol yang butuh perhatian.</p>`}
 `;
 })()}
