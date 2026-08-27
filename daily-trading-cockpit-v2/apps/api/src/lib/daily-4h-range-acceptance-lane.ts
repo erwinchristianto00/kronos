@@ -1703,6 +1703,20 @@ export class DailyRangeAcceptanceLane {
     const frictionModelId = state.frictionModelByUtcDate?.[utcDate(now)] ?? null;
     const frictionModel = frictionModelId ? state.frictionModels?.find((model) => model.id === frictionModelId) ?? null : null;
     const frictionUnavailable = !frictionModel;
+    const economicsSignals = state.signals.filter((signal) => signal.economics !== null && signal.economics !== undefined);
+    const economicRejectReasons = new Set<DailyRangeSignalReason>([
+      "STOP_ECONOMICS_FAIL",
+      "RISK_BUDGET_UNEXECUTABLE",
+      "BBO_STALE",
+      "FRICTION_MODEL_UNAVAILABLE",
+      "NEGATIVE_EXPECTED_VALUE",
+    ]);
+    const economicRejectCount = state.signals.filter((signal) => signal.reason !== null && economicRejectReasons.has(signal.reason)).length;
+    const mean = (values: number[]): number | null => values.length
+      ? values.reduce((sum, value) => sum + value, 0) / values.length
+      : null;
+    const plannedRisks = economicsSignals.map((signal) => signal.economics!.plannedRiskUsd).filter(finiteNumber);
+    const actualRisks = state.trades.map((trade) => trade.initialRiskDollar).filter(finiteNumber);
     const newEntriesEnabled = state.control.mode === "ARMED" && effectiveAllocatorMode !== "PAUSED" && entryControlReason === null && !frictionUnavailable;
     const newEntryReason = !newEntriesEnabled
       ? mainnetPausedForSelection ? "SELECTION_FIX_PENDING_VALIDATION"
@@ -1782,16 +1796,26 @@ export class DailyRangeAcceptanceLane {
         maxPlannedRiskUsd: DAILY_RANGE_MAX_PLANNED_RISK_USD,
         maxCostRatio: DAILY_RANGE_MAX_COST_RATIO,
         bboMaxAgeMs: MAX_DECISION_BBO_AGE_MS,
-        frictionModel: frictionModel ? {
-          id: frictionModel.id,
-          source: frictionModel.source,
-          createdAt: frictionModel.createdAt,
-          cutoffAt: frictionModel.cutoffAt,
-          sampleCount: frictionModel.sampleCount,
-          exactFeeSampleCount: frictionModel.exactFeeSampleCount,
-          legacyFeeSampleCount: frictionModel.legacyFeeSampleCount,
-          hash: frictionModel.hash,
-        } : null,
+        /** The immutable model is safe to expose: it contains execution-cost
+         * percentiles and provenance only, never credentials or order state. */
+        frictionModel: frictionModel ? { ...frictionModel } : null,
+        candidateSummary: {
+          evaluated: economicsSignals.length,
+          economicsRejected: economicRejectCount,
+          averageStopRiskBps: mean(economicsSignals.map((signal) => signal.economics!.stopRiskBps).filter(finiteNumber)),
+          averageCostRatio: mean(economicsSignals.map((signal) => signal.economics!.costRatio).filter(finiteNumber)),
+          plannedRiskUsd: {
+            count: plannedRisks.length,
+            minimum: plannedRisks.length ? Math.min(...plannedRisks) : null,
+            average: mean(plannedRisks),
+            maximum: plannedRisks.length ? Math.max(...plannedRisks) : null,
+          },
+          actualInitialRiskUsd: {
+            count: actualRisks.length,
+            average: mean(actualRisks),
+            maximum: actualRisks.length ? Math.max(...actualRisks) : null,
+          },
+        },
       },
       availableSlots: capacity.displaySlots,
       maxDailyPositions: capacity.maxOpenTrades,

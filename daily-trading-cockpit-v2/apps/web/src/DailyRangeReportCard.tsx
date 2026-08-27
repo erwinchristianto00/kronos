@@ -102,7 +102,32 @@ type DailyRangeStatus = {
       exactFeeSampleCount?: number;
       legacyFeeSampleCount?: number;
       cutoffAt?: string;
+      entryAdverseP50Bps?: number;
+      entryAdverseP95Bps?: number;
+      stopGapP50Bps?: number;
+      stopGapP95Bps?: number;
+      entryFeeP50Bps?: number;
+      entryFeeP95Bps?: number;
+      exitFeeP50Bps?: number;
+      exitFeeP95Bps?: number;
+      lossAdverseP50Bps?: number;
+      lossAdverseP95Bps?: number;
     } | null;
+    candidateSummary?: {
+      evaluated?: number;
+      economicsRejected?: number;
+      averageStopRiskBps?: number | null;
+      averageCostRatio?: number | null;
+      plannedRiskUsd?: { count?: number; minimum?: number | null; average?: number | null; maximum?: number | null };
+      actualInitialRiskUsd?: { count?: number; average?: number | null; maximum?: number | null };
+    } | null;
+  } | null;
+  lastBatchCandidateCount?: number;
+  lastBatchSelectedCount?: number;
+  dataHealth?: {
+    candidateSignalsCollected?: number;
+    fullPITSignals?: number;
+    oversubscribedBatches?: number;
   } | null;
   openTrades?: DailyRangeTrade[];
   performance?: DailyRangePerformance;
@@ -404,6 +429,18 @@ export default function DailyRangeReportCard({
     : `Testnet only · ${data?.control?.mode ?? 'memuat mode…'}`;
   const usesAutoRouter = data?.strategyVersion === 'daily-4h-range-auto-route-ny-2r-v2';
   const friction = data?.economics?.frictionModel ?? null;
+  const candidateSummary = data?.economics?.candidateSummary ?? null;
+  const maxCostRatio = data?.economics?.maxCostRatio ?? null;
+  const bboMaxAgeMs = data?.economics?.bboMaxAgeMs ?? null;
+  const safeLossFrictionBps = friction
+    && finite(friction.entryFeeP95Bps)
+    && finite(friction.exitFeeP95Bps)
+    && finite(friction.lossAdverseP95Bps)
+    ? friction.entryFeeP95Bps + friction.exitFeeP95Bps + 1.25 * friction.lossAdverseP95Bps
+    : null;
+  const impliedMinimumStopRiskBps = finite(safeLossFrictionBps) && finite(maxCostRatio) && maxCostRatio > 0
+    ? safeLossFrictionBps / maxCostRatio
+    : null;
 
   return <>
     <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="daily-range-open-report">
@@ -420,10 +457,26 @@ export default function DailyRangeReportCard({
         Range <strong>{usesAutoRouter ? '00:00–04:00 New York' : '00:00–04:00 UTC'}</strong> → {usesAutoRouter ? 'breakout bertahan = Continuation; kembali masuk range = Breakout Fade.' : 'dua close 5m selesai di luar range → native structural SL + fixed 2R TP.'}
         Klik simbol trade untuk membuka candle; level range selalu memakai data trade yang dibekukan saat entry.
       </div>
-      {usesAutoRouter ? <div className="daily-range-breakdown" title="V3 mengurutkan hanya kandidat yang sudah lolos stop economics. Router, arah, structural stop, 2R, dan native bracket tidak berubah.">
-        <span>Allocator {data?.allocatorMode ?? '—'} → efektif {data?.effectiveAllocatorMode ?? '—'} · alpha {data?.alphaSelector?.status ?? data?.selectorStatus ?? '—'} (tanpa authority)</span>
-        <span>{friction ? `friction ${friction.source} · N ${friction.sampleCount ?? 0} · ${friction.id ?? '—'}` : 'friction model belum tersedia: entry baru fail-closed'}</span>
-      </div> : null}
+      {usesAutoRouter ? <>
+        <div className="daily-range-breakdown" title="V3 mengurutkan hanya kandidat yang sudah lolos stop economics. Router, arah, structural stop, 2R, dan native bracket tidak berubah.">
+          <span>Allocator {data?.allocatorMode ?? '—'} → efektif {data?.effectiveAllocatorMode ?? '—'} · alpha {data?.alphaSelector?.status ?? data?.selectorStatus ?? '—'} (tanpa authority)</span>
+          <span>{friction ? `friction ${friction.source} · N ${friction.sampleCount ?? 0} · ${friction.id ?? '—'}` : 'friction model belum tersedia: entry baru fail-closed'}</span>
+        </div>
+        <div className="daily-range-breakdown" title="Angka ini adalah pagar biaya/risk V3, bukan sinyal arah atau optimasi threshold.">
+          <span>Cap: {formatUnsignedMoney(data?.economics?.maxNotionalUsd)} notional · {formatUnsignedMoney(data?.economics?.maxPlannedRiskUsd)} planned risk · cost ≤ {finite(maxCostRatio) ? formatPercent(maxCostRatio * 100) : '—'} · BBO ≤ {bboMaxAgeMs == null ? '—' : `${Math.round(bboMaxAgeMs / 1000)}s`}</span>
+          <span>{finite(safeLossFrictionBps)
+            ? `safe loss ${formatBps(safeLossFrictionBps)} → structural stop minimum ${formatBps(impliedMinimumStopRiskBps)}`
+            : 'safe loss belum tersedia: entry baru fail-closed'}</span>
+          <span>{friction
+            ? `fee p50 ${formatBps(friction.entryFeeP50Bps)}+${formatBps(friction.exitFeeP50Bps)} · entry adverse p95 ${formatBps(friction.entryAdverseP95Bps)} · stop gap p95 ${formatBps(friction.stopGapP95Bps)}`
+            : '—'}</span>
+        </div>
+        <div className="daily-range-breakdown" title="Ringkasan ini hanya menghitung kandidat V3 yang sudah memiliki snapshot ekonomi; legacy trade tetap diberi label legacy.">
+          <span>Batch terakhir: {data?.lastBatchCandidateCount ?? 0} kandidat · {data?.lastBatchSelectedCount ?? 0} dipilih · reject ekonomi {candidateSummary?.economicsRejected ?? 0}</span>
+          <span>Snapshot V3: {candidateSummary?.evaluated ?? 0} · avg stop {formatBps(candidateSummary?.averageStopRiskBps)} · avg cost {finite(candidateSummary?.averageCostRatio) ? formatPercent(candidateSummary.averageCostRatio * 100) : '—'}</span>
+          <span>Forward Full PIT {data?.dataHealth?.fullPITSignals ?? 0} · batch oversubscribed {data?.dataHealth?.oversubscribedBatches ?? 0}</span>
+        </div>
+      </> : null}
       {error ? <div className="daily-range-message tone-warning">Daily Range status unavailable: {error}</div> : null}
       {!error && data && openTrades.length === 0 ? <div className="daily-range-message">Tidak ada Daily Range trade aktif yang sudah terisi untuk direview.</div> : null}
       {openTrades.length > 0 ? <>

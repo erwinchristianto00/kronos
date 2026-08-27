@@ -395,7 +395,19 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       { source: "CONSERVATIVE_FALLBACK", sampleCount: 0 },
     ]);
     expect(lane.getStatus()).toMatchObject({
-      economics: { frictionModel: { source: "CONSERVATIVE_FALLBACK" } },
+      economics: {
+        frictionModel: {
+          source: "CONSERVATIVE_FALLBACK",
+          entryFeeP95Bps: 4,
+          stopGapP95Bps: 8,
+        },
+        candidateSummary: {
+          evaluated: 0,
+          economicsRejected: 0,
+          plannedRiskUsd: { count: 0, minimum: null, average: null, maximum: null },
+          actualInitialRiskUsd: { count: 0, average: null, maximum: null },
+        },
+      },
     });
   });
 
