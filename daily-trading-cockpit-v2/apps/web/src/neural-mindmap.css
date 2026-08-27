@@ -2430,7 +2430,7 @@ i.health-diagnostic {
 }
 
 .daily-range-table {
-  min-width: 1420px !important;
+  min-width: 1600px !important;
 }
 
 .daily-range-table th,
@@ -2483,6 +2483,21 @@ i.health-diagnostic {
 .daily-range-state.is-stop {
   border-color: rgba(255, 107, 107, 0.48);
   color: #ff8b8b !important;
+}
+
+.daily-range-state.is-continuation {
+  border-color: rgba(111, 179, 214, 0.55);
+  color: #8ccae8 !important;
+}
+
+.daily-range-state.is-fade {
+  border-color: rgba(240, 181, 75, 0.58);
+  color: #f0c56d !important;
+}
+
+.daily-range-state.is-legacy {
+  border-color: rgba(125, 151, 163, 0.52);
+  color: #a9c2cb !important;
 }
 
 .daily-range-action {

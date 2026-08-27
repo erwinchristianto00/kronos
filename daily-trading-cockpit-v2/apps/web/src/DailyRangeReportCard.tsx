@@ -170,6 +170,22 @@ function closeReason(reason: string | null): string {
   return reason?.replaceAll('_', ' ') ?? '—';
 }
 
+function entryPolicyLabel(policy: DailyRangeTrade['entryPolicy']): string {
+  if (policy === 'FADE') return 'BREAKOUT FADE';
+  if (policy === 'CONTINUATION') return 'CONTINUATION';
+  return 'LEGACY CONTINUATION';
+}
+
+function entryPolicyDescription(policy: DailyRangeTrade['entryPolicy']): string {
+  if (policy === 'FADE') return 'Breakout gagal: harga kembali masuk ke dalam range 4H.';
+  if (policy === 'CONTINUATION') return 'Breakout bertahan: close 5m berikutnya makin jauh di luar range 4H.';
+  return 'Aturan continuation sebelum router otomatis diterapkan.';
+}
+
+function entryPolicyClass(policy: DailyRangeTrade['entryPolicy']): string {
+  return policy === 'FADE' ? 'is-fade' : policy === 'CONTINUATION' ? 'is-continuation' : 'is-legacy';
+}
+
 function latestFirst(left: DailyRangeTrade, right: DailyRangeTrade): number {
   return Date.parse(right.exitTimestamp ?? '') - Date.parse(left.exitTimestamp ?? '');
 }
@@ -210,11 +226,13 @@ function ClosedDailyRangeReport({
     {closedTrades.length > 0 ? <div className="testnet-table-wrap">
       <table className="daily-range-table daily-range-closed-table">
         <thead><tr>
-          <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th><th>Hold</th><th>Reason</th><th>Gross</th><th>Fees</th><th>Funding</th><th>Net realized</th><th>R realized</th><th>MFE / MAE</th><th>Closed</th>
+          <th>Symbol</th><th>Side</th><th>Setup</th><th>Opened (Taipei)</th><th>Entry</th><th>Exit</th><th>Hold</th><th>Reason</th><th>Gross</th><th>Fees</th><th>Funding</th><th>Net realized</th><th>R realized</th><th>MFE / MAE</th><th>Closed (Taipei)</th>
         </tr></thead>
         <tbody>{closedTrades.map((trade) => <tr key={trade.tradeId}>
           <td><strong>{trade.symbol}</strong></td>
           <td style={{ color: toneForSide(trade.direction), fontWeight: 700 }}>{trade.direction}</td>
+          <td><span className={`daily-range-state ${entryPolicyClass(trade.entryPolicy)}`} title={entryPolicyDescription(trade.entryPolicy)}>{entryPolicyLabel(trade.entryPolicy)}</span></td>
+          <td>{formatTaipei(trade.entryFilledAt ?? trade.entrySubmittedAt)}</td>
           <td>{formatPrice(trade.entryFillPrice)}</td>
           <td>{formatPrice(trade.exitPrice)}</td>
           <td>{formatDuration(trade.holdingDurationMs)}</td>
@@ -340,6 +358,7 @@ export default function DailyRangeReportCard({
       ? 'LIVE · OBSERVE ONLY'
       : `LIVE · ${data.control?.mode ?? 'memuat mode…'}`
     : `Testnet only · ${data?.control?.mode ?? 'memuat mode…'}`;
+  const usesAutoRouter = data?.strategyVersion === 'daily-4h-range-auto-route-ny-2r-v2';
 
   return <>
     <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="daily-range-open-report">
@@ -353,7 +372,7 @@ export default function DailyRangeReportCard({
         <span className="tone-measure">{runtimeLabel}</span>
       </header>
       <div className="daily-range-report-note">
-        Range <strong>00:00–04:00 UTC</strong> → dua close 5m selesai di luar range → native structural SL + fixed 2R TP.
+        Range <strong>{usesAutoRouter ? '00:00–04:00 New York' : '00:00–04:00 UTC'}</strong> → {usesAutoRouter ? 'breakout bertahan = Continuation; kembali masuk range = Breakout Fade.' : 'dua close 5m selesai di luar range → native structural SL + fixed 2R TP.'}
         Klik simbol trade untuk membuka candle; level range selalu memakai data trade yang dibekukan saat entry.
       </div>
       {error ? <div className="daily-range-message tone-warning">Daily Range status unavailable: {error}</div> : null}
@@ -366,7 +385,7 @@ export default function DailyRangeReportCard({
         <div className="testnet-table-wrap">
           <table className="daily-range-table">
             <thead><tr>
-              <th>Book</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Stop</th><th>R now / peak</th><th>Gross mark</th><th>Range H / L</th><th>Opened</th><th>Intent state</th><th>Action</th>
+              <th>Book</th><th>Symbol</th><th>Side</th><th>Setup</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Stop</th><th>R now / peak</th><th>Gross mark</th><th>Range H / L</th><th>Opened (Taipei)</th><th>Intent state</th><th>Action</th>
             </tr></thead>
             <tbody>{openTrades.map((trade) => {
               const selected = selectedTrade?.tradeId === trade.tradeId;
@@ -377,6 +396,7 @@ export default function DailyRangeReportCard({
                 <td>Daily range</td>
                 <td><button type="button" className="daily-range-symbol-button" onClick={() => setSelectedTradeId(trade.tradeId)} aria-pressed={selected} title={`Buka candle ${trade.symbol}`}>{trade.symbol}</button></td>
                 <td style={{ color: toneForSide(trade.direction), fontWeight: 700 }}>{trade.direction}</td>
+                <td><span className={`daily-range-state ${entryPolicyClass(trade.entryPolicy)}`} title={entryPolicyDescription(trade.entryPolicy)}>{entryPolicyLabel(trade.entryPolicy)}</span></td>
                 <td>{finite(trade.entryQty) ? Number(trade.entryQty.toFixed(8)) : '—'}</td>
                 <td>{formatPrice(trade.entryFillPrice)}</td>
                 <td>{formatPrice(trade.lastMarkPrice)}</td>
