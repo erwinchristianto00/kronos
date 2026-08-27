@@ -23,7 +23,7 @@ function shuffled<T>(source: readonly T[], seed: number): T[] {
   return out;
 }
 
-function selected(input: readonly DailyRangeAllocationCandidate[], mode: "SEEDED_RANDOM_BASELINE" | "VALIDATED_SELECTOR") {
+function selected(input: readonly DailyRangeAllocationCandidate[], mode: "SEEDED_RANDOM_BASELINE" | "VALIDATED_SELECTOR" | "ECONOMIC_QUALITY_BASELINE" | "SHADOW_ALPHA_SELECTOR") {
   return allocateDailyRangeBatch({
     mode,
     strategyVersion: "daily-range-test-v2",
@@ -45,6 +45,24 @@ describe("Daily Range batch allocator", () => {
     const baseline = selected(candidates, "SEEDED_RANDOM_BASELINE");
     for (let seed = 1; seed <= 1_000; seed++) {
       expect(selected(shuffled(candidates, seed), "SEEDED_RANDOM_BASELINE")).toEqual(baseline);
+    }
+  });
+
+  it("uses the same economic top-N across 1,000 permutations and never consults alpha shadow score", () => {
+    const economic = candidates.map((candidate, index) => ({
+      ...candidate,
+      // Deliberately reverse alpha score from the economic quality order.
+      selectorScore: 1 - index / 10,
+      economic: {
+        breakEvenWinRate: 0.40 + index / 100,
+        costRatio: 0.10 + index / 100,
+        plannedRiskUsd: 0.25 - index / 1_000,
+        qualityTieBreakHash: `quality-${index}`,
+      },
+    }));
+    for (let seed = 1; seed <= 1_000; seed++) {
+      expect(selected(shuffled(economic, seed), "ECONOMIC_QUALITY_BASELINE")).toEqual(["A", "B"]);
+      expect(selected(shuffled(economic, seed), "SHADOW_ALPHA_SELECTOR")).toEqual(["A", "B"]);
     }
   });
 

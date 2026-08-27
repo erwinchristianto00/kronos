@@ -55,7 +55,7 @@ describe("Daily Range mainnet controls", () => {
       maxOpenTrades: 2,
       maxGrossNotionalUsd: 50.5,
       newEntryMode: "ENABLED",
-      allocatorMode: "SEEDED_RANDOM_BASELINE",
+      allocatorMode: "ECONOMIC_QUALITY_BASELINE",
     });
   });
 
@@ -68,6 +68,13 @@ describe("Daily Range mainnet controls", () => {
       DAILY_RANGE_NEW_ENTRY_MODE: "PAUSED_SELECTION_FIX",
       DAILY_RANGE_ALLOCATOR: "SEEDED_RANDOM_BASELINE",
     })).toMatchObject({ newEntryMode: "PAUSED_SELECTION_FIX", allocatorMode: "PAUSED" });
+  });
+
+  it("never grants Mainnet random baseline authority", () => {
+    expect(parseDailyRangeMainnetControls({
+      DAILY_RANGE_NEW_ENTRY_MODE: "ENABLED",
+      DAILY_RANGE_ALLOCATOR: "SEEDED_RANDOM_BASELINE",
+    })).toMatchObject({ allocatorMode: "ECONOMIC_QUALITY_BASELINE" });
   });
 
   it("keeps Testnet baseline allocation under the fixed three-trade cap", () => {

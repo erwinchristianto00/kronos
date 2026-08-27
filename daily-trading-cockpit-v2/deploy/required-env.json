@@ -204,12 +204,12 @@
           "why": "Refresh the isolated Daily Range C1-C6 pool every five minutes so its required 5m/4h quality check is current. Existing daily trades retain their frozen day snapshot and exchange-side brackets."
         },
         "DAILY_RANGE_ALLOCATOR": {
-          "value": "SEEDED_RANDOM_BASELINE",
-          "why": "Testnet batch allocator is a deterministic neutral baseline. It breaks the old lexical loop-order authority without granting an unvalidated selector any alpha or sizing authority."
+          "value": "ECONOMIC_QUALITY_BASELINE",
+          "why": "Daily Range V3 Testnet ranks only candidates that pass frozen BBO/stop-economics and the fixed 25-USDT / 0.25-USDT-risk cap. Alpha remains shadow-only; seeded random is research-only and has no operational authority."
         },
         "DAILY_RANGE_TESTNET_MAX_OPEN_TRADES": {
           "value": "3",
-          "why": "Testnet seeded-random execution uses the same finite three-position allocation cap as Live, so an oversubscribed batch is a real top-N decision rather than every candidate being entered."
+          "why": "Testnet V3 economic execution uses the same finite three-position allocation cap as Live, so an oversubscribed batch remains a real top-N decision rather than every candidate being entered."
         }
       }
     },
@@ -297,8 +297,8 @@
           "why": "Operator-authorized baseline activation after the batch allocator and native-exit reconciliation fixes. New Live entries remain capped at three 25-USDT / 1x trades and use no unvalidated alpha selector."
         },
         "DAILY_RANGE_ALLOCATOR": {
-          "value": "SEEDED_RANDOM_BASELINE",
-          "why": "Operator-authorized neutral Live allocator. The deterministic seed removes lexical loop-order authority while keeping SELECTOR = SHADOW; it does not claim alpha."
+          "value": "ECONOMIC_QUALITY_BASELINE",
+          "why": "Daily Range V3 Live uses the frozen economic-quality baseline: causal BBO, structural-stop cost gate, and capped 25-USDT / 0.25-USDT planned risk. Seeded random has no Mainnet authority; alpha stays shadow-only until promotion gates and explicit approval pass."
         },
         "DAILY_RANGE_MAINNET_EXECUTION_ENABLED": {
           "value": "1",

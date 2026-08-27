@@ -11,8 +11,16 @@ import { createHash } from "node:crypto";
 export const DAILY_RANGE_ALLOCATOR_MODES = [
   "PAUSED",
   "LOOP_ORDER_LEGACY",
+  /** Research/test comparator only. It has no Mainnet execution authority. */
   "SEEDED_RANDOM_BASELINE",
+  "ECONOMIC_QUALITY_BASELINE",
+  /** Alpha may be observed, but economic ordering remains the execution authority. */
+  "SHADOW_ALPHA_SELECTOR",
+  /** Requires a separately validated artifact and positive expected net value. */
+  "VALIDATED_ALPHA_SELECTOR",
+  /** @deprecated durable-record compatibility only. */
   "SHADOW_SELECTOR",
+  /** @deprecated durable-record compatibility only. */
   "VALIDATED_SELECTOR",
 ] as const;
 
@@ -22,6 +30,7 @@ export type DailyRangeAllocationSkipReason =
   | "NO_AVAILABLE_SLOT"
   | "SKIP_CAP_LOWER_RANK"
   | "SELECTOR_NOT_READY"
+  | "NEGATIVE_EXPECTED_VALUE"
   | "LIVE_NEW_ENTRY_PAUSED";
 
 export interface DailyRangeAllocationCandidate {
@@ -31,6 +40,15 @@ export interface DailyRangeAllocationCandidate {
   legacySequence: number;
   /** A future promoted artifact may supply this.  Null never becomes an alpha score. */
   selectorScore: number | null;
+  /** Positive net USD from a validated alpha artifact only. */
+  selectorExpectedNetUsd?: number | null;
+  /** V3 non-alpha candidate quality. It must be computed before allocation. */
+  economic?: {
+    breakEvenWinRate: number;
+    costRatio: number;
+    plannedRiskUsd: number;
+    qualityTieBreakHash: string;
+  } | null;
 }
 
 export interface DailyRangeAllocationDecision {
@@ -101,6 +119,22 @@ function canonicalCandidates(candidates: readonly DailyRangeAllocationCandidate[
       selectorScore: typeof candidate.selectorScore === "number" && Number.isFinite(candidate.selectorScore)
         ? candidate.selectorScore
         : null,
+      selectorExpectedNetUsd: typeof candidate.selectorExpectedNetUsd === "number" && Number.isFinite(candidate.selectorExpectedNetUsd)
+        ? candidate.selectorExpectedNetUsd
+        : null,
+      economic: candidate.economic
+        && Number.isFinite(candidate.economic.breakEvenWinRate)
+        && Number.isFinite(candidate.economic.costRatio)
+        && Number.isFinite(candidate.economic.plannedRiskUsd)
+        && typeof candidate.economic.qualityTieBreakHash === "string"
+        && candidate.economic.qualityTieBreakHash.length > 0
+        ? {
+          breakEvenWinRate: candidate.economic.breakEvenWinRate,
+          costRatio: candidate.economic.costRatio,
+          plannedRiskUsd: candidate.economic.plannedRiskUsd,
+          qualityTieBreakHash: candidate.economic.qualityTieBreakHash,
+        }
+        : null,
     });
   }
   return [...bySignal.values()].sort((a, b) => a.symbol.localeCompare(b.symbol) || a.signalId.localeCompare(b.signalId));
@@ -128,10 +162,10 @@ export function allocateDailyRangeBatch(input: {
   const candidates = canonicalCandidates(input.candidates);
   const seed = `${input.strategyVersion}:${input.batchTimestampMs}:${input.environment}`;
   const withTieBreak = candidates.map((candidate) => {
-    const baselineMode = input.mode === "SEEDED_RANDOM_BASELINE" || input.mode === "SHADOW_SELECTOR";
+    const seededBaselineMode = input.mode === "SEEDED_RANDOM_BASELINE" || input.mode === "SHADOW_SELECTOR";
     return {
       candidate,
-      tieBreakHash: baselineMode
+      tieBreakHash: candidate.economic?.qualityTieBreakHash ?? (seededBaselineMode
         ? dailyRangeBaselineHash({
           strategyVersion: input.strategyVersion,
           batchTimestampMs: input.batchTimestampMs,
@@ -142,7 +176,7 @@ export function allocateDailyRangeBatch(input: {
           strategyVersion: input.strategyVersion,
           batchTimestampMs: input.batchTimestampMs,
           symbol: candidate.symbol,
-        }),
+        })),
     };
   });
   const slots = boundedSlots(input.availableSlots, withTieBreak.length);
@@ -164,7 +198,9 @@ export function allocateDailyRangeBatch(input: {
     };
   }
 
-  if (input.mode === "VALIDATED_SELECTOR" && withTieBreak.some(({ candidate }) => candidate.selectorScore === null)) {
+  const validatedMode = input.mode === "VALIDATED_SELECTOR" || input.mode === "VALIDATED_ALPHA_SELECTOR";
+  const v3ValidatedMode = input.mode === "VALIDATED_ALPHA_SELECTOR";
+  if (validatedMode && withTieBreak.some(({ candidate }) => candidate.selectorScore === null || (v3ValidatedMode && (candidate.selectorExpectedNetUsd ?? Number.NEGATIVE_INFINITY) <= 0))) {
     return {
       mode: input.mode,
       seed,
@@ -176,7 +212,7 @@ export function allocateDailyRangeBatch(input: {
         selectorScore: candidate.selectorScore,
         tieBreakHash,
         selected: false,
-        skipReason: "SELECTOR_NOT_READY",
+        skipReason: candidate.selectorScore === null ? "SELECTOR_NOT_READY" : "NEGATIVE_EXPECTED_VALUE",
       })),
     };
   }
@@ -185,13 +221,28 @@ export function allocateDailyRangeBatch(input: {
     if (input.mode === "LOOP_ORDER_LEGACY") {
       return a.candidate.legacySequence - b.candidate.legacySequence || a.tieBreakHash.localeCompare(b.tieBreakHash);
     }
-    if (input.mode === "VALIDATED_SELECTOR") {
+    if (validatedMode) {
       return (b.candidate.selectorScore ?? Number.NEGATIVE_INFINITY) - (a.candidate.selectorScore ?? Number.NEGATIVE_INFINITY)
         || a.tieBreakHash.localeCompare(b.tieBreakHash);
     }
-    // SHADOW_SELECTOR deliberately uses the identical neutral baseline until a
-    // separately versioned, promoted artifact exists.  It may score candidates,
-    // but its score has zero execution authority here.
+    if (input.mode === "ECONOMIC_QUALITY_BASELINE" || input.mode === "SHADOW_ALPHA_SELECTOR") {
+      // No alpha lives here.  A lower break-even requirement and lower safe-loss
+      // friction are preferable; larger *capped* planned risk wins only after
+      // those two economic properties tie. The frozen hash is the final tie.
+      const ae = a.candidate.economic;
+      const be = b.candidate.economic;
+      if (ae && be) {
+        return ae.breakEvenWinRate - be.breakEvenWinRate
+          || ae.costRatio - be.costRatio
+          || be.plannedRiskUsd - ae.plannedRiskUsd
+          || a.tieBreakHash.localeCompare(b.tieBreakHash);
+      }
+      if (ae) return -1;
+      if (be) return 1;
+    }
+    // Deprecated shadow and seeded modes deliberately retain the prior neutral
+    // comparator solely for historical replay/test data. Neither is permitted
+    // to become Mainnet execution authority by the runtime policy.
     return a.tieBreakHash.localeCompare(b.tieBreakHash);
   });
 

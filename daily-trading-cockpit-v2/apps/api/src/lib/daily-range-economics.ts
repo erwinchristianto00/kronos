@@ -1,0 +1,444 @@
+/**
+ * Daily Range V3 execution economics.
+ *
+ * This module deliberately contains no exchange I/O or mutable process state.
+ * A lane freezes one returned model for a UTC decision day, persists it, and
+ * passes the immutable model plus a causal BBO snapshot into these pure
+ * functions before it allocates a scarce slot.  That keeps selection, sizing,
+ * and later accounting explainable without allowing a later quote or a future
+ * fill to rewrite the original decision.
+ */
+import { createHash } from "node:crypto";
+
+import type { FuturesSymbolFilters } from "./binance-futures-private.js";
+
+export const DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID = "daily-range-execution-economics-v1";
+export const DAILY_RANGE_ECONOMIC_ALLOCATOR_POLICY_ID = "daily-range-economic-quality-baseline-v1";
+export const DAILY_RANGE_ALPHA_SELECTOR_POLICY_ID = "daily-range-route-selector-v1";
+
+export const DAILY_RANGE_MAX_NOTIONAL_USD = 25;
+export const DAILY_RANGE_MAX_PLANNED_RISK_USD = 0.25;
+export const DAILY_RANGE_MAX_COST_RATIO = 0.25;
+export const DAILY_RANGE_SAFE_FRICTION_MULTIPLIER = 1.25;
+export const DAILY_RANGE_MIN_EMPIRICAL_FRICTION_SAMPLES = 12;
+
+export type DailyRangeEconomicsSide = "LONG" | "SHORT";
+export type DailyRangeFrictionModelSource = "EMPIRICAL_LEDGER" | "CONSERVATIVE_FALLBACK";
+export type DailyRangeFeeEvidence = "EXACT_FILL_COMMISSION" | "LEGACY_COMBINED_FEE_ALLOCATION" | "CONFIGURED_CONSERVATIVE";
+
+export interface DailyRangeFrictionSample {
+  tradeId: string;
+  closedAt: string;
+  entryFeeBps: number | null;
+  exitFeeBps: number | null;
+  entryAdverseBps: number | null;
+  takeProfitExitAdverseBps: number | null;
+  stopExitAdverseBps: number | null;
+  stopGapBps: number | null;
+  exitReason: "TAKE_PROFIT" | "STOP_LOSS" | "OTHER";
+  feeEvidence: DailyRangeFeeEvidence;
+}
+
+export interface DailyRangeFrictionModel {
+  id: string;
+  policyId: typeof DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID;
+  source: DailyRangeFrictionModelSource;
+  createdAt: string;
+  cutoffAt: string;
+  sampleCount: number;
+  exactFeeSampleCount: number;
+  legacyFeeSampleCount: number;
+  /** Median, observed/admitted entry adverse execution cost. */
+  entryAdverseP50Bps: number;
+  entryAdverseP95Bps: number;
+  takeProfitExitAdverseP50Bps: number;
+  takeProfitExitAdverseP95Bps: number;
+  stopExitAdverseP50Bps: number;
+  stopExitAdverseP95Bps: number;
+  stopGapP50Bps: number;
+  stopGapP95Bps: number;
+  entryFeeP50Bps: number;
+  entryFeeP95Bps: number;
+  exitFeeP50Bps: number;
+  exitFeeP95Bps: number;
+  /** Empirical all-in adverse price friction, separated by terminal path. */
+  winAdverseP50Bps: number;
+  lossAdverseP50Bps: number;
+  lossAdverseP95Bps: number;
+  hash: string;
+}
+
+export interface DailyRangeEconomicsBbo {
+  bid: number;
+  ask: number;
+  observedAt: string;
+  sourceTime: number | null;
+  receivedAt: string;
+}
+
+export interface DailyRangePreTradeEconomics {
+  economicsPolicyId: typeof DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID;
+  allocatorPolicyId: typeof DAILY_RANGE_ECONOMIC_ALLOCATOR_POLICY_ID;
+  frictionModelId: string;
+  frictionModelSource: DailyRangeFrictionModelSource;
+  frictionModelCutoffAt: string;
+  decisionBid: number;
+  decisionAsk: number;
+  decisionSpreadBps: number;
+  bboObservedAt: string;
+  bboReceivedAt: string;
+  bboSourceTime: number | null;
+  expectedEntryPrice: number;
+  expectedStopPrice: number;
+  expectedTakeProfitPrice: number;
+  rawStructuralStop: number;
+  stopRiskPrice: number;
+  stopRiskBps: number;
+  requestedQty: number;
+  plannedNotionalUsd: number;
+  plannedRiskUsd: number;
+  entryFeeBps: number;
+  exitFeeBps: number;
+  medianWinFrictionBps: number;
+  medianLossFrictionBps: number;
+  safeLossFrictionBps: number;
+  costRatio: number;
+  netWinR: number;
+  netLossR: number;
+  breakEvenWinRate: number;
+  qualityTieBreakHash: string;
+}
+
+export type DailyRangeEconomicsPreparation =
+  | { ok: true; economics: DailyRangePreTradeEconomics }
+  | { ok: false; reason: "BBO_STALE" | "FRICTION_MODEL_UNAVAILABLE" | "STOP_ECONOMICS_FAIL" | "RISK_BUDGET_UNEXECUTABLE" };
+
+export interface DailyRangeActualFillEconomics {
+  actualStopRiskPrice: number;
+  actualStopRiskBps: number;
+  actualInitialRiskUsd: number;
+  actualCostRatio: number;
+  materialViolation: boolean;
+}
+
+function finite(value: number | null | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function nonNegative(value: number | null | undefined): number | null {
+  return finite(value) && value >= 0 ? value : null;
+}
+
+function cleanValues(values: readonly (number | null | undefined)[]): number[] {
+  return values.filter((value): value is number => finite(value) && value >= 0).sort((left, right) => left - right);
+}
+
+export function percentile(values: readonly (number | null | undefined)[], p: number, fallback: number): number {
+  const clean = cleanValues(values);
+  if (clean.length === 0) return fallback;
+  const clamped = Math.max(0, Math.min(1, p));
+  const index = (clean.length - 1) * clamped;
+  const low = Math.floor(index);
+  const high = Math.ceil(index);
+  if (low === high) return clean[low]!;
+  return clean[low]! + (clean[high]! - clean[low]!) * (index - low);
+}
+
+function rounded(value: number): number {
+  return Number(value.toFixed(8));
+}
+
+function modelHash(input: Omit<DailyRangeFrictionModel, "id" | "hash">): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
+
+function modelId(createdAt: string, hash: string): string {
+  return `daily-friction-v1-${createdAt.replace(/[-:.TZ]/g, "").slice(0, 14)}-${hash.slice(0, 12)}`;
+}
+
+function baseModel(input: {
+  source: DailyRangeFrictionModelSource;
+  createdAt: string;
+  cutoffAt: string;
+  sampleCount: number;
+  exactFeeSampleCount: number;
+  legacyFeeSampleCount: number;
+  entryAdverseP50Bps: number;
+  entryAdverseP95Bps: number;
+  takeProfitExitAdverseP50Bps: number;
+  takeProfitExitAdverseP95Bps: number;
+  stopExitAdverseP50Bps: number;
+  stopExitAdverseP95Bps: number;
+  stopGapP50Bps: number;
+  stopGapP95Bps: number;
+  entryFeeP50Bps: number;
+  entryFeeP95Bps: number;
+  exitFeeP50Bps: number;
+  exitFeeP95Bps: number;
+  winAdverseP50Bps: number;
+  lossAdverseP50Bps: number;
+  lossAdverseP95Bps: number;
+}): DailyRangeFrictionModel {
+  const canonical: Omit<DailyRangeFrictionModel, "id" | "hash"> = {
+    policyId: DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID,
+    ...input,
+  };
+  const hash = modelHash(canonical);
+  return { id: modelId(input.createdAt, hash), ...canonical, hash };
+}
+
+/**
+ * Testnet's fallback is intentionally non-zero and conservative.  It is a
+ * safety observation baseline, not an implicit substitute for a Live model.
+ */
+export function conservativeFallbackFrictionModel(createdAt: string, cutoffAt = createdAt): DailyRangeFrictionModel {
+  return baseModel({
+    source: "CONSERVATIVE_FALLBACK",
+    createdAt,
+    cutoffAt,
+    sampleCount: 0,
+    exactFeeSampleCount: 0,
+    legacyFeeSampleCount: 0,
+    entryAdverseP50Bps: 1.5,
+    entryAdverseP95Bps: 4,
+    takeProfitExitAdverseP50Bps: 1.5,
+    takeProfitExitAdverseP95Bps: 4,
+    stopExitAdverseP50Bps: 3,
+    stopExitAdverseP95Bps: 8,
+    stopGapP50Bps: 2,
+    stopGapP95Bps: 8,
+    entryFeeP50Bps: 4,
+    entryFeeP95Bps: 4,
+    exitFeeP50Bps: 4,
+    exitFeeP95Bps: 4,
+    winAdverseP50Bps: 3,
+    lossAdverseP50Bps: 8,
+    lossAdverseP95Bps: 20,
+  });
+}
+
+/** Build one immutable model from terminal fills known before its cutoff. */
+export function buildEmpiricalFrictionModel(input: {
+  samples: readonly DailyRangeFrictionSample[];
+  createdAt: string;
+  cutoffAt: string;
+  minimumSamples?: number;
+}): DailyRangeFrictionModel | null {
+  const samples = input.samples.filter((sample) => Date.parse(sample.closedAt) <= Date.parse(input.cutoffAt));
+  const minimum = input.minimumSamples ?? DAILY_RANGE_MIN_EMPIRICAL_FRICTION_SAMPLES;
+  if (samples.length < minimum) return null;
+  const exactFeeSampleCount = samples.filter((sample) => sample.feeEvidence === "EXACT_FILL_COMMISSION").length;
+  const legacyFeeSampleCount = samples.filter((sample) => sample.feeEvidence === "LEGACY_COMBINED_FEE_ALLOCATION").length;
+  const wins = samples.filter((sample) => sample.exitReason === "TAKE_PROFIT");
+  const losses = samples.filter((sample) => sample.exitReason === "STOP_LOSS");
+  const entryAdverse = samples.map((sample) => nonNegative(sample.entryAdverseBps));
+  const tpExit = wins.map((sample) => nonNegative(sample.takeProfitExitAdverseBps));
+  const stopExit = losses.map((sample) => nonNegative(sample.stopExitAdverseBps));
+  const stopGap = losses.map((sample) => nonNegative(sample.stopGapBps));
+  const entryFee = samples.map((sample) => nonNegative(sample.entryFeeBps));
+  const exitFee = samples.map((sample) => nonNegative(sample.exitFeeBps));
+  const winAdverse = wins.map((sample) => Math.max(0, (sample.entryAdverseBps ?? 0) + (sample.takeProfitExitAdverseBps ?? 0)));
+  const lossAdverse = losses.map((sample) => Math.max(0, (sample.entryAdverseBps ?? 0) + (sample.stopExitAdverseBps ?? 0) + (sample.stopGapBps ?? 0)));
+
+  // A missing category should not create a cost-free route.  Use the all-sample
+  // distribution or the fixed conservative fallback for that one component.
+  const fallback = conservativeFallbackFrictionModel(input.createdAt, input.cutoffAt);
+  return baseModel({
+    source: "EMPIRICAL_LEDGER",
+    createdAt: input.createdAt,
+    cutoffAt: input.cutoffAt,
+    sampleCount: samples.length,
+    exactFeeSampleCount,
+    legacyFeeSampleCount,
+    entryAdverseP50Bps: rounded(percentile(entryAdverse, 0.5, fallback.entryAdverseP50Bps)),
+    entryAdverseP95Bps: rounded(percentile(entryAdverse, 0.95, fallback.entryAdverseP95Bps)),
+    takeProfitExitAdverseP50Bps: rounded(percentile(tpExit, 0.5, fallback.takeProfitExitAdverseP50Bps)),
+    takeProfitExitAdverseP95Bps: rounded(percentile(tpExit, 0.95, fallback.takeProfitExitAdverseP95Bps)),
+    stopExitAdverseP50Bps: rounded(percentile(stopExit, 0.5, fallback.stopExitAdverseP50Bps)),
+    stopExitAdverseP95Bps: rounded(percentile(stopExit, 0.95, fallback.stopExitAdverseP95Bps)),
+    stopGapP50Bps: rounded(percentile(stopGap, 0.5, fallback.stopGapP50Bps)),
+    stopGapP95Bps: rounded(percentile(stopGap, 0.95, fallback.stopGapP95Bps)),
+    entryFeeP50Bps: rounded(percentile(entryFee, 0.5, fallback.entryFeeP50Bps)),
+    entryFeeP95Bps: rounded(percentile(entryFee, 0.95, fallback.entryFeeP95Bps)),
+    exitFeeP50Bps: rounded(percentile(exitFee, 0.5, fallback.exitFeeP50Bps)),
+    exitFeeP95Bps: rounded(percentile(exitFee, 0.95, fallback.exitFeeP95Bps)),
+    winAdverseP50Bps: rounded(percentile(winAdverse, 0.5, fallback.winAdverseP50Bps)),
+    lossAdverseP50Bps: rounded(percentile(lossAdverse, 0.5, fallback.lossAdverseP50Bps)),
+    lossAdverseP95Bps: rounded(percentile(lossAdverse, 0.95, fallback.lossAdverseP95Bps)),
+  });
+}
+
+function roundToStep(value: number, step: number, mode: "down" | "up"): number {
+  if (!finite(value) || !finite(step) || step <= 0) return value;
+  const units = value / step;
+  const raw = mode === "down" ? Math.floor(units + 1e-10) : Math.ceil(units - 1e-10);
+  const decimals = Math.max(0, Math.ceil(-Math.log10(step)) + 2);
+  return Number((raw * step).toFixed(Math.min(14, decimals)));
+}
+
+function clampQtyDown(raw: number, filter: FuturesSymbolFilters): number | null {
+  if (!finite(raw) || raw <= 0 || !finite(filter.stepSize) || filter.stepSize <= 0) return null;
+  const qty = roundToStep(raw, filter.stepSize, "down");
+  return qty + 1e-12 >= filter.minQty ? qty : null;
+}
+
+function bracket(input: { side: DailyRangeEconomicsSide; entry: number; rawStop: number; tickSize: number }): {
+  stop: number;
+  takeProfit: number;
+  risk: number;
+} | null {
+  if (!finite(input.entry) || input.entry <= 0 || !finite(input.rawStop) || input.rawStop <= 0 || !finite(input.tickSize) || input.tickSize <= 0) return null;
+  const stop = input.side === "LONG"
+    ? roundToStep(input.rawStop, input.tickSize, "down")
+    : roundToStep(input.rawStop, input.tickSize, "up");
+  const risk = input.side === "LONG" ? input.entry - stop : stop - input.entry;
+  if (!(risk > 1e-12)) return null;
+  const rawTakeProfit = input.side === "LONG" ? input.entry + 2 * risk : input.entry - 2 * risk;
+  const takeProfit = input.side === "LONG"
+    ? roundToStep(rawTakeProfit, input.tickSize, "up")
+    : roundToStep(rawTakeProfit, input.tickSize, "down");
+  const reward = input.side === "LONG" ? takeProfit - input.entry : input.entry - takeProfit;
+  return takeProfit > 0 && reward + 1e-12 >= 2 * risk ? { stop, takeProfit, risk } : null;
+}
+
+export function dailyRangeEconomicTieBreakHash(input: {
+  strategyPolicyId: string;
+  batchTimestampMs: number;
+  symbol: string;
+  side: DailyRangeEconomicsSide;
+  route: string;
+}): string {
+  return createHash("sha256")
+    .update(`${input.strategyPolicyId}\u0000${input.batchTimestampMs}\u0000${input.symbol.trim().toUpperCase()}\u0000${input.side}\u0000${input.route}`)
+    .digest("hex");
+}
+
+export function prepareDailyRangeEconomics(input: {
+  side: DailyRangeEconomicsSide;
+  route: string;
+  symbol: string;
+  batchTimestampMs: number;
+  rawStructuralStop: number;
+  bbo: DailyRangeEconomicsBbo | null;
+  filter: FuturesSymbolFilters | null;
+  frictionModel: DailyRangeFrictionModel | null;
+  bboMaxAgeMs: number;
+  allocationAtMs: number;
+}): DailyRangeEconomicsPreparation {
+  if (!input.frictionModel) return { ok: false, reason: "FRICTION_MODEL_UNAVAILABLE" };
+  if (!input.bbo || !finite(input.bbo.bid) || input.bbo.bid <= 0 || !finite(input.bbo.ask) || input.bbo.ask <= 0 || input.bbo.ask < input.bbo.bid) {
+    return { ok: false, reason: "BBO_STALE" };
+  }
+  const observedAtMs = Date.parse(input.bbo.observedAt);
+  if (!Number.isFinite(observedAtMs) || observedAtMs < input.batchTimestampMs || observedAtMs > input.allocationAtMs || input.allocationAtMs - observedAtMs > input.bboMaxAgeMs) {
+    return { ok: false, reason: "BBO_STALE" };
+  }
+  if (!input.filter) return { ok: false, reason: "RISK_BUDGET_UNEXECUTABLE" };
+  const model = input.frictionModel;
+  const sideBook = input.side === "LONG" ? input.bbo.ask : input.bbo.bid;
+  const expectedEntry = input.side === "LONG"
+    ? sideBook * (1 + model.entryAdverseP95Bps / 10_000)
+    : sideBook * (1 - model.entryAdverseP95Bps / 10_000);
+  const roundedBracket = bracket({ side: input.side, entry: expectedEntry, rawStop: input.rawStructuralStop, tickSize: input.filter.tickSize });
+  if (!roundedBracket) return { ok: false, reason: "STOP_ECONOMICS_FAIL" };
+  const stopRiskBps = (roundedBracket.risk / expectedEntry) * 10_000;
+  const medianWinFrictionBps = model.entryFeeP50Bps + model.exitFeeP50Bps + model.winAdverseP50Bps;
+  const medianLossFrictionBps = model.entryFeeP50Bps + model.exitFeeP50Bps + model.lossAdverseP50Bps;
+  const safeLossFrictionBps = model.entryFeeP95Bps + model.exitFeeP95Bps + DAILY_RANGE_SAFE_FRICTION_MULTIPLIER * model.lossAdverseP95Bps;
+  if (!(stopRiskBps > 0) || !finite(safeLossFrictionBps)) return { ok: false, reason: "STOP_ECONOMICS_FAIL" };
+  const costRatio = safeLossFrictionBps / stopRiskBps;
+  if (costRatio > DAILY_RANGE_MAX_COST_RATIO + 1e-12) return { ok: false, reason: "STOP_ECONOMICS_FAIL" };
+  const rawQty = Math.min(
+    DAILY_RANGE_MAX_NOTIONAL_USD / expectedEntry,
+    DAILY_RANGE_MAX_PLANNED_RISK_USD / roundedBracket.risk,
+  );
+  const qty = clampQtyDown(rawQty, input.filter);
+  const plannedNotionalUsd = qty === null ? 0 : qty * expectedEntry;
+  const plannedRiskUsd = qty === null ? 0 : qty * roundedBracket.risk;
+  if (!qty || plannedNotionalUsd + 1e-12 < input.filter.minNotional || plannedRiskUsd > DAILY_RANGE_MAX_PLANNED_RISK_USD + 1e-9 || plannedNotionalUsd > DAILY_RANGE_MAX_NOTIONAL_USD + 1e-9) {
+    return { ok: false, reason: "RISK_BUDGET_UNEXECUTABLE" };
+  }
+  const netWinR = 2 - medianWinFrictionBps / stopRiskBps;
+  const netLossR = -1 - medianLossFrictionBps / stopRiskBps;
+  const denominator = netWinR + Math.abs(netLossR);
+  if (!(netWinR > 0) || !(denominator > 0)) return { ok: false, reason: "STOP_ECONOMICS_FAIL" };
+  const breakEvenWinRate = Math.abs(netLossR) / denominator;
+  const mid = (input.bbo.bid + input.bbo.ask) / 2;
+  const decisionSpreadBps = mid > 0 ? ((input.bbo.ask - input.bbo.bid) / mid) * 10_000 : Number.POSITIVE_INFINITY;
+  return {
+    ok: true,
+    economics: {
+      economicsPolicyId: DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID,
+      allocatorPolicyId: DAILY_RANGE_ECONOMIC_ALLOCATOR_POLICY_ID,
+      frictionModelId: model.id,
+      frictionModelSource: model.source,
+      frictionModelCutoffAt: model.cutoffAt,
+      decisionBid: input.bbo.bid,
+      decisionAsk: input.bbo.ask,
+      decisionSpreadBps,
+      bboObservedAt: input.bbo.observedAt,
+      bboReceivedAt: input.bbo.receivedAt,
+      bboSourceTime: input.bbo.sourceTime,
+      expectedEntryPrice: expectedEntry,
+      expectedStopPrice: roundedBracket.stop,
+      expectedTakeProfitPrice: roundedBracket.takeProfit,
+      rawStructuralStop: input.rawStructuralStop,
+      stopRiskPrice: roundedBracket.risk,
+      stopRiskBps,
+      requestedQty: qty,
+      plannedNotionalUsd,
+      plannedRiskUsd,
+      entryFeeBps: model.entryFeeP50Bps,
+      exitFeeBps: model.exitFeeP50Bps,
+      medianWinFrictionBps,
+      medianLossFrictionBps,
+      safeLossFrictionBps,
+      costRatio,
+      netWinR,
+      netLossR,
+      breakEvenWinRate,
+      qualityTieBreakHash: dailyRangeEconomicTieBreakHash({
+        strategyPolicyId: DAILY_RANGE_ECONOMIC_ALLOCATOR_POLICY_ID,
+        batchTimestampMs: input.batchTimestampMs,
+        symbol: input.symbol,
+        side: input.side,
+        route: input.route,
+      }),
+    },
+  };
+}
+
+/**
+ * The fill check intentionally never changes the structural stop.  If a market
+ * fill materially invalidates the safe decision, the only safe action is an
+ * immediate exact reduce-only flatten by the caller.
+ */
+export function evaluateActualFillEconomics(input: {
+  side: DailyRangeEconomicsSide;
+  entryPrice: number;
+  quantity: number;
+  stopPrice: number;
+  expectedCostRatio: number;
+  expectedPlannedRiskUsd: number;
+  safeLossFrictionBps: number;
+}): DailyRangeActualFillEconomics | null {
+  if (!finite(input.entryPrice) || input.entryPrice <= 0 || !finite(input.quantity) || input.quantity <= 0 || !finite(input.stopPrice) || input.stopPrice <= 0) return null;
+  const risk = input.side === "LONG" ? input.entryPrice - input.stopPrice : input.stopPrice - input.entryPrice;
+  if (!(risk > 0)) return null;
+  const actualStopRiskBps = risk / input.entryPrice * 10_000;
+  const actualInitialRiskUsd = risk * input.quantity;
+  const actualCostRatio = input.safeLossFrictionBps / actualStopRiskBps;
+  return {
+    actualStopRiskPrice: risk,
+    actualStopRiskBps,
+    actualInitialRiskUsd,
+    actualCostRatio,
+    materialViolation: actualCostRatio > DAILY_RANGE_MAX_COST_RATIO + 1e-12
+      || actualCostRatio > input.expectedCostRatio * 1.15 + 1e-12
+      // The requested quantity is frozen before the POST, so a worse market
+      // fill can only be tolerated within the same materiality band.  This
+      // keeps a $0.25 planned-risk cap meaningful without flattening for
+      // floating-point dust or a single tick of normal execution noise.
+      || actualInitialRiskUsd > input.expectedPlannedRiskUsd * 1.15 + 1e-9,
+  };
+}

@@ -45,12 +45,26 @@ type DailyRangeTrade = DailyRangeHeadlineTrade & {
   exitPrice: number | null;
   grossPnlUsd: number | null;
   feesUsd: number | null;
+  entryFeesUsd?: number | null;
+  exitFeesUsd?: number | null;
+  feeEvidence?: 'EXACT_FILL_COMMISSION' | 'LEGACY_COMBINED_FEE_ALLOCATION' | null;
   fundingUsd: number | null;
   realizedR: number | null;
   mfeR: number | null;
   maeR: number | null;
   holdingDurationMs: number | null;
   lastReconcileError: string | null;
+  economics?: {
+    frictionModelId: string;
+    frictionModelSource: 'EMPIRICAL_LEDGER' | 'CONSERVATIVE_FALLBACK';
+    stopRiskBps: number;
+    plannedRiskUsd: number;
+    costRatio: number;
+    breakEvenWinRate: number;
+  } | null;
+  actualStopRiskBps?: number | null;
+  actualCostRatio?: number | null;
+  postFillEconomicsStatus?: 'PASS' | 'POST_FILL_ECONOMICS_FAIL' | null;
 };
 
 type DailyRangePerformance = {
@@ -70,6 +84,26 @@ type DailyRangeStatus = {
   strategyVersion?: string;
   control?: { mode?: string };
   mainnetControls?: { entryBlockReason?: string | null } | null;
+  allocatorMode?: string;
+  effectiveAllocatorMode?: string;
+  selectorStatus?: string;
+  alphaSelector?: { executionAuthority?: boolean; status?: string; promotion?: string } | null;
+  economics?: {
+    policyId?: string;
+    allocatorPolicyId?: string;
+    maxNotionalUsd?: number;
+    maxPlannedRiskUsd?: number;
+    maxCostRatio?: number;
+    bboMaxAgeMs?: number;
+    frictionModel?: {
+      id?: string;
+      source?: string;
+      sampleCount?: number;
+      exactFeeSampleCount?: number;
+      legacyFeeSampleCount?: number;
+      cutoffAt?: string;
+    } | null;
+  } | null;
   openTrades?: DailyRangeTrade[];
   performance?: DailyRangePerformance;
 };
@@ -108,6 +142,10 @@ function formatR(value: number | null | undefined): string {
 function formatPercent(value: number | null | undefined): string {
   if (!finite(value)) return '—';
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+}
+
+function formatBps(value: number | null | undefined): string {
+  return finite(value) ? `${value.toFixed(1)} bps` : '—';
 }
 
 function formatTaipei(value: string | null | undefined): string {
@@ -226,7 +264,7 @@ function ClosedDailyRangeReport({
     {closedTrades.length > 0 ? <div className="testnet-table-wrap">
       <table className="daily-range-table daily-range-closed-table">
         <thead><tr>
-          <th>Symbol</th><th>Side</th><th>Setup</th><th>Opened (Taipei)</th><th>Entry</th><th>Exit</th><th>Hold</th><th>Reason</th><th>Gross</th><th>Fees</th><th>Funding</th><th>Net realized</th><th>R realized</th><th>MFE / MAE</th><th>Closed (Taipei)</th>
+          <th>Symbol</th><th>Side</th><th>Setup</th><th>Opened (Taipei)</th><th>Entry</th><th>Exit</th><th>Hold</th><th>Reason</th><th>Gross</th><th>Fees</th><th>Funding</th><th>Net realized</th><th>R realized</th><th>MFE / MAE</th><th>Economics</th><th>Closed (Taipei)</th>
         </tr></thead>
         <tbody>{closedTrades.map((trade) => <tr key={trade.tradeId}>
           <td><strong>{trade.symbol}</strong></td>
@@ -238,11 +276,17 @@ function ClosedDailyRangeReport({
           <td>{formatDuration(trade.holdingDurationMs)}</td>
           <td><span className={`daily-range-state ${trade.exitReason === 'TAKE_PROFIT' ? 'is-tp' : 'is-stop'}`}>{closeReason(trade.exitReason)}</span></td>
           <td style={{ color: toneForValue(trade.grossPnlUsd) }}>{formatMoney(trade.grossPnlUsd)}</td>
-          <td style={{ color: C.bad }}>{finite(trade.feesUsd) ? `-${trade.feesUsd.toFixed(4)} USDT` : '—'}</td>
+          <td style={{ color: C.bad }} title={trade.feeEvidence === 'EXACT_FILL_COMMISSION' ? 'Komisi entry dan exit dari fill exchange.' : 'Record lama hanya menyimpan total fee; split entry/exit tidak diklaim exact.'}>
+            {finite(trade.feesUsd) ? `-${trade.feesUsd.toFixed(4)} USDT` : '—'}
+            {finite(trade.entryFeesUsd) || finite(trade.exitFeesUsd) ? <small>in {formatUnsignedMoney(trade.entryFeesUsd)} / out {formatUnsignedMoney(trade.exitFeesUsd)}</small> : null}
+          </td>
           <td style={{ color: toneForValue(trade.fundingUsd) }}>{formatMoney(trade.fundingUsd)}</td>
           <td style={{ color: toneForValue(trade.netPnlUsd), fontWeight: 700 }}>{formatMoney(trade.netPnlUsd)}</td>
           <td style={{ color: toneForValue(trade.realizedR) }}>{formatR(trade.realizedR)}</td>
           <td><span style={{ color: toneForValue(trade.mfeR) }}>{formatR(trade.mfeR)}</span> / <span style={{ color: toneForValue(trade.maeR) }}>{formatR(trade.maeR)}</span></td>
+          <td>{trade.economics ? <small title={`model ${trade.economics.frictionModelId}`}>
+            stop {formatBps(trade.actualStopRiskBps ?? trade.economics.stopRiskBps)} · cost {formatPercent((trade.actualCostRatio ?? trade.economics.costRatio) * 100)}
+          </small> : <span className="tone-measure">legacy</span>}</td>
           <td>{formatTaipei(trade.exitTimestamp)}</td>
         </tr>)}</tbody>
       </table>
@@ -359,6 +403,7 @@ export default function DailyRangeReportCard({
       : `LIVE · ${data.control?.mode ?? 'memuat mode…'}`
     : `Testnet only · ${data?.control?.mode ?? 'memuat mode…'}`;
   const usesAutoRouter = data?.strategyVersion === 'daily-4h-range-auto-route-ny-2r-v2';
+  const friction = data?.economics?.frictionModel ?? null;
 
   return <>
     <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="daily-range-open-report">
@@ -375,6 +420,10 @@ export default function DailyRangeReportCard({
         Range <strong>{usesAutoRouter ? '00:00–04:00 New York' : '00:00–04:00 UTC'}</strong> → {usesAutoRouter ? 'breakout bertahan = Continuation; kembali masuk range = Breakout Fade.' : 'dua close 5m selesai di luar range → native structural SL + fixed 2R TP.'}
         Klik simbol trade untuk membuka candle; level range selalu memakai data trade yang dibekukan saat entry.
       </div>
+      {usesAutoRouter ? <div className="daily-range-breakdown" title="V3 mengurutkan hanya kandidat yang sudah lolos stop economics. Router, arah, structural stop, 2R, dan native bracket tidak berubah.">
+        <span>Allocator {data?.allocatorMode ?? '—'} → efektif {data?.effectiveAllocatorMode ?? '—'} · alpha {data?.alphaSelector?.status ?? data?.selectorStatus ?? '—'} (tanpa authority)</span>
+        <span>{friction ? `friction ${friction.source} · N ${friction.sampleCount ?? 0} · ${friction.id ?? '—'}` : 'friction model belum tersedia: entry baru fail-closed'}</span>
+      </div> : null}
       {error ? <div className="daily-range-message tone-warning">Daily Range status unavailable: {error}</div> : null}
       {!error && data && openTrades.length === 0 ? <div className="daily-range-message">Tidak ada Daily Range trade aktif yang sudah terisi untuk direview.</div> : null}
       {openTrades.length > 0 ? <>
@@ -385,7 +434,7 @@ export default function DailyRangeReportCard({
         <div className="testnet-table-wrap">
           <table className="daily-range-table">
             <thead><tr>
-              <th>Book</th><th>Symbol</th><th>Side</th><th>Setup</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Stop</th><th>R now / peak</th><th>Gross mark</th><th>Range H / L</th><th>Opened (Taipei)</th><th>Intent state</th><th>Action</th>
+              <th>Book</th><th>Symbol</th><th>Side</th><th>Setup</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Stop</th><th>R now / peak</th><th>Gross mark</th><th>Economics</th><th>Range H / L</th><th>Opened (Taipei)</th><th>Intent state</th><th>Action</th>
             </tr></thead>
             <tbody>{openTrades.map((trade) => {
               const selected = selectedTrade?.tradeId === trade.tradeId;
@@ -405,6 +454,10 @@ export default function DailyRangeReportCard({
                 <td style={{ color: C.bad }}>{formatPrice(trade.stopPrice)}</td>
                 <td><span style={{ color: toneForValue(nowR) }}>{formatR(nowR)}</span> / <span style={{ color: toneForValue(trade.mfeR) }}>{formatR(trade.mfeR)}</span></td>
                 <td style={{ color: toneForValue(gross), fontWeight: 700 }}>{formatMoney(gross)}</td>
+                <td>{trade.economics ? <small title={`model ${trade.economics.frictionModelId}; break-even ${formatPercent(trade.economics.breakEvenWinRate * 100)}`}>
+                  risk {formatUnsignedMoney(trade.economics.plannedRiskUsd)} · cost {formatPercent((trade.actualCostRatio ?? trade.economics.costRatio) * 100)} · BE {formatPercent(trade.economics.breakEvenWinRate * 100)}
+                  {trade.postFillEconomicsStatus ? <><br />fill {trade.postFillEconomicsStatus}</> : null}
+                </small> : <span className="tone-measure">legacy</span>}</td>
                 <td>{formatPrice(trade.rangeHigh)} / {formatPrice(trade.rangeLow)}</td>
                 <td>{formatTaipei(trade.entryFilledAt ?? trade.entrySubmittedAt)}</td>
                 <td><span className="daily-range-state">{trade.status}</span>{trade.lastReconcileError ? <small className="tone-warning daily-range-reconcile">reconcile: {trade.lastReconcileError}</small> : null}</td>

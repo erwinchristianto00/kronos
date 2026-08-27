@@ -1309,11 +1309,27 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       referenceRangeOpenTime: window.rangeOpenTime,
       referenceRangeCloseTime: window.rangeCloseTime,
     });
+    expect(trade.economics).toMatchObject({
+      frictionModelSource: "CONSERVATIVE_FALLBACK",
+      plannedNotionalUsd: expect.any(Number),
+      plannedRiskUsd: expect.any(Number),
+      costRatio: expect.any(Number),
+    });
+    expect(trade.economics!.plannedNotionalUsd).toBeLessThanOrEqual(25);
+    expect(trade.economics!.plannedRiskUsd).toBeLessThanOrEqual(0.25 + 1e-9);
+    expect(trade.economics!.costRatio).toBeLessThanOrEqual(0.25);
+    expect(trade.actualCostRatio).toBeLessThanOrEqual(0.25);
+    expect(trade.postFillEconomicsStatus).toBe("PASS");
     expect(client.placed.filter((row) => !row.reduceOnly)).toMatchObject([{ symbol: "AAAUSDT", side: "SELL", type: "MARKET" }]);
     expect(client.algoPlaced.map((row) => [row.type, row.side, row.triggerPrice]))
       .toEqual(expect.arrayContaining([["STOP_MARKET", "BUY", 104], ["TAKE_PROFIT_MARKET", "BUY", 92]]));
     expect(client.fiveMinuteReadSymbols.has("AAAUSDT")).toBe(true);
-    expect(store.getState().signalCohorts[0]?.candidates[0]).toMatchObject({ breakoutDistancePrice: -1, breakoutDistanceOfRange: -0.1 });
+    expect(store.getState().signalCohorts[0]?.candidates[0]).toMatchObject({
+      breakoutDistancePrice: -1,
+      breakoutDistanceOfRange: -0.1,
+      economics: expect.objectContaining({ frictionModelSource: "CONSERVATIVE_FALLBACK" }),
+      alphaSelector: expect.objectContaining({ status: "SHADOW_ONLY", reason: "ALPHA_SELECTOR_SHADOW_ONLY" }),
+    });
   });
 
   it("never lets a pending V1 signal cross the V2 cutover boundary into an order", async () => {

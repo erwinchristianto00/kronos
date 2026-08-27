@@ -34,6 +34,21 @@ import {
   type DailyRangeAllocatorMode,
   type DailyRangeAllocationSkipReason,
 } from "./daily-range-selector.js";
+import {
+  DAILY_RANGE_ALPHA_SELECTOR_POLICY_ID,
+  DAILY_RANGE_ECONOMIC_ALLOCATOR_POLICY_ID,
+  DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID,
+  DAILY_RANGE_MAX_COST_RATIO,
+  DAILY_RANGE_MAX_NOTIONAL_USD,
+  DAILY_RANGE_MAX_PLANNED_RISK_USD,
+  buildEmpiricalFrictionModel,
+  conservativeFallbackFrictionModel,
+  evaluateActualFillEconomics,
+  prepareDailyRangeEconomics,
+  type DailyRangeFrictionModel,
+  type DailyRangeFrictionSample,
+  type DailyRangePreTradeEconomics,
+} from "./daily-range-economics.js";
 
 export const DAILY_RANGE_LANE_ID = "DAILY_4H_RANGE_ACCEPTANCE";
 /** Preserved solely for legacy trades and their immutable exit/reconciliation lineage. */
@@ -51,8 +66,11 @@ export type DailyRangeStrategyMode = "LEGACY_CONTINUATION" | "AUTO_ROUTE_NY_V2";
 export type DailyRangeEntryPolicy = "LEGACY_CONTINUATION" | "CONTINUATION" | "FADE";
 export type DailyRangeBreakoutDirection = "UP" | "DOWN";
 /** No model has allocation authority. New data is collected under this immutable policy label. */
+/** Historical v1 batch lineage remains immutable and readable. */
 export const DAILY_RANGE_SELECTOR_POLICY_VERSION = "DAILY_RANGE_BATCH_SELECTOR_SHADOW_V1";
-export const DAILY_RANGE_TRADE_NOTIONAL_USD = 25;
+/** V3 selection is economic baseline; alpha remains explicitly non-authoritative. */
+export const DAILY_RANGE_ECONOMIC_SELECTOR_POLICY_VERSION = DAILY_RANGE_ECONOMIC_ALLOCATOR_POLICY_ID;
+export const DAILY_RANGE_TRADE_NOTIONAL_USD = DAILY_RANGE_MAX_NOTIONAL_USD;
 export const DAILY_RANGE_LEVERAGE = 1;
 export const DAILY_RANGE_RR = 2;
 
@@ -72,6 +90,8 @@ const RESEARCH_ENTRY_FEE_BPS = 4;
 const RESEARCH_EXIT_FEE_BPS = 4;
 const RESEARCH_SLIPPAGE_BPS = 0;
 const NEW_YORK_TIME_ZONE = "America/New_York";
+/** A quote older than this at allocation is not a causal executable decision. */
+const MAX_DECISION_BBO_AGE_MS = 30_000;
 
 export type DailyRangeDirection = "LONG" | "SHORT";
 export type DailyRangeControlMode = "DISARMED" | "ARMED";
@@ -83,6 +103,7 @@ export type DailyRangeTradeStatus =
   | "EXIT_RECONCILING"
   | "CLOSED"
   | "ENTRY_ABORT_INVALID_RISK"
+  | "ENTRY_ABORT_POST_FILL_ECONOMICS_FAIL"
   | "ENTRY_ABORT_PROTECTION_FAILED"
   | "ENTRY_ABORT_EXECUTION_FAILED"
   | "ENTRY_ABORT_SYMBOL_IN_FLIGHT"
@@ -109,6 +130,13 @@ export type DailyRangeSignalReason =
   | "STRATEGY_SYMBOL_CONFLICT"
   | "SPREAD_HARD_REJECT"
   | "SELECTOR_NOT_READY"
+  | "STOP_ECONOMICS_FAIL"
+  | "RISK_BUDGET_UNEXECUTABLE"
+  | "BBO_STALE"
+  | "FRICTION_MODEL_UNAVAILABLE"
+  | "NEGATIVE_EXPECTED_VALUE"
+  | "POST_FILL_ECONOMICS_FAIL"
+  | "ALPHA_SELECTOR_SHADOW_ONLY"
   | "LIVE_NEW_ENTRY_PAUSED"
   | "SELECTED_EXECUTION_FAILED"
   | "RETIRED_STRATEGY_VERSION";
@@ -203,6 +231,9 @@ export interface DailyRangeSignal {
   selectorId?: string | null;
   selectorScore?: number | null;
   selectorRank?: number | null;
+  /** Frozen pre-allocation V3 economic decision. Absent is legacy evidence. */
+  economics?: DailyRangePreTradeEconomics | null;
+  alphaSelector?: DailyRangeAlphaSelectorSnapshot | null;
   actuallySelected?: boolean;
   actuallyExecuted?: boolean;
   research?: DailyRangeSignalResearchRecord | null;
@@ -240,6 +271,8 @@ export interface DailyRangeSignalMarketQualitySnapshot {
     | "FUTURE_OF_DECISION"
     | "UNAVAILABLE";
   bookObservedAt: string | null;
+  /** Local receipt timestamp of the exact BBO payload; legacy rows may omit it. */
+  bookReceivedAt?: string | null;
   bookSourceTime: number | null;
   bestBid: number | null;
   bestAsk: number | null;
@@ -348,6 +381,18 @@ export interface DailyRangeSignalResearchRecord {
   counterfactual: DailyRangeCounterfactualOutcome | null;
 }
 
+/** A shadow selector record has no allocation authority until a separately approved artifact exists. */
+export interface DailyRangeAlphaSelectorSnapshot {
+  policyId: typeof DAILY_RANGE_ALPHA_SELECTOR_POLICY_ID;
+  selectorId: string | null;
+  status: "SHADOW_ONLY" | "VALIDATED" | "UNAVAILABLE" | "FALLBACK_ECONOMIC";
+  pTp: number | null;
+  expectedNetR: number | null;
+  expectedNetUsd: number | null;
+  reason: "ALPHA_SELECTOR_SHADOW_ONLY" | "SELECTOR_NOT_READY" | "NEGATIVE_EXPECTED_VALUE" | null;
+  featureSnapshotAt: string | null;
+}
+
 export interface DailyRangeSignalCohortCandidate {
   signalId: string;
   symbol: string;
@@ -378,6 +423,8 @@ export interface DailyRangeSignalCohortCandidate {
   selectorScore?: number | null;
   selectorRank?: number | null;
   tieBreakHash?: string | null;
+  economics?: DailyRangePreTradeEconomics | null;
+  alphaSelector?: DailyRangeAlphaSelectorSnapshot | null;
   actuallySelected?: boolean;
   actuallyExecuted?: boolean;
   skipReason?: DailyRangeSignalReason | null;
@@ -405,6 +452,7 @@ export interface DailyRangeSignalCohort {
   /** Absent on passive pre-fix cohorts; they are never retroactively allocated. */
   allocation?: {
     allocatorMode: DailyRangeAllocatorMode;
+    effectiveAllocatorMode?: DailyRangeAllocatorMode;
     selectorStatus: "SHADOW" | "VALIDATED" | "NOT_READY";
     selectorId: string | null;
     availableSlots: number | null;
@@ -417,6 +465,10 @@ export interface DailyRangeSignalCohort {
     selectedSignalIds: string[];
     finalizedAt: string | null;
     allocationError: string | null;
+    economicsPolicyId?: string;
+    frictionModelId?: string | null;
+    frictionModelSource?: "EMPIRICAL_LEDGER" | "CONSERVATIVE_FALLBACK" | null;
+    allocationCutoffAt?: string | null;
   };
 }
 
@@ -443,6 +495,12 @@ export interface DailyRangeTrade {
   entryNotionalUsd: number | null;
   entrySlippageBps: number | null;
   signalReferencePrice: number | null;
+  /** Immutable V3 decision facts, persisted before the market POST. */
+  economics?: DailyRangePreTradeEconomics | null;
+  alphaSelector?: DailyRangeAlphaSelectorSnapshot | null;
+  actualStopRiskBps?: number | null;
+  actualCostRatio?: number | null;
+  postFillEconomicsStatus?: "PASS" | "POST_FILL_ECONOMICS_FAIL" | null;
   rangeHigh: number;
   rangeLow: number;
   /** V2 route + reference lineage; absent fields identify untouched legacy trades. */
@@ -478,6 +536,10 @@ export interface DailyRangeTrade {
   exitSlippageBps: number | null;
   grossPnlUsd: number | null;
   feesUsd: number | null;
+  /** Exact per-order commissions for V3 and later. Legacy records retain only feesUsd. */
+  entryFeesUsd?: number | null;
+  exitFeesUsd?: number | null;
+  feeEvidence?: "EXACT_FILL_COMMISSION" | "LEGACY_COMBINED_FEE_ALLOCATION" | null;
   fundingUsd: number | null;
   netPnlUsd: number | null;
   grossR: number | null;
@@ -559,6 +621,9 @@ interface DailyRangePersistedState {
   signalCohorts: DailyRangeSignalCohort[];
   trades: DailyRangeTrade[];
   canaries: DailyRangeCanaryEvidence[];
+  /** Immutable model snapshots; a decision day points to exactly one id. */
+  frictionModels?: DailyRangeFrictionModel[];
+  frictionModelByUtcDate?: Record<string, string>;
   runtime: DailyRangeRuntimeState;
 }
 
@@ -756,6 +821,8 @@ function emptyState(nowMs: number): DailyRangePersistedState {
     signalCohorts: [],
     trades: [],
     canaries: [],
+    frictionModels: [],
+    frictionModelByUtcDate: {},
     runtime: {
       reconciledAt: null,
       reconciliationError: null,
@@ -802,6 +869,10 @@ export class DailyRangeLaneStore {
         signalCohorts: Array.isArray(parsed.signalCohorts) ? parsed.signalCohorts as DailyRangeSignalCohort[] : [],
         trades: parsed.trades as DailyRangeTrade[],
         canaries: Array.isArray(parsed.canaries) ? parsed.canaries as DailyRangeCanaryEvidence[] : [],
+        frictionModels: Array.isArray(parsed.frictionModels) ? parsed.frictionModels as DailyRangeFrictionModel[] : [],
+        frictionModelByUtcDate: parsed.frictionModelByUtcDate && typeof parsed.frictionModelByUtcDate === "object"
+          ? parsed.frictionModelByUtcDate as Record<string, string>
+          : {},
         runtime: {
           reconciledAt: parsed.runtime?.reconciledAt ?? null,
           reconciliationError: parsed.runtime?.reconciliationError ?? null,
@@ -980,7 +1051,7 @@ export interface DailyRangeAcceptanceLaneOptions {
   entryGate?: () => DailyRangeEntryGateDecision;
   /** Best-effort notification after one real, settled lane close. */
   onTradeClosed?: (netPnlUsd: number) => void;
-  /** PAUSED is the Mainnet-safe default; Testnet defaults to neutral seeded random. */
+  /** PAUSED is the Mainnet-safe default; Testnet defaults to the non-alpha economic baseline. */
   allocatorMode?: DailyRangeAllocatorMode;
   /** Null until a separately promoted model artifact exists. */
   selectorId?: string | null;
@@ -1302,7 +1373,7 @@ export class DailyRangeAcceptanceLane {
     this.entryGate = opts.entryGate ?? (() => ({ allowed: true, reason: null }));
     this.onTradeClosed = opts.onTradeClosed ?? null;
     this.allocatorMode = opts.allocatorMode
-      ?? (opts.environment === "mainnet" ? opts.mainnetControls?.allocatorMode ?? "PAUSED" : "SEEDED_RANDOM_BASELINE");
+      ?? (opts.environment === "mainnet" ? opts.mainnetControls?.allocatorMode ?? "PAUSED" : "ECONOMIC_QUALITY_BASELINE");
     this.selectorId = opts.selectorId ?? null;
     this.strategyMode = opts.strategyMode ?? "LEGACY_CONTINUATION";
     this.strategyVersion = this.strategyMode === "AUTO_ROUTE_NY_V2"
@@ -1479,17 +1550,114 @@ export class DailyRangeAcceptanceLane {
   }
 
   private selectorStatus(): "SHADOW" | "VALIDATED" | "NOT_READY" {
-    if (this.allocatorMode === "VALIDATED_SELECTOR" && this.selectorId) return "VALIDATED";
-    if (this.allocatorMode === "SHADOW_SELECTOR" || this.allocatorMode === "SEEDED_RANDOM_BASELINE") return "SHADOW";
+    // No artifact has passed the historical + forward promotion contract in
+    // this release. A configured VALIDATED mode therefore falls back to the
+    // economic allocator rather than falsely advertising alpha authority.
+    if (this.allocatorMode === "SHADOW_ALPHA_SELECTOR" || this.allocatorMode === "SHADOW_SELECTOR") return "SHADOW";
+    if (this.allocatorMode === "ECONOMIC_QUALITY_BASELINE" || this.allocatorMode === "SEEDED_RANDOM_BASELINE") return "SHADOW";
     return "NOT_READY";
+  }
+
+  private effectiveAllocatorMode(): DailyRangeAllocatorMode {
+    if (this.environment === "mainnet" && this.allocatorMode === "SEEDED_RANDOM_BASELINE") {
+      return "ECONOMIC_QUALITY_BASELINE";
+    }
+    if (this.allocatorMode === "SHADOW_ALPHA_SELECTOR" || this.allocatorMode === "SHADOW_SELECTOR") {
+      return "ECONOMIC_QUALITY_BASELINE";
+    }
+    // The V3 runtime does not ship a promoted alpha artifact. Keep the selected
+    // candidates attributable to the economic comparator until one exists.
+    if (this.allocatorMode === "VALIDATED_ALPHA_SELECTOR" || this.allocatorMode === "VALIDATED_SELECTOR") {
+      return "ECONOMIC_QUALITY_BASELINE";
+    }
+    return this.allocatorMode;
   }
 
   /** A manually enabled Live baseline must never look like an alpha promotion. */
   private operatorSelectorStatus(): "SHADOW" | "VALIDATED" | "NOT_READY" | "NO_VALIDATED_ALPHA_SELECTOR" {
-    if (this.environment === "mainnet" && this.allocatorMode === "SEEDED_RANDOM_BASELINE") {
+    if (this.environment === "mainnet" && (this.allocatorMode === "SEEDED_RANDOM_BASELINE" || this.allocatorMode === "VALIDATED_ALPHA_SELECTOR" || this.allocatorMode === "VALIDATED_SELECTOR")) {
       return "NO_VALIDATED_ALPHA_SELECTOR";
     }
     return this.selectorStatus();
+  }
+
+  private frictionSampleForTrade(trade: DailyRangeTrade): DailyRangeFrictionSample | null {
+    if (trade.status !== "CLOSED" || !trade.exitTimestamp || !finitePositive(trade.entryFillPrice) || !finitePositive(trade.entryQty) || !finitePositive(trade.exitPrice)) return null;
+    const entryNotional = trade.entryFillPrice * trade.entryQty;
+    const exitNotional = trade.exitPrice * trade.entryQty;
+    if (!(entryNotional > 0) || !(exitNotional > 0)) return null;
+    // A zero commission is still a real, exact exchange fact (for example a
+    // temporary rebate).  Do not silently relabel it as a legacy estimated
+    // split merely because it is not positive.
+    const exact = trade.feeEvidence === "EXACT_FILL_COMMISSION"
+      || (
+        typeof trade.entryFeesUsd === "number" && Number.isFinite(trade.entryFeesUsd)
+        && typeof trade.exitFeesUsd === "number" && Number.isFinite(trade.exitFeesUsd)
+      );
+    const totalFees = Math.max(0, trade.feesUsd ?? 0);
+    const combinedNotional = entryNotional + exitNotional;
+    const entryFees = exact ? Math.max(0, trade.entryFeesUsd ?? 0) : totalFees * entryNotional / combinedNotional;
+    const exitFees = exact ? Math.max(0, trade.exitFeesUsd ?? 0) : totalFees * exitNotional / combinedNotional;
+    const entryFeeBps = entryFees / entryNotional * 10_000;
+    const exitFeeBps = exitFees / exitNotional * 10_000;
+    const entryAdverseBps = Math.max(0, trade.entrySlippageBps ?? 0);
+    const exitAdverseBps = Math.max(0, trade.exitSlippageBps ?? 0);
+    const stopGapBps = trade.exitReason === "STOP_LOSS" && finitePositive(trade.stopPrice)
+      ? Math.max(0, 10_000 * (trade.direction === "LONG"
+        ? (trade.stopPrice - trade.exitPrice) / trade.stopPrice
+        : (trade.exitPrice - trade.stopPrice) / trade.stopPrice))
+      : null;
+    const tpExitAdverseBps = trade.exitReason === "TAKE_PROFIT" && finitePositive(trade.takeProfitPrice)
+      ? Math.max(0, 10_000 * (trade.direction === "LONG"
+        ? (trade.takeProfitPrice - trade.exitPrice) / trade.takeProfitPrice
+        : (trade.exitPrice - trade.takeProfitPrice) / trade.takeProfitPrice)) + exitAdverseBps
+      : null;
+    const stopExitAdverseBps = trade.exitReason === "STOP_LOSS" ? exitAdverseBps : null;
+    return {
+      tradeId: trade.tradeId,
+      closedAt: trade.exitTimestamp,
+      entryFeeBps,
+      exitFeeBps,
+      entryAdverseBps,
+      takeProfitExitAdverseBps: tpExitAdverseBps,
+      stopExitAdverseBps,
+      stopGapBps,
+      exitReason: trade.exitReason === "TAKE_PROFIT" ? "TAKE_PROFIT" : trade.exitReason === "STOP_LOSS" ? "STOP_LOSS" : "OTHER",
+      feeEvidence: exact ? "EXACT_FILL_COMMISSION" : "LEGACY_COMBINED_FEE_ALLOCATION",
+    };
+  }
+
+  /**
+   * Freeze no more than one friction model per UTC decision date. Existing
+   * trade records remain immutable; only the model registry grows. Mainnet
+   * fails closed if its own ledger cannot produce a usable model.
+   */
+  private ensureFrictionModel(now = this.nowMs()): DailyRangeFrictionModel | null {
+    const state = this.store.getState();
+    const date = utcDate(now);
+    const models = state.frictionModels ?? (state.frictionModels = []);
+    const byDate = state.frictionModelByUtcDate ?? (state.frictionModelByUtcDate = {});
+    const existingId = byDate[date];
+    if (existingId) return models.find((model) => model.id === existingId) ?? null;
+    const cutoffAt = iso(now);
+    const samples = state.trades
+      .map((trade) => this.frictionSampleForTrade(trade))
+      .filter((sample): sample is DailyRangeFrictionSample => sample !== null);
+    const empirical = buildEmpiricalFrictionModel({ samples, createdAt: cutoffAt, cutoffAt });
+    const model = empirical ?? (this.environment === "testnet" ? conservativeFallbackFrictionModel(cutoffAt) : null);
+    if (!model) return null;
+    models.push(model);
+    byDate[date] = model.id;
+    this.store.save();
+    console.log(`[daily-range-lane] FRICTION_MODEL_FROZEN id=${model.id} source=${model.source} samples=${model.sampleCount} cutoff=${model.cutoffAt}`);
+    return model;
+  }
+
+  private frozenFrictionModelForSignalTimestamp(signalTimestampMs: number): DailyRangeFrictionModel | null {
+    const state = this.store.getState();
+    const date = utcDate(signalTimestampMs);
+    const id = state.frictionModelByUtcDate?.[date] ?? null;
+    return id ? state.frictionModels?.find((model) => model.id === id) ?? null : null;
   }
 
   private entryLimitReason(): Extract<DailyRangeSignalReason, "MAX_OPEN_TRADES_REACHED" | "MAX_GROSS_NOTIONAL_REACHED"> | null {
@@ -1531,12 +1699,16 @@ export class DailyRangeAcceptanceLane {
       || state.control.disarmReason?.startsWith("SELECTION_FIX_PENDING_VALIDATION") === true
     );
     const entryControlReason = this.mainnetControlBlockReason("entry");
-    const newEntriesEnabled = state.control.mode === "ARMED" && this.allocatorMode !== "PAUSED" && entryControlReason === null;
+    const effectiveAllocatorMode = this.effectiveAllocatorMode();
+    const frictionModelId = state.frictionModelByUtcDate?.[utcDate(now)] ?? null;
+    const frictionModel = frictionModelId ? state.frictionModels?.find((model) => model.id === frictionModelId) ?? null : null;
+    const frictionUnavailable = !frictionModel;
+    const newEntriesEnabled = state.control.mode === "ARMED" && effectiveAllocatorMode !== "PAUSED" && entryControlReason === null && !frictionUnavailable;
     const newEntryReason = !newEntriesEnabled
       ? mainnetPausedForSelection ? "SELECTION_FIX_PENDING_VALIDATION"
-        : this.allocatorMode === "PAUSED" ? "ALLOCATOR_PAUSED"
+        : effectiveAllocatorMode === "PAUSED" ? "ALLOCATOR_PAUSED"
           : state.control.mode !== "ARMED" ? state.control.disarmReason ?? "LANE_DISARMED"
-            : entryControlReason
+            : entryControlReason ?? (frictionUnavailable ? "FRICTION_MODEL_UNAVAILABLE" : null)
       : null;
     return {
       ok: true,
@@ -1592,10 +1764,35 @@ export class DailyRangeAcceptanceLane {
         entryBlockReason: this.mainnetControlBlockReason("entry"),
       } : null,
       allocatorMode: this.allocatorMode,
+      effectiveAllocatorMode,
       newEntriesEnabled,
       newEntryReason,
       selectorStatus: this.operatorSelectorStatus(),
       selectorId: this.selectorId,
+      alphaSelector: {
+        policyId: DAILY_RANGE_ALPHA_SELECTOR_POLICY_ID,
+        executionAuthority: false,
+        status: this.selectorStatus() === "SHADOW" ? "SHADOW_ONLY" : "UNAVAILABLE",
+        promotion: "requires historical gates plus 20 mature FULL_PIT oversubscribed forward batches and explicit mainnet approval",
+      },
+      economics: {
+        policyId: DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID,
+        allocatorPolicyId: DAILY_RANGE_ECONOMIC_ALLOCATOR_POLICY_ID,
+        maxNotionalUsd: DAILY_RANGE_TRADE_NOTIONAL_USD,
+        maxPlannedRiskUsd: DAILY_RANGE_MAX_PLANNED_RISK_USD,
+        maxCostRatio: DAILY_RANGE_MAX_COST_RATIO,
+        bboMaxAgeMs: MAX_DECISION_BBO_AGE_MS,
+        frictionModel: frictionModel ? {
+          id: frictionModel.id,
+          source: frictionModel.source,
+          createdAt: frictionModel.createdAt,
+          cutoffAt: frictionModel.cutoffAt,
+          sampleCount: frictionModel.sampleCount,
+          exactFeeSampleCount: frictionModel.exactFeeSampleCount,
+          legacyFeeSampleCount: frictionModel.legacyFeeSampleCount,
+          hash: frictionModel.hash,
+        } : null,
+      },
       availableSlots: capacity.displaySlots,
       maxDailyPositions: capacity.maxOpenTrades,
       openDailyPositions: openTrades.filter((trade) => ["PROTECTING", "OPEN", "EXIT_RECONCILING"].includes(trade.status)).length,
@@ -1982,6 +2179,12 @@ export class DailyRangeAcceptanceLane {
     if (!day) return;
     const latestCompletedOpen = lastClosedFiveMinuteOpenTime(now);
     if (latestCompletedOpen === null || latestCompletedOpen < window.rangeCloseTime) return;
+    if (this.isAutoRoute()) {
+      // The model/fingerprint boundary is a completed five-minute boundary,
+      // not a random scheduler instant. A later batch on that UTC day can only
+      // reference this one immutable model.
+      this.ensureFrictionModel(latestCompletedOpen + FIVE_MIN_MS);
+    }
     const actions: DailyRangeSignal[] = [];
     for (const [symbol, level] of Object.entries(day.levels)) {
       const symbolState = day.symbolStates[symbol] ?? blankSymbolState(latestCompletedOpen);
@@ -2034,8 +2237,14 @@ export class DailyRangeAcceptanceLane {
     // C2 closes, so the just-observed BBO is causal even though it follows the
     // candle timestamp. Recovery reads below never receive this authority.
     await this.captureSignalTimeMarketQuality(day, actions, "FORWARD_BEFORE_ALLOCATION");
+    // V3 AUTO_ROUTE candidates get their causal feature snapshot before any
+    // scarce-slot allocation. Legacy V1 evidence stays on its original passive
+    // post-allocation collection path and is never retroactively reinterpreted.
+    if (this.isAutoRoute()) {
+      await this.capturePendingResearchSnapshots(day, "FORWARD_BEFORE_ALLOCATION");
+    }
     await this.finalizePendingSignalBatches(day);
-    await this.capturePendingResearchSnapshots(day);
+    await this.capturePendingResearchSnapshots(day, "RECOVERY_AFTER_ALLOCATION");
     await this.matureCounterfactualOutcomes();
     this.syncSignalCohortDecisions();
   }
@@ -2231,6 +2440,8 @@ export class DailyRangeAcceptanceLane {
       selectorId: this.selectorId,
       selectorScore: null,
       selectorRank: null,
+      economics: null,
+      alphaSelector: null,
       actuallySelected: false,
       actuallyExecuted: false,
       research: { marketQuality: null, features: null, counterfactual: null },
@@ -2277,6 +2488,8 @@ export class DailyRangeAcceptanceLane {
       selectorScore: signal.selectorScore ?? null,
       selectorRank: signal.selectorRank ?? null,
       tieBreakHash: null,
+      economics: signal.economics ?? null,
+      alphaSelector: signal.alphaSelector ?? null,
       actuallySelected: signal.actuallySelected ?? false,
       actuallyExecuted: signal.actuallyExecuted ?? false,
       skipReason: signal.reason,
@@ -2308,7 +2521,9 @@ export class DailyRangeAcceptanceLane {
           cohortId,
           strategyVersion: this.strategyVersion,
           laneId: DAILY_RANGE_LANE_ID,
-          selectorPolicyVersion: DAILY_RANGE_SELECTOR_POLICY_VERSION,
+          selectorPolicyVersion: this.strategyVersion === DAILY_RANGE_AUTO_ROUTE_STRATEGY_VERSION
+            ? DAILY_RANGE_ECONOMIC_SELECTOR_POLICY_VERSION
+            : DAILY_RANGE_SELECTOR_POLICY_VERSION,
           dateUtc: day.dateUtc,
           signalTimestamp: iso(signalTimestampMs),
           signalTimestampMs,
@@ -2425,6 +2640,7 @@ export class DailyRangeAcceptanceLane {
         capturePhase,
         bookSnapshotQuality,
         bookObservedAt,
+        bookReceivedAt: bookObservedAt,
         bookSourceTime,
         bestBid,
         bestAsk,
@@ -2510,6 +2726,32 @@ export class DailyRangeAcceptanceLane {
     }
   }
 
+  private alphaSnapshotForSignal(signal: DailyRangeSignal): DailyRangeAlphaSelectorSnapshot {
+    const featureSnapshotAt = signal.research?.features?.capturedAt ?? null;
+    if (this.allocatorMode === "SHADOW_ALPHA_SELECTOR" || this.allocatorMode === "SHADOW_SELECTOR" || this.allocatorMode === "ECONOMIC_QUALITY_BASELINE") {
+      return {
+        policyId: DAILY_RANGE_ALPHA_SELECTOR_POLICY_ID,
+        selectorId: this.selectorId,
+        status: "SHADOW_ONLY",
+        pTp: null,
+        expectedNetR: null,
+        expectedNetUsd: null,
+        reason: "ALPHA_SELECTOR_SHADOW_ONLY",
+        featureSnapshotAt,
+      };
+    }
+    return {
+      policyId: DAILY_RANGE_ALPHA_SELECTOR_POLICY_ID,
+      selectorId: this.selectorId,
+      status: "FALLBACK_ECONOMIC",
+      pTp: null,
+      expectedNetR: null,
+      expectedNetUsd: null,
+      reason: "SELECTOR_NOT_READY",
+      featureSnapshotAt,
+    };
+  }
+
   private async finalizeSignalBatch(batch: DailyRangeSignalCohort): Promise<void> {
     const allocation = batch.allocation;
     if (!allocation || allocation.finalizedAt !== null) return;
@@ -2522,12 +2764,60 @@ export class DailyRangeAcceptanceLane {
     const reservations: Array<{ signal: DailyRangeSignal; trade: DailyRangeTrade }> = [];
     try {
       const signals = new Map(this.store.getState().signals.map((signal) => [signal.signalId, signal]));
+      const allocationAtMs = this.nowMs();
+      const v3Batch = batch.strategyVersion === DAILY_RANGE_AUTO_ROUTE_STRATEGY_VERSION;
+      const effectiveAllocatorMode = v3Batch ? this.effectiveAllocatorMode() : this.allocatorMode;
+      const frictionModel = v3Batch
+        ? this.frozenFrictionModelForSignalTimestamp(batch.signalTimestampMs) ?? this.ensureFrictionModel(batch.signalTimestampMs)
+        : null;
+      let filters: Map<string, FuturesSymbolFilters> | null = null;
+      if (v3Batch) {
+        try {
+          filters = await this.client.getExchangeFilters();
+        } catch {
+          // A missing filter is handled as an unexecutable risk budget for every
+          // candidate.  Never recover it from a later tick after a selection.
+        }
+      }
       const signalPoolEvidence = clonePoolEvidence(this.getSignalPoolEvidence(
         [...new Set(batch.candidates.map((candidate) => candidate.symbol))],
       ));
       const preflight = await Promise.all(batch.candidates.map(async (candidate) => {
         const signal = signals.get(candidate.signalId) ?? null;
         if (!signal) return { candidate, signal, block: "STALE_DATA" as DailyRangeSignalReason };
+        if (v3Batch) {
+          const quality = signal.research?.marketQuality ?? null;
+          const bbo = quality && quality.capturePhase === "FORWARD_BEFORE_ALLOCATION"
+            && finitePositive(quality.bestBid) && finitePositive(quality.bestAsk) && quality.bookObservedAt
+            ? {
+              bid: quality.bestBid,
+              ask: quality.bestAsk,
+              observedAt: quality.bookObservedAt,
+              sourceTime: quality.bookSourceTime,
+              receivedAt: quality.bookReceivedAt ?? quality.bookObservedAt,
+            }
+            : null;
+          const prepared = prepareDailyRangeEconomics({
+            side: signal.direction,
+            route: signal.entryPolicy ?? "LEGACY_CONTINUATION",
+            symbol: signal.symbol,
+            batchTimestampMs: batch.signalTimestampMs,
+            rawStructuralStop: structuralStopForDailyRangeSignal(signal),
+            bbo,
+            filter: filters?.get(signal.symbol) ?? null,
+            frictionModel,
+            bboMaxAgeMs: MAX_DECISION_BBO_AGE_MS,
+            allocationAtMs,
+          });
+          signal.economics = prepared.ok ? prepared.economics : null;
+          signal.alphaSelector = this.alphaSnapshotForSignal(signal);
+          candidate.economics = signal.economics;
+          candidate.alphaSelector = signal.alphaSelector;
+          candidate.selectorMode = this.allocatorMode;
+          candidate.selectorId = this.selectorId;
+          candidate.selectorScore = signal.alphaSelector.pTp;
+          if (!prepared.ok) return { candidate, signal, block: prepared.reason as DailyRangeSignalReason };
+        }
         const normalBlock = this.batchCandidateBlockReason(signal);
         if (normalBlock) return { candidate, signal, block: normalBlock };
         const poolAudit = signalPoolEvidence?.auditBySymbol[signal.symbol] ?? null;
@@ -2537,11 +2827,12 @@ export class DailyRangeAcceptanceLane {
         return { candidate, signal, block: await this.batchExchangeBlockReason(signal) };
       }));
       const eligible: DailyRangeSignal[] = [];
-      for (const { signal, block } of preflight) {
+      for (const { candidate, signal, block } of preflight) {
         if (!signal) continue;
         if (block) {
           signal.actuallySelected = false;
           signal.actuallyExecuted = false;
+          candidate.skipReason = block;
           this.markSignal(signal, { eligible: false, reason: block });
           continue;
         }
@@ -2549,15 +2840,22 @@ export class DailyRangeAcceptanceLane {
       }
       const capacity = this.allocationCapacity();
       allocation.selectorStatus = this.selectorStatus();
+      allocation.effectiveAllocatorMode = effectiveAllocatorMode;
       allocation.availableSlots = capacity.displaySlots;
       allocation.pendingReservationsAtBatch = capacity.pendingReservations;
       allocation.batchComplete = true;
       allocation.oversubscriptionRatio = capacity.displaySlots !== null && capacity.displaySlots > 0
         ? eligible.length / capacity.displaySlots
         : capacity.displaySlots === 0 && eligible.length > 0 ? Number.POSITIVE_INFINITY : null;
+      if (v3Batch) {
+        allocation.economicsPolicyId = DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID;
+        allocation.frictionModelId = frictionModel?.id ?? null;
+        allocation.frictionModelSource = frictionModel?.source ?? null;
+        allocation.allocationCutoffAt = iso(allocationAtMs);
+      }
 
       const result = allocateDailyRangeBatch({
-        mode: this.allocatorMode,
+        mode: effectiveAllocatorMode,
         strategyVersion: batch.strategyVersion,
         batchTimestampMs: batch.signalTimestampMs,
         environment: this.environment,
@@ -2566,7 +2864,14 @@ export class DailyRangeAcceptanceLane {
           signalId: signal.signalId,
           symbol: signal.symbol,
           legacySequence: batch.candidates.find((candidate) => candidate.signalId === signal.signalId)?.executionSequence ?? Number.MAX_SAFE_INTEGER,
-          selectorScore: this.selectorId ? signal.selectorScore ?? null : null,
+          selectorScore: v3Batch ? signal.alphaSelector?.pTp ?? null : this.selectorId ? signal.selectorScore ?? null : null,
+          selectorExpectedNetUsd: v3Batch ? signal.alphaSelector?.expectedNetUsd ?? null : null,
+          economic: v3Batch && signal.economics ? {
+            breakEvenWinRate: signal.economics.breakEvenWinRate,
+            costRatio: signal.economics.costRatio,
+            plannedRiskUsd: signal.economics.plannedRiskUsd,
+            qualityTieBreakHash: signal.economics.qualityTieBreakHash,
+          } : null,
         })),
       });
       const decisions = new Map(result.decisions.map((decision) => [decision.signalId, decision]));
@@ -2581,6 +2886,8 @@ export class DailyRangeAcceptanceLane {
           candidate.selectorId = this.selectorId;
           candidate.selectorScore = decision.selectorScore;
           candidate.selectorRank = decision.selectorRank;
+          candidate.economics = signal.economics ?? null;
+          candidate.alphaSelector = signal.alphaSelector ?? null;
           candidate.actuallySelected = decision.selected;
           candidate.skipReason = decision.skipReason as DailyRangeSignalReason | null;
         }
@@ -2665,6 +2972,8 @@ export class DailyRangeAcceptanceLane {
           selectorId: signal.selectorId ?? candidate.selectorId ?? null,
           selectorScore: signal.selectorScore ?? null,
           selectorRank: signal.selectorRank ?? null,
+          economics: signal.economics ?? null,
+          alphaSelector: signal.alphaSelector ?? null,
           actuallySelected: signal.actuallySelected ?? false,
           actuallyExecuted: signal.actuallyExecuted ?? false,
           skipReason: signal.reason,
@@ -2681,6 +2990,8 @@ export class DailyRangeAcceptanceLane {
           selectorId: candidate.selectorId ?? null,
           selectorScore: candidate.selectorScore ?? null,
           selectorRank: candidate.selectorRank ?? null,
+          economics: candidate.economics ?? null,
+          alphaSelector: candidate.alphaSelector ?? null,
           actuallySelected: candidate.actuallySelected ?? false,
           actuallyExecuted: candidate.actuallyExecuted ?? false,
           skipReason: candidate.skipReason ?? null,
@@ -2692,6 +3003,8 @@ export class DailyRangeAcceptanceLane {
           candidate.selectorId = next.selectorId;
           candidate.selectorScore = next.selectorScore;
           candidate.selectorRank = next.selectorRank;
+          candidate.economics = next.economics;
+          candidate.alphaSelector = next.alphaSelector;
           candidate.actuallySelected = next.actuallySelected;
           candidate.actuallyExecuted = next.actuallyExecuted;
           candidate.skipReason = next.skipReason;
@@ -2713,19 +3026,28 @@ export class DailyRangeAcceptanceLane {
     return signal.research;
   }
 
-  private async capturePendingResearchSnapshots(day: DailyRangeDayState): Promise<void> {
+  private async capturePendingResearchSnapshots(
+    day: DailyRangeDayState,
+    phase: "FORWARD_BEFORE_ALLOCATION" | "RECOVERY_AFTER_ALLOCATION" = "RECOVERY_AFTER_ALLOCATION",
+  ): Promise<void> {
     const batches = this.store.getState().signalCohorts
-      .filter((batch) => batch.strategyVersion === this.strategyVersion && batch.dateUtc === day.dateUtc && batch.allocation?.batchComplete)
+      .filter((batch) => batch.strategyVersion === this.strategyVersion && batch.dateUtc === day.dateUtc && batch.allocation && (
+        phase === "FORWARD_BEFORE_ALLOCATION"
+          ? batch.allocation.finalizedAt === null
+          : batch.allocation.batchComplete
+      ))
       .sort((a, b) => a.signalTimestampMs - b.signalTimestampMs || a.cohortId.localeCompare(b.cohortId));
     for (const batch of batches) {
       const signals = batch.candidates
         .map((candidate) => this.store.findSignal(candidate.signalId))
         .filter((signal): signal is DailyRangeSignal => signal !== null);
       if (signals.length === 0) continue;
-      // Recovery path only: normal forward flow captured this before allocation.
-      // A post-allocation read may document a missing snapshot but can never
-      // turn it into causal training evidence.
-      await this.captureSignalTimeMarketQuality(day, signals, "RECOVERY_AFTER_ALLOCATION");
+      // Recovery reads can document an absence but never upgrade an old batch
+      // to a causal decision observation. Normal flow already captured BBO
+      // before this pre-allocation feature pass.
+      if (phase === "RECOVERY_AFTER_ALLOCATION") {
+        await this.captureSignalTimeMarketQuality(day, signals, "RECOVERY_AFTER_ALLOCATION");
+      }
       const needsCapture = signals.some((signal) => {
         const research = signal.research;
         return !research?.marketQuality || !research.features || !research.counterfactual;
@@ -3074,8 +3396,12 @@ export class DailyRangeAcceptanceLane {
 
   private createPendingTrade(signal: DailyRangeSignal, options: { persist?: boolean } = {}): DailyRangeTrade | null {
     if (!signal.confirmationBar1) return null;
+    // The normal AUTO_ROUTE_V2 allocator only reaches this constructor after it
+    // persisted a V3 economic plan. The defensive legacy fallback below exists
+    // solely for historical fixtures/reconciliation paths, not a public entry
+    // route, so older durable records remain readable.
     const tradeId = tradeIdFromSignal(signal);
-    const rawStop = structuralStopForDailyRangeSignal(signal);
+    const rawStop = signal.economics?.rawStructuralStop ?? structuralStopForDailyRangeSignal(signal);
     if (!finitePositive(rawStop)) return null;
     const trade: DailyRangeTrade = {
       tradeId,
@@ -3093,10 +3419,17 @@ export class DailyRangeAcceptanceLane {
       entryFilledAt: null,
       entryFillPrice: null,
       entryQty: null,
-      requestedQty: null,
+      requestedQty: signal.economics?.requestedQty ?? null,
       entryNotionalUsd: null,
       entrySlippageBps: null,
-      signalReferencePrice: null,
+      signalReferencePrice: signal.economics
+        ? signal.direction === "LONG" ? signal.economics.decisionAsk : signal.economics.decisionBid
+        : null,
+      economics: signal.economics ?? null,
+      alphaSelector: signal.alphaSelector ?? null,
+      actualStopRiskBps: null,
+      actualCostRatio: null,
+      postFillEconomicsStatus: null,
       rangeHigh: signal.rangeHigh,
       rangeLow: signal.rangeLow,
       entryPolicy: signal.entryPolicy ?? "LEGACY_CONTINUATION",
@@ -3129,6 +3462,9 @@ export class DailyRangeAcceptanceLane {
       exitSlippageBps: null,
       grossPnlUsd: null,
       feesUsd: null,
+      entryFeesUsd: null,
+      exitFeesUsd: null,
+      feeEvidence: null,
       fundingUsd: null,
       netPnlUsd: null,
       grossR: null,
@@ -3271,9 +3607,17 @@ export class DailyRangeAcceptanceLane {
     let filters: Map<string, FuturesSymbolFilters>;
     let referencePrice: number;
     try {
-      const [allFilters, book] = await Promise.all([this.client.getExchangeFilters(), this.client.getBookTicker(trade.symbol)]);
-      filters = allFilters;
-      referencePrice = trade.direction === "LONG" ? book.ask ?? 0 : book.bid ?? 0;
+      filters = await this.client.getExchangeFilters();
+      if (trade.economics) {
+        // V3 uses the persisted pre-allocation BBO side for execution lineage.
+        // It never replaces the selected candidate's decision price with a
+        // newer quote just before the POST.
+        referencePrice = trade.direction === "LONG" ? trade.economics.decisionAsk : trade.economics.decisionBid;
+      } else {
+        // Only immutable legacy records arrive here without a V3 plan.
+        const book = await this.client.getBookTicker(trade.symbol);
+        referencePrice = trade.direction === "LONG" ? book.ask ?? 0 : book.bid ?? 0;
+      }
     } catch (error) {
       this.abortTrade(trade, "ENTRY_ABORT_EXECUTION_FAILED", `execution reference unavailable: ${error instanceof Error ? error.message : String(error)}`);
       this.markSignal(signal, { eligible: false, reason: "EXECUTION_INELIGIBLE", tradeId: trade.tradeId });
@@ -3285,10 +3629,15 @@ export class DailyRangeAcceptanceLane {
       this.markSignal(signal, { eligible: false, reason: "EXECUTION_INELIGIBLE", tradeId: trade.tradeId });
       return;
     }
-    const qty = clampQty(DAILY_RANGE_TRADE_NOTIONAL_USD / referencePrice, filter);
-    if (qty === null || qty * referencePrice + EPSILON < filter.minNotional) {
-      this.abortTrade(trade, "ENTRY_ABORT_EXECUTION_FAILED", "25 USDT cannot satisfy exchange quantity/minNotional filter");
-      this.markSignal(signal, { eligible: false, reason: "EXECUTION_INELIGIBLE", tradeId: trade.tradeId });
+    const plannedQty = trade.economics ? trade.requestedQty : clampQty(DAILY_RANGE_TRADE_NOTIONAL_USD / referencePrice, filter);
+    const qty = plannedQty === null ? null : clampQty(plannedQty, filter);
+    const expectedNotional = trade.economics?.plannedNotionalUsd ?? (qty === null ? 0 : qty * referencePrice);
+    const frozenQtyChanged = trade.economics && qty !== null && Math.abs(qty - plannedQty!) > Math.max(EPSILON, plannedQty! * 1e-9);
+    if (qty === null || frozenQtyChanged || expectedNotional + EPSILON < filter.minNotional) {
+      this.abortTrade(trade, "ENTRY_ABORT_EXECUTION_FAILED", trade.economics
+        ? "frozen V3 quantity is no longer executable under the current exchange filter"
+        : "25 USDT cannot satisfy exchange quantity/minNotional filter");
+      this.markSignal(signal, { eligible: false, reason: trade.economics ? "RISK_BUDGET_UNEXECUTABLE" : "EXECUTION_INELIGIBLE", tradeId: trade.tradeId });
       return;
     }
     trade.signalReferencePrice = referencePrice;
@@ -3457,6 +3806,50 @@ export class DailyRangeAcceptanceLane {
       this.store.save();
       await this.emergencyFlatten(trade, "ENTRY_ABORT_INVALID_RISK", "ENTRY_ABORT_INVALID_RISK");
       return;
+    }
+    if (trade.economics) {
+      const fillEconomics = evaluateActualFillEconomics({
+        side: trade.direction,
+        entryPrice: entry,
+        quantity: qty,
+        stopPrice: bracket.stop,
+        expectedCostRatio: trade.economics.costRatio,
+        expectedPlannedRiskUsd: trade.economics.plannedRiskUsd,
+        safeLossFrictionBps: trade.economics.safeLossFrictionBps,
+      });
+      if (!fillEconomics) {
+        trade.postFillEconomicsStatus = "POST_FILL_ECONOMICS_FAIL";
+        trade.lastReconcileError = "POST_FILL_ECONOMICS_FAIL: actual fill cannot form a valid structural-risk record";
+        trade.status = "PROTECTING";
+        this.store.save();
+        try {
+          // Keep the structural native stop/2R protection live while the
+          // exact reduce-only flatten is being reconciled. The failure never
+          // widens or rewrites either bracket.
+          await this.placeAndVerifyBrackets(trade);
+        } catch (error) {
+          trade.lastReconcileError = `POST_FILL_ECONOMICS_FAIL: protective bracket setup failed: ${error instanceof Error ? error.message : String(error)}`;
+          this.store.save();
+        }
+        await this.emergencyFlatten(trade, "ENTRY_ABORT_POST_FILL_ECONOMICS_FAIL", "POST_FILL_ECONOMICS_FAIL");
+        return;
+      }
+      trade.actualStopRiskBps = fillEconomics.actualStopRiskBps;
+      trade.actualCostRatio = fillEconomics.actualCostRatio;
+      trade.postFillEconomicsStatus = fillEconomics.materialViolation ? "POST_FILL_ECONOMICS_FAIL" : "PASS";
+      if (fillEconomics.materialViolation) {
+        trade.lastReconcileError = `POST_FILL_ECONOMICS_FAIL: actualCostRatio=${fillEconomics.actualCostRatio.toFixed(6)} max=${DAILY_RANGE_MAX_COST_RATIO}`;
+        trade.status = "PROTECTING";
+        this.store.save();
+        try {
+          await this.placeAndVerifyBrackets(trade);
+        } catch (error) {
+          trade.lastReconcileError = `POST_FILL_ECONOMICS_FAIL: protective bracket setup failed: ${error instanceof Error ? error.message : String(error)}`;
+          this.store.save();
+        }
+        await this.emergencyFlatten(trade, "ENTRY_ABORT_POST_FILL_ECONOMICS_FAIL", "POST_FILL_ECONOMICS_FAIL");
+        return;
+      }
     }
     trade.status = "PROTECTING";
     trade.lastReconcileError = null;
@@ -3831,11 +4224,20 @@ export class DailyRangeAcceptanceLane {
     }
     const gross = ownFills.reduce((sum, fill) => sum + fill.realizedPnl, 0);
     const fees = ownFills.reduce((sum, fill) => sum + Math.abs(fill.commission), 0);
+    const entryFees = ownFills
+      .filter((fill) => fill.orderId === trade.entryOrderId)
+      .reduce((sum, fill) => sum + Math.abs(fill.commission), 0);
+    const exitFees = ownFills
+      .filter((fill) => fill.orderId === trade.exitOrderId)
+      .reduce((sum, fill) => sum + Math.abs(fill.commission), 0);
     const funding = income
       .filter((entry) => entry.symbol === trade.symbol && entry.time >= start)
       .reduce((sum, entry) => sum + entry.income, 0);
     trade.grossPnlUsd = gross;
     trade.feesUsd = fees;
+    trade.entryFeesUsd = entryFees;
+    trade.exitFeesUsd = exitFees;
+    trade.feeEvidence = "EXACT_FILL_COMMISSION";
     trade.fundingUsd = funding;
     trade.netPnlUsd = gross - fees + funding;
     trade.grossR = gross / trade.initialRiskDollar;

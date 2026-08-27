@@ -59,9 +59,10 @@ export function resolveDailyRangeTestnetMaxOpenTrades(
 }
 
 /**
- * Testnet uses a neutral, deterministic baseline by default.  Mainnet inherits
- * its separately fail-closed controls; no environment typo can enable alpha or
- * the retired loop-order allocator.
+ * Testnet may still run the explicitly labelled seeded comparator for research,
+ * but Mainnet never may. Mainnet's safe operational fallback is the frozen
+ * economic-quality baseline; no environment typo can grant random, loop-order,
+ * or unvalidated-alpha authority to a real-money entry.
  */
 export function resolveDailyRangeRuntimeAllocatorMode(input: {
   environment: "testnet" | "mainnet";
@@ -69,7 +70,7 @@ export function resolveDailyRangeRuntimeAllocatorMode(input: {
   mainnetControls?: DailyRangeMainnetControls | null;
 }): DailyRangeAllocatorMode {
   if (input.environment === "mainnet") return input.mainnetControls?.allocatorMode ?? "PAUSED";
-  const requested = parseDailyRangeAllocatorMode(input.env?.DAILY_RANGE_ALLOCATOR, "SEEDED_RANDOM_BASELINE");
+  const requested = parseDailyRangeAllocatorMode(input.env?.DAILY_RANGE_ALLOCATOR, "ECONOMIC_QUALITY_BASELINE");
   // The legacy mode is retained only in pure replay/tests, never in a running lane.
   return requested === "LOOP_ORDER_LEGACY" ? "PAUSED" : requested;
 }
@@ -83,6 +84,15 @@ export function parseDailyRangeMainnetControls(
 ): DailyRangeMainnetControls {
   const parsedEntryMode = newEntryMode(env.DAILY_RANGE_NEW_ENTRY_MODE);
   const requestedAllocator = parseDailyRangeAllocatorMode(env.DAILY_RANGE_ALLOCATOR, "PAUSED");
+  const safeAllocator: DailyRangeAllocatorMode = requestedAllocator === "LOOP_ORDER_LEGACY"
+    ? "PAUSED"
+    : requestedAllocator === "SEEDED_RANDOM_BASELINE"
+      ? "ECONOMIC_QUALITY_BASELINE"
+      : requestedAllocator === "SHADOW_SELECTOR"
+        ? "SHADOW_ALPHA_SELECTOR"
+        : requestedAllocator === "VALIDATED_SELECTOR"
+          ? "VALIDATED_ALPHA_SELECTOR"
+          : requestedAllocator;
   return {
     executionEnabled: env.DAILY_RANGE_MAINNET_EXECUTION_ENABLED === "1",
     confirmed: env.DAILY_RANGE_MAINNET_CONFIRM === DAILY_RANGE_MAINNET_CONFIRM_PHRASE,
@@ -91,8 +101,8 @@ export function parseDailyRangeMainnetControls(
     maxOpenTrades: nonNegativeInteger(env.DAILY_RANGE_MAINNET_MAX_OPEN_TRADES),
     maxGrossNotionalUsd: nonNegativeNumber(env.DAILY_RANGE_MAINNET_MAX_GROSS_NOTIONAL_USD),
     newEntryMode: parsedEntryMode,
-    allocatorMode: parsedEntryMode === "PAUSED_SELECTION_FIX" || requestedAllocator === "LOOP_ORDER_LEGACY"
+    allocatorMode: parsedEntryMode === "PAUSED_SELECTION_FIX"
       ? "PAUSED"
-      : requestedAllocator,
+      : safeAllocator,
   };
 }
