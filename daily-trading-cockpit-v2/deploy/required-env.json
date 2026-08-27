@@ -143,20 +143,24 @@
       "why": "The Dynamic policy freezes six equal $25 legs and has no confidence-sized learning tier. Keep the old traffic-light scaler OFF in both environments."
     },
     "CROSS_SECTIONAL_POLICY_VERSION": {
-      "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
-      "why": "Active TESTNET Dynamic MOM36 V5 identity. Preserve the already-running continuation, SLOW_AND_FAST preference/fallback, and SL/MFE policy across dashboard-only releases; new evidence must not be reclassified as V4."
+      "value": "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
+      "why": "Dynamic MOM36 V4 identity. V4 applies SLOW_AND_FAST as a hard per-leg gate: an incomplete strict formation is rejected and never borrows a V5 raw-MOM36 fallback leg."
     },
     "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-      "value": "2026-08-27T02:30:00Z",
-      "why": "Active TESTNET V5 forward-cohort boundary observed in the running lane. Retain it exactly during the unrelated Daily Range V3 release so prior baskets are not reclassified."
+      "value": "2026-08-27T14:21:18Z",
+      "why": "V4 strict Slow+Fast forward-cohort boundary. Existing V5 and earlier baskets retain their frozen fingerprints and remain historical; only baskets admitted under this V4 policy may enter the new cohort."
     },
     "CROSS_SECTIONAL_STRATEGY_VERSION": {
-      "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
-      "why": "Active TESTNET Dynamic MOM36 V5 implementation: continuation, MOM36 rank walk, SLOW_AND_FAST preference/fallback, and unchanged SL/MFE exit dispatcher for new baskets only."
+      "value": "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
+      "why": "Selects Dynamic MOM36 V4: continuation allocation, MOM36 rank walk, and STRICT SLOW_AND_FAST per-leg eligibility with no raw-MOM36 fallback for new baskets only. V5 breadth admission remains implemented and can be selected explicitly in a later versioned cutover."
     },
     "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
-      "value": "2026-08-27T02:30:00Z",
-      "why": "Active TESTNET V5 deployment timestamp observed in the running lane and captured in every new basket fingerprint."
+      "value": "2026-08-27T14:21:18Z",
+      "why": "V4 strict Slow+Fast deployment identity captured in every newly admitted basket fingerprint."
+    },
+    "KRONOS_RELEASE_SHA": {
+      "value": "c4314673f395daf84e27858fc47f5eacab13373a",
+      "why": "Source baseline for the V4 strict cutover. The strategy version above, rather than a dashboard label, determines whether STRICT or V5 PREFER/fallback formation executes."
     },
     "CROSS_SECTIONAL_EXEC_VARIANT": {
       "value": "DYNAMIC_MOM36_SHOCK",
@@ -217,72 +221,72 @@
       "role": "mainnet",
       "extra": {
         "KRONOS_RELEASE_SHA": {
-          "value": "41cc9f46975ce74e51814e6747a1b90301086edd",
-          "why": "Exact source identity for the Live-only Dynamic MOM36 V5 policy fence. Every new basket fingerprint records this immutable V5 parity commit, rather than inheriting a prior Plain or Dynamic V1 identity."
+          "value": "c4314673f395daf84e27858fc47f5eacab13373a",
+          "why": "Exact source identity for the LIVE V4 strict policy fence. Every newly admitted basket records this immutable source identity and its V4 strategy fingerprint."
         },
         "CROSS_SECTIONAL_POLICY_VERSION": {
-          "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
-          "why": "Operator-authorized LIVE parity with the active TESTNET Dynamic MOM36 V5 architecture. New LIVE evidence is a separate V5 cohort; existing baskets retain their frozen policy."
+          "value": "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
+          "why": "Operator-authorized LIVE parity with TESTNET Dynamic MOM36 V4 strict Slow+Fast. New LIVE evidence is a separate V4 cohort; existing baskets retain their frozen policy."
         },
         "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-          "value": "2026-08-27T02:30:00Z",
-          "why": "Forward-cohort boundary observed in the running LIVE Dynamic MOM36 V5 policy. Prior Plain, Dynamic V1, and legacy baskets remain historical and cannot be mixed into this cohort."
+          "value": "2026-08-27T14:21:18Z",
+          "why": "LIVE V4 strict Slow+Fast forward-cohort boundary. Prior V5, Plain, Dynamic V1, and legacy baskets remain historical and cannot be mixed into this cohort."
         },
         "CROSS_SECTIONAL_STRATEGY_VERSION": {
-          "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
-          "why": "Use the same V5 breadth, frozen continuation, MOM36 rank walk, SLOW_AND_FAST preference/fallback, and exact-six-leg formation as active TESTNET."
+          "value": "dynamic-mom36-cont-slowfast-sl2-mfe30-36h-v4",
+          "why": "Use the same V4 continuation allocation, MOM36 rank walk, and strict SLOW_AND_FAST hard gate as TESTNET. A strict insufficiency blocks a new basket; it may not substitute a raw-MOM36 fallback leg."
         },
         "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
-          "value": "2026-08-27T02:30:00Z",
-          "why": "Active LIVE Dynamic MOM36 V5 deployment identity observed at runtime and frozen into every new basket fingerprint."
+          "value": "2026-08-27T14:21:18Z",
+          "why": "LIVE V4 strict Slow+Fast deployment identity frozen into every newly admitted basket fingerprint."
         },
         "CROSS_SECTIONAL_EXEC_VARIANT": {
           "value": "DYNAMIC_MOM36_SHOCK",
-          "why": "The LIVE executor must consume the same Dynamic MOM36 V5 signal as TESTNET. A variant/strategy mismatch remains fail-closed."
+          "why": "The LIVE executor must consume the same Dynamic MOM36 V4 signal as TESTNET. A variant/strategy mismatch remains fail-closed."
         },
         "CROSS_SECTIONAL_K": {
           "value": "3",
-          "why": "Matches TESTNET's V5 base configuration. Dynamic V5 owns the final breadth allocation while preserving the exact six-leg total."
+          "why": "Matches TESTNET's V4 base configuration. Dynamic V4 owns the continuation-adjusted breadth allocation while preserving the exact six-leg total."
         },
         "CROSS_SECTIONAL_REGIME_SKEW_ENABLED": {
           "value": "0",
-          "why": "Matches TESTNET. Dynamic V5 uses its own frozen MOM36 breadth plus continuation mechanism rather than the retired generic regime-skew switch."
+          "why": "Matches TESTNET. Dynamic V4 uses its own frozen MOM36 breadth plus continuation mechanism rather than the retired generic regime-skew switch."
         },
         "CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT": {
           "value": "1",
-          "why": "Matches TESTNET. V5 itself owns SLOW_AND_FAST in PREFER mode: it uses strict aligned selection when complete, otherwise the complete same-snapshot raw MOM36 selection."
+          "why": "Matches TESTNET. V4 itself owns SLOW_AND_FAST in STRICT mode: it uses only aligned candidates and rejects an incomplete formation."
         },
         "CROSS_SECTIONAL_FILTERED_WEIGHTING": {
           "value": "CAPPED_SCORE_RANK",
-          "why": "Retained to match TESTNET configuration; Dynamic V5 freezes its actual execution sizing separately at six equal 25 USDT legs."
+          "why": "Retained to match TESTNET configuration; Dynamic V4 freezes its actual execution sizing separately at six equal 25 USDT legs."
         },
         "CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP": {
           "value": "0.058",
-          "why": "Same Dynamic V5 formation admission floor as TESTNET."
+          "why": "Same Dynamic V4 formation admission floor as TESTNET."
         },
         "CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER": {
           "value": "2",
-          "why": "Same Dynamic V5 concentration guardrail as TESTNET."
+          "why": "Same Dynamic V4 concentration guardrail as TESTNET."
         },
         "CROSS_SECTIONAL_SMART_FORMATION_RERANK": {
           "value": "0",
-          "why": "Matches TESTNET: Dynamic V5's own versioned formation owns selection; Smart Formation utility reranking stays off."
+          "why": "Matches TESTNET: Dynamic V4's own versioned formation owns selection; Smart Formation utility reranking stays off."
         },
         "CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS": {
           "value": "36",
-          "why": "Matches TESTNET V5's fixed 36-hour execution cap; the separate report horizon remains non-execution metadata."
+          "why": "Matches TESTNET V4's fixed 36-hour execution cap; the separate report horizon remains non-execution metadata."
         },
         "CROSS_SECTIONAL_EXEC_TP_DISABLED": {
           "value": "1",
-          "why": "Matches TESTNET V5: ordinary TP stays off. V5's frozen -2% hard cut and +3% MFE / 30% giveback exit are separate from ordinary TP."
+          "why": "Matches TESTNET V4: ordinary TP stays off. V4's frozen -2% hard cut and +3% MFE / 30% giveback exit are separate from ordinary TP."
         },
         "CROSS_SECTIONAL_EXEC_STOP_NET_RETURN": {
           "value": "0",
-          "why": "Matches TESTNET V5: ordinary stop stays off. The V5 frozen basket-level -2% hard cut remains active for newly admitted V5 baskets."
+          "why": "Matches TESTNET V4: ordinary stop stays off. The V4 frozen basket-level -2% hard cut remains active for newly admitted V4 baskets."
         },
         "CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED": {
           "value": "0",
-          "why": "Matches TESTNET V5: generic adaptive exits stay off; the separate frozen V5 -2% / MFE-giveback state machine remains active."
+          "why": "Matches TESTNET V4: generic adaptive exits stay off; the separate frozen V4 -2% / MFE-giveback state machine remains active."
         },
         "DAILY_RANGE_AUTO_POOL_ENABLED": {
           "value": "1",
