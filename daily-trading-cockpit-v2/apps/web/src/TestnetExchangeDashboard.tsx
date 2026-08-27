@@ -443,6 +443,47 @@ function percent(value: number | null | undefined): string {
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
 }
 
+/** Formats a net return stored as a fraction, e.g. -0.02 → -2.0%. */
+function netReturnPercent(value: number | null | undefined, digits = 2): string {
+  if (value == null || !Number.isFinite(value)) return '—';
+  return `${value >= 0 ? '+' : ''}${(value * 100).toFixed(digits)}%`;
+}
+
+function dynamicMfePlanText(exit: XsecBasketExitPlan): string {
+  if (!exit.hasMfeGiveback || exit.mfeArmNetReturn == null || exit.mfeGivebackFraction == null) return '—';
+  return `arm ${netReturnPercent(exit.mfeArmNetReturn, 1)} → GB ${(exit.mfeGivebackFraction * 100).toFixed(0)}%`;
+}
+
+function dynamicMfeStatusText(exit: XsecBasketExitPlan): string {
+  if (!exit.hasMfeGiveback) return '—';
+  if (exit.mfeTrailArmed) {
+    return exit.mfeTrailingFloor == null
+      ? `armed · GB ${((exit.mfeGivebackFraction ?? 0) * 100).toFixed(0)}%`
+      : `armed · floor ${netReturnPercent(exit.mfeTrailingFloor)} · GB ${((exit.mfeGivebackFraction ?? 0) * 100).toFixed(0)}%`;
+  }
+  return exit.peakMfeReturn == null
+    ? 'belum armed'
+    : `belum armed · peak ${netReturnPercent(exit.peakMfeReturn)}`;
+}
+
+/** Short form for the per-leg table; the full explanation stays in the basket summary above it. */
+function dynamicMfeTablePlanText(exit: XsecBasketExitPlan): string {
+  if (!exit.hasMfeGiveback || exit.mfeArmNetReturn == null || exit.mfeGivebackFraction == null) return '—';
+  return `MFE ${netReturnPercent(exit.mfeArmNetReturn, 0)} / GB ${(exit.mfeGivebackFraction * 100).toFixed(0)}%`;
+}
+
+function dynamicMfeTableStatusText(exit: XsecBasketExitPlan): string {
+  if (!exit.hasMfeGiveback) return '—';
+  if (exit.mfeTrailArmed) {
+    return exit.mfeTrailingFloor == null
+      ? 'armed'
+      : `armed · ${netReturnPercent(exit.mfeTrailingFloor, 1)}`;
+  }
+  return exit.peakMfeReturn == null
+    ? 'pending'
+    : `pending · ${netReturnPercent(exit.peakMfeReturn)}`;
+}
+
 function tone(value: number | null | undefined): string {
   if (value == null || value === 0) return 'tone-measure';
   return value > 0 ? 'tone-healthy' : 'tone-critical';
@@ -460,6 +501,14 @@ function timeAgo(iso: string | null | undefined): string {
 function compactLane(laneId: string): string {
   if (laneId === 'DAILY_4H_RANGE_ACCEPTANCE') return 'DAILY RANGE 4H';
   return laneId.replace(/^CG_VARIANT_MATRIX:/, '').replace(/^CG_LONG_VARIANT_MATRIX:/, '');
+}
+
+/** Compact table labels keep the per-leg ledger readable; the exact lane remains in its tooltip. */
+function compactOpenPositionLane(laneId: string): string {
+  if (laneId === 'CROSS_SECTIONAL_MARKET_NEUTRAL') return 'Cross basket';
+  if (laneId === 'CROSS_SECTIONAL_TREND') return 'Cross trend';
+  if (laneId === 'CROSS_SECTIONAL_MIXED') return 'Cross mixed';
+  return compactLane(laneId);
 }
 
 function allocationLaneValue(raw: string | null | undefined): string | null {
@@ -580,6 +629,19 @@ function localMonthInput(date = new Date()): string {
   return localDateInput(date).slice(0, 7);
 }
 
+type XsecDynamicV3Exit = {
+  hardCutLossNetReturn?: number | null;
+  /** Runtime executor spelling retained for baskets opened by the current V3 engine. */
+  hardCutLossThreshold?: number | null;
+  mfeArmNetReturn?: number | null;
+  /** Runtime executor spelling retained for baskets opened by the current V3 engine. */
+  mfeArmThreshold?: number | null;
+  mfeGivebackFraction?: number | null;
+  mfeTrailArmed?: boolean | null;
+  peakMfeReturn?: number | null;
+  mfeTrailingFloor?: number | null;
+};
+
 type XsecExitPolicy = {
   executionCapHours?: number | null;
   takeProfitEnabled?: boolean;
@@ -587,6 +649,8 @@ type XsecExitPolicy = {
   stopLossEnabled?: boolean;
   stopLossNetReturn?: number | null;
   adaptiveExitsEnabled?: boolean;
+  /** Dynamic MOM36 V3 exits are whole-basket net-return controls, not price TP/SLs per leg. */
+  dynamicV3Exit?: XsecDynamicV3Exit | null;
 };
 
 type XsecBasketPolicyFingerprint = {
@@ -599,6 +663,8 @@ type XsecOpenBasket = {
   /** Measurement horizon, not necessarily the executor's earlier HORIZON cap. */
   closesAtMs: number;
   policyFingerprint?: XsecBasketPolicyFingerprint | null;
+  /** Runtime state for the frozen Dynamic MOM36 V3 exit policy, when this basket uses it. */
+  dynamicMom36V3Exit?: XsecDynamicV3Exit | null;
   lastNetReturn?: number | null;
   lastNetAt?: string | null;
   legs: Array<{ symbol: string; side: string; exitOrderId: string | null }>;
@@ -651,6 +717,68 @@ function positiveFinite(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
 
+function finiteNumber(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+type XsecBasketExitPlan = {
+  policy: XsecExitPolicy | null;
+  fixedTakeProfitNetReturn: number | null;
+  stopNetReturn: number | null;
+  dynamicHardCutNetReturn: number | null;
+  hasMfeGiveback: boolean;
+  mfeArmNetReturn: number | null;
+  mfeGivebackFraction: number | null;
+  mfeTrailArmed: boolean;
+  peakMfeReturn: number | null;
+  mfeTrailingFloor: number | null;
+};
+
+/**
+ * Resolves the exit policy frozen into a basket. Runtime status fields such as
+ * `tpDisabled` only describe old fixed exits, so they must never hide the V3
+ * MFE runner or its whole-basket hard cut in the operator display.
+ */
+export function basketExitPlan(basket: XsecOpenBasket, executor: XsecExecStatus | null): XsecBasketExitPlan {
+  const policy = basket.policyFingerprint?.execution ?? executor?.legacyExitPolicy ?? null;
+  const fingerprintDynamic = policy?.dynamicV3Exit ?? null;
+  const runtimeDynamic = basket.dynamicMom36V3Exit ?? null;
+  const dynamic = fingerprintDynamic != null || runtimeDynamic != null
+    ? { ...fingerprintDynamic, ...runtimeDynamic }
+    : null;
+  const dynamicHardCutCandidate = finiteNumber(
+    dynamic?.hardCutLossNetReturn ?? dynamic?.hardCutLossThreshold,
+  );
+  const dynamicHardCutNetReturn = dynamicHardCutCandidate != null && dynamicHardCutCandidate < 0
+    ? dynamicHardCutCandidate
+    : null;
+  const mfeArmNetReturn = positiveFinite(dynamic?.mfeArmNetReturn ?? dynamic?.mfeArmThreshold);
+  const mfeGivebackCandidate = finiteNumber(dynamic?.mfeGivebackFraction);
+  const mfeGivebackFraction = mfeGivebackCandidate != null && mfeGivebackCandidate >= 0 && mfeGivebackCandidate <= 1
+    ? mfeGivebackCandidate
+    : null;
+  const fixedTpEnabled = policy?.takeProfitEnabled ?? !executor?.tpDisabled;
+  const fixedTakeProfitNetReturn = fixedTpEnabled
+    ? finiteNumber(policy?.takeProfitNetReturn ?? (executor?.tpNetReturnPct == null ? null : executor.tpNetReturnPct / 100))
+    : null;
+  const staticStopEnabled = policy?.stopLossEnabled ?? executor?.stopNetReturnPct != null;
+  const staticStopNetReturn = staticStopEnabled
+    ? finiteNumber(policy?.stopLossNetReturn ?? (executor?.stopNetReturnPct == null ? null : executor.stopNetReturnPct / 100))
+    : null;
+  return {
+    policy,
+    fixedTakeProfitNetReturn,
+    stopNetReturn: dynamicHardCutNetReturn ?? staticStopNetReturn,
+    dynamicHardCutNetReturn,
+    hasMfeGiveback: mfeArmNetReturn != null && mfeGivebackFraction != null,
+    mfeArmNetReturn,
+    mfeGivebackFraction,
+    mfeTrailArmed: dynamic?.mfeTrailArmed === true,
+    peakMfeReturn: finiteNumber(dynamic?.peakMfeReturn),
+    mfeTrailingFloor: finiteNumber(dynamic?.mfeTrailingFloor),
+  };
+}
+
 export function basketHorizonSchedule(basket: XsecOpenBasket, executor: XsecExecStatus | null): {
   closeAtMs: number | null;
   capHours: number | null;
@@ -663,6 +791,7 @@ export function basketHorizonSchedule(basket: XsecOpenBasket, executor: XsecExec
   const legacyCap = positiveFinite(legacyPolicy?.executionCapHours);
   const runtimeCap = positiveFinite(executor?.maxHoldHours);
   const policy = fingerprintPolicy ?? legacyPolicy;
+  const exitPlan = basketExitPlan(basket, executor);
   const source = fingerprintCap != null
     ? 'basket fingerprint'
     : legacyCap != null
@@ -683,7 +812,14 @@ export function basketHorizonSchedule(basket: XsecOpenBasket, executor: XsecExec
     closeAtMs,
     capHours,
     source,
-    earlyExitPossible: Boolean(policy?.takeProfitEnabled || policy?.stopLossEnabled || policy?.adaptiveExitsEnabled),
+    earlyExitPossible: Boolean(
+      exitPlan.fixedTakeProfitNetReturn != null ||
+      exitPlan.stopNetReturn != null ||
+      exitPlan.hasMfeGiveback ||
+      policy?.takeProfitEnabled ||
+      policy?.stopLossEnabled ||
+      policy?.adaptiveExitsEnabled,
+    ),
   };
 }
 
@@ -704,6 +840,11 @@ export function taipeiDateTime(value: string | number | null | undefined): strin
     minute: '2-digit',
     hour12: false,
   }).replace(',', '');
+}
+
+/** The complete Taipei timestamp remains in the tooltip; the table needs only day/month and time. */
+function compactTaipeiDateTime(value: string | number | null | undefined): string | null {
+  return taipeiDateTime(value)?.replace(/\/\d{4}(?= )/, '') ?? null;
 }
 
 function horizonDetail(closeAtMs: number | null, source: string, earlyExitPossible: boolean): string {
@@ -2119,6 +2260,7 @@ export default function TestnetExchangeDashboard() {
   const openBasketLegSchedules = xsecInstances.flatMap(({ label, laneId, status: xs }) =>
     (xs?.openBaskets ?? []).flatMap((basket) => {
       const horizon = basketHorizonSchedule(basket, xs);
+      const exit = basketExitPlan(basket, xs);
       return basket.legs.map((leg) => ({
         label,
         laneId,
@@ -2127,6 +2269,7 @@ export default function TestnetExchangeDashboard() {
         side: leg.side,
         openedAt: basket.openedAt,
         horizon,
+        exit,
       }));
     }),
   );
@@ -2585,20 +2728,30 @@ export default function TestnetExchangeDashboard() {
                 // An open basket keeps the exit policy it was born with.  Do not let a
                 // later runtime policy change make an old NoTP basket look as though it
                 // has a new TP target (or vice versa).
-                const basketExitPolicy = b.policyFingerprint?.execution ?? xs?.legacyExitPolicy ?? null;
-                const basketTpEnabled = basketExitPolicy?.takeProfitEnabled ?? !xs?.tpDisabled;
-                const tp = basketTpEnabled
-                  ? (basketExitPolicy?.takeProfitNetReturn ?? (xs?.tpNetReturnPct == null ? null : xs.tpNetReturnPct / 100))
-                  : null;
+                const exit = basketExitPlan(b, xs);
                 const net = b.lastNetReturn != null ? b.lastNetReturn * 100 : null;
-                const tpPct = tp == null ? null : tp * 100;
+                const tpPct = exit.fixedTakeProfitNetReturn == null ? null : exit.fixedTakeProfitNetReturn * 100;
                 const gap = tpPct != null && net != null ? tpPct - net : null;
-                const basketStopEnabled = basketExitPolicy?.stopLossEnabled ?? xs?.stopNetReturnPct != null;
-                const sl = basketStopEnabled
-                  ? (basketExitPolicy?.stopLossNetReturn ?? (xs?.stopNetReturnPct == null ? null : xs.stopNetReturnPct / 100))
-                  : null;
-                const slPct = sl == null ? null : sl * 100;
-                const slGap = slPct != null && net != null ? net + slPct : null;
+                const stopPct = exit.stopNetReturn == null ? null : Math.abs(exit.stopNetReturn * 100);
+                const stopGap = exit.stopNetReturn != null && net != null ? net - exit.stopNetReturn * 100 : null;
+                const profitText = exit.hasMfeGiveback
+                  ? `${dynamicMfePlanText(exit)} · ${dynamicMfeStatusText(exit)}`
+                  : tpPct == null
+                    ? 'fixed TP off'
+                    : gap == null
+                      ? `fixed TP +${tpPct.toFixed(1)}%`
+                      : `${gap.toFixed(2)}pp (fixed TP +${tpPct.toFixed(1)}%)`;
+                const profitTitle = exit.hasMfeGiveback
+                  ? 'Whole-basket net runner: arm on the recorded MFE, then exit after the stated giveback fraction.'
+                  : 'Fixed whole-basket take-profit policy.';
+                const stopText = stopPct == null
+                  ? 'stop off'
+                  : stopGap == null
+                    ? `-${stopPct.toFixed(1)}%`
+                    : `${stopGap.toFixed(2)}pp (−${stopPct.toFixed(1)}%)`;
+                const stopTitle = exit.dynamicHardCutNetReturn != null
+                  ? 'Whole-basket net hard cut. It is not a per-leg exchange price stop.'
+                  : 'Fixed whole-basket stop policy.';
                 // Keep the established compact row layout, but derive its countdown from the policy
                 // frozen for this basket. `closesAtMs` is the research measurement horizon, not always
                 // the executor's HORIZON cap; the complete source/time remains available on hover.
@@ -2615,23 +2768,31 @@ export default function TestnetExchangeDashboard() {
                 const oldEnough = Date.now() - new Date(b.openedAt).getTime() > 15 * 60_000;
                 const stale = b.lastNetAt ? Date.now() - new Date(b.lastNetAt).getTime() > 15 * 60_000 : oldEnough;
                 return (
-                  <div key={b.basketId} style={{ display: 'flex', gap: 14, padding: '2px 0', flexWrap: 'wrap' }}>
-                    <span className="tone-measure">[{label}] {b.basketId}</span>
-                    {missing.length > 0 && <span className="tone-warning" title={b.operatorException?.reason}>
-                      pengecualian operator · {actualLegs}/{expectedLegs} leg nyata · {missing.map((leg) => `${leg.symbol} ${leg.side}`).join(', ')} tidak dibuka
-                    </span>}
-                    <span>net <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong></span>
-                    <span>ke TP <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{!basketTpEnabled ? 'TP mati' : gap == null ? '—' : `${gap.toFixed(2)}pp (${tpPct?.toFixed(1)}%)`}</strong></span>
-                    <span>ke stop <strong className={slGap != null && slGap <= 0 ? 'tone-critical' : ''}>{!basketStopEnabled ? 'stop mati' : slGap == null ? '—' : `${slGap.toFixed(2)}pp (-${slPct?.toFixed(1)}%)`}</strong></span>
-                    <span className="tone-measure">buka {openedAt == null ? '—' : `${openedAt} Taipei`}</span>
-                    <span
-                      className="tone-measure"
-                      title={horizonDetail(horizon.closeAtMs, horizon.source, horizon.earlyExitPossible)}
-                    >
-                      {closeLabel} {closesAt == null ? '—' : `${closesAt} Taipei`}
-                      {hoursLeft == null ? '' : ` · ${hoursLeft.toFixed(1)}h lagi`}{horizon.capHours != null ? ` (cap ${horizon.capHours}h)` : ''}
-                    </span>
-                    {stale && <span className="tone-warning">stamp basi &gt;15m — cek executor</span>}
+                  <div key={b.basketId} className="xsec-open-basket-summary">
+                    <div className="xsec-open-basket-identity">
+                      <span className="tone-measure">[{label}] {b.basketId}</span>
+                      {missing.length > 0 && <span className="tone-warning xsec-open-basket-detail" title={b.operatorException?.reason}>
+                        pengecualian operator · {actualLegs}/{expectedLegs} leg nyata · {missing.map((leg) => `${leg.symbol} ${leg.side}`).join(', ')} tidak dibuka
+                      </span>}
+                    </div>
+                    <div className="xsec-open-basket-metric">
+                      <span>Net</span>
+                      <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong>
+                    </div>
+                    <div className="xsec-open-basket-metric">
+                      <span>{exit.hasMfeGiveback ? 'MFE runner' : 'fixed TP'}</span>
+                      <strong className={exit.hasMfeGiveback && exit.mfeTrailArmed ? 'tone-healthy' : gap != null && gap <= 0 ? 'tone-healthy' : ''} title={profitTitle}>{profitText}</strong>
+                    </div>
+                    <div className="xsec-open-basket-metric">
+                      <span>{exit.dynamicHardCutNetReturn != null ? 'hard stop' : 'fixed stop'}</span>
+                      <strong className={stopGap != null && stopGap <= 0 ? 'tone-critical' : ''} title={stopTitle}>{stopText}</strong>
+                    </div>
+                    <div className="xsec-open-basket-window" title={horizonDetail(horizon.closeAtMs, horizon.source, horizon.earlyExitPossible)}>
+                      <span>Buka {openedAt == null ? '—' : `${openedAt} Taipei`}</span>
+                      <strong>{closeLabel} {closesAt == null ? '—' : `${closesAt} Taipei`}</strong>
+                      <span className="xsec-open-basket-detail">{hoursLeft == null ? '' : `${hoursLeft.toFixed(1)}h lagi`}{horizon.capHours != null ? ` · cap ${horizon.capHours}h` : ''}</span>
+                      {stale && <span className="tone-warning xsec-open-basket-detail">stamp basi &gt;15m — cek executor</span>}
+                    </div>
                   </div>
                 );
               }))}
@@ -2677,7 +2838,7 @@ export default function TestnetExchangeDashboard() {
               <thead>
                 <tr>
                   <th>Book</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th>
-                  <th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Stop</th><th>R now / peak</th>
+                  <th>Exit</th><th>State</th><th>Liq / margin call</th><th>Stop</th><th>R / MFE</th>
                   <th>Basket horizon</th><th>Unrealized</th><th>After fee+slip</th><th>Lev</th><th>Source entries</th><th>Source lane</th><th>Opened</th>
                   <th>Intent state</th>
                   <th>Action</th>
@@ -2764,11 +2925,64 @@ export default function TestnetExchangeDashboard() {
                           <td>{Number(qty.toFixed(8))}</td>
                           <td>{entry == null ? 'multi-leg' : price(entry)}</td>
                           <td>{price(p.markPrice)}</td>
-                          <td>—</td>
-                          <td>—</td>
+                          <td>
+                            {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
+                              const exit = schedule.exit;
+                              const text = exit.hasMfeGiveback
+                                ? dynamicMfeTablePlanText(exit)
+                                : exit.fixedTakeProfitNetReturn == null
+                                  ? 'fixed TP off'
+                                  : `fixed TP ${netReturnPercent(exit.fixedTakeProfitNetReturn, 1)}`;
+                              return (
+                                <span
+                                  key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}-profit`}
+                                  style={{ display: 'block', whiteSpace: 'nowrap' }}
+                                  title={exit.hasMfeGiveback
+                                    ? 'Whole-basket net MFE runner; this is not a per-leg price target.'
+                                    : 'Whole-basket fixed take-profit policy.'}
+                                >
+                                  {text}
+                                </span>
+                              );
+                            })}
+                          </td>
+                          <td>
+                            {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
+                              const exit = schedule.exit;
+                              const text = exit.hasMfeGiveback
+                                ? dynamicMfeTableStatusText(exit)
+                                : exit.fixedTakeProfitNetReturn == null
+                                  ? '—'
+                                  : 'fixed target';
+                              return <span key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}-profit-status`} style={{ display: 'block', whiteSpace: 'nowrap' }}>{text}</span>;
+                            })}
+                          </td>
                           <td className="tone-critical">{price(p.liquidationPrice)}</td>
-                          <td>—</td>
-                          <td>—</td>
+                          <td>
+                            {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
+                              const exit = schedule.exit;
+                              const text = exit.stopNetReturn == null
+                                ? 'stop off'
+                                : `${exit.dynamicHardCutNetReturn != null ? 'basket ' : ''}${netReturnPercent(exit.stopNetReturn, 1)}`;
+                              return (
+                                <span
+                                  key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}-stop`}
+                                  style={{ display: 'block', whiteSpace: 'nowrap' }}
+                                  title={exit.dynamicHardCutNetReturn != null
+                                    ? 'Whole-basket net hard cut; it is not a per-leg exchange price stop.'
+                                    : 'Whole-basket fixed stop policy.'}
+                                >
+                                  {text}
+                                </span>
+                              );
+                            })}
+                          </td>
+                          <td>
+                            {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
+                              const peak = schedule.exit.peakMfeReturn;
+                              return <span key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}-mfe`} style={{ display: 'block', whiteSpace: 'nowrap' }}>{peak == null ? '—' : netReturnPercent(peak)}</span>;
+                            })}
+                          </td>
                           <td>
                             {basketSchedules.length === 0 ? (
                               <span
@@ -2780,7 +2994,7 @@ export default function TestnetExchangeDashboard() {
                                 {basketScheduleStillLoading ? 'schedule loading…' : 'schedule unavailable'}
                               </span>
                             ) : basketSchedules.map((schedule) => {
-                              const closesAt = taipeiDateTime(schedule.horizon.closeAtMs);
+                              const closesAt = compactTaipeiDateTime(schedule.horizon.closeAtMs);
                               const hoursLeft = schedule.horizon.closeAtMs == null
                                 ? null
                                 : Math.max(0, (schedule.horizon.closeAtMs - Date.now()) / 3600000);
@@ -2791,8 +3005,8 @@ export default function TestnetExchangeDashboard() {
                                   title={horizonDetail(schedule.horizon.closeAtMs, schedule.horizon.source, schedule.horizon.earlyExitPossible)}
                                 >
                                   {basketSchedules.length > 1 ? `[${schedule.label}] ` : ''}
-                                  {schedule.horizon.earlyExitPossible ? 'batas close' : 'tutup'} {closesAt == null ? '—' : `${closesAt} Taipei`}
-                                  {hoursLeft == null ? '' : ` · ${hoursLeft.toFixed(1)}h lagi`}
+                                  {schedule.horizon.earlyExitPossible ? 'close' : 'cap'} {closesAt == null ? '—' : closesAt}
+                                  {hoursLeft == null ? '' : ` · ${hoursLeft.toFixed(1)}h`}
                                 </span>
                               );
                             })}
@@ -2801,7 +3015,7 @@ export default function TestnetExchangeDashboard() {
                           <td className={tone(afterCost)}>{signed(afterCost)}</td>
                           <td>{p.leverage}x</td>
                           <td>{p.sourceOrderCount}</td>
-                          <td>{p.laneIds.length > 0 ? p.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
+                          <td title={p.laneIds.join(', ')}>{p.laneIds.length > 0 ? p.laneIds.map(compactOpenPositionLane).join(', ') : 'unattributed'}</td>
                           <td>
                             {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
                               const openedAt = taipeiDateTime(schedule.openedAt);
