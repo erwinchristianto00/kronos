@@ -59,3 +59,12 @@ ATR multiple, policy limits, and PASS/FAIL reason.
   25%.
 - The BMT example rejects at `STRUCTURAL_STOP_TOO_WIDE` before sizing or
   allocation.
+
+## Production regression confirmation
+
+The Live BMT row precisely reproduced the intended generic guard: actual entry
+`0.02114`, structural stop `0.02012` (4.825%), and exact 2R TP `0.02318`
+(9.650%). It was rejected as `STRUCTURAL_STOP_TOO_WIDE` and safely flattened
+through the existing owned reduce-only path. No BMT-specific blacklist or
+change to route, friction, size, allocator, alpha mode, structural SL, or 2R
+TP was introduced.
