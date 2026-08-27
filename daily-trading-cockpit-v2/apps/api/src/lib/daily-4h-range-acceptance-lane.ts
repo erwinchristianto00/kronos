@@ -1716,7 +1716,12 @@ export class DailyRangeAcceptanceLane {
       ? values.reduce((sum, value) => sum + value, 0) / values.length
       : null;
     const plannedRisks = economicsSignals.map((signal) => signal.economics!.plannedRiskUsd).filter(finiteNumber);
-    const actualRisks = state.trades.map((trade) => trade.initialRiskDollar).filter(finiteNumber);
+    // V3 metrics must never borrow legacy position risk: an old fixed-notional
+    // trade can legitimately exceed the new 0.25-USDT planned-risk cap.
+    const actualRisks = state.trades
+      .filter((trade) => trade.economics !== null && trade.economics !== undefined)
+      .map((trade) => trade.initialRiskDollar)
+      .filter(finiteNumber);
     const newEntriesEnabled = state.control.mode === "ARMED" && effectiveAllocatorMode !== "PAUSED" && entryControlReason === null && !frictionUnavailable;
     const newEntryReason = !newEntriesEnabled
       ? mainnetPausedForSelection ? "SELECTION_FIX_PENDING_VALIDATION"
