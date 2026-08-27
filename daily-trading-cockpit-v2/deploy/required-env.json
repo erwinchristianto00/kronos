@@ -147,16 +147,16 @@
       "why": "Active TESTNET Dynamic MOM36 V5 identity. Preserve the already-running continuation, SLOW_AND_FAST preference/fallback, and SL/MFE policy across dashboard-only releases; new evidence must not be reclassified as V4."
     },
     "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-      "value": "2026-08-26T06:20:00Z",
-      "why": "Active TESTNET V5 forward-cohort boundary. It is retained exactly during dashboard-only releases and does not reclassify prior baskets."
+      "value": "2026-08-27T02:30:00Z",
+      "why": "Active TESTNET V5 forward-cohort boundary observed in the running lane. Retain it exactly during the unrelated Daily Range V3 release so prior baskets are not reclassified."
     },
     "CROSS_SECTIONAL_STRATEGY_VERSION": {
       "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
       "why": "Active TESTNET Dynamic MOM36 V5 implementation: continuation, MOM36 rank walk, SLOW_AND_FAST preference/fallback, and unchanged SL/MFE exit dispatcher for new baskets only."
     },
     "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
-      "value": "2026-08-26T06:20:00Z",
-      "why": "Active TESTNET V5 deployment timestamp captured in every new basket fingerprint."
+      "value": "2026-08-27T02:30:00Z",
+      "why": "Active TESTNET V5 deployment timestamp observed in the running lane and captured in every new basket fingerprint."
     },
     "CROSS_SECTIONAL_EXEC_VARIANT": {
       "value": "DYNAMIC_MOM36_SHOCK",
@@ -225,16 +225,16 @@
           "why": "Operator-authorized LIVE parity with the active TESTNET Dynamic MOM36 V5 architecture. New LIVE evidence is a separate V5 cohort; existing baskets retain their frozen policy."
         },
         "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
-          "value": "2026-08-26T14:08:52Z",
-          "why": "Forward-cohort boundary for the LIVE Dynamic MOM36 V5 parity policy. Prior Plain, Dynamic V1, and legacy baskets remain historical and cannot be mixed into this cohort."
+          "value": "2026-08-27T02:30:00Z",
+          "why": "Forward-cohort boundary observed in the running LIVE Dynamic MOM36 V5 policy. Prior Plain, Dynamic V1, and legacy baskets remain historical and cannot be mixed into this cohort."
         },
         "CROSS_SECTIONAL_STRATEGY_VERSION": {
           "value": "dynamic-mom36-cont-slowfast-prefer-sl2-mfe30-36h-v5",
           "why": "Use the same V5 breadth, frozen continuation, MOM36 rank walk, SLOW_AND_FAST preference/fallback, and exact-six-leg formation as active TESTNET."
         },
         "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
-          "value": "2026-08-26T14:08:52Z",
-          "why": "Deployment identity frozen into every new LIVE Dynamic MOM36 V5 basket fingerprint."
+          "value": "2026-08-27T02:30:00Z",
+          "why": "Active LIVE Dynamic MOM36 V5 deployment identity observed at runtime and frozen into every new basket fingerprint."
         },
         "CROSS_SECTIONAL_EXEC_VARIANT": {
           "value": "DYNAMIC_MOM36_SHOCK",
