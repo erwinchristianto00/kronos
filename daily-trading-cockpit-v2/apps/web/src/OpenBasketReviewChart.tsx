@@ -8,6 +8,7 @@ import {
   LineSeries,
   LineStyle,
   type SeriesMarker,
+  type Time,
   type UTCTimestamp,
 } from 'lightweight-charts';
 import { calculateEmaSeries, calculateStructuralTrendlines } from './openBasketChartOverlays';
@@ -33,6 +34,7 @@ const REFRESH_MS = 30_000;
 const CROSS_SECTIONAL_CHART_HEIGHT = 400;
 const DAILY_RANGE_CHART_HEIGHT = 420;
 const VOLUME_PANE_HEIGHT = 84;
+const DEFAULT_VISIBLE_BARS = 96;
 const HISTORICAL_INTERVALS = [
   { value: '15m', label: '15m' },
   { value: '1h', label: '1H' },
@@ -130,7 +132,10 @@ type CandleViewport = { from: number; to: number };
 // completed candles every 30 seconds.  A ref inside the component disappears if React remounts
 // the card during either refresh, so retain the operator's viewport for this browser tab instead.
 const viewportMemory = new Map<string, CandleViewport>();
-const VIEWPORT_STORAGE_PREFIX = 'dtc-candle-viewport:v1:';
+// v2 intentionally starts a fresh default viewport: the old v1 default fitted all history and
+// buried the current mark/entry at the far-right edge.  Once an operator pans or zooms, that
+// view remains persisted exactly as before.
+const VIEWPORT_STORAGE_PREFIX = 'dtc-candle-viewport:v2:';
 
 function validViewport(value: unknown): value is CandleViewport {
   if (typeof value !== 'object' || value === null) return false;
@@ -185,11 +190,51 @@ function formatTaipei(value: string | number): string {
   }).format(new Date(ms));
 }
 
-function formatUtc(value: number): string {
-  return new Intl.DateTimeFormat('en-GB', {
-    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
-    hour12: false, timeZone: 'UTC',
-  }).format(new Date(value)).replace(',', '');
+function timeToMs(time: Time): number | null {
+  if (typeof time === 'number') return time * 1_000;
+  if (typeof time === 'string') {
+    const parsed = Date.parse(time);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return Date.UTC(time.year, time.month - 1, time.day);
+}
+
+/** Lightweight Charts always receives UTC timestamps. Render every operator-facing axis in Taipei. */
+function formatTaipeiChartTime(time: Time): string {
+  const ms = timeToMs(time);
+  if (ms == null) return '';
+  const date = new Date(ms);
+  // Daily bars are anchored at 00:00 UTC. A date-only label is clearer than showing their
+  // Taiwan conversion as 08:00, while all intraday bars retain a Taipei clock time.
+  const isDailyAnchor = date.getUTCHours() === 0 && date.getUTCMinutes() === 0 && date.getUTCSeconds() === 0;
+  return new Intl.DateTimeFormat('en-GB', isDailyAnchor
+    ? { day: '2-digit', month: 'short', timeZone: 'Asia/Taipei' }
+    : { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Taipei' },
+  ).format(date).replace(',', '');
+}
+
+function decimalPlaces(value: number): number {
+  const text = Math.abs(value).toString().toLowerCase();
+  const [coefficient, exponentText] = text.split('e');
+  const exponent = exponentText == null ? 0 : Number(exponentText);
+  const fraction = coefficient?.split('.')[1]?.length ?? 0;
+  return Math.max(0, fraction - (Number.isFinite(exponent) ? exponent : 0));
+}
+
+/**
+ * Binance's candle payload is numeric, so Lightweight Charts otherwise defaults to two decimals.
+ * Keep enough exchange-facing precision for tiny contracts without exposing floating-point noise.
+ */
+function inferPriceFormat(candles: Candle[], levels: PriceLevel[]): { type: 'price'; precision: number; minMove: number } {
+  const values = [
+    ...candles.flatMap((candle) => [candle.open, candle.high, candle.low, candle.close]),
+    ...levels.map((level) => level.price),
+  ].filter((value) => Number.isFinite(value) && value > 0);
+  const magnitude = values.length > 0 ? Math.max(...values) : 1;
+  const baseline = magnitude < 0.0001 ? 10 : magnitude < 0.01 ? 8 : magnitude < 1 ? 6 : magnitude < 100 ? 4 : 2;
+  const payloadPrecision = values.reduce((max, value) => Math.max(max, decimalPlaces(value)), 0);
+  const precision = Math.max(0, Math.min(10, Math.max(baseline, payloadPrecision)));
+  return { type: 'price', precision, minMove: 10 ** -precision };
 }
 
 function historicalIntervalLabel(interval: HistoricalInterval): string {
@@ -270,6 +315,7 @@ function CandlePane({
   showMovingAverages = false,
   showStructuralTrendlines = false,
   executionMarker,
+  liveMarkPrice,
   chartHeight,
   viewportKey,
 }: {
@@ -283,12 +329,20 @@ function CandlePane({
   showStructuralTrendlines?: boolean;
   /** Only used by Daily Range's 5m panel, where the entry fill is persisted. */
   executionMarker?: ExecutionMarker | null;
+  /** Account-mark snapshot, intentionally distinct from completed-candle close. */
+  liveMarkPrice?: number | null;
   /** Display-only canvas height selected by review kind. */
   chartHeight: number;
   /** Per leg/timeframe state survives card remounts and completed-candle refreshes. */
   viewportKey: string;
 }) {
   const host = useRef<HTMLDivElement | null>(null);
+  const displayedLevels = useMemo<PriceLevel[]>(() => [
+    ...(liveMarkPrice != null && Number.isFinite(liveMarkPrice) && liveMarkPrice > 0
+      ? [{ price: liveMarkPrice, label: 'Live mark', color: C.text }]
+      : []),
+    ...levels,
+  ], [levels, liveMarkPrice]);
 
   useEffect(() => {
     const node = host.current;
@@ -300,12 +354,19 @@ function CandlePane({
       layout: { background: { type: ColorType.Solid, color: '#071016' }, textColor: '#8fa5ae', fontFamily: 'IBM Plex Mono, Cascadia Code, monospace' },
       grid: { vertLines: { color: 'rgba(38, 61, 72, 0.45)' }, horzLines: { color: 'rgba(38, 61, 72, 0.45)' } },
       rightPriceScale: { borderColor: '#29414c' },
-      timeScale: { borderColor: '#29414c', timeVisible: true, secondsVisible: false },
+      timeScale: {
+        borderColor: '#29414c',
+        timeVisible: true,
+        secondsVisible: false,
+        tickMarkFormatter: (time: Time) => formatTaipeiChartTime(time),
+      },
+      localization: { locale: 'en-GB', timeFormatter: (time: Time) => formatTaipeiChartTime(time) },
       crosshair: { vertLine: { color: 'rgba(143, 165, 174, 0.28)' }, horzLine: { color: 'rgba(143, 165, 174, 0.28)' } },
     });
     const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#5ce4a6', downColor: '#ff777d', borderVisible: false,
       wickUpColor: '#5ce4a6', wickDownColor: '#ff777d',
+      priceFormat: inferPriceFormat(candles, displayedLevels),
     });
     candleSeries.setData(candles.map((candle) => ({
       time: toTime(candle.openTime), open: candle.open, high: candle.high, low: candle.low, close: candle.close,
@@ -323,14 +384,17 @@ function CandlePane({
       color: candle.close >= candle.open ? 'rgba(92, 228, 166, 0.45)' : 'rgba(255, 119, 125, 0.42)',
     })));
     chart.panes()[1]?.setHeight(Math.min(VOLUME_PANE_HEIGHT, Math.round(chartHeight * 0.18)));
-    for (const level of levels) {
+    for (const level of displayedLevels) {
       candleSeries.createPriceLine({
         price: level.price,
         color: level.color,
-        lineWidth: 2,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: level.label,
+        lineWidth: level.label === 'Live mark' ? 1 : 2,
+        lineStyle: level.label === 'Live mark' ? LineStyle.Solid : LineStyle.Dashed,
+        // Level names and values live in the compact legend below.  Putting every long label
+        // on the price scale made close-together range/SL/TP levels unreadable and rounded tiny
+        // contract prices into the same visual value.
+        axisLabelVisible: false,
+        title: '',
       });
     }
     if (showMovingAverages) {
@@ -343,7 +407,7 @@ function CandlePane({
           priceLineVisible: false,
           lastValueVisible: false,
           crosshairMarkerVisible: false,
-          title: `EMA${period}`,
+          title: '',
         });
         emaSeries.setData(values.map((point) => ({ time: toTime(point.openTime), value: point.value })));
       };
@@ -359,7 +423,7 @@ function CandlePane({
           priceLineVisible: false,
           lastValueVisible: false,
           crosshairMarkerVisible: false,
-          title: isResistance ? 'Structural resistance · confirmed peaks' : 'Structural support · confirmed troughs',
+          title: '',
         });
         series.setData(trendline.points.map((point) => ({ time: toTime(point.openTime), value: point.value })));
       }
@@ -375,7 +439,13 @@ function CandlePane({
     };
     const savedViewport = readViewport(viewportKey);
     if (savedViewport) chart.timeScale().setVisibleLogicalRange(savedViewport);
-    else chart.timeScale().fitContent();
+    else {
+      // The first view is an operator view, not an archive chart: keep the current mark and
+      // recent price action readable.  The full history remains one scroll/pan away.
+      const to = Math.max(0, candles.length - 1 + 3);
+      const from = Math.max(-3, to - Math.min(DEFAULT_VISIBLE_BARS, candles.length));
+      chart.timeScale().setVisibleLogicalRange({ from, to });
+    }
     chart.timeScale().subscribeVisibleLogicalRangeChange(saveViewport);
     const resize = () => chart.resize(Math.max(1, node.clientWidth), chartHeight);
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(resize);
@@ -388,7 +458,7 @@ function CandlePane({
       window.removeEventListener('resize', resize);
       chart.remove();
     };
-  }, [candles, chartHeight, executionMarker, levels, showMovingAverages, showStructuralTrendlines, viewportKey]);
+  }, [candles, chartHeight, displayedLevels, executionMarker, showMovingAverages, showStructuralTrendlines, viewportKey]);
 
   return <div style={{ minWidth: 0, border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden', background: C.sub }}>
     <div style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}`, color: C.text, fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
@@ -398,7 +468,19 @@ function CandlePane({
       ? <div style={{ padding: 12, color: C.bad, fontSize: 12 }}>Candle chart unavailable: {error}</div>
       : candles.length === 0
       ? <div style={{ padding: 12, color: C.dim, fontSize: 12 }}>Tidak ada completed candle dari USD-M untuk chart ini.</div>
-      : <div ref={host} aria-label={ariaLabel} />}
+      : <>
+        <div ref={host} aria-label={ariaLabel} />
+        <div className="candle-review-level-legend" aria-label={`${ariaLabel} level legend`}>
+          {displayedLevels.map((level) => (
+            <span key={`${level.label}:${level.price}`}>
+              <i style={{ background: level.color }} />
+              <b>{level.label}</b> {formatPrice(level.price)}
+            </span>
+          ))}
+          {showMovingAverages && <><span><i style={{ background: C.ema20 }} /><b>EMA20</b></span><span><i style={{ background: C.ema50 }} /><b>EMA50</b></span></>}
+          {showStructuralTrendlines && <><span><i style={{ background: C.structuralResistance }} /><b>Resistance</b></span><span><i style={{ background: C.structuralSupport }} /><b>Support</b></span></>}
+        </div>
+      </>}
   </div>;
 }
 
@@ -406,7 +488,9 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   const [data, setData] = useState<ChartResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [historicalInterval, setHistoricalInterval] = useState<HistoricalInterval>('1d');
+  // A 36h basket is operated from a live/recent view.  Daily context remains one click away,
+  // but must not be the default that hides the current candle and mark.
+  const [historicalInterval, setHistoricalInterval] = useState<HistoricalInterval>('1h');
   const [historicalSeries, setHistoricalSeries] = useState<IntervalChartResponse | null>(null);
   const [historicalSeriesError, setHistoricalSeriesError] = useState<string | null>(null);
   const [historicalLoading, setHistoricalLoading] = useState(false);
@@ -419,6 +503,13 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   const historicalEndpoint = leg
     ? `${apiPrefix}/live/open-basket-chart?symbol=${encodeURIComponent(leg.symbol)}&interval=${historicalInterval}`
     : null;
+
+  // Cross baskets are monitored from a recent 1H view. Daily Range keeps its 4H structural
+  // context beside the actual 5m execution path. A deliberate selector change still persists
+  // while the same selected leg remains open.
+  useEffect(() => {
+    setHistoricalInterval(leg?.reviewKind === 'daily-range' ? '4h' : '1h');
+  }, [leg?.key, leg?.reviewKind]);
 
   useEffect(() => {
     if (!leg) {
@@ -531,7 +622,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   if (!leg) {
     return <section className="testnet-panel testnet-wide-panel candle-review-card" id="open-basket-review-chart">
       <header><div><span>Basket candle review</span><strong>Menunggu basket aktif</strong></div></header>
-      <div style={{ padding: 12, color: C.dim, fontSize: 12 }}>Saat ada basket aktif, klik simbolnya di tabel untuk membuka candle 1D dan 5m. Tidak ada dropdown simbol.</div>
+      <div style={{ padding: 12, color: C.dim, fontSize: 12 }}>Saat ada basket aktif, klik simbolnya di tabel untuk membuka candle live/recent. Tidak ada dropdown simbol.</div>
     </section>;
   }
   // A Daily Range trade cannot be accepted before its source 4h candle has closed.  Keep the
@@ -547,7 +638,7 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
   const latestShortAcceptance = acceptanceEvents.filter((event) => event.side === 'SHORT').at(-1);
   const reviewTitle = isDailyRange ? 'Daily Range 4H candle review · klik trade' : 'Basket candle review · klik leg di tabel';
   const ownerNoun = isDailyRange ? 'trade' : 'basket';
-  const historicalTitle = `${historicalIntervalLabel(historicalInterval)} · EMA20/EMA50 + structural support / resistance`;
+  const historicalTitle = `${historicalIntervalLabel(historicalInterval)} · context candle`;
   const historicalControl = <label style={{ color: C.dim, fontSize: 10, fontWeight: 500, whiteSpace: 'nowrap' }}>
     candle{' '}
     <select
@@ -568,41 +659,39 @@ export default function OpenBasketReviewChart({ apiPrefix, leg }: { apiPrefix: s
       </div>
       <span style={{ color: C.dim, fontSize: 11 }}>{loading || historicalLoading ? 'memperbarui completed candles…' : historicalAsOf ? `as of ${formatTaipei(historicalAsOf)} Taipei` : 'memuat…'}</span>
     </header>
-    <div style={{ padding: '8px 12px', display: 'flex', gap: 14, flexWrap: 'wrap', color: C.dim, fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
-      <span>{ownerNoun} <strong style={{ color: C.text }}>{leg.basketId}</strong></span>
-      <span>entry {formatPrice(leg.entryPrice)}</span>
-      <span>mark {formatPrice(leg.markPrice)}</span>
-      <span style={{ color: leg.grossUnrealizedUsd == null ? C.dim : leg.grossUnrealizedUsd >= 0 ? C.good : C.bad }}>{isDailyRange ? 'gross mark P&L' : 'leg P&L'} {formatMoney(leg.grossUnrealizedUsd)}</span>
-      {isDailyRange && <span>native SL {formatPrice(leg.stopPrice)} · TP 2R {formatPrice(leg.takeProfitPrice)}</span>}
-      <span>open {formatTaipei(leg.openedAt)} Taipei</span>
+    <div className="candle-review-summary">
+      <span><b>{ownerNoun}</b> {leg.basketId}</span>
+      <span><b>entry</b> {formatPrice(leg.entryPrice)}</span>
+      <span><b>live mark</b> {formatPrice(leg.markPrice)}</span>
+      <span style={{ color: leg.grossUnrealizedUsd == null ? C.dim : leg.grossUnrealizedUsd >= 0 ? C.good : C.bad }}><b>{isDailyRange ? 'gross mark P&L' : 'leg P&L'}</b> {formatMoney(leg.grossUnrealizedUsd)}</span>
+      {isDailyRange && <span><b>native bracket</b> SL {formatPrice(leg.stopPrice)} · TP 2R {formatPrice(leg.takeProfitPrice)}</span>}
+      <span><b>open</b> {formatTaipei(leg.openedAt)} Taipei</span>
     </div>
     {error ? <div style={{ padding: 12, color: C.bad, fontSize: 12 }}>Candle chart unavailable: {error}</div> : <>
-      <div style={{ padding: '9px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55, borderBottom: `1px solid ${C.border}` }}>
-        {reference ? <>
+      <details className="candle-review-guide">
+        <summary>Guide level & data chart</summary>
+        {reference ? <div>
           {isDailyRange
             ? <>Referensi eksekusi: session <strong style={{ color: C.text }}>{reference.dateUtc} {referenceSession}</strong> yang dibekukan saat trade dibuat.</>
             : <>Referensi: candle 4H <strong style={{ color: C.text }}>{reference.dateUtc} 00:00–04:00 UTC</strong> (hari kalender sebelum hari ini UTC).</>}
-          Range high <strong style={{ color: C.accent }}>{formatPrice(reference.rangeHigh)}</strong> · range low <strong style={{ color: C.good }}>{formatPrice(reference.rangeLow)}</strong>.
+          {' '}Range high <strong style={{ color: C.accent }}>{formatPrice(reference.rangeHigh)}</strong> · range low <strong style={{ color: C.good }}>{formatPrice(reference.rangeLow)}</strong>.
           {isDailyRange && entryPolicy === 'FADE'
-            ? <>Router: satu close 5m selesai di luar, lalu close kembali masuk range → <strong style={{ color: C.text }}>FADE</strong> berlawanan arah dengan SL di extreme breakout.</>
+            ? <> Router: satu close 5m selesai di luar, lalu close kembali masuk range → <strong style={{ color: C.text }}>FADE</strong> berlawanan arah dengan SL di extreme breakout.</>
             : isDailyRange && entryPolicy === 'CONTINUATION'
-              ? <>Router: close 5m tetap di luar dan <strong style={{ color: C.text }}>meluas lebih jauh</strong> → <strong style={{ color: C.text }}>CONTINUATION</strong> mengikuti arah breakout.</>
-              : <>Acceptance memakai <strong style={{ color: C.text }}>dua close 5m selesai berturut-turut</strong> di luar level tersebut.</>}
-          {' '}Garis putus-putus ini tetap horizontal karena ini harga high/low range 4H yang dibekukan untuk eksekusi.
-          {isDailyRange && <> Titik <strong style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>ENTRY {leg.side}</strong> di panel 5m adalah fill entry aktual pada waktu fill yang tersimpan.</>}
-          {' '}Garis penuh oranye/biru di panel historis adalah resistance/support struktural: masing-masing menghubungkan dua pivot peak/trough selesai paling baru dan hanya untuk review visual.
-          {' '}EMA20/EMA50 juga memakai completed candle saja; tidak mengubah formation, entry, sizing, atau exit.
-        </> : <span>Level Daily Range belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
-      </div>
+              ? <> Router: close 5m tetap di luar dan <strong style={{ color: C.text }}>meluas lebih jauh</strong> → <strong style={{ color: C.text }}>CONTINUATION</strong> mengikuti arah breakout.</>
+              : <> Acceptance memakai <strong style={{ color: C.text }}>dua close 5m selesai berturut-turut</strong> di luar level tersebut.</>}
+          {' '}Semua candle adalah USD-M completed candle; `Live mark` adalah snapshot akun terbaru dan bukan candle atau prediksi. EMA/structure hanya review visual, tidak mengubah formation, entry, sizing, atau exit.
+        </div> : <span>Level Daily Range belum tersedia: {data?.referenceReason ?? 'memuat referensi'}</span>}
+      </details>
       <div className={`candle-review-chart-stack${isDailyRange ? ' candle-review-chart-stack--daily-range' : ''}`}>
-        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines chartHeight={isDailyRange ? DAILY_RANGE_CHART_HEIGHT : CROSS_SECTIONAL_CHART_HEIGHT} viewportKey={`${apiPrefix}:${leg.key}:historical:${historicalInterval}`} />
-        {isDailyRange && <CandlePane title="5m · EMA20/EMA50 + breakout / breakdown + router + native bracket" candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages executionMarker={dailyRangeEntryMarker} chartHeight={DAILY_RANGE_CHART_HEIGHT} viewportKey={`${apiPrefix}:${leg.key}:5m`} />}
+        <CandlePane title={historicalTitle} candles={historicalCandles} levels={dailyLevels} ariaLabel={`${leg.symbol} ${historicalInterval} candle chart`} headerRight={historicalControl} error={historicalError} showMovingAverages showStructuralTrendlines liveMarkPrice={leg.markPrice} chartHeight={isDailyRange ? DAILY_RANGE_CHART_HEIGHT : CROSS_SECTIONAL_CHART_HEIGHT} viewportKey={`${apiPrefix}:${leg.key}:historical:${historicalInterval}`} />
+        {isDailyRange && <CandlePane title="5m · actual execution path" candles={data?.fiveMinute.candles ?? []} levels={fiveMinuteLevels} ariaLabel={`${leg.symbol} 5m candle chart`} showMovingAverages executionMarker={dailyRangeEntryMarker} liveMarkPrice={leg.markPrice} chartHeight={DAILY_RANGE_CHART_HEIGHT} viewportKey={`${apiPrefix}:${leg.key}:5m`} />}
       </div>
-      {reference && <div style={{ padding: '0 12px 12px', color: C.dim, fontSize: 11, lineHeight: 1.55 }}>
+      {reference && <div className="candle-review-status-line">
         {isAutoRouterTrade
           ? <>Policy entry trade ini: <strong style={{ color: entryPolicy === 'FADE' ? C.accent : C.good }}>{entryPolicy}</strong>. Satu breakout event hanya menghasilkan satu kandidat; router tidak membalik posisi continuation yang sudah terbentuk.</>
           : <>Status acceptance sekarang: <strong style={{ color: latestAcceptance === 'LONG' ? C.good : latestAcceptance === 'SHORT' ? C.bad : C.text }}>{latestAcceptance ? `${latestAcceptance} confirmed` : 'belum ada dua close 5m berturut-turut'}</strong>.
-            {' '}Terakhir long {latestLongAcceptance ? formatUtc(latestLongAcceptance.at) + ' UTC' : '—'} · terakhir short {latestShortAcceptance ? formatUtc(latestShortAcceptance.at) + ' UTC' : '—'}.
+            {' '}Terakhir long {latestLongAcceptance ? formatTaipei(latestLongAcceptance.at) + ' Taipei' : '—'} · terakhir short {latestShortAcceptance ? formatTaipei(latestShortAcceptance.at) + ' Taipei' : '—'}.
             {' '}Garis acceptance sama dengan level breakout/breakdown—yang membedakan adalah dua close 5m, bukan harga baru—jadi tidak dibuat garis harga palsu kedua.</>}
       </div>}
     </>}

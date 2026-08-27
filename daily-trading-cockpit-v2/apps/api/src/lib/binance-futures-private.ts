@@ -72,6 +72,14 @@ const TIME_SYNC_TTL_MS = 60_000;
 const HTTP_418_FALLBACK_COOLDOWN_MS = 2 * 60_000;
 /** A plain 429 may be a short endpoint throttle; honour it too, but do not turn it into a ban. */
 const HTTP_429_FALLBACK_COOLDOWN_MS = 5_000;
+/**
+ * Testnet bans the shared IP much more readily than mainnet when a completed 5m boundary fans
+ * across the Daily Range universe.  Requests were already serialized, but serial dispatch can
+ * still burst dozens of public USD-M reads in a few seconds.  Eight reads/second keeps the full
+ * active-universe batch comfortably inside its five-minute window while leaving risk-reducing
+ * POST/DELETE traffic unqueued (see rawRequest()).
+ */
+const TESTNET_GET_MIN_DISPATCH_GAP_MS = 125;
 // Re-fetch exchange filters (tickSize/stepSize/minQty/minNotional) periodically instead of caching
 // them for the process lifetime. Binance occasionally updates a symbol's LOT_SIZE/PRICE_FILTER/
 // MIN_NOTIONAL specs; without a TTL, a long-running process (days between restarts) would keep
@@ -546,6 +554,8 @@ export class BinanceFuturesPrivateClient {
   private timeSyncInFlight: Promise<void> | null = null;
   /** Serialises actual HTTP dispatch, so a Promise.all cannot race several requests past a new 418. */
   private transportTail: Promise<void> = Promise.resolve();
+  /** Next permitted queued GET dispatch; only non-zero for Binance Testnet. */
+  private nextReadDispatchAtMs = 0;
   private rateLimitCooldownUntilMs = 0;
   private lastRateLimitHttpStatus: 418 | 429 | null = null;
   private lastRateLimitFailure: string | null = null;
@@ -587,10 +597,23 @@ export class BinanceFuturesPrivateClient {
     await previous;
     try {
       this.assertRateLimitCircuitClosed();
+      await this.paceQueuedRead();
+      // A priority exit may have learnt of an exchange cooldown while this queued read waited.
+      this.assertRateLimitCircuitClosed();
       return await operation();
     } finally {
       release();
     }
+  }
+
+  /** Pace only Testnet GETs. Mainnet retains its existing low-latency read behaviour. */
+  private async paceQueuedRead(): Promise<void> {
+    if (this.env !== "testnet") return;
+    const now = this.nowMs();
+    const dispatchAt = Math.max(now, this.nextReadDispatchAtMs);
+    this.nextReadDispatchAtMs = dispatchAt + TESTNET_GET_MIN_DISPATCH_GAP_MS;
+    const waitMs = dispatchAt - now;
+    if (waitMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
   }
 
   private assertRateLimitCircuitClosed(): void {

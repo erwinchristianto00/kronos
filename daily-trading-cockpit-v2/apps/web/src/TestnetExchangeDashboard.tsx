@@ -184,6 +184,12 @@ interface LiveStatus {
     clockSkewMs: number | null;
     lastTickAt: string | null;
     lastTickError: string | null;
+    rateLimit?: {
+      coolingDown: boolean;
+      retryAt: string | null;
+      lastHttpStatus: 418 | 429 | null;
+      lastFailure: string | null;
+    } | null;
   };
   controller?: {
     regime: string | null;
@@ -433,9 +439,8 @@ function plain(value: number | null | undefined, suffix = ''): string {
 
 function price(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value) || value <= 0) return 'n/a';
-  if (value >= 1000) return value.toFixed(2);
-  if (value >= 1) return value.toFixed(4);
-  return value.toFixed(6);
+  const digits = value < 0.0001 ? 10 : value < 0.01 ? 8 : value < 1 ? 6 : value < 100 ? 4 : 2;
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits: digits }).format(value);
 }
 
 function percent(value: number | null | undefined): string {
@@ -496,6 +501,15 @@ function timeAgo(iso: string | null | undefined): string {
   const ageMin = Math.floor(ageSec / 60);
   if (ageMin < 60) return `${ageMin}m ago`;
   return `${Math.floor(ageMin / 60)}h ago`;
+}
+
+function formatTaipeiDateTime(iso: string | null | undefined): string {
+  if (!iso) return '—';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '—';
+  return new Intl.DateTimeFormat('id-ID', {
+    day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Taipei',
+  }).format(date).replace(',', '');
 }
 
 function compactLane(laneId: string): string {
@@ -573,15 +587,15 @@ function formatBucketLabel(iso: string, view: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
   if (view === 'hourly') {
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Taipei' });
   }
   if (view === 'daily' || view === 'weekly') {
-    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    return date.toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'Asia/Taipei' });
   }
   if (view === 'monthly') {
-    return date.toLocaleDateString([], { month: 'short' });
+    return date.toLocaleDateString([], { month: 'short', timeZone: 'Asia/Taipei' });
   }
-  return date.toLocaleDateString([], { year: 'numeric' });
+  return date.toLocaleDateString([], { year: 'numeric', timeZone: 'Asia/Taipei' });
 }
 
 // Terser than formatBucketLabel: hourly/daily views plot up to 24-31 ticks, so the axis
@@ -590,8 +604,8 @@ function formatBucketLabel(iso: string, view: string): string {
 function formatAxisTick(iso: string, view: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return '';
-  if (view === 'hourly') return `${date.getHours()}`.padStart(2, '0');
-  if (view === 'daily') return `${date.getDate()}`;
+  if (view === 'hourly') return new Intl.DateTimeFormat('en-GB', { hour: '2-digit', hour12: false, timeZone: 'Asia/Taipei' }).format(date);
+  if (view === 'daily') return new Intl.DateTimeFormat('en-GB', { day: '2-digit', timeZone: 'Asia/Taipei' }).format(date);
   return formatBucketLabel(iso, view);
 }
 
@@ -1057,7 +1071,7 @@ function RegimeAxisChart({ data, mode = 'full' }: { data: RegimeAxisTimelineData
   const forecastColor = forecast?.bias === 'BEARISH' ? '#ff6b6b' : forecast?.bias === 'NEUTRAL' ? '#f0b54b' : forecast?.bias === 'UNCERTAIN' ? '#9db1ba' : '#5ce4a6';
   const entryDecision = data.entryDecision;
   const entryColor = entryDecision?.directionalBias === 'SHORT' ? '#ff6b6b' : entryDecision?.directionalBias === 'LONG' ? '#5ce4a6' : '#f0b54b';
-  const timeLabel = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const timeLabel = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Taipei' });
   const signed = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}`;
   const pct = (value: number | null | undefined) => value == null ? 'n/a' : `${Math.round(value * 100)}%`;
 
@@ -1197,24 +1211,23 @@ function SingleSymbolPriceTimelineChart({ data, positions }: { data: SingleSymbo
     return <div className="testnet-chart-empty"><strong>Loading BTC / ETH / SOL timeline…</strong><p>Need fresh 5m and 1h Binance candles.</p></div>;
   }
   const toneFor = (directive: string) => directive === 'ENTER_LONG' ? '#5ce4a6' : directive === 'ENTER_SHORT' ? '#ff6b6b' : '#f0b54b';
-  const signedPct = (value: number) => `${value >= 0 ? '+' : ''}${(value * 100).toFixed(2)}%`;
   return (
     <div className="testnet-price-timeline-list">
       {rows.map((row) => {
         if (!row.available || row.points.length < 2 || row.price == null) {
           return <div className="testnet-chart-empty" key={row.symbol}><strong>{row.symbol}: timeline unavailable</strong><p>{row.reason ?? 'Waiting for candle data.'}</p></div>;
         }
-        const width = 960; const height = 160; const px = 46; const py = 22;
-        const forecast = row.forecasts ?? [];
-        const values = [...row.points.map((p) => p.price), ...forecast.flatMap((p) => [p.lowerPrice, p.upperPrice])];
+        const width = 960; const height = 190; const px = 46; const py = 22;
+        // Do not turn a heuristic gate into a price target. The former dotted 1/3/6h line was
+        // based on score × ATR and could visually point the same way across unrelated symbols.
+        // This panel is now strictly an actual-price history with its gate/indicator context.
+        const values = row.points.map((p) => p.price);
         const rawMin = Math.min(...values); const rawMax = Math.max(...values); const pad = Math.max((rawMax - rawMin) * 0.12, row.price * 0.002);
         const min = rawMin - pad; const max = rawMax + pad; const currentAt = new Date(row.points.at(-1)!.at).getTime();
-        const t0 = new Date(row.points[0]!.at).getTime(); const t1 = currentAt + 6 * 3_600_000; const span = Math.max(1, t1 - t0);
+        const t0 = new Date(row.points[0]!.at).getTime(); const t1 = currentAt; const span = Math.max(1, t1 - t0);
         const xy = (at: string, priceValue: number) => ({ x: px + ((new Date(at).getTime() - t0) / span) * (width - px * 2), y: py + (1 - (priceValue - min) / Math.max(max - min, 1e-9)) * (height - py * 2) });
         const line = (points: Array<{ at: string; price: number }>) => points.map((p, i) => { const v = xy(p.at, p.price); return `${i ? 'L' : 'M'} ${v.x.toFixed(1)} ${v.y.toFixed(1)}`; }).join(' ');
-        const current = xy(row.points.at(-1)!.at, row.price); const targetPoints = forecast.map((p) => ({ at: new Date(currentAt + p.hours * 3_600_000).toISOString(), price: p.targetPrice }));
-        const forecastLine = line([{ at: row.points.at(-1)!.at, price: row.price }, ...targetPoints]);
-        const rangePath = forecast.length ? line([{ at: row.points.at(-1)!.at, price: row.price }, ...forecast.map((p) => ({ at: new Date(currentAt + p.hours * 3_600_000).toISOString(), price: p.lowerPrice })), ...[...forecast].reverse().map((p) => ({ at: new Date(currentAt + p.hours * 3_600_000).toISOString(), price: p.upperPrice }))]) + ' Z' : '';
+        const current = xy(row.points.at(-1)!.at, row.price);
         const color = toneFor(row.directive); const m5 = row.indicators.m5; const h1 = row.indicators.h1;
         // 2026-07-21 operator ask: the directive/confidence above is a GATE, not a trigger — it never
         // opens anything by itself (a lane must independently propose this symbol as a fresh candidate,
@@ -1225,31 +1238,26 @@ function SingleSymbolPriceTimelineChart({ data, positions }: { data: SingleSymbo
         const posColor = openPosition ? (openPosition.direction === 'LONG' ? '#5ce4a6' : '#ff6b6b') : '#9db1ba';
         return <div key={row.symbol} className="testnet-price-timeline">
           <div className="testnet-regime-forecast-head"><span>{row.symbol} PRICE TIMELINE</span><strong style={{ color }}>{row.directive.replace('_', ' ')}</strong><em>{row.confidence == null ? 'n/a' : `${Math.round(row.confidence * 100)}% confidence`}</em></div>
-          {/* 2026-07-23 dashboard consolidation: chart + m5/h1 indicator detail collapse behind a
-             per-symbol Disclosure — the Keputusan-trade line + entry/exit reason text below stay
-             outside it, always visible (real open-position state must never require a click). */}
-          <Disclosure summary="Chart & forecast ▸">
-            <svg className="testnet-lane-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${row.symbol} price timeline and forecast`}>
+          {/* Chart + m5/h1 indicator detail collapse behind a per-symbol Disclosure — the
+             Keputusan-trade line + entry/exit reason stay outside it, always visible. */}
+          <Disclosure summary="12h actual price + indicators ▸">
+            <svg className="testnet-lane-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${row.symbol} actual 12h price timeline`}>
               <rect x="0" y="0" width={width} height={height} rx="12" className="testnet-chart-bg" />
               {[0.2, 0.5, 0.8].map((ratio) => <line key={ratio} x1={px} x2={width - px} y1={py + ratio * (height - py * 2)} y2={py + ratio * (height - py * 2)} className="testnet-chart-grid" />)}
               <line x1={current.x} x2={current.x} y1={py} y2={height - py} className="testnet-chart-now" />
               <path d={line(row.points)} fill="none" stroke="#8bd3f0" strokeWidth="2.2" strokeLinejoin="round" strokeLinecap="round" />
-              {rangePath && <path d={rangePath} fill={color} opacity="0.12" />}
-              {forecastLine && <path d={forecastLine} fill="none" stroke={color} strokeWidth="2" strokeDasharray="6 5" />}
               <circle cx={current.x} cy={current.y} r="4.5" fill={color} stroke="#071016" strokeWidth="1.5" />
               <text x={px} y={15} className="testnet-chart-axis">{price(max)}</text><text x={px} y={height - py - 4} className="testnet-chart-axis">{price(min)}</text>
-              <text x={px} y={height - 7} className="testnet-chart-time">{new Date(row.points[0]!.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · -12h</text><text x={current.x} y={height - 7} className="testnet-chart-time middle">NOW</text><text x={width - px} y={height - 7} className="testnet-chart-time end">+6h</text>
-              {forecast.map((f) => { const pt = xy(new Date(currentAt + f.hours * 3_600_000).toISOString(), f.targetPrice); return <g key={f.hours}><circle cx={pt.x} cy={pt.y} r="3.5" fill={color} /><text x={pt.x} y={Math.max(18, pt.y - 8)} textAnchor="middle" className="testnet-chart-forecast-label">+{f.hours}h {price(f.targetPrice)}</text></g>; })}
+              <text x={px} y={height - 7} className="testnet-chart-time">{new Date(row.points[0]!.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Taipei' })} Taipei · -12h</text><text x={width - px} y={height - 7} className="testnet-chart-time end">NOW</text>
             </svg>
             <div className="testnet-price-timeline-meta">
               <span><b>Now</b> {price(row.price)} · score {row.score == null ? 'n/a' : `${row.score >= 0 ? '+' : ''}${row.score.toFixed(2)}`}</span>
               <span><b>Turn</b> {row.turningPoint.replaceAll('_', ' ')}</span>
               <span><b>5m</b> RSI {m5?.rsi14.toFixed(0) ?? 'n/a'} · {m5?.trend ?? 'n/a'} · vol {m5?.volumeRatio?.toFixed(2) ?? 'n/a'}x</span>
               <span><b>1h</b> RSI {h1?.rsi14.toFixed(0) ?? 'n/a'} · {h1?.trend ?? 'n/a'} · ATR {h1?.atrPercent.toFixed(2) ?? 'n/a'}%</span>
-              {forecast.map((f) => <span key={f.hours}><b>+{f.hours}h</b> {price(f.targetPrice)} ({signedPct(f.expectedMovePct)}) · {price(f.lowerPrice)}–{price(f.upperPrice)}</span>)}
             </div>
           </Disclosure>
-          <p className="tone-measure" style={{ margin: '5px 0 12px', fontSize: 12 }}>{row.entryReason}. Long exit: {row.exitLongReason ?? 'hold lane/stop'} · Short exit: {row.exitShortReason ?? 'hold lane/stop'}.</p>
+          <p className="tone-measure" style={{ margin: '5px 0 12px', fontSize: 12 }}>{row.entryReason}. Tidak ada target harga/proyeksi garis di chart ini; directive adalah gate, bukan prediksi. Long exit: {row.exitLongReason ?? 'hold lane/stop'} · Short exit: {row.exitShortReason ?? 'hold lane/stop'}.</p>
           <p style={{ margin: '0 0 12px', fontSize: 12 }}>
             <b>Keputusan trade:</b>{' '}
             {openPosition ? (
@@ -1288,9 +1296,9 @@ function LanePerformanceChart({ series }: { series: LanePerformanceSeries | null
   const zeroY = padding + plotHeight - ((0 - minY) / Math.max(maxY - minY, 1)) * plotHeight;
   const labelBuckets = series?.bucketStarts ?? [];
   const tickCount = labelBuckets.length;
-  // Cap tick density so a future higher-resolution view can't render illegibly-overlapping
-  // labels; every view shipped today (max 31 daily buckets) renders one tick per bucket.
-  const MAX_TICKS = 31;
+  // Keep actual axis labels readable at the narrow Live layout too. Hourly/daily views can have
+  // 24–31 buckets, but rendering every one made the time axis overlap into an unreadable ribbon.
+  const MAX_TICKS = 12;
   const tickStep = tickCount > MAX_TICKS ? Math.ceil(tickCount / MAX_TICKS) : 1;
   const axisTicks = labelBuckets
     .map((iso, index) => ({ iso, index }))
@@ -1731,7 +1739,10 @@ export default function TestnetExchangeDashboard() {
   }
 
   async function loadExchangeOnly() {
-    if (isLivePage && Date.now() < liveRateLimitUntilRef.current) return;
+    // Both pages ultimately read Binance USD-M account state. Honour the server-advertised
+    // cooldown on Testnet too, rather than repeatedly asking the local API for an account read
+    // that Binance has explicitly told it not to make yet.
+    if (Date.now() < liveRateLimitUntilRef.current) return;
     const seq = ++exchangeLoadSeqRef.current;
     try {
       const anchor =
@@ -1768,13 +1779,13 @@ export default function TestnetExchangeDashboard() {
       setLastLoadedAt(new Date().toISOString());
     } catch (nextError) {
       if (seq !== exchangeLoadSeqRef.current) return;
-      if (isLivePage && isBinanceRateLimit(nextError)) {
+      if (isBinanceRateLimit(nextError)) {
         const advertisedRetryMs = nextError.retryAt ? Date.parse(nextError.retryAt) : Number.NaN;
         const retryAtMs = Number.isFinite(advertisedRetryMs)
           ? advertisedRetryMs
           : Date.now() + LIVE_RATE_LIMIT_BACKOFF_MS;
         liveRateLimitUntilRef.current = retryAtMs;
-        setError(`Binance sedang membatasi pembacaan akun; dashboard menunggu sampai ${new Date(retryAtMs).toLocaleTimeString('id-ID')} sebelum mencoba lagi.`);
+        setError(`Binance ${isLivePage ? 'mainnet' : 'testnet'} sedang membatasi pembacaan akun; dashboard menunggu sampai ${formatTaipeiDateTime(new Date(retryAtMs).toISOString())} Taipei sebelum mencoba lagi.`);
         return;
       }
       setError(nextError instanceof Error ? nextError.message : `Unable to load Binance ${isLivePage ? 'mainnet' : 'testnet'} mirror`);
@@ -2163,7 +2174,10 @@ export default function TestnetExchangeDashboard() {
   }, [status]);
 
   const stale = lastLoadedAt ? Date.now() - new Date(lastLoadedAt).getTime() > exchangeRefreshMs * 2.5 : true;
-  const healthTone = status?.armed ? 'tone-healthy' : status?.health?.lastTickError ? 'tone-warning' : 'tone-measure';
+  const transportCoolingDown = status?.health?.rateLimit?.coolingDown === true;
+  const healthTone = transportCoolingDown || status?.health?.lastTickError
+    ? 'tone-warning'
+    : status?.armed ? 'tone-healthy' : 'tone-measure';
   const totalSourceEntries = account?.positions.reduce((sum, position) => sum + position.sourceOrderCount, 0) ?? 0;
   const regimeOptions = laneSeries?.regimeOptions ?? FALLBACK_REGIME_OPTIONS;
   // The timeline is intentionally limited to the operator's two displayed books: hedge baskets
@@ -2488,11 +2502,22 @@ export default function TestnetExchangeDashboard() {
         </section>
       )}
 
-      {status?.health?.lastTickError && (
+      {transportCoolingDown && (
         <section className="testnet-panel testnet-warning">
-          <span>Live engine warning</span>
+          <span>Binance USD-M cooldown aktif</span>
+          <strong>
+            {status?.health?.rateLimit?.lastFailure ?? 'Binance sementara membatasi request'}
+            {status?.health?.rateLimit?.retryAt ? ` · coba lagi ${formatTaipeiDateTime(status.health.rateLimit.retryAt)} Taipei` : ''}
+          </strong>
+          <p>Engine sengaja tidak mengirim request Binance sampai cooldown berakhir. Dashboard hanya menampilkan state exchange terakhir; tidak mengubah posisi atau order.</p>
+        </section>
+      )}
+
+      {!transportCoolingDown && status?.health?.lastTickError && (
+        <section className="testnet-panel testnet-warning">
+          <span>{pageName} engine warning aktif</span>
           <strong>{status.health.lastTickError}</strong>
-          <p>The page is still exchange-only; this warning is from the Binance mirror engine, not diagnostics.</p>
+          <p>Ini kegagalan tick terbaru yang masih aktif. Setelah tick berikutnya berhasil, warning akan hilang otomatis.</p>
         </section>
       )}
 
