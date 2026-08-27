@@ -7,9 +7,9 @@ Audit date: 2026-08-27 (Asia/Taipei). Scope is read-only until the V3 release cu
 | Lane | PM2 process | active release | deployed source | durable Daily Range state |
 | --- | --- | --- | --- | --- |
 | Testnet | `dtc-api-testnet` | `daily-range-chart-events-9ffc23f-20260827T033704Z` | `9ffc23f` | `/root/kronos-testnet-releases/128b09f/daily-trading-cockpit-v2/apps/api/data/daily-4h-range-acceptance-2r-v1.json` |
-| Live | `dtc-api-live` | `pool-preview-consistency-5215e7c-20260827T031400Z` | `5215e7c` | `/root/kronos-live/daily-trading-cockpit-v2/apps/api/data/daily-4h-range-acceptance-2r-v1-mainnet.json` |
+| Live | `dtc-api-live` | `daily-range-chart-events-9ffc23f-20260827T033704Z` | `9ffc23f` (Daily Range API hash verified) | `/root/kronos-live/daily-trading-cockpit-v2/apps/api/data/daily-4h-range-acceptance-2r-v1-mainnet.json` |
 
-The Testnet release's state path is a shared-state symlink. The Live state path is outside release directories. A V3 cutover must preserve those files unchanged and restart only one PM2 process per lane.
+The Testnet release's state path is a shared-state symlink. The Live state path is outside release directories. The PM2 script path, rather than an older planned release label, is the runtime source of truth. A V3 cutover must preserve those files unchanged and restart only one PM2 process per lane.
 
 ## Actual policy before V3
 
