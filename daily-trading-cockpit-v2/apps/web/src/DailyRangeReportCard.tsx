@@ -52,6 +52,13 @@ type DailyRangeTrade = DailyRangeHeadlineTrade & {
   realizedR: number | null;
   mfeR: number | null;
   maeR: number | null;
+  mfePrice?: number | null;
+  mfeEventTime?: string | null;
+  maePrice?: number | null;
+  maeEventTime?: string | null;
+  pathSource?: 'CONTRACT_AGG_TRADE' | 'EXIT_FILL' | 'RECOVERED_1M' | 'RECONCILE_MARK' | null;
+  pathQuality?: 'EXACT_STREAM' | 'RECOVERED_FINE_DATA' | 'APPROX_1M' | 'INCOMPLETE' | null;
+  pathFrozenAt?: string | null;
   holdingDurationMs: number | null;
   lastReconcileError: string | null;
   economics?: {
@@ -64,7 +71,7 @@ type DailyRangeTrade = DailyRangeHeadlineTrade & {
   } | null;
   actualStopRiskBps?: number | null;
   actualCostRatio?: number | null;
-  postFillEconomicsStatus?: 'PASS' | 'POST_FILL_ECONOMICS_FAIL' | null;
+  postFillEconomicsStatus?: 'PASS' | 'POST_FILL_ECONOMICS_FAIL' | 'POST_FILL_RISK_FAIL' | null;
 };
 
 type DailyRangePerformance = {
@@ -87,7 +94,28 @@ type DailyRangeStatus = {
   allocatorMode?: string;
   effectiveAllocatorMode?: string;
   selectorStatus?: string;
-  alphaSelector?: { executionAuthority?: boolean; status?: string; promotion?: string } | null;
+  selectorId?: string | null;
+  selectorArtifact?: {
+    activeSelectorId?: string | null;
+    activeStatus?: string;
+    fallback?: string;
+    reason?: string | null;
+    promotionGates?: {
+      historical?: { status?: string };
+      forwardFullPit?: { status?: string; matureOversubscribedBatches?: number; requiredMatureOversubscribedBatches?: number };
+      testnetParity?: { status?: string };
+      operatorApproval?: { status?: string };
+      executionAuthority?: boolean;
+    } | null;
+  } | null;
+  alphaSelector?: {
+    executionAuthority?: boolean;
+    status?: string;
+    promotion?: string;
+    artifactStatus?: string;
+    artifactFallback?: string;
+    forwardGate?: { matureFullPITOversubscribedBatches?: number; requiredMatureFullPITOversubscribedBatches?: number; status?: string };
+  } | null;
   economics?: {
     policyId?: string;
     allocatorPolicyId?: string;
@@ -112,6 +140,12 @@ type DailyRangeStatus = {
       exitFeeP95Bps?: number;
       lossAdverseP50Bps?: number;
       lossAdverseP95Bps?: number;
+      environment?: string;
+      definitionVersion?: string;
+      safeLossFormula?: string;
+      sourceTradeCount?: number;
+      sourceFillCount?: number;
+      sourceFillCountKnownTradeCount?: number;
     } | null;
     candidateSummary?: {
       evaluated?: number;
@@ -124,9 +158,18 @@ type DailyRangeStatus = {
   } | null;
   lastBatchCandidateCount?: number;
   lastBatchSelectedCount?: number;
+  lastCompletedBatch?: {
+    economicRejects?: number;
+    minFeatureAgeMs?: number | null;
+    maxFeatureAgeMs?: number | null;
+    featureAgeSpreadMs?: number | null;
+  } | null;
+  mfeMae?: { triggerWorkingType?: string; collection?: string; fallback?: string; openPathQuality?: Record<string, number> } | null;
   dataHealth?: {
     candidateSignalsCollected?: number;
     fullPITSignals?: number;
+    matureFullPITSignals?: number;
+    matureFullPITOversubscribedBatches?: number;
     oversubscribedBatches?: number;
   } | null;
   openTrades?: DailyRangeTrade[];
@@ -171,6 +214,14 @@ function formatPercent(value: number | null | undefined): string {
 
 function formatBps(value: number | null | undefined): string {
   return finite(value) ? `${value.toFixed(1)} bps` : '—';
+}
+
+function pathQualityLabel(value: DailyRangeTrade['pathQuality']): string {
+  if (value === 'EXACT_STREAM') return 'exact contract stream';
+  if (value === 'APPROX_1M') return 'approx. 1m recovery';
+  if (value === 'RECOVERED_FINE_DATA') return 'fine-data recovery';
+  if (value === 'INCOMPLETE') return 'path incomplete';
+  return 'legacy / belum diukur';
 }
 
 function formatTaipei(value: string | null | undefined): string {
@@ -308,7 +359,10 @@ function ClosedDailyRangeReport({
           <td style={{ color: toneForValue(trade.fundingUsd) }}>{formatMoney(trade.fundingUsd)}</td>
           <td style={{ color: toneForValue(trade.netPnlUsd), fontWeight: 700 }}>{formatMoney(trade.netPnlUsd)}</td>
           <td style={{ color: toneForValue(trade.realizedR) }}>{formatR(trade.realizedR)}</td>
-          <td><span style={{ color: toneForValue(trade.mfeR) }}>{formatR(trade.mfeR)}</span> / <span style={{ color: toneForValue(trade.maeR) }}>{formatR(trade.maeR)}</span></td>
+          <td title={`MFE ${formatPrice(trade.mfePrice)} · MAE ${formatPrice(trade.maePrice)} · ${pathQualityLabel(trade.pathQuality)}`}>
+            <span style={{ color: toneForValue(trade.mfeR) }}>{formatR(trade.mfeR)}</span> / <span style={{ color: toneForValue(trade.maeR) }}>{formatR(trade.maeR)}</span>
+            <small>{pathQualityLabel(trade.pathQuality)}</small>
+          </td>
           <td>{trade.economics ? <small title={`model ${trade.economics.frictionModelId}`}>
             stop {formatBps(trade.actualStopRiskBps ?? trade.economics.stopRiskBps)} · cost {formatPercent((trade.actualCostRatio ?? trade.economics.costRatio) * 100)}
           </small> : <span className="tone-measure">legacy</span>}</td>
@@ -432,6 +486,7 @@ export default function DailyRangeReportCard({
   const candidateSummary = data?.economics?.candidateSummary ?? null;
   const maxCostRatio = data?.economics?.maxCostRatio ?? null;
   const bboMaxAgeMs = data?.economics?.bboMaxAgeMs ?? null;
+  const alphaGates = data?.selectorArtifact?.promotionGates ?? null;
   const safeLossFrictionBps = friction
     && finite(friction.entryFeeP95Bps)
     && finite(friction.exitFeeP95Bps)
@@ -460,7 +515,9 @@ export default function DailyRangeReportCard({
       {usesAutoRouter ? <>
         <div className="daily-range-breakdown" title="V3 mengurutkan hanya kandidat yang sudah lolos stop economics. Router, arah, structural stop, 2R, dan native bracket tidak berubah.">
           <span>Allocator {data?.allocatorMode ?? '—'} → efektif {data?.effectiveAllocatorMode ?? '—'} · alpha {data?.alphaSelector?.status ?? data?.selectorStatus ?? '—'} (tanpa authority)</span>
-          <span>{friction ? `friction ${friction.source} · N ${friction.sampleCount ?? 0} · ${friction.id ?? '—'}` : 'friction model belum tersedia: entry baru fail-closed'}</span>
+          <span>{friction ? `friction ${friction.source}/${friction.environment ?? '—'} · N trade ${friction.sourceTradeCount ?? friction.sampleCount ?? 0} · fill ${friction.sourceFillCount ?? '—'} · ${friction.id ?? '—'}` : 'friction model belum tersedia: entry baru fail-closed'}</span>
+          <span>Artifact alpha {data?.selectorArtifact?.activeSelectorId ?? 'belum ada'} · status {data?.selectorArtifact?.activeStatus ?? 'MISSING'} · fallback {data?.selectorArtifact?.fallback ?? 'ECONOMIC_QUALITY_BASELINE'}</span>
+          {alphaGates ? <span>Gate alpha: historical {alphaGates.historical?.status ?? '—'} · forward {alphaGates.forwardFullPit?.matureOversubscribedBatches ?? 0}/{alphaGates.forwardFullPit?.requiredMatureOversubscribedBatches ?? 20} ({alphaGates.forwardFullPit?.status ?? 'PENDING'}) · Testnet {alphaGates.testnetParity?.status ?? 'PENDING'} · approval {alphaGates.operatorApproval?.status ?? 'NOT_APPROVED'} · authority {alphaGates.executionAuthority ? 'ON' : 'OFF'}</span> : null}
         </div>
         <div className="daily-range-breakdown" title="Angka ini adalah pagar biaya/risk V3, bukan sinyal arah atau optimasi threshold.">
           <span>Cap: {formatUnsignedMoney(data?.economics?.maxNotionalUsd)} notional · {formatUnsignedMoney(data?.economics?.maxPlannedRiskUsd)} planned risk · cost ≤ {finite(maxCostRatio) ? formatPercent(maxCostRatio * 100) : '—'} · BBO ≤ {bboMaxAgeMs == null ? '—' : `${Math.round(bboMaxAgeMs / 1000)}s`}</span>
@@ -468,13 +525,14 @@ export default function DailyRangeReportCard({
             ? `safe loss ${formatBps(safeLossFrictionBps)} → structural stop minimum ${formatBps(impliedMinimumStopRiskBps)}`
             : 'safe loss belum tersedia: entry baru fail-closed'}</span>
           <span>{friction
-            ? `fee p50 ${formatBps(friction.entryFeeP50Bps)}+${formatBps(friction.exitFeeP50Bps)} · entry adverse p95 ${formatBps(friction.entryAdverseP95Bps)} · stop gap p95 ${formatBps(friction.stopGapP95Bps)}`
+            ? `fee p50 ${formatBps(friction.entryFeeP50Bps)}+${formatBps(friction.exitFeeP50Bps)} · loss-path p95 ${formatBps(friction.lossAdverseP95Bps)} (sudah termasuk adverse entry/exit/gap secara per-loss; tidak dijumlah dua kali)`
             : '—'}</span>
         </div>
         <div className="daily-range-breakdown" title="Ringkasan ini hanya menghitung kandidat V3 yang sudah memiliki snapshot ekonomi; legacy trade tetap diberi label legacy.">
-          <span>Batch terakhir: {data?.lastBatchCandidateCount ?? 0} kandidat · {data?.lastBatchSelectedCount ?? 0} dipilih · reject ekonomi {candidateSummary?.economicsRejected ?? 0}</span>
+          <span>Batch terakhir: {data?.lastBatchCandidateCount ?? 0} kandidat · {data?.lastBatchSelectedCount ?? 0} dipilih · reject ekonomi {data?.lastCompletedBatch?.economicRejects ?? candidateSummary?.economicsRejected ?? 0}</span>
           <span>Snapshot V3: {candidateSummary?.evaluated ?? 0} · avg stop {formatBps(candidateSummary?.averageStopRiskBps)} · avg cost {finite(candidateSummary?.averageCostRatio) ? formatPercent(candidateSummary.averageCostRatio * 100) : '—'}</span>
-          <span>Forward Full PIT {data?.dataHealth?.fullPITSignals ?? 0} · batch oversubscribed {data?.dataHealth?.oversubscribedBatches ?? 0}</span>
+          <span>Forward Full PIT {data?.dataHealth?.fullPITSignals ?? 0} · mature {data?.dataHealth?.matureFullPITSignals ?? 0} · mature complete scarce batch {data?.alphaSelector?.forwardGate?.matureFullPITOversubscribedBatches ?? data?.dataHealth?.matureFullPITOversubscribedBatches ?? 0}/{data?.alphaSelector?.forwardGate?.requiredMatureFullPITOversubscribedBatches ?? 20} ({data?.alphaSelector?.forwardGate?.status ?? 'COLLECTING'}) · feature age {data?.lastCompletedBatch?.minFeatureAgeMs == null ? '—' : `${Math.round(data.lastCompletedBatch.minFeatureAgeMs)}–${Math.round(data.lastCompletedBatch.maxFeatureAgeMs ?? data.lastCompletedBatch.minFeatureAgeMs)}ms`}</span>
+          <span>Path native {data?.mfeMae?.triggerWorkingType ?? '—'} · {data?.mfeMae?.collection ?? '—'} · open {Object.entries(data?.mfeMae?.openPathQuality ?? {}).map(([key, count]) => `${key}:${count}`).join(', ') || '—'}</span>
         </div>
       </> : null}
       {error ? <div className="daily-range-message tone-warning">Daily Range status unavailable: {error}</div> : null}
@@ -487,7 +545,7 @@ export default function DailyRangeReportCard({
         <div className="testnet-table-wrap">
           <table className="daily-range-table">
             <thead><tr>
-              <th>Book</th><th>Symbol</th><th>Side</th><th>Setup</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Stop</th><th>R now / peak</th><th>Gross mark</th><th>Economics</th><th>Range H / L</th><th>Opened (Taipei)</th><th>Intent state</th><th>Action</th>
+              <th>Book</th><th>Symbol</th><th>Side</th><th>Setup</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Stop</th><th>R mark / MFE path</th><th>Gross mark</th><th>Economics</th><th>Range H / L</th><th>Opened (Taipei)</th><th>Intent state</th><th>Action</th>
             </tr></thead>
             <tbody>{openTrades.map((trade) => {
               const selected = selectedTrade?.tradeId === trade.tradeId;
@@ -505,7 +563,10 @@ export default function DailyRangeReportCard({
                 <td>{formatPrice(trade.takeProfitPrice)} <small>{trade.rrTarget}R</small></td>
                 <td style={{ color: toneForValue(gap) }}>{formatPercent(gap)}</td>
                 <td style={{ color: C.bad }}>{formatPrice(trade.stopPrice)}</td>
-                <td><span style={{ color: toneForValue(nowR) }}>{formatR(nowR)}</span> / <span style={{ color: toneForValue(trade.mfeR) }}>{formatR(trade.mfeR)}</span></td>
+                <td title={`MFE ${formatPrice(trade.mfePrice)} · MAE ${formatPrice(trade.maePrice)} · ${pathQualityLabel(trade.pathQuality)}`}>
+                  <span style={{ color: toneForValue(nowR) }}>{formatR(nowR)}</span> / <span style={{ color: toneForValue(trade.mfeR) }}>{formatR(trade.mfeR)}</span>
+                  <small>{pathQualityLabel(trade.pathQuality)}</small>
+                </td>
                 <td style={{ color: toneForValue(gross), fontWeight: 700 }}>{formatMoney(gross)}</td>
                 <td>{trade.economics ? <small title={`model ${trade.economics.frictionModelId}; break-even ${formatPercent(trade.economics.breakEvenWinRate * 100)}`}>
                   risk {formatUnsignedMoney(trade.economics.plannedRiskUsd)} · cost {formatPercent((trade.actualCostRatio ?? trade.economics.costRatio) * 100)} · BE {formatPercent(trade.economics.breakEvenWinRate * 100)}

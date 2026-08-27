@@ -219,13 +219,14 @@ function makeLane(
   universe = ["AAAUSDT"],
   claim = { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
   strategyMode: DailyRangeStrategyMode = "LEGACY_CONTINUATION",
+  evidence: DailyRangePoolEvidence | null = null,
 ) {
   const dir = dataDir();
   const store = new DailyRangeLaneStore(dir, "state.json", nowRef.value);
   const lane = new DailyRangeAcceptanceLane({
     client,
     store,
-    getUniverse: () => ({ symbols: universe, source: "TEST" }),
+    getUniverse: () => ({ symbols: universe, source: "TEST", poolEvidence: evidence }),
     getShortBlocklist: () => new Set<string>(),
     entryClaims: claim,
     environment: "testnet",
@@ -712,6 +713,59 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect((await client.getPositions("AAAUSDT")).some((position) => Math.abs(position.positionAmt) > 0)).toBe(false);
   });
 
+  it("measures MFE/MAE from contract-price events through the terminal fill and freezes post-exit events", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeLane(client, now);
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value);
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    const trade = store.getState().trades[0]!;
+    const entryAt = Date.parse(trade.entryFilledAt!);
+
+    lane.ingestContractPricePath({
+      symbol: "AAAUSDT", price: 103, eventTimeMs: entryAt + 1, receivedAtMs: entryAt + 2,
+      source: "CONTRACT_AGG_TRADE", streamStartedAtMs: entryAt - 1_000,
+    });
+    lane.ingestContractPricePath({
+      symbol: "AAAUSDT", price: 97, eventTimeMs: entryAt + 3, receivedAtMs: entryAt + 4,
+      source: "CONTRACT_AGG_TRADE", streamStartedAtMs: entryAt - 1_000,
+    });
+    expect(trade.pathQuality).toBe("EXACT_STREAM");
+    expect(trade.mfeR).toBeCloseTo(1.5, 10);
+    expect(trade.maeR).toBeCloseTo(-1.5, 10);
+
+    now.value = entryAt + 10;
+    client.now = now.value;
+    await lane.manualCloseTrade(trade.tradeId);
+    const frozenMfe = trade.mfeR;
+    const frozenMae = trade.maeR;
+    expect(trade.pathFrozenAt).not.toBeNull();
+    lane.ingestContractPricePath({
+      symbol: "AAAUSDT", price: 110, eventTimeMs: now.value + 1, receivedAtMs: now.value + 2,
+      source: "CONTRACT_AGG_TRADE", streamStartedAtMs: entryAt - 1_000,
+    });
+    expect(trade.mfeR).toBe(frozenMfe);
+    expect(trade.maeR).toBe(frozenMae);
+  });
+
+  it("downgrades an open path to INCOMPLETE after a stream gap without changing native protection", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeLane(client, now);
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value);
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+    const trade = store.getState().trades[0]!;
+    lane.markContractPathStreamGap("test websocket gap");
+    expect(trade.pathQuality).toBe("INCOMPLETE");
+    expect(trade.pathGapReason).toBe("test websocket gap");
+    expect(trade.stopAlgoOrderId).not.toBeNull();
+    expect(trade.takeProfitAlgoOrderId).not.toBeNull();
+  });
+
   it("passes an exchange-like canary lifecycle: entry, brackets, sibling cancel, flat, no orphan", async () => {
     const now = { value: AT_0410 };
     const client = new FakeDailyClient();
@@ -989,6 +1043,8 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       pitQuality: "FULL_PIT",
       capturePhase: "FORWARD_BEFORE_ALLOCATION",
       bookSnapshotQuality: "AT_DECISION_BEFORE_ALLOCATION",
+      bboEventTime: expect.any(String),
+      bboReceivedAt: expect.any(String),
       quoteVolume24hUsd: 42_000_000,
       c1Pass: true,
       c6Pass: true,
@@ -1298,6 +1354,7 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       ["AAAUSDT"],
       { tryClaimEntrySymbol: () => true, releaseEntrySymbol: () => {} },
       "AUTO_ROUTE_NY_V2",
+      poolEvidence(["AAAUSDT"]),
     );
 
     await lane.tick(); // freezes only a completed NY 00:00-04:00 reference; still disarmed
@@ -1330,6 +1387,34 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
       referenceTimezone: "America/New_York",
       referenceRangeOpenTime: window.rangeOpenTime,
       referenceRangeCloseTime: window.rangeCloseTime,
+    });
+    expect(emitted[0]?.research?.marketQuality).toMatchObject({
+      capturePhase: "FORWARD_BEFORE_ALLOCATION",
+      bboEventTime: expect.any(String),
+      bboReceivedAt: expect.any(String),
+      featureSnapshotAt: expect.any(String),
+      featureAgeMs: expect.any(Number),
+    });
+    expect(store.getState().signalCohorts[0]?.allocation).toMatchObject({
+      minFeatureAgeMs: expect.any(Number),
+      maxFeatureAgeMs: expect.any(Number),
+      featureAgeSpreadMs: expect.any(Number),
+    });
+    const matureCounterfactual = emitted[0]?.research?.counterfactual;
+    expect(matureCounterfactual).not.toBeNull();
+    // The small route fixture intentionally lacks the 49-bar feature history;
+    // make its already causal snapshot complete so this assertion isolates the
+    // forward-gate cohort accounting rather than feature-data availability.
+    if (emitted[0]?.research?.features) emitted[0].research.features.pitQuality = "FULL_PIT";
+    if (matureCounterfactual) {
+      matureCounterfactual.status = "MATURE_TP";
+      matureCounterfactual.maturedAt = new Date(now.value).toISOString();
+    }
+    const batch = store.getState().signalCohorts[0]!;
+    batch.allocation!.availableSlots = 0; // one complete candidate now forms a scarce-slot test cohort.
+    expect(lane.getStatus()).toMatchObject({
+      dataHealth: { matureFullPITSignals: 1, matureFullPITOversubscribedBatches: 1 },
+      alphaSelector: { forwardGate: { matureFullPITOversubscribedBatches: 1, requiredMatureFullPITOversubscribedBatches: 20, status: "COLLECTING" } },
     });
     const trade = store.getState().trades[0]!;
     expect(trade).toMatchObject({

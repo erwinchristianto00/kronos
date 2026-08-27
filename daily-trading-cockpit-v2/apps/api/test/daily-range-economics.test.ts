@@ -81,6 +81,7 @@ describe("Daily Range V3 economics", () => {
       safeLossFrictionBps: 33,
     });
     expect(actual?.materialViolation).toBe(true);
+    expect(actual?.violation).toBe("POST_FILL_ECONOMICS_FAIL");
     expect(actual?.actualCostRatio).toBeGreaterThan(DAILY_RANGE_MAX_COST_RATIO);
   });
 
@@ -96,6 +97,7 @@ describe("Daily Range V3 economics", () => {
     });
     expect(actual?.actualInitialRiskUsd).toBeCloseTo(0.3, 10);
     expect(actual?.materialViolation).toBe(true);
+    expect(actual?.violation).toBe("POST_FILL_RISK_FAIL");
   });
 
   it("creates empirical models only from enough terminal observations", () => {
@@ -111,13 +113,45 @@ describe("Daily Range V3 economics", () => {
       exitReason: "TAKE_PROFIT" as const,
       feeEvidence: "EXACT_FILL_COMMISSION" as const,
     };
-    expect(buildEmpiricalFrictionModel({ samples: [sample], createdAt: at, cutoffAt: at })).toBeNull();
+    expect(buildEmpiricalFrictionModel({ samples: [sample], createdAt: at, cutoffAt: at, environment: "testnet" })).toBeNull();
     const model = buildEmpiricalFrictionModel({
       samples: Array.from({ length: 12 }, (_, index) => ({ ...sample, tradeId: `t${index}`, exitReason: index % 2 ? "STOP_LOSS" as const : "TAKE_PROFIT" as const })),
       createdAt: at,
       cutoffAt: at,
+      environment: "mainnet",
     });
-    expect(model).toMatchObject({ source: "EMPIRICAL_LEDGER", sampleCount: 12 });
+    expect(model).toMatchObject({ source: "EMPIRICAL_LEDGER", sampleCount: 12, environment: "mainnet", sourceTradeCount: 12 });
     expect(model?.id).toMatch(/^daily-friction-v1-/);
+  });
+
+  it("uses one pointwise all-in loss path, so entry adverse execution is neither omitted nor double counted", () => {
+    const samples = Array.from({ length: 12 }, (_, index) => ({
+      tradeId: `loss-${index}`,
+      closedAt: new Date(Date.parse(at) - (12 - index) * 1_000).toISOString(),
+      entryFeeBps: 5,
+      exitFeeBps: 5,
+      // The high entry and high stop-gap observations occur on different loss
+      // paths. Summing standalone p95s would invent a loss that never occurred.
+      entryAdverseBps: index % 2 ? 10 : 0,
+      takeProfitExitAdverseBps: null,
+      stopExitAdverseBps: 0,
+      stopGapBps: index % 2 ? 0 : 20,
+      exitReason: "STOP_LOSS" as const,
+      feeEvidence: "EXACT_FILL_COMMISSION" as const,
+      sourceFillCount: 2,
+    }));
+    const model = buildEmpiricalFrictionModel({ samples, createdAt: at, cutoffAt: at, environment: "mainnet" });
+    expect(model).not.toBeNull();
+    expect(model?.entryAdverseP95Bps).toBe(10);
+    expect(model?.stopGapP95Bps).toBe(20);
+    // Each actual loss had 10 or 20 bps all-in, therefore p95 is 20 — never 30.
+    expect(model?.lossAdverseP95Bps).toBe(20);
+    const result = prepareDailyRangeEconomics(baseInput({ frictionModel: model }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.economics.safeLossEntryFeeComponentBps).toBe(5);
+    expect(result.economics.safeLossExitFeeComponentBps).toBe(5);
+    expect(result.economics.safeLossPathAdverseComponentBps).toBe(25);
+    expect(result.economics.safeLossFrictionBps).toBe(35);
   });
 });

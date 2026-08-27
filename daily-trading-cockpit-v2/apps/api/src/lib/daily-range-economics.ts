@@ -21,10 +21,19 @@ export const DAILY_RANGE_MAX_PLANNED_RISK_USD = 0.25;
 export const DAILY_RANGE_MAX_COST_RATIO = 0.25;
 export const DAILY_RANGE_SAFE_FRICTION_MULTIPLIER = 1.25;
 export const DAILY_RANGE_MIN_EMPIRICAL_FRICTION_SAMPLES = 12;
+/**
+ * A loss-path price sample is one terminal loss's non-overlapping sum:
+ * entry adverse execution + explicitly measured market-exit adverse execution
+ * (when present) + native stop trigger-to-fill gap. Its percentile is already
+ * end-to-end for that loss path; entryAdverseP95 must not be added again.
+ */
+export const DAILY_RANGE_FRICTION_DEFINITION_VERSION = "daily-loss-friction-decomposition-v1";
+export const DAILY_RANGE_SAFE_LOSS_FORMULA = "ENTRY_FEE_P95 + EXIT_FEE_P95 + 1.25 * LOSS_PATH_ALL_IN_ADVERSE_P95";
 
 export type DailyRangeEconomicsSide = "LONG" | "SHORT";
 export type DailyRangeFrictionModelSource = "EMPIRICAL_LEDGER" | "CONSERVATIVE_FALLBACK";
 export type DailyRangeFeeEvidence = "EXACT_FILL_COMMISSION" | "LEGACY_COMBINED_FEE_ALLOCATION" | "CONFIGURED_CONSERVATIVE";
+export type DailyRangeFrictionEnvironment = "testnet" | "mainnet";
 
 export interface DailyRangeFrictionSample {
   tradeId: string;
@@ -37,15 +46,35 @@ export interface DailyRangeFrictionSample {
   stopGapBps: number | null;
   exitReason: "TAKE_PROFIT" | "STOP_LOSS" | "OTHER";
   feeEvidence: DailyRangeFeeEvidence;
+  /**
+   * Exact exchange fill count only when the terminal trade persisted its
+   * per-order user-fill ledger. Legacy combined-fee rows leave this null
+   * rather than inventing a count.
+   */
+  sourceFillCount?: number | null;
 }
 
 export interface DailyRangeFrictionModel {
   id: string;
   policyId: typeof DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID;
+  definitionVersion: typeof DAILY_RANGE_FRICTION_DEFINITION_VERSION;
+  safeLossFormula: typeof DAILY_RANGE_SAFE_LOSS_FORMULA;
+  /** Environment provenance is part of the immutable artifact hash. */
+  environment: DailyRangeFrictionEnvironment;
   source: DailyRangeFrictionModelSource;
   createdAt: string;
   cutoffAt: string;
+  /** Alias retained explicitly for research/artifact manifests. */
+  trainingCutoff: string;
   sampleCount: number;
+  /** Terminal trade rows used to build this artifact. */
+  sourceTradeCount: number;
+  /** Exact exchange user fills represented by rows that persisted a count. */
+  sourceFillCount: number;
+  /** Number of source trades for which sourceFillCount is known. */
+  sourceFillCountKnownTradeCount: number;
+  /** SHA-256 over the canonical, cutoff-bounded source sample rows. */
+  sourceSampleHash: string;
   exactFeeSampleCount: number;
   legacyFeeSampleCount: number;
   /** Median, observed/admitted entry adverse execution cost. */
@@ -63,6 +92,11 @@ export interface DailyRangeFrictionModel {
   exitFeeP95Bps: number;
   /** Empirical all-in adverse price friction, separated by terminal path. */
   winAdverseP50Bps: number;
+  /**
+   * Pointwise terminal-loss total. It already includes entry adverse execution,
+   * any independently observed lane-originated market exit adverse execution,
+   * and the native stop trigger-to-fill gap for the same loss row.
+   */
   lossAdverseP50Bps: number;
   lossAdverseP95Bps: number;
   hash: string;
@@ -101,6 +135,10 @@ export interface DailyRangePreTradeEconomics {
   exitFeeBps: number;
   medianWinFrictionBps: number;
   medianLossFrictionBps: number;
+  safeLossEntryFeeComponentBps: number;
+  safeLossExitFeeComponentBps: number;
+  safeLossPathAdverseComponentBps: number;
+  safeLossDefinitionVersion: typeof DAILY_RANGE_FRICTION_DEFINITION_VERSION;
   safeLossFrictionBps: number;
   costRatio: number;
   netWinR: number;
@@ -118,6 +156,7 @@ export interface DailyRangeActualFillEconomics {
   actualStopRiskBps: number;
   actualInitialRiskUsd: number;
   actualCostRatio: number;
+  violation: "POST_FILL_ECONOMICS_FAIL" | "POST_FILL_RISK_FAIL" | null;
   materialViolation: boolean;
 }
 
@@ -156,11 +195,35 @@ function modelId(createdAt: string, hash: string): string {
   return `daily-friction-v1-${createdAt.replace(/[-:.TZ]/g, "").slice(0, 14)}-${hash.slice(0, 12)}`;
 }
 
+function sourceSampleHash(samples: readonly DailyRangeFrictionSample[]): string {
+  const canonical = [...samples]
+    .map((sample) => ({
+      tradeId: sample.tradeId,
+      closedAt: sample.closedAt,
+      entryFeeBps: nonNegative(sample.entryFeeBps),
+      exitFeeBps: nonNegative(sample.exitFeeBps),
+      entryAdverseBps: nonNegative(sample.entryAdverseBps),
+      takeProfitExitAdverseBps: nonNegative(sample.takeProfitExitAdverseBps),
+      stopExitAdverseBps: nonNegative(sample.stopExitAdverseBps),
+      stopGapBps: nonNegative(sample.stopGapBps),
+      exitReason: sample.exitReason,
+      feeEvidence: sample.feeEvidence,
+      sourceFillCount: nonNegative(sample.sourceFillCount),
+    }))
+    .sort((left, right) => left.closedAt.localeCompare(right.closedAt) || left.tradeId.localeCompare(right.tradeId));
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
 function baseModel(input: {
+  environment: DailyRangeFrictionEnvironment;
   source: DailyRangeFrictionModelSource;
   createdAt: string;
   cutoffAt: string;
   sampleCount: number;
+  sourceTradeCount: number;
+  sourceFillCount: number;
+  sourceFillCountKnownTradeCount: number;
+  sourceSampleHash: string;
   exactFeeSampleCount: number;
   legacyFeeSampleCount: number;
   entryAdverseP50Bps: number;
@@ -181,6 +244,9 @@ function baseModel(input: {
 }): DailyRangeFrictionModel {
   const canonical: Omit<DailyRangeFrictionModel, "id" | "hash"> = {
     policyId: DAILY_RANGE_EXECUTION_ECONOMICS_POLICY_ID,
+    definitionVersion: DAILY_RANGE_FRICTION_DEFINITION_VERSION,
+    safeLossFormula: DAILY_RANGE_SAFE_LOSS_FORMULA,
+    trainingCutoff: input.cutoffAt,
     ...input,
   };
   const hash = modelHash(canonical);
@@ -191,12 +257,21 @@ function baseModel(input: {
  * Testnet's fallback is intentionally non-zero and conservative.  It is a
  * safety observation baseline, not an implicit substitute for a Live model.
  */
-export function conservativeFallbackFrictionModel(createdAt: string, cutoffAt = createdAt): DailyRangeFrictionModel {
+export function conservativeFallbackFrictionModel(
+  createdAt: string,
+  cutoffAt = createdAt,
+  environment: DailyRangeFrictionEnvironment = "testnet",
+): DailyRangeFrictionModel {
   return baseModel({
+    environment,
     source: "CONSERVATIVE_FALLBACK",
     createdAt,
     cutoffAt,
     sampleCount: 0,
+    sourceTradeCount: 0,
+    sourceFillCount: 0,
+    sourceFillCountKnownTradeCount: 0,
+    sourceSampleHash: sourceSampleHash([]),
     exactFeeSampleCount: 0,
     legacyFeeSampleCount: 0,
     entryAdverseP50Bps: 1.5,
@@ -222,6 +297,7 @@ export function buildEmpiricalFrictionModel(input: {
   samples: readonly DailyRangeFrictionSample[];
   createdAt: string;
   cutoffAt: string;
+  environment: DailyRangeFrictionEnvironment;
   minimumSamples?: number;
 }): DailyRangeFrictionModel | null {
   const samples = input.samples.filter((sample) => Date.parse(sample.closedAt) <= Date.parse(input.cutoffAt));
@@ -242,12 +318,19 @@ export function buildEmpiricalFrictionModel(input: {
 
   // A missing category should not create a cost-free route.  Use the all-sample
   // distribution or the fixed conservative fallback for that one component.
-  const fallback = conservativeFallbackFrictionModel(input.createdAt, input.cutoffAt);
+  const fallback = conservativeFallbackFrictionModel(input.createdAt, input.cutoffAt, input.environment);
+  const knownFillSamples = samples.filter((sample) => nonNegative(sample.sourceFillCount) !== null);
+  const sourceFillCount = knownFillSamples.reduce((sum, sample) => sum + (nonNegative(sample.sourceFillCount) ?? 0), 0);
   return baseModel({
+    environment: input.environment,
     source: "EMPIRICAL_LEDGER",
     createdAt: input.createdAt,
     cutoffAt: input.cutoffAt,
     sampleCount: samples.length,
+    sourceTradeCount: samples.length,
+    sourceFillCount,
+    sourceFillCountKnownTradeCount: knownFillSamples.length,
+    sourceSampleHash: sourceSampleHash(samples),
     exactFeeSampleCount,
     legacyFeeSampleCount,
     entryAdverseP50Bps: rounded(percentile(entryAdverse, 0.5, fallback.entryAdverseP50Bps)),
@@ -344,7 +427,10 @@ export function prepareDailyRangeEconomics(input: {
   const stopRiskBps = (roundedBracket.risk / expectedEntry) * 10_000;
   const medianWinFrictionBps = model.entryFeeP50Bps + model.exitFeeP50Bps + model.winAdverseP50Bps;
   const medianLossFrictionBps = model.entryFeeP50Bps + model.exitFeeP50Bps + model.lossAdverseP50Bps;
-  const safeLossFrictionBps = model.entryFeeP95Bps + model.exitFeeP95Bps + DAILY_RANGE_SAFE_FRICTION_MULTIPLIER * model.lossAdverseP95Bps;
+  const safeLossEntryFeeComponentBps = model.entryFeeP95Bps;
+  const safeLossExitFeeComponentBps = model.exitFeeP95Bps;
+  const safeLossPathAdverseComponentBps = DAILY_RANGE_SAFE_FRICTION_MULTIPLIER * model.lossAdverseP95Bps;
+  const safeLossFrictionBps = safeLossEntryFeeComponentBps + safeLossExitFeeComponentBps + safeLossPathAdverseComponentBps;
   if (!(stopRiskBps > 0) || !finite(safeLossFrictionBps)) return { ok: false, reason: "STOP_ECONOMICS_FAIL" };
   const costRatio = safeLossFrictionBps / stopRiskBps;
   if (costRatio > DAILY_RANGE_MAX_COST_RATIO + 1e-12) return { ok: false, reason: "STOP_ECONOMICS_FAIL" };
@@ -392,6 +478,10 @@ export function prepareDailyRangeEconomics(input: {
       exitFeeBps: model.exitFeeP50Bps,
       medianWinFrictionBps,
       medianLossFrictionBps,
+      safeLossEntryFeeComponentBps,
+      safeLossExitFeeComponentBps,
+      safeLossPathAdverseComponentBps,
+      safeLossDefinitionVersion: DAILY_RANGE_FRICTION_DEFINITION_VERSION,
       safeLossFrictionBps,
       costRatio,
       netWinR,
@@ -428,17 +518,24 @@ export function evaluateActualFillEconomics(input: {
   const actualStopRiskBps = risk / input.entryPrice * 10_000;
   const actualInitialRiskUsd = risk * input.quantity;
   const actualCostRatio = input.safeLossFrictionBps / actualStopRiskBps;
+  const economicsViolation = actualCostRatio > DAILY_RANGE_MAX_COST_RATIO + 1e-12
+    || actualCostRatio > input.expectedCostRatio * 1.15 + 1e-12;
+  const riskViolation = actualInitialRiskUsd > input.expectedPlannedRiskUsd * 1.15 + 1e-9;
+  const violation = economicsViolation
+    ? "POST_FILL_ECONOMICS_FAIL" as const
+    : riskViolation
+      ? "POST_FILL_RISK_FAIL" as const
+      : null;
   return {
     actualStopRiskPrice: risk,
     actualStopRiskBps,
     actualInitialRiskUsd,
     actualCostRatio,
-    materialViolation: actualCostRatio > DAILY_RANGE_MAX_COST_RATIO + 1e-12
-      || actualCostRatio > input.expectedCostRatio * 1.15 + 1e-12
-      // The requested quantity is frozen before the POST, so a worse market
-      // fill can only be tolerated within the same materiality band.  This
-      // keeps a $0.25 planned-risk cap meaningful without flattening for
-      // floating-point dust or a single tick of normal execution noise.
-      || actualInitialRiskUsd > input.expectedPlannedRiskUsd * 1.15 + 1e-9,
+    violation,
+    // The requested quantity is frozen before the POST, so a worse market
+    // fill can only be tolerated within the same materiality band. This keeps
+    // the $0.25 planned-risk cap meaningful without flattening for rounding
+    // dust or a single normal execution tick.
+    materialViolation: violation !== null,
   };
 }

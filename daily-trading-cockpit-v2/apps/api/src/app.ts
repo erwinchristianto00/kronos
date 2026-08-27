@@ -55,6 +55,8 @@ import {
   DailyRangeAcceptanceLane,
   DailyRangeLaneStore,
 } from "./lib/daily-4h-range-acceptance-lane.js";
+import { DailyRangeContractPathSupervisor } from "./lib/daily-range-contract-path.js";
+import { DailyRangeSelectorArtifactRegistry } from "./lib/daily-range-selector-artifacts.js";
 import {
   parseDailyRangeMainnetControls,
   resolveDailyRangeRuntimeAllocatorMode,
@@ -1105,6 +1107,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // mainnet execution process may construct it only in observation mode until
   // the lane's independent real-money policy explicitly permits more.
   let dailyRangeLane: DailyRangeAcceptanceLane | null = null;
+  let dailyRangeContractPathSupervisor: DailyRangeContractPathSupervisor | null = null;
   // The Daily Range pool is a separate C1-C6 universe. Keeping its snapshot behind a getter lets
   // the Testnet status route expose exactly what was eligible without giving Live any construction
   // path to this lane.
@@ -1645,6 +1648,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       const dailyRangePoolFile = liveConfig.env === "mainnet"
         ? "daily-range-auto-pool-mainnet.json"
         : "daily-range-auto-pool.json";
+      const dailyRangeSelectorArtifactFile = liveConfig.env === "mainnet"
+        ? "daily-range-selector-artifacts-mainnet.json"
+        : "daily-range-selector-artifacts-testnet.json";
+      const dailyRangeSelectorArtifacts = new DailyRangeSelectorArtifactRegistry("data", dailyRangeSelectorArtifactFile);
       const dailyRangePoolInput = () => resolveDailyRangeAutoPoolInput(
         CROSS_SECTIONAL_UNIVERSE,
         dailyRangeForeignStrategySymbols(),
@@ -1689,6 +1696,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           env: process.env,
           mainnetControls: dailyRangeMainnetControls,
         }),
+        selectorArtifactStatus: () => dailyRangeSelectorArtifacts.status(),
         // V2 routes each completed NY-session breakout event by its observed
         // path. Durable v1 trades remain in the same store solely for bracket
         // reconciliation and reporting; they are never reinterpreted or used
@@ -1707,9 +1715,22 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           ? (netPnlUsd) => liveEngine?.recordExternalConsecutiveLossOutcome(netPnlUsd)
           : undefined,
       });
+      // MFE/MAE is a measurement stream only. It follows the native bracket's
+      // CONTRACT_PRICE semantics but has no access to place/cancel/replace an
+      // order. A gap is explicitly downgraded in the lane instead of inferred.
+      dailyRangeContractPathSupervisor = new DailyRangeContractPathSupervisor({
+        environment: liveConfig.env,
+        onEvent: (event) => dailyRangeLane?.ingestContractPricePath(event),
+        onStreamInterrupted: (reason) => dailyRangeLane?.markContractPathStreamGap(reason),
+        logger: (event, fields) => console.log(`[daily-range-path] ${event} ${JSON.stringify(fields)}`),
+      });
+      dailyRangeContractPathSupervisor.refresh(dailyRangeLane.getPathSubscriptionSymbols());
       const tickDailyRangeLane = (): void => {
         void dailyRangeAutoPool.refreshIfDue(dailyRangePoolInput())
-          .then(() => dailyRangeLane?.tick())
+          .then(() => {
+            dailyRangeContractPathSupervisor?.refresh(dailyRangeLane?.getPathSubscriptionSymbols() ?? []);
+            return dailyRangeLane?.tick();
+          })
           .catch((error) => console.error("[daily-range-lane] AUTO_POOL_REFRESH_FAILED", error));
       };
       setTimeout(tickDailyRangeLane, 20_000);
@@ -1720,6 +1741,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         (liveConfig.env === "mainnet" ? " mode=OBSERVE_ONLY_UNTIL_EXPLICIT_ARM" : ""),
       );
     }
+    app.addHook("onClose", async () => {
+      dailyRangeContractPathSupervisor?.disconnect("API process shutting down");
+    });
+
     // Shared account-exposure coordinator (account-exposure-coordinator.ts) — the reserve-then-
     // commit-then-release capacity ledger for EVERY SingleSymbolLaneExecutor/CrossSectionalExecutor
     // real exchange-entry path, mainnet AND innovation-testnet lanes alike. Constructed ONCE here,
