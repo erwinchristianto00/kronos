@@ -243,6 +243,14 @@ function formatDuration(value: number | null | undefined): string {
   return hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
 }
 
+/** Transport cooldown is shown once by the exchange-health banner, never as a trade defect. */
+function reconcileErrorForDisplay(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return /^(?:account reconciliation unavailable|bracket transition recheck unavailable):\s*.*(?:rate limited|HTTP\s*(?:418|429)|transport cooldown)/i.test(value)
+    ? null
+    : value;
+}
+
 function reviewableTrade(trade: DailyRangeTrade): boolean {
   return REVIEWABLE_STATUSES.has(trade.status)
     && finite(trade.entryFillPrice)
@@ -632,6 +640,7 @@ export default function DailyRangeReportCard({
               const gross = grossMarkPnl(trade);
               const nowR = currentR(trade);
               const gap = targetGapPct(trade);
+              const reconcileError = reconcileErrorForDisplay(trade.lastReconcileError);
               return <tr key={trade.tradeId} className={selected ? 'is-selected' : undefined}>
                 <td>Daily range</td>
                 <td><button type="button" className="daily-range-symbol-button" onClick={() => setSelectedTradeId(trade.tradeId)} aria-pressed={selected} title={`Buka candle ${trade.symbol}`}>{trade.symbol}</button></td>
@@ -654,7 +663,7 @@ export default function DailyRangeReportCard({
                 </small> : <span className="tone-measure">legacy</span>}</td>
                 <td>{formatPrice(trade.rangeHigh)} / {formatPrice(trade.rangeLow)}</td>
                 <td>{formatTaipei(trade.entryFilledAt ?? trade.entrySubmittedAt)}</td>
-                <td><span className="daily-range-state">{trade.status}</span>{trade.lastReconcileError ? <small className="tone-warning daily-range-reconcile">reconcile: {trade.lastReconcileError}</small> : null}</td>
+                <td><span className="daily-range-state">{trade.status}</span>{reconcileError ? <small className="tone-warning daily-range-reconcile">reconcile: {reconcileError}</small> : null}</td>
                 <td><span className="daily-range-action">view candles</span></td>
               </tr>;
             })}</tbody>

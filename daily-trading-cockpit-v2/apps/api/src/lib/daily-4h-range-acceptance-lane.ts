@@ -1328,6 +1328,46 @@ function orderWasExplicitlyRejected(error: unknown): boolean {
   return error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error";
 }
 
+/**
+ * A Binance 418/429 circuit is transport state, not evidence that an owned
+ * position, its quantity, or its native brackets are wrong. The engine health
+ * surface owns that warning; persisting it against every trade made `/live`
+ * look like each trade had independently failed reconciliation.
+ */
+function isRateLimitedTransportFailure(error: unknown): boolean {
+  if (error instanceof BinanceFuturesPrivateError) return error.failureType === "429";
+  const message = error instanceof Error ? error.message : String(error);
+  return isRateLimitTransportMessage(message);
+}
+
+function isRateLimitTransportMessage(value: string | null | undefined): boolean {
+  return typeof value === "string" && /(?:rate limited|HTTP\s*(?:418|429)|transport cooldown)/i.test(value);
+}
+
+function isTransientRateLimitReconciliationDiagnostic(value: string | null | undefined): boolean {
+  return typeof value === "string" &&
+    /^(?:account reconciliation unavailable|bracket transition recheck unavailable):/i.test(value) &&
+    isRateLimitTransportMessage(value);
+}
+
+/** Clear only the old transport-shaped UI noise; preserve actual safety diagnostics. */
+function clearTransientRateLimitReconciliationDiagnostics(
+  state: DailyRangePersistedState,
+  trades: readonly DailyRangeTrade[],
+): boolean {
+  let changed = false;
+  if (isRateLimitTransportMessage(state.runtime.reconciliationError)) {
+    state.runtime.reconciliationError = null;
+    changed = true;
+  }
+  for (const trade of trades) {
+    if (!isTransientRateLimitReconciliationDiagnostic(trade.lastReconcileError)) continue;
+    trade.lastReconcileError = null;
+    changed = true;
+  }
+  return changed;
+}
+
 function orderStatusFilled(order: FuturesOrder | null): boolean {
   return order !== null && order.status === "FILLED" && order.executedQty > EPSILON && order.avgPrice > 0;
 }
@@ -4216,8 +4256,16 @@ export class DailyRangeAcceptanceLane {
       [positions, algos] = await Promise.all([this.client.getPositions(), this.client.getOpenAlgoOrders()]);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const state = this.store.getState();
+      if (isRateLimitedTransportFailure(error)) {
+        // The client has already opened an account-wide cooldown circuit. Do
+        // not relabel healthy trades as reconciliation failures while no
+        // exchange read is permitted, and do not keep an older 418 attached.
+        if (clearTransientRateLimitReconciliationDiagnostics(state, active)) this.store.save();
+        return;
+      }
       for (const trade of active) trade.lastReconcileError = `account reconciliation unavailable: ${message}`;
-      this.store.getState().runtime.reconciliationError = message;
+      state.runtime.reconciliationError = message;
       this.store.save();
       return;
     }
@@ -4252,6 +4300,11 @@ export class DailyRangeAcceptanceLane {
           refreshedPosition = await this.readVisiblePosition(trade.symbol);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          if (isRateLimitedTransportFailure(error)) {
+            const state = this.store.getState();
+            if (clearTransientRateLimitReconciliationDiagnostics(state, active)) this.store.save();
+            return;
+          }
           trade.lastReconcileError = `bracket transition recheck unavailable: ${message}`;
           this.store.save();
           continue;
@@ -4303,6 +4356,9 @@ export class DailyRangeAcceptanceLane {
         trade.status = "OPEN";
       }
     }
+    const state = this.store.getState();
+    state.runtime.reconciledAt = iso(this.nowMs());
+    state.runtime.reconciliationError = null;
     this.store.save();
   }
 

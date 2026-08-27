@@ -1398,6 +1398,14 @@ function isBinanceRateLimit(error: unknown): error is ApiRequestError {
   return error instanceof ApiRequestError && /rate limit|HTTP 418|HTTP 429/i.test(error.message);
 }
 
+/** The shared exchange-health banner owns active cooldown status, not each trade row. */
+function reconcileErrorForDisplay(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return /^(?:account reconciliation unavailable|bracket transition recheck unavailable):\s*.*(?:rate limited|HTTP\s*(?:418|429)|transport cooldown)/i.test(value)
+    ? null
+    : value;
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const response = await fetch(url, { cache: 'no-store' });
   const body = await readJsonResponse<T & { ok?: boolean; reason?: string; retryAt?: string | null }>(response);
@@ -3068,6 +3076,7 @@ export default function TestnetExchangeDashboard() {
                         : null;
                       const unreal = p.dailyRangeUnrealizedPnl ?? p.unrealizedPnl;
                       const afterCost = unreal - (p.estimatedCloseCostUsd ?? 0);
+                      const reconcileError = reconcileErrorForDisplay(p.dailyRangeLastReconcileError);
                       return (
                         <tr key={`daily-range-${p.dailyRangeTradeId ?? p.symbol}`} style={{ background: 'rgba(95, 208, 168, 0.055)' }}>
                           <td>Daily range</td>
@@ -3088,7 +3097,7 @@ export default function TestnetExchangeDashboard() {
                           <td>{p.sourceOrderCount}</td>
                           <td>{compactLane('DAILY_4H_RANGE_ACCEPTANCE')}</td>
                           <td>{p.dailyRangeOpenedAt ? taipeiDateTime(p.dailyRangeOpenedAt) ?? '—' : '—'}</td>
-                          <td>{p.dailyRangeStatus ?? '—'}{p.dailyRangeLastReconcileError ? <small className="tone-warning" style={{ display: 'block' }}>reconcile: {p.dailyRangeLastReconcileError}</small> : null}</td>
+                          <td>{p.dailyRangeStatus ?? '—'}{reconcileError ? <small className="tone-warning" style={{ display: 'block' }}>reconcile: {reconcileError}</small> : null}</td>
                           <td className="tone-measure" title="Milik lane daily-range dengan native stop dan target 2R. Penutupan harus melalui lifecycle lane, bukan close net position generik.">lane-managed</td>
                         </tr>
                       );

@@ -634,6 +634,39 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     expect(lane.getActiveLeaseSymbols()).toEqual([]);
   });
 
+  it("keeps a Binance rate-limit cooldown out of per-trade reconciliation errors", async () => {
+    const now = { value: AT_0410 };
+    const client = new FakeDailyClient();
+    const { lane, store } = makeLane(client, now);
+    store.arm(new Date(now.value).toISOString());
+    const row = signal("AAAUSDT", now.value, "SHORT");
+    store.getState().signals.push(row);
+    await (lane as unknown as { executeFreshSignal(signal: DailyRangeSignal): Promise<void> }).executeFreshSignal(row);
+
+    const trade = store.getState().trades[0]!;
+    const cooldownMessage = "account reconciliation unavailable: rate limited (HTTP 418); transport cooldown until 2026-08-27T09:27:00.331Z";
+    trade.lastReconcileError = cooldownMessage;
+    store.getState().runtime.reconciliationError = cooldownMessage.replace("account reconciliation unavailable: ", "");
+    client.getPositions = async () => {
+      throw new BinanceFuturesPrivateError(
+        "429",
+        "rate limited (HTTP 418); transport cooldown until 2026-08-27T09:27:00.331Z",
+        { httpStatus: 418, retryAt: "2026-08-27T09:27:00.331Z" },
+      );
+    };
+
+    await (lane as unknown as { reconcileOpenTrades(): Promise<void> }).reconcileOpenTrades();
+
+    expect(trade.status).toBe("OPEN");
+    expect(trade.lastReconcileError).toBeNull();
+    expect(store.getState().runtime.reconciliationError).toBeNull();
+
+    // A transport cooldown must not erase a real ownership/protection alarm.
+    trade.lastReconcileError = "P0 ownership mismatch: exchange=-2, laneQty=1";
+    await (lane as unknown as { reconcileOpenTrades(): Promise<void> }).reconcileOpenTrades();
+    expect(trade.lastReconcileError).toBe("P0 ownership mismatch: exchange=-2, laneQty=1");
+  });
+
   it("does not false-disarm when a native exit settles between position and algo snapshots", async () => {
     const now = { value: AT_0410 };
     const client = new FakeDailyClient();
