@@ -4091,8 +4091,8 @@ describe("[TP-MATH FIX] closeBasketsHittingProfitTarget skips lopsided (non-two-
   });
 });
 
-// ── Bounded pre-entry recovery — never reopen a stale zero-fill reservation ──
-describe("[PRE-ENTRY TIMEOUT] zero-fill reservations", () => {
+// ── Bounded pre-entry recovery — never reopen a stale incomplete reservation ──
+describe("[PRE-ENTRY TIMEOUT] incomplete reservations", () => {
   function seedExpiredZeroFill(store: CrossSectionalExecutorStore, basketId: string): void {
     store.getState().baskets.push({
       basketId,
@@ -4164,6 +4164,84 @@ describe("[PRE-ENTRY TIMEOUT] zero-fill reservations", () => {
     expect(basket.preEntryExpiredAt).toBe(NOW);
     expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(0);
     expect(executor.getStatus().lastError).toMatch(/no new entry order will be sent/);
+  });
+
+  it("rolls back an expired partial formation instead of treating its first filled leg as permission to resume stale entry", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    const { executor, store } = makeExecutor({ client });
+    store.getState().baskets.push({
+      basketId: "xb-expired-partial",
+      sourceObservationId: "manual:xb-expired-partial",
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - 5 * 60_000).toISOString(),
+      closesAtMs: NOW_MS + 24 * 3_600_000,
+      legs: [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100, entryOrderId: "sol-entry", entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null, planIndex: 0 }],
+      status: "PARTIALLY_FILLED",
+      plan: [
+        { planIndex: 0, symbol: "SOLUSDT", side: "LONG", requestedQty: 1, refPrice: 100, reservationId: null, entryClientOrderId: "xsec-expired-partial-e0", status: "FILLED", failureReason: null },
+        { planIndex: 1, symbol: "DOGEUSDT", side: "SHORT", requestedQty: 100, refPrice: 0.1, reservationId: null, entryClientOrderId: "xsec-expired-partial-e1", status: "PLACING", failureReason: null },
+      ],
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    });
+    store.save();
+
+    await executor.tick();
+
+    const basket = store.getState().baskets.find((candidate) => candidate.basketId === "xb-expired-partial")!;
+    expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(0);
+    expect(client.placed.filter((order) => order.reduceOnly && order.symbol === "SOLUSDT")).toHaveLength(1);
+    expect(basket.status).toBe("ABORTED");
+    expect(basket.closeReason).toBe("PRE_ENTRY_TIMEOUT_ROLLBACK_CONFIRMED_FILL");
+  });
+
+  it("prioritizes an identifiable maker fill over an earlier no-order plan and sends its reduce-only exit before an unrelated reconciliation remains inconclusive", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const queried: string[] = [];
+    const originalQuery = client.queryOrderByClientId.bind(client);
+    client.queryOrderByClientId = async (symbol, clientOrderId) => {
+      queried.push(clientOrderId);
+      return originalQuery(symbol, clientOrderId);
+    };
+    client.queryOrderByClientIdResponses.set("xsec-maker-priority-e1", {
+      symbol: "DOGEUSDT", orderId: "doge-maker-entry", clientOrderId: "xsec-maker-priority-e1", status: "FILLED", type: "LIMIT", side: "SELL", reduceOnly: false,
+      price: 0.1, stopPrice: 0, origQty: 100, executedQty: 100, avgPrice: 0.1, updateTime: NOW_MS,
+    });
+    const { executor, store } = makeExecutor({ client });
+    store.getState().baskets.push({
+      basketId: "xb-maker-priority",
+      sourceObservationId: "manual:xb-maker-priority",
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - 5 * 60_000).toISOString(),
+      closesAtMs: NOW_MS + 24 * 3_600_000,
+      legs: [],
+      status: "PLACING",
+      plan: [
+        { planIndex: 0, symbol: "SOLUSDT", side: "LONG", requestedQty: 1, refPrice: 100, reservationId: null, entryClientOrderId: "xsec-maker-priority-e0", status: "PLACING", failureReason: null },
+        { planIndex: 1, symbol: "DOGEUSDT", side: "SHORT", requestedQty: 100, refPrice: 0.1, reservationId: null, entryClientOrderId: "xsec-maker-priority-e1", makerRestingOrderId: "doge-maker-entry", makerRestingPrice: 0.1, status: "PLACING", failureReason: null },
+      ],
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    });
+    store.save();
+
+    await executor.tick();
+
+    const basket = store.getState().baskets.find((candidate) => candidate.basketId === "xb-maker-priority")!;
+    expect(queried).toEqual(["xsec-maker-priority-e1"]);
+    expect(client.placed.filter((order) => order.reduceOnly && order.symbol === "DOGEUSDT")).toHaveLength(1);
+    expect(basket.legs).toMatchObject([{ symbol: "DOGEUSDT", exitOrderId: expect.any(String) }]);
+    expect(basket.status).toBe("PARTIALLY_FILLED");
   });
 });
 

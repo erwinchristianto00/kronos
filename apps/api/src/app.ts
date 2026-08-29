@@ -2795,6 +2795,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         setTimeout(tick, Math.min(delayMs, crossSectionalTickMs));
         setInterval(tick, crossSectionalTickMs);
       };
+      // An expired pre-entry reservation may already contain a real partial
+      // fill. Contain it immediately after restart rather than waiting for the
+      // normal scheduler; this path cannot create or resume a fresh entry.
+      void crossSectionalExecutor?.containExpiredPreEntry();
       scheduleCrossSectionalTick(90_000, () => void crossSectionalExecutor?.tick());
 
       // 2026-07-08 (operator: "wire lane baru ke allocation selection, jangan sampe ada blocker"):

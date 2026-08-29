@@ -3873,13 +3873,24 @@ export class CrossSectionalExecutor {
       await this.closeBasketsHittingProfitTarget();
       await this.closeDueBaskets();
       this.refreshDynamicV3ForwardCounterfactualLinks();
+      // An expired reservation is a containment problem, not an ordinary
+      // entry-recovery problem. Resolve it before any leverage/account GET
+      // can hold a real partial fill behind the Testnet read queue. With
+      // allowFreshResume=false this pass cannot place a new leg.
+      const containedExpiredPreEntry = await this.recoverIncompleteBaskets({ allowFreshResume: false });
       await this.ensureOpenBasketLeverage();
       // Restart-recovery may only resume a fresh plan while armed. An expired
       // plan is different: it is a cancellation/reconciliation-only safety
       // action and is allowed to roll back even while new entry is disarmed.
       // It is deliberately NOT gated on entryHealth(), which applies only to
       // a fresh signal, never to containment of already-confirmed exposure.
-      await this.recoverIncompleteBaskets({ allowFreshResume: this.isAllowed() });
+      // A containment pass deliberately spends at most one ambiguous fallback
+      // reconciliation per expired basket. Do not immediately run a second
+      // recovery pass and turn that bounded work back into a read fan-out;
+      // normal fresh-plan recovery resumes on the next scheduler tick.
+      if (!containedExpiredPreEntry) {
+        await this.recoverIncompleteBaskets({ allowFreshResume: this.isAllowed() });
+      }
       // Health is evaluated together with the actual candidate inside maybeOpenBasket().  That is
       // essential for the traffic light: a YELLOW exception is valid only for a fresh Smart Basket
       // V1 signal, never as a process-wide "health bypass" before we know what would be traded.
@@ -3888,6 +3899,26 @@ export class CrossSectionalExecutor {
       }
     } catch (error) {
       this.lastError = (error as Error).message ?? "tick failed";
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  /**
+   * Startup-only containment for a reservation whose fresh-entry window has
+   * already expired. Unlike tick(), this cannot resume an ordinary plan or
+   * create an entry: it only cancels, reconciles, and rolls back durable
+   * partial exposure. Calling it immediately after a process restart avoids
+   * leaving a known partial fill waiting for the regular scheduler while the
+   * rest of the application warms its read queues.
+   */
+  async containExpiredPreEntry(): Promise<void> {
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      await this.recoverIncompleteBaskets({ allowFreshResume: false });
+    } catch (error) {
+      this.lastError = (error as Error).message ?? "expired pre-entry containment failed";
     } finally {
       this.ticking = false;
     }
@@ -4382,6 +4413,11 @@ export class CrossSectionalExecutor {
       if (!this.isBasketLive(basket)) continue;
       const leverage = this.basketLeverage(basket);
       for (const leg of basket.legs) {
+        // Once an exit order is durably recorded this leg is no longer an
+        // exposure whose leverage needs enforcement. In particular, a stale
+        // pre-entry rollback must not wait behind a fresh signed GET merely to
+        // set leverage on a leg it has already sent to reduce-only close.
+        if (leg.exitOrderId !== null) continue;
         const prior = symbols.get(leg.symbol);
         // A same-symbol different-leverage collision should be impossible while MAX_OPEN=1. If a
         // legacy state already contains one, retain the more conservative (lower) setting instead
@@ -6407,10 +6443,17 @@ export class CrossSectionalExecutor {
     }
   }
 
-  /** True when a zero-fill reservation has exceeded its fresh-entry window. */
+  /** True when an incomplete reservation has exceeded its fresh-entry window.
+   *
+   * A first leg filling does not turn an unfinished six-leg formation into a
+   * valid basket. Treating only zero-fill reservations as expired used to let
+   * a slow filter/quote/reconciliation path hold that partial directional
+   * exposure indefinitely. Once the bounded pre-entry window expires, every
+   * incomplete basket is cancel/reconcile/rollback only. */
   private preEntryPlacementExpired(basket: ExecutorBasket): boolean {
     if (basket.preEntryExpiredAt) return true;
-    if (basket.legs.length !== 0) return false;
+    const plan = basket.plan ?? [];
+    if (plan.length === 0 || basket.legs.length >= plan.length) return false;
     const openedAtMs = Date.parse(basket.openedAt);
     const nowMs = Date.parse(this.nowIso());
     return Number.isFinite(openedAtMs) && Number.isFinite(nowMs) &&
@@ -6549,9 +6592,17 @@ export class CrossSectionalExecutor {
     }
 
     let usedFallbackReconciliation = false;
-    for (let index = 0; index < plan.length; index++) {
-      const planned = plan[index]!;
-      if (planned.status === "FILLED" || planned.status === "FAILED" || planned.status === "NEVER_ATTEMPTED") continue;
+    // A plan entry with a durable maker-order id has stronger, more actionable
+    // exchange identity than a later/earlier entry that never obtained one.
+    // Check those first so an absent WLD/PEPE order cannot delay the rollback
+    // of an actual filled OP/TAO/ADA maker order. Preserve plan order within
+    // each group and retain the one fallback GET per pass, so this does not
+    // recreate the Testnet read fan-out that caused the starvation.
+    const reconciliationOrder = plan
+      .map((planned, index) => ({ planned, index }))
+      .filter(({ planned }) => !["FILLED", "FAILED", "NEVER_ATTEMPTED"].includes(planned.status))
+      .sort((a, b) => Number(Boolean(b.planned.makerRestingOrderId)) - Number(Boolean(a.planned.makerRestingOrderId)));
+    for (const { planned, index } of reconciliationOrder) {
       if (planned.status === "PENDING") {
         planned.status = "NEVER_ATTEMPTED";
         planned.failureReason = "PRE_ENTRY_TIMEOUT_NEVER_ATTEMPTED";
@@ -6586,6 +6637,14 @@ export class CrossSectionalExecutor {
       if (resolution.outcome !== "FILLED") continue; // exhaustive safety guard for the type and future states
       this.adoptExpiredPlannedFill(basket, planned, index, resolution);
       this.store.save();
+      // Do not leave a just-discovered fill open while a different plan entry
+      // waits for its own ambiguous GET. `flattenFilledLegs` persists a
+      // reduce-only exit order id before any optional price lookup, so a later
+      // retry cannot submit a duplicate close.
+      if (basket.legs.some((leg) => leg.exitOrderId === null)) {
+        await this.flattenFilledLegs(basket);
+        this.store.save();
+      }
     }
 
     basket.status = "ABORTED";
@@ -6645,16 +6704,18 @@ export class CrossSectionalExecutor {
    * skip it for this tick — self-healing, same "never guess, retry later" posture INCONCLUSIVE
    * already uses below, and the very next tick's recovery pass retries once the claim is free.
    */
-  private async recoverIncompleteBaskets({ allowFreshResume }: { allowFreshResume: boolean }): Promise<void> {
+  private async recoverIncompleteBaskets({ allowFreshResume }: { allowFreshResume: boolean }): Promise<boolean> {
     const st = this.store.getState();
     const incomplete = st.baskets.filter(
       (b) => (b.status === "RESERVED" || b.status === "PLACING" || b.status === "PARTIALLY_FILLED") && Array.isArray(b.plan),
     );
+    let containedExpiredPreEntry = false;
     for (const basket of incomplete) {
       if (!this.claimBasket(basket.basketId)) continue; // owned by a concurrent close — retry next tick
       try {
         const plan = basket.plan!;
         if (this.preEntryPlacementExpired(basket)) {
+          containedExpiredPreEntry = true;
           await this.expirePreEntryPlacement(basket);
           continue;
         }
@@ -6724,6 +6785,7 @@ export class CrossSectionalExecutor {
         this.releaseBasket(basket.basketId);
       }
     }
+    return containedExpiredPreEntry;
   }
 
   /**
