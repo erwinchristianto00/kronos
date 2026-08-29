@@ -1825,6 +1825,13 @@ export interface CrossSectionalExecutorOptions {
    *  reference belongs to THIS submission; failure is swallowed and the order proceeds. */
   warmPublicQuote?: (symbol: string) => Promise<unknown>;
   /**
+   * Populates the shared quote cache for a complete entry plan in one
+   * exchange snapshot.  When supplied, entry preflight uses this instead of
+   * per-symbol warming so serialized transports cannot starve late legs.  It
+   * does not weaken the all-leg USD-M guard below.
+   */
+  warmPublicQuotes?: (symbols: readonly string[]) => Promise<unknown>;
+  /**
    * Require a fresh, two-sided USD-M execution-book quote for every remaining leg before the
    * first order of a basket is sent. This is opt-in so legacy callers retain their semantics;
    * production cross executors turn it on explicitly.
@@ -2009,6 +2016,7 @@ export class CrossSectionalExecutor {
   private readonly nowIso: () => string;
   private readonly readPublicQuoteFn: CrossSectionalExecutorOptions["readPublicQuote"] | null;
   private readonly warmPublicQuoteFn: CrossSectionalExecutorOptions["warmPublicQuote"] | null;
+  private readonly warmPublicQuotesFn: CrossSectionalExecutorOptions["warmPublicQuotes"] | null;
   private readonly requireExecutionVenueQuote: boolean;
   private readonly readFuturesMarketReferenceFn: CrossSectionalExecutorOptions["readFuturesMarketReference"] | null;
   private readonly warmFuturesMarketReferenceFn: CrossSectionalExecutorOptions["warmFuturesMarketReference"] | null;
@@ -2084,6 +2092,7 @@ export class CrossSectionalExecutor {
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
     this.readPublicQuoteFn = opts.readPublicQuote ?? null;
     this.warmPublicQuoteFn = opts.warmPublicQuote ?? null;
+    this.warmPublicQuotesFn = opts.warmPublicQuotes ?? null;
     this.requireExecutionVenueQuote = opts.requireExecutionVenueQuote === true;
     this.readFuturesMarketReferenceFn = opts.readFuturesMarketReference ?? null;
     this.warmFuturesMarketReferenceFn = opts.warmFuturesMarketReference ?? null;
@@ -5817,7 +5826,7 @@ export class CrossSectionalExecutor {
    */
   private executionVenueQuoteFailure(plan: readonly PlannedLeg[], observeStartMs: number): string | null {
     if (!this.requireExecutionVenueQuote) return null;
-    if (!this.readPublicQuoteFn || !this.warmPublicQuoteFn) {
+    if (!this.readPublicQuoteFn || (!this.warmPublicQuoteFn && !this.warmPublicQuotesFn)) {
       return "USD-M execution-quote providers unavailable";
     }
     const unavailable: string[] = [];
@@ -6001,21 +6010,23 @@ export class CrossSectionalExecutor {
       claimedSymbols.push(symbol);
     }
     try {
-    // 2026-08-15: warm the shared quote cache for every leg still to place, ONCE and in PARALLEL,
-    // before any order goes out. Warming per-leg instead would put a book fetch (up to ~750ms)
-    // between consecutive placements and stretch a 6-leg basket's open window from ~1s to ~4.5s —
-    // more time for the market to move between legs, which is a real execution cost paid to obtain
-    // a measurement. One parallel fetch costs a single round trip; the reference is then slightly
-    // older for later legs, and `ageAtSubmitMs` records exactly how much so a report can filter on
-    // it rather than be misled by it. Legacy callers remain fail-open; production cross executors
-    // enable the all-leg USD-M guard immediately below.
+    // Warm the shared quote cache for every leg still to place before any order
+    // goes out.  Production supplies one true batch warmer: it takes a single
+    // USD-M snapshot rather than enqueueing one serialized GET per leg, so no
+    // late leg can disappear merely because it was sixth in the client queue.
+    // Legacy callers retain the old parallel one-by-one behavior.  In either
+    // case the guard immediately below still requires every fresh two-sided
+    // USD-M quote, so this optimization can never create a partial hedge.
     const quoteObserveStartMs = Date.parse(this.nowIso());
     const pending = plan
       .slice(startIndex)
       .filter((p) => p.status !== "FILLED");
-    if (this.warmPublicQuoteFn) {
+    const pendingSymbols = [...new Set(pending.map((p) => p.symbol))];
+    if (this.warmPublicQuotesFn) {
+      await this.warmPublicQuotesFn(pendingSymbols).catch(() => null);
+    } else if (this.warmPublicQuoteFn) {
       await Promise.all(
-        [...new Set(pending.map((p) => p.symbol))].map((symbol) =>
+        pendingSymbols.map((symbol) =>
           this.warmPublicQuoteFn!(symbol).catch(() => null),
         ),
       ).catch(() => null);
