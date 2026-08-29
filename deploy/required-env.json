@@ -1,0 +1,334 @@
+{
+  "_": [
+    "Env values that MUST survive a release cutover, with the evidence for each.",
+    "",
+    "A release dir gets a REAL .env file, not a symlink, so a cutover that forgets to carry these",
+    "forward silently reverts them to code defaults. That is not hypothetical: the 36h hold policy",
+    "was lost exactly this way once (2026-08-05), and nothing failed loudly when it happened.",
+    "",
+    "'shared' applies identically to TESTNET and LIVE unless an explicitly documented real-money",
+    "policy fence appears under instances.<id>.extra. A Live-only fence must carry a new strategy",
+    "version and forward-cohort timestamp so neither side can silently inherit the other's selector.",
+    "",
+    "Apply or verify with deploy/apply-required-env.sh. Run --check after EVERY cutover.",
+    "Values here are per-lane policy, never secrets — API keys stay out of version control."
+  ],
+  "shared": {
+    "CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS": {
+      "value": "36",
+      "why": "+35% return per unit of slot time at statistically identical per-basket return. Lost in a release cutover on 2026-08-05; this file exists because of it."
+    },
+    "CROSS_SECTIONAL_EXEC_STOP_NET_RETURN": {
+      "value": "0",
+      "why": "No new-basket stop. Canonical continuation research keeps NoTP/Hold as the comparator; a stop challenger has not passed robust temporal OOS. Existing pre-cutover baskets keep their separately pinned legacy stop."
+    },
+    "CROSS_SECTIONAL_EXEC_TP_NET_RETURN": {
+      "value": "0.06",
+      "why": "Retained only as an explicit dormant numeric value. TP is disabled by the separate boolean; deleting this key would silently revive the 0.60% default if that boolean ever drifted."
+    },
+    "CROSS_SECTIONAL_EXEC_TP_DISABLED": {
+      "value": "1",
+      "why": "Dynamic MOM36 never uses an ordinary TP. The numeric value remains explicitly present only so a future flag drift cannot silently revive the default TP. Existing baskets use their frozen or legacy contract."
+    },
+    "CROSS_SECTIONAL_SMART_BASKET_V1": {
+      "value": "1",
+      "why": "Lifecycle guard only: keeps entry revalidation, provenance, and ghost telemetry available for FILTERED baskets. It must not select symbols or enable utility reranking; that is controlled solely by CROSS_SECTIONAL_SMART_FORMATION_RERANK below."
+    },
+    "CROSS_SECTIONAL_SMART_INVALIDATION_SCANS": {
+      "value": "999",
+      "why": "Disables all three Smart Basket exits by making them arithmetically unreachable - a 48h horizon yields at most 48 hourly scans. Measured 2026-08-19 on 362 blocks x 24 offsets: the deployed REGIME+CONTEXT pair cost -0.2382pp/basket and lost in 24 of 24 offsets (median t -2.84), turning a +0.14%/basket lane into -0.11%. cross-sectional-edge.ts never reads this key, so Formation is untouched."
+    },
+    "CROSS_SECTIONAL_SMART_REGIME_LOSS_EXIT": {
+      "value": "0",
+      "why": "Second, explicit layer over the scans threshold. Its own measurement is the weakest of the three (proxy regime classifier, sign-flips out-of-sample), but it contributes to the pair via first-to-fire truncation."
+    },
+    "CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED": {
+      "value": "0",
+      "why": "Adaptive exits remain OFF in production. Ghost observation continues, but regime/context/MFE may not send an order until a challenger passes robust forward evidence."
+    },
+    "CROSS_SECTIONAL_K": {
+      "value": "3",
+      "why": "Legacy admission probe geometry only. Dynamic MOM36 itself freezes one of 6L0S through 0L6S after breadth, always six total legs."
+    },
+    "CROSS_SECTIONAL_INTERVAL": {
+      "value": "1h",
+      "why": "Canonical measurement bar interval."
+    },
+    "CROSS_SECTIONAL_MOMENTUM_BARS": {
+      "value": "36",
+      "why": "Plain MOM36 signal baseline."
+    },
+    "CROSS_SECTIONAL_HORIZON_BARS": {
+      "value": "48",
+      "why": "Measurement horizon remains 48h; execution cap is separately 36h and must never be confused with this research label."
+    },
+    "CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP": {
+      "value": "0.058",
+      "why": "Formation admission gate: long-short separation floor. The code default 0.02 is inert (rejects ~0.2% of baskets). At 0.058 across 48 offsets, mean/basket rises monotonically 0.1634% -> 0.2394%, max drawdown falls -54.47% -> -44.03%, and it improves BOTH out-of-sample halves - turning the losing half from -6.92% to +4.79%. Absolute MOM36 strength and dispersion were tested as alternative gates and have no gradient."
+    },
+    "CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER": {
+      "value": "2",
+      "why": "Concentration guardrail only; it is not claimed as an alpha source."
+    },
+    "CROSS_SECTIONAL_FILTERED_WEIGHTING": {
+      "value": "CAPPED_SCORE_RANK",
+      "why": "Preserved for the existing production admission probe and legacy baskets. Dynamic MOM36 final selection is always six equal $25 legs."
+    },
+    "CROSS_SECTIONAL_EDGE_MAX_STORED_OBSERVATIONS": {
+      "value": "15000",
+      "why": "Depth of the IN-APP shadow reports only. History no longer depends on it: deploy/archive-observations.py harvests every resolved observation into an append-only JSONL (~15MB/yr/instance, never pruned) so the cap can no longer silently decide what survives. 15000 keeps the store ~24MB, an order of magnitude below the 234MB that once made testnet unresponsive; it is now a free knob rather than a load-bearing one."
+    },
+    "CROSS_SECTIONAL_SMART_FORMATION_RERANK": {
+      "value": "0",
+      "why": "Smart Formation's utility re-ranking (fastSupport, adverseExtension, counter-axis, cluster penalty) OFF. Ablation over 12 block offsets across two years: full re-ranking +0.2227%/basket vs +0.2220% for plain MOM36 rank — 0.0007pp, with identical PF, hit rate, quarterly stability and worst quarter. The hard cluster cap stays as a concentration guardrail; entry revalidation and ghost use the frozen selected-leg data without running utility rerank."
+    },
+    "CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED": {
+      "value": "1",
+      "why": "Reliability V1 is the only side-specific eligibility circuit breaker in this policy. It may quarantine only a symbol+side after two evidence-changing actual NoTP+Hold36h independent-episode evaluations; HEALTHY, DEGRADED, and INSUFFICIENT_DATA never alter Plain MOM36 selection. Pinning the explicit enable flag prevents a future release directory from silently reverting the deployed observer/gate to its safe code default OFF."
+    },
+    "CROSS_SECTIONAL_MAKER_EXIT_ENABLED": {
+      "value": "0",
+      "why": "Preserves the current market-exit runtime behaviour. Dynamic MOM36's scheduled horizon and every exceptional/manual exit use the established immediate market/reconciliation path."
+    },
+    "CROSS_SECTIONAL_MAKER_EXIT_WAIT_MS": {
+      "value": "20000",
+      "why": "How long the reduce-only post-only exit rests before it is cancelled and the remainder crosses. Bounded 1s-120s in code."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_MAX_HOLD_HOURS": {
+      "value": "36",
+      "why": "Exit contract retained for an already-open pre-cutover basket that has no policy fingerprint."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_STOP_NET_RETURN": {
+      "value": "0",
+      "why": "The current pre-cutover executor reports no ordinary stop. This fallback is used only for a historical row without a frozen policy fingerprint; it does not alter a new Dynamic basket."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_TP_NET_RETURN": {
+      "value": "0.06",
+      "why": "Pre-cutover TP retained only for rows with no policy fingerprint; it does not alter a new basket."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_TP_DISABLED": {
+      "value": "0",
+      "why": "Pre-cutover TP was enabled; keeping it explicit prevents a new release from rewriting an existing basket's exit contract."
+    },
+    "CROSS_SECTIONAL_LEGACY_MAKER_EXIT_ENABLED": {
+      "value": "0",
+      "why": "Maker exit did not exist in the pre-cutover runtime, so an existing basket remains on its original market-exit contract."
+    },
+    "CROSS_SECTIONAL_LEGACY_ADAPTIVE_EXITS_ENABLED": {
+      "value": "0",
+      "why": "Pre-cutover adaptive exits were operationally disabled; legacy rows preserve that behavior."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_LEG_USD": {
+      "value": "25",
+      "why": "Pre-cutover sizing fallback for a persisted basket whose old fingerprint lacks sizing fields. It prevents the Dynamic 1x contract from rewriting an old basket."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_LEVERAGE": {
+      "value": "3",
+      "why": "Observed pre-cutover basket leverage. Used only when a legacy fingerprint did not store leverage."
+    },
+    "CROSS_SECTIONAL_LEGACY_EXEC_MAX_OPEN_BASKETS": {
+      "value": "1",
+      "why": "Observed pre-cutover slot limit retained for legacy compatibility."
+    },
+    "CROSS_SECTIONAL_EXEC_TICK_MS": {
+      "value": "60000",
+      "why": "Executor tick. Was a hardcoded 5 minutes, so a fresh signal waited ~150s on average before anything looked at it — measured end to end at 239.8s live / 229.9s testnet, almost all of it this interval. No gate is weakened by being asked sooner; the tick is idempotent and single-flighted. Bounded 15s-5m in code."
+    },
+    "CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH": {
+      "value": "0",
+      "why": "Dynamic MOM36 uses its versioned admission path directly. Pin the legacy bypass OFF in both environments so testnet/live configuration stays strategy-identical and an old testnet override cannot silently leak into reporting."
+    },
+    "CROSS_SECTIONAL_ENTRY_TRAFFIC_LIGHT": {
+      "value": "0",
+      "why": "The Dynamic policy freezes six equal $25 legs and has no confidence-sized learning tier. Keep the old traffic-light scaler OFF in both environments."
+    },
+    "CROSS_SECTIONAL_POLICY_VERSION": {
+      "value": "dynamic-mom36-cont-slowfast-feasibility-final-admission-sl2-mfe30-36h-v6.1",
+      "why": "Dynamic MOM36 V6.1 identity. The V6 strict directional-feasibility resolver is unchanged; admission now evaluates its exact final selected plan. One-sided 6L0S/0L6S has scoreGap N/A, while every other guard remains mandatory."
+    },
+    "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
+      "value": "2026-08-29T08:03:09Z",
+      "why": "V6.1 final-allocation-aware admission forward-cohort boundary. Existing V6, V5, V4, and earlier baskets retain their frozen fingerprints and remain historical."
+    },
+    "CROSS_SECTIONAL_STRATEGY_VERSION": {
+      "value": "dynamic-mom36-cont-slowfast-feasibility-final-admission-sl2-mfe30-36h-v6.1",
+      "why": "Selects Dynamic MOM36 V6.1: existing continuation allocation, MOM36 rank walk, strict SLOW_AND_FAST eligibility, nearest complete directional-feasibility search, then exact-final-plan admission. An incomplete strict formation remains a no-entry."
+    },
+    "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
+      "value": "2026-08-29T08:03:09Z",
+      "why": "V6.1 final-plan admission deployment identity captured in every newly admitted basket fingerprint."
+    },
+    "KRONOS_RELEASE_SHA": {
+      "value": "ddf829e5055dc21e7179d6e0779d26609e69738b",
+      "why": "Auditable source identity for the V6.1 exact-final-plan admission implementation. The versioned strategy above, rather than a dashboard label, determines runtime behavior."
+    },
+    "CROSS_SECTIONAL_EXEC_VARIANT": {
+      "value": "DYNAMIC_MOM36_SHOCK",
+      "why": "Makes the intended execution variant explicit even though app wiring also pins the Dynamic target variant."
+    },
+    "CROSS_SECTIONAL_EXEC_LEG_USD": {
+      "value": "25",
+      "why": "Six fixed equal-notional legs: every Dynamic basket is exactly $150 gross before exchange rounding."
+    },
+    "CROSS_SECTIONAL_EXEC_LEVERAGE": {
+      "value": "1",
+      "why": "Dynamic MOM36 invariant: no leverage increase or confidence scaling."
+    },
+    "CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS": {
+      "value": "1",
+      "why": "Global Dynamic slot limit: an existing cross basket blocks a new portfolio."
+    },
+    "CROSS_SECTIONAL_AUTO_POOL_ENABLED": {
+      "value": "1",
+      "why": "Durable C1/C2 runtime membership refresh for new Dynamic baskets only. It uses public USD-M mainnet data in both environments; existing baskets retain their frozen legs and exit contract."
+    },
+    "CROSS_SECTIONAL_AUTO_POOL_REFRESH_MS": {
+      "value": "900000",
+      "why": "Fifteen-minute automatic C1/C2 membership refresh with 10% hysteresis. This does not tune selection, sizing, exits, or historical results."
+    },
+    "CROSS_SECTIONAL_REGIME_SKEW_ENABLED": {
+      "value": "0",
+      "why": "Legacy regime skew cannot modify Dynamic MOM36 breadth allocation."
+    },
+    "CONTINUATION_LIFECYCLE_ROOT": {
+      "value": "/root/kronos-continuation",
+      "why": "Canonical shared continuation registry and data root outside both release directories. TESTNET and LIVE read the same approved immutable champion pointer; collector/trainer failures cannot alter entry, sizing, exit, or an already-open basket."
+    }
+  },
+  "instances": {
+    "3102": {
+      "role": "testnet",
+      "extra": {
+        "DAILY_RANGE_AUTO_POOL_ENABLED": {
+          "value": "1",
+          "why": "Testnet-only Daily Range lane owns an independent, auto-discovered USD-M C1-C6 pool. It never uses a static symbol catalog and hard-excludes cross-sectional or currently strategy-owned symbols."
+        },
+        "DAILY_RANGE_AUTO_POOL_REFRESH_MS": {
+          "value": "300000",
+          "why": "Refresh the isolated Daily Range C1-C6 pool every five minutes so its required 5m/4h quality check is current. Existing daily trades retain their frozen day snapshot and exchange-side brackets."
+        },
+        "DAILY_RANGE_ALLOCATOR": {
+          "value": "ECONOMIC_QUALITY_BASELINE",
+          "why": "Daily Range V3 Testnet ranks only candidates that pass frozen BBO/stop-economics and the fixed 25-USDT / 0.25-USDT-risk cap. Alpha remains shadow-only; seeded random is research-only and has no operational authority."
+        },
+        "DAILY_RANGE_TESTNET_MAX_OPEN_TRADES": {
+          "value": "3",
+          "why": "Testnet V3 economic execution uses the same finite three-position allocation cap as Live, so an oversubscribed batch remains a real top-N decision rather than every candidate being entered."
+        }
+      }
+    },
+    "3103": {
+      "role": "mainnet",
+      "extra": {
+        "KRONOS_RELEASE_SHA": {
+          "value": "ddf829e5055dc21e7179d6e0779d26609e69738b",
+          "why": "Exact source identity for the LIVE V6.1 final-plan admission fence. Every newly admitted basket records this immutable source identity and V6.1 fingerprint."
+        },
+        "CROSS_SECTIONAL_POLICY_VERSION": {
+          "value": "dynamic-mom36-cont-slowfast-feasibility-final-admission-sl2-mfe30-36h-v6.1",
+          "why": "Operator-authorized LIVE parity with TESTNET Dynamic MOM36 V6.1 final-plan admission. Existing baskets retain their frozen policy."
+        },
+        "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": {
+          "value": "2026-08-29T08:03:09Z",
+          "why": "LIVE V6.1 final-plan admission forward-cohort boundary. Prior V6, V5, V4, Plain, Dynamic V1, and legacy baskets remain historical and cannot be mixed into this cohort."
+        },
+        "CROSS_SECTIONAL_STRATEGY_VERSION": {
+          "value": "dynamic-mom36-cont-slowfast-feasibility-final-admission-sl2-mfe30-36h-v6.1",
+          "why": "Use the same V6.1 continuation allocation, MOM36 rank walk, strict SLOW_AND_FAST hard gate, nearest complete directional-feasibility search, and exact-final-plan admission as TESTNET."
+        },
+        "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": {
+          "value": "2026-08-29T08:03:09Z",
+          "why": "LIVE V6.1 final-plan admission deployment identity frozen into every newly admitted basket fingerprint."
+        },
+        "CROSS_SECTIONAL_EXEC_VARIANT": {
+          "value": "DYNAMIC_MOM36_SHOCK",
+          "why": "The LIVE executor must consume the same Dynamic MOM36 V6 signal as TESTNET. A variant/strategy mismatch remains fail-closed."
+        },
+        "CROSS_SECTIONAL_K": {
+          "value": "3",
+          "why": "Matches TESTNET's V6 base configuration. Dynamic V6 owns the continuation-adjusted breadth allocation and may resolve only toward a full strict directional allocation while preserving the exact six-leg total."
+        },
+        "CROSS_SECTIONAL_REGIME_SKEW_ENABLED": {
+          "value": "0",
+          "why": "Matches TESTNET. Dynamic V6 uses its own frozen MOM36 breadth plus continuation mechanism rather than the retired generic regime-skew switch."
+        },
+        "CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT": {
+          "value": "1",
+          "why": "Matches TESTNET. V6 itself owns SLOW_AND_FAST in strict mode: it uses only aligned candidates and rejects an incomplete formation when no full directional allocation exists."
+        },
+        "CROSS_SECTIONAL_FILTERED_WEIGHTING": {
+          "value": "CAPPED_SCORE_RANK",
+          "why": "Retained to match TESTNET configuration; Dynamic V6 freezes its actual execution sizing separately at six equal 25 USDT legs."
+        },
+        "CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP": {
+          "value": "0.058",
+          "why": "Same Dynamic V6 formation admission floor as TESTNET."
+        },
+        "CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER": {
+          "value": "2",
+          "why": "Same Dynamic V6 concentration guardrail as TESTNET."
+        },
+        "CROSS_SECTIONAL_SMART_FORMATION_RERANK": {
+          "value": "0",
+          "why": "Matches TESTNET: Dynamic V6's own versioned formation owns selection; Smart Formation utility reranking stays off."
+        },
+        "CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS": {
+          "value": "36",
+          "why": "Matches TESTNET V6's fixed 36-hour execution cap; the separate report horizon remains non-execution metadata."
+        },
+        "CROSS_SECTIONAL_EXEC_TP_DISABLED": {
+          "value": "1",
+          "why": "Matches TESTNET V6: ordinary TP stays off. V6's frozen -2% hard cut and +3% MFE / 30% giveback exit are separate from ordinary TP."
+        },
+        "CROSS_SECTIONAL_EXEC_STOP_NET_RETURN": {
+          "value": "0",
+          "why": "Matches TESTNET V6: ordinary stop stays off. The V6 frozen basket-level -2% hard cut remains active for newly admitted V6 baskets."
+        },
+        "CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED": {
+          "value": "0",
+          "why": "Matches TESTNET V6: generic adaptive exits stay off; the separate frozen V6 -2% / MFE-giveback state machine remains active."
+        },
+        "DAILY_RANGE_AUTO_POOL_ENABLED": {
+          "value": "1",
+          "why": "Prepare the Live Daily Range C1-C6 universe with the same public USD-M evidence contract as Testnet. Observation only; lane execution remains independently disabled below."
+        },
+        "DAILY_RANGE_AUTO_POOL_REFRESH_MS": {
+          "value": "300000",
+          "why": "Same five-minute membership refresh cadence as Testnet. It affects only a future UTC-day pool snapshot and cannot enter while the mainnet execution gate is off."
+        },
+        "DAILY_RANGE_NEW_ENTRY_MODE": {
+          "value": "ENABLED",
+          "why": "Operator-authorized baseline activation after the batch allocator and native-exit reconciliation fixes. New Live entries remain capped at three 25-USDT / 1x trades and use no unvalidated alpha selector."
+        },
+        "DAILY_RANGE_ALLOCATOR": {
+          "value": "ECONOMIC_QUALITY_BASELINE",
+          "why": "Daily Range V3 Live uses the frozen economic-quality baseline: causal BBO, structural-stop cost gate, and capped 25-USDT / 0.25-USDT planned risk. Seeded random has no Mainnet authority; alpha stays shadow-only until promotion gates and explicit approval pass."
+        },
+        "DAILY_RANGE_MAINNET_EXECUTION_ENABLED": {
+          "value": "1",
+          "why": "Operator-authorized Live activation. This enables only the isolated Daily Range lane; every signal still requires the dedicated confirmation, arm, ownership, account-health, and cap guards."
+        },
+        "DAILY_RANGE_MAINNET_CONFIRM": {
+          "value": "I_UNDERSTAND_DAILY_RANGE_REAL_MONEY",
+          "why": "Dedicated real-money acknowledgement for the operator-authorized Daily Range activation, intentionally separate from LIVE_MAINNET_CONFIRM."
+        },
+        "DAILY_RANGE_MAINNET_CANARY_ENABLED": {
+          "value": "1",
+          "why": "Permit the required controlled 25-USDT Live canary. The lane cannot arm until its full entry, native-bracket, cancellation, flat-position, and zero-orphan lifecycle passes."
+        },
+        "DAILY_RANGE_MAINNET_ARM_ENABLED": {
+          "value": "1",
+          "why": "Permit arming only after the Live canary has passed. Entry still remains constrained by account health, the frozen range, and the explicit three-trade cap below."
+        },
+        "DAILY_RANGE_MAINNET_MAX_OPEN_TRADES": {
+          "value": "3",
+          "why": "Operator-authorized Live cap: at most three simultaneous Daily Range trades. Each trade remains the fixed 25-USDT, 1x allocation."
+        },
+        "DAILY_RANGE_MAINNET_MAX_GROSS_NOTIONAL_USD": {
+          "value": "75",
+          "why": "Operator-authorized aggregate cap: three fixed 25-USDT, 1x Daily Range allocations. The lane reserves the full amount before each entry."
+        }
+      }
+    }
+  }
+}
