@@ -728,6 +728,36 @@ describe("binance-futures-private signing", () => {
     expect(urls[0]).toContain("reduceOnly=true");
   });
 
+  it("does not wait for a stale server-time refresh before a reduce-only rollback", async () => {
+    let now = 1_700_000_000_000;
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: now }), { status: 200 });
+      }
+      if (u.includes("/fapi/v2/balance")) return new Response(JSON.stringify([]), { status: 200 });
+      expect(init?.method).toBe("POST");
+      return new Response(JSON.stringify({
+        symbol: "BTCUSDT", orderId: "125", clientOrderId: "rollback-125", status: "FILLED", type: "MARKET", side: "SELL",
+        reduceOnly: true, price: "0", stopPrice: "0", origQty: "1", executedQty: "1", avgPrice: "100", updateTime: 1,
+      }), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl, nowMs: () => now,
+    });
+
+    await client.getBalances(); // establishes a valid, but soon-to-be-stale, time offset
+    now += 60_001;
+    await client.placeOrder({
+      symbol: "BTCUSDT", side: "SELL", type: "MARKET", quantity: 1, reduceOnly: true, newClientOrderId: "rollback-125",
+    });
+
+    expect(urls.filter((url) => url.includes("/fapi/v1/time"))).toHaveLength(1);
+    expect(urls.filter((url) => url.includes("/fapi/v1/order"))).toHaveLength(1);
+  });
+
   it("still fails closed when the very first time-sync attempt never succeeds", async () => {
     const fetchImpl = (async (url: RequestInfo | URL) => {
       const u = String(url);

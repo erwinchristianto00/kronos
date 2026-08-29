@@ -743,10 +743,13 @@ export class BinanceFuturesPrivateClient {
     // though the host clock is ordinarily NTP-synchronised.  Send the
     // risk-reducing request with the local clock instead; an inaccurate clock
     // is safely rejected by Binance (-1021), never turned into an entry.
-    if (!(options.allowUnsyncedRiskReduction && this.lastTimeSyncAtMs === 0)) {
+    // This exemption applies even when an earlier background signed GET has
+    // already started a *stale* /time refresh. Waiting on that in-flight GET
+    // was enough to keep a newly discovered partial fill exposed.
+    if (!options.allowUnsyncedRiskReduction) {
       await this.ensureTimeSync();
+      this.assertClockSkewOk();
     }
-    this.assertClockSkewOk();
     const buildSignedUrl = (): string => {
       const qs = buildQueryString({
         ...params,
@@ -791,7 +794,7 @@ export class BinanceFuturesPrivateClient {
       if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021) {
         // Best-effort resync for the NEXT signed call — this call is failing with -1021 regardless,
         // so a resync failure here must not replace the original error being rethrown below.
-        if (options.allowUnsyncedRiskReduction && this.lastTimeSyncAtMs === 0) {
+        if (options.allowUnsyncedRiskReduction) {
           // Do not turn a rejected *risk-reducing* request into an unbounded
           // wait behind a cold GET queue. The next attempt can use this
           // background resync once it finishes; this attempt stays a clean,
