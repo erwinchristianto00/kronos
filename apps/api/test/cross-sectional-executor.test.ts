@@ -555,6 +555,7 @@ describe("CrossSectionalExecutor — account-exposure reservation wiring (2026-0
     try {
       const client = new FakeExecClient() as FakeExecClient & {
         cancelOrder: (symbol: string, orderId: string) => Promise<void>;
+        cancelOrderAndRead: (symbol: string, orderId: string) => Promise<FuturesOrder>;
       };
       client.fillPriceBySymbol.set("SOLUSDT", 100);
       client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
@@ -584,6 +585,11 @@ describe("CrossSectionalExecutor — account-exposure reservation wiring (2026-0
         return order(params.symbol, id, isMaker ? "NEW" : "FILLED", isMaker ? 0 : price, isMaker ? 0 : params.quantity);
       };
       client.cancelOrder = async () => {};
+      let cancelAndReadCalls = 0;
+      client.cancelOrderAndRead = async (symbol, orderId) => {
+        cancelAndReadCalls += 1;
+        return order(symbol, orderId, "CANCELED", 0, 0);
+      };
       client.queryOrder = async (symbol, orderId) => {
         const isMaker = orderId.includes("-maker-");
         const price = client.fillPriceBySymbol.get(symbol) ?? 0;
@@ -615,6 +621,7 @@ describe("CrossSectionalExecutor — account-exposure reservation wiring (2026-0
       await executor.tick();
       const basket = store.getState().baskets[0]!;
       expect(basket.status).toBe("COMPLETE");
+      expect(cancelAndReadCalls).toBe(2);
       // The two GTX orders were cancelled unfilled.  The ledger must identify the two MARKET
       // fallbacks that actually opened the legs, or their commissions will never be collected.
       expect(basket.legs.map((leg) => leg.entryOrderId).sort()).toEqual(["DOGEUSDT-taker-4", "SOLUSDT-taker-3"]);
@@ -4081,6 +4088,82 @@ describe("[TP-MATH FIX] closeBasketsHittingProfitTarget skips lopsided (non-two-
 
     expect(basket.status).toBe("CLOSED");
     expect(basket.closeReason).toBe("PROFIT_BANK");
+  });
+});
+
+// ── Bounded pre-entry recovery — never reopen a stale zero-fill reservation ──
+describe("[PRE-ENTRY TIMEOUT] zero-fill reservations", () => {
+  function seedExpiredZeroFill(store: CrossSectionalExecutorStore, basketId: string): void {
+    store.getState().baskets.push({
+      basketId,
+      sourceObservationId: `manual:${basketId}`,
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - 5 * 60_000).toISOString(),
+      closesAtMs: NOW_MS + 24 * 3_600_000,
+      legs: [],
+      status: "PLACING",
+      plan: [{
+        planIndex: 0,
+        symbol: "SOLUSDT",
+        side: "LONG",
+        requestedQty: 1,
+        refPrice: 100,
+        reservationId: null,
+        entryClientOrderId: `xsec-${basketId}-e0`,
+        makerRestingOrderId: "maker-expired-1",
+        makerRestingPrice: 99.99,
+        status: "PLACING",
+        failureReason: null,
+      }],
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    });
+    store.save();
+  }
+
+  it("cancels and aborts an expired maker reservation with no fill; it never opens from the stale signal", async () => {
+    const client = new FakeExecClient() as FakeExecClient & {
+      cancelOrderAndRead: (symbol: string, orderId: string) => Promise<FuturesOrder>;
+    };
+    let cancelCalls = 0;
+    client.cancelOrderAndRead = async (symbol, orderId) => {
+      cancelCalls += 1;
+      return {
+        symbol, orderId, clientOrderId: "", status: "CANCELED", type: "LIMIT", side: "BUY", reduceOnly: false,
+        price: 99.99, stopPrice: 0, origQty: 1, executedQty: 0, avgPrice: 0, updateTime: NOW_MS,
+      };
+    };
+    const { executor, store } = makeExecutor({ client });
+    seedExpiredZeroFill(store, "xb-expired-no-fill");
+
+    await executor.tick();
+
+    const basket = store.getState().baskets.find((candidate) => candidate.basketId === "xb-expired-no-fill")!;
+    expect(cancelCalls).toBe(1);
+    expect(client.queryOrderByClientIdCallCount).toBe(0); // DELETE response was enough
+    expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(0);
+    expect(basket.status).toBe("ABORTED");
+    expect(basket.closeReason).toBe("PRE_ENTRY_TIMEOUT_NO_CONFIRMED_FILL");
+    expect(basket.preEntryExpiredAt).toBe(NOW);
+  });
+
+  it("keeps an expired reservation blocked when exchange truth is inconclusive; it never resumes placement", async () => {
+    const client = new FakeExecClient();
+    client.queryOrderByClientIdNetworkError = true;
+    const { executor, store } = makeExecutor({ client });
+    seedExpiredZeroFill(store, "xb-expired-unknown");
+
+    await executor.tick();
+
+    const basket = store.getState().baskets.find((candidate) => candidate.basketId === "xb-expired-unknown")!;
+    expect(basket.status).toBe("PLACING");
+    expect(basket.preEntryExpiredAt).toBe(NOW);
+    expect(client.placed.filter((order) => !order.reduceOnly)).toHaveLength(0);
+    expect(executor.getStatus().lastError).toMatch(/no new entry order will be sent/);
   });
 });
 

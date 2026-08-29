@@ -973,7 +973,9 @@ export class BinanceFuturesPrivateClient {
     return candles;
   }
 
-  async getExchangeFilters(): Promise<Map<string, FuturesSymbolFilters>> {
+  async getExchangeFilters(
+    _priority: "EXECUTION" | "BACKGROUND" = "BACKGROUND",
+  ): Promise<Map<string, FuturesSymbolFilters>> {
     if (this.exchangeFiltersCache && this.nowMs() - this.exchangeFiltersCacheAtMs < EXCHANGE_FILTERS_TTL_MS) {
       return new Map(this.exchangeFiltersCache);
     }
@@ -1019,8 +1021,11 @@ export class BinanceFuturesPrivateClient {
     return new Map(out);
   }
 
-  private async getSymbolFilters(symbol: string): Promise<FuturesSymbolFilters | null> {
-    const filters = await this.getExchangeFilters();
+  private async getSymbolFilters(
+    symbol: string,
+    priority: "EXECUTION" | "BACKGROUND" = "BACKGROUND",
+  ): Promise<FuturesSymbolFilters | null> {
+    const filters = await this.getExchangeFilters(priority);
     return filters.get(symbol) ?? null;
   }
 
@@ -1109,7 +1114,9 @@ export class BinanceFuturesPrivateClient {
   }
 
   async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
-    const filters = await this.getSymbolFilters(params.symbol);
+    // Order placement is execution-critical on both venues.  The Testnet
+    // transport honours this priority; Mainnet keeps the same public contract.
+    const filters = await this.getSymbolFilters(params.symbol, "EXECUTION");
     const quantity = filters
       ? formatToStep(params.quantity, filters.stepSize, "down", filters.quantityPrecision)
       : params.quantity;
@@ -1159,6 +1166,15 @@ export class BinanceFuturesPrivateClient {
 
   async cancelOrder(symbol: string, orderId: string): Promise<void> {
     await this.requestSigned("DELETE", "/fapi/v1/order", { symbol, orderId });
+  }
+
+  /**
+   * Returns Binance's terminal cancellation response so maker-entry recovery
+   * can use its actual filled quantity without issuing a separate status GET.
+   */
+  async cancelOrderAndRead(symbol: string, orderId: string): Promise<FuturesOrder> {
+    const parsed = await this.requestSigned("DELETE", "/fapi/v1/order", { symbol, orderId });
+    return this.mapOrder(parsed);
   }
 
   async cancelAlgoOrder(algoId: string): Promise<void> {

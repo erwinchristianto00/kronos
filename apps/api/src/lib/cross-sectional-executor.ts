@@ -126,7 +126,7 @@ export type CrossSectionalExecClient = Pick<
   /** Optional so every existing fake client keeps compiling. Maker entry REFUSES to run without
    *  it: a post-only order that cannot be cancelled has no safe way to stop resting, and leaving
    *  one on the book past its wait is worse than paying the taker fee. */
-  Partial<Pick<BinanceFuturesPrivateClient, "cancelOrder">
+  Partial<Pick<BinanceFuturesPrivateClient, "cancelOrder" | "cancelOrderAndRead">
 > & {
   /** Restart-recovery reconciliation only (see recoverIncompleteBaskets/reconcilePlannedLeg below) —
    *  deliberately OPTIONAL, not added to the Pick<...> list above, so every existing fake/test client
@@ -353,6 +353,16 @@ const EXEC_VARIANT = () => process.env.CROSS_SECTIONAL_EXEC_VARIANT ?? "FILTERED
  */
 const MAX_SIGNAL_AGE_MS = () =>
   Math.max(60_000, Math.floor(Number(process.env.CROSS_SECTIONAL_EXEC_MAX_SIGNAL_AGE_MS) || 50 * 60_000));
+/**
+ * A RESERVED basket with no confirmed fill is valid only while its entry
+ * preflight remains fresh.  This permits a normal maker window while stopping
+ * a stalled process from reopening an hours-old momentum signal after restart.
+ */
+export function crossSectionalPreEntryTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = Number.parseInt(env.CROSS_SECTIONAL_PRE_ENTRY_TIMEOUT_MS ?? "", 10);
+  const raw = Number.isFinite(configured) && configured > 0 ? configured : 120_000;
+  return Math.min(10 * 60_000, Math.max(30_000, raw));
+}
 /**
  * Max concurrently-OPEN baskets. Was hard-locked to 1 — with a 24h horizon that capped the whole
  * lane to ONE basket per day (why testnet looked dead). >1 opens a fresh basket each hour it forms,
@@ -837,6 +847,10 @@ export interface PlannedLeg {
   /** Limit price the resting order was posted at, kept so a fill whose avgPrice never confirms can
    *  still be booked at the price we actually rested at rather than a guess. */
   makerRestingPrice?: number;
+  /** Final exchange state returned by maker cancellation.  A successful DELETE
+   *  already provides the definitive fill quantity, avoiding a redundant
+   *  per-leg signed GET before fallback sizing. */
+  makerCancelSnapshot?: Pick<FuturesOrder, "status" | "executedQty" | "avgPrice" | "updateTime">;
   /** submitRef captured at PRE-PLACE time. Without this the loop would stamp it minutes later and
    *  `ageAtSubmitMs` would describe a quote the order never saw. */
   makerSubmitRef?: SubmitRef | null;
@@ -1207,6 +1221,9 @@ export interface ExecutorBasket {
    *  recoverIncompleteBaskets() never touches a basket whose plan isn't a real array — it cannot
    *  safely guess a plan it was never given. */
   plan?: PlannedLeg[];
+  /** A zero-fill reservation exceeded its bounded preflight window.  Recovery
+   * may reconcile/cancel it, but must never resume it as a stale new basket. */
+  preEntryExpiredAt?: string;
   /**
    * 2026-08-04 (concurrent-close race fix, ground truth #8): set by closeAllBasketsOrderly() when
    * it needs THIS basket closed but an in-flight placeRemainingLegs() call currently owns it (see
@@ -2608,11 +2625,36 @@ export class CrossSectionalExecutor {
       }
     }));
 
-    // ONE wait for all of them. Poll every second and stop early the moment nothing is still
-    // resting — a basket whose legs all filled must not sit here burning the rest of the timeout.
+    // ONE wait for all of them.  A successful Binance DELETE returns terminal
+    // executedQty/avgPrice, so production can cancel every resting maker leg
+    // concurrently after this one window instead of serializing a status GET
+    // for each symbol before safe fallback sizing.
     const resting = pending.filter((p) => p.makerRestingOrderId);
     if (resting.length === 0) return;
     const waitMs = crossSectionalMakerWaitMs();
+    if (this.client.cancelOrderAndRead) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, waitMs));
+      await Promise.allSettled(resting.map(async (planned) => {
+        try {
+          const terminal = await this.client.cancelOrderAndRead!(planned.symbol, planned.makerRestingOrderId as string);
+          planned.makerCancelSnapshot = {
+            status: terminal.status,
+            executedQty: terminal.executedQty,
+            avgPrice: terminal.avgPrice,
+            updateTime: terminal.updateTime,
+          };
+        } catch {
+          // A terminal race or ambiguous transport failure is reconciled by
+          // the sequential resolver before any fallback order is considered.
+        } finally {
+          this.store.save();
+        }
+      }));
+      return;
+    }
+
+    // Compatibility fallback for test/dry-run clients exposing only the
+    // legacy cancelOrder(void) API.
     const deadline = Date.parse(this.nowIso()) + waitMs;
     const terminal = new Set(["FILLED", "CANCELED", "EXPIRED", "REJECTED"]);
     // Bounded by POLL COUNT as well as by the clock. nowIso() is injectable, and a frozen or
@@ -2661,12 +2703,29 @@ export class CrossSectionalExecutor {
       };
     }
 
-    const maker = preplaced
+    const makerFromCancel = preplaced && planned.makerCancelSnapshot
+      ? {
+          symbol: planned.symbol,
+          orderId: preplaced.orderId,
+          clientOrderId: planned.entryClientOrderId,
+          status: planned.makerCancelSnapshot.status,
+          type: "LIMIT",
+          side,
+          reduceOnly: false,
+          price: preplaced.price ?? 0,
+          stopPrice: 0,
+          origQty: planned.requestedQty,
+          executedQty: planned.makerCancelSnapshot.executedQty,
+          avgPrice: planned.makerCancelSnapshot.avgPrice,
+          updateTime: planned.makerCancelSnapshot.updateTime,
+        } satisfies FuturesOrder
+      : null;
+    const maker = makerFromCancel ?? (preplaced
       ? await this.client.queryOrder(planned.symbol, preplaced.orderId)
       : await this.client.placeOrder({
           symbol: planned.symbol, side, type: "LIMIT", timeInForce: "GTX",
           price: limitPrice, quantity: planned.requestedQty, newClientOrderId: planned.entryClientOrderId,
-        });
+        }));
 
     let latest = maker;
     // A pre-placed leg has ALREADY served its wait in preplaceMakerLegs — waiting again here would
@@ -2685,12 +2744,30 @@ export class CrossSectionalExecutor {
       }
     }
 
-    // Cancel first, THEN read. Best-effort: a cancel that fails because the order already reached a
-    // terminal state is not an error, and the re-query below is what actually decides.
+    // Cancel first, THEN resolve.  DELETE returns the final order state on
+    // Binance, so use that state directly.  Only an ambiguous cancel falls
+    // back to the conservative legacy re-query; no market remainder is sent
+    // without a terminal maker quantity.
     if (!["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(latest.status).toUpperCase())) {
-      try { await this.client.cancelOrder!(planned.symbol, maker.orderId); } catch { /* terminal already */ }
+      if (this.client.cancelOrderAndRead) {
+        try {
+          latest = await this.client.cancelOrderAndRead(planned.symbol, maker.orderId);
+          planned.makerCancelSnapshot = {
+            status: latest.status,
+            executedQty: latest.executedQty,
+            avgPrice: latest.avgPrice,
+            updateTime: latest.updateTime,
+          };
+          this.store.save();
+        } catch {
+          try { await this.client.cancelOrder!(planned.symbol, maker.orderId); } catch { /* terminal race */ }
+          try { latest = await this.client.queryOrder(planned.symbol, maker.orderId); } catch { /* retain last known */ }
+        }
+      } else {
+        try { await this.client.cancelOrder!(planned.symbol, maker.orderId); } catch { /* terminal race */ }
+        try { latest = await this.client.queryOrder(planned.symbol, maker.orderId); } catch { /* retain last known */ }
+      }
     }
-    try { latest = await this.client.queryOrder(planned.symbol, maker.orderId); } catch { /* keep last known */ }
 
     const decision = resolveMakerLeg(planned.requestedQty, latest.status, latest.executedQty);
     planned.makerOutcome = {
@@ -5470,7 +5547,10 @@ export class CrossSectionalExecutor {
 
     let filters: Map<string, FuturesSymbolFilters>;
     try {
-      filters = await this.client.getExchangeFilters();
+      // This is an admitted basket's executable preflight, not a scanner
+      // refresh.  On Testnet the matching client call is transport-prioritized;
+      // Mainnet shares the same explicit contract.
+      filters = await this.client.getExchangeFilters("EXECUTION");
     } catch (error) {
       const reason = `exchange filters unavailable; skipped signal: ${error instanceof Error ? error.message : String(error)}`;
       this.skipSignal(signal, "EXCHANGE_FILTERS", reason, smartEntry.referencePrices);
@@ -6322,6 +6402,152 @@ export class CrossSectionalExecutor {
     }
   }
 
+  /** True when a zero-fill reservation has exceeded its fresh-entry window. */
+  private preEntryPlacementExpired(basket: ExecutorBasket): boolean {
+    if (basket.preEntryExpiredAt) return true;
+    if (basket.legs.length !== 0) return false;
+    const openedAtMs = Date.parse(basket.openedAt);
+    const nowMs = Date.parse(this.nowIso());
+    return Number.isFinite(openedAtMs) && Number.isFinite(nowMs) &&
+      nowMs - openedAtMs >= crossSectionalPreEntryTimeoutMs();
+  }
+
+  /**
+   * Classifies a successful maker cancellation without another signed GET.
+   * A fallback order, if any, still requires normal durable reconciliation
+   * because it can represent a second contributing fill.
+   */
+  private makerCancelSnapshotResolution(planned: PlannedLeg): ReconciledPlannedEntry | null {
+    const snapshot = planned.makerCancelSnapshot;
+    if (!snapshot || !planned.makerRestingOrderId || planned.takerFallbackClientOrderId) return null;
+    const executedQty = Number.isFinite(snapshot.executedQty) ? snapshot.executedQty : 0;
+    const avgPrice = Number.isFinite(snapshot.avgPrice) ? snapshot.avgPrice : 0;
+    if (executedQty > 0 && avgPrice > 0) {
+      return {
+        outcome: "FILLED",
+        qty: executedQty,
+        avgPrice,
+        orderId: planned.makerRestingOrderId,
+        entryOrderIds: [planned.makerRestingOrderId],
+        entryFilledAt: exchangeTimestampIso(snapshot.updateTime),
+      };
+    }
+    const status = String(snapshot.status).trim().toUpperCase();
+    if (executedQty <= 0 && ["CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FILLED"].includes(status)) {
+      return { outcome: "NOT_PLACED" };
+    }
+    return null;
+  }
+
+  /**
+   * A timed-out zero-fill reservation is never resumed as a fresh entry.  It
+   * first retracts every known maker order and persists Binance's final result;
+   * then it reconciles any still-ambiguous client id.  Inconclusive exchange
+   * truth stays visibly blocked (no new order is sent); a confirmed fill is
+   * adopted and immediately rolled back rather than completing a stale hedge.
+   */
+  private async expirePreEntryPlacement(basket: ExecutorBasket): Promise<void> {
+    const plan = basket.plan ?? [];
+    if (!basket.preEntryExpiredAt) {
+      basket.preEntryExpiredAt = this.nowIso();
+      this.store.save();
+    }
+
+    const cancelable = plan.filter(
+      (planned) => planned.status === "PLACING" && Boolean(planned.makerRestingOrderId) && !planned.makerCancelSnapshot,
+    );
+    if (cancelable.length > 0 && this.client.cancelOrderAndRead) {
+      await Promise.allSettled(cancelable.map(async (planned) => {
+        try {
+          const terminal = await this.client.cancelOrderAndRead!(planned.symbol, planned.makerRestingOrderId as string);
+          planned.makerCancelSnapshot = {
+            status: terminal.status,
+            executedQty: terminal.executedQty,
+            avgPrice: terminal.avgPrice,
+            updateTime: terminal.updateTime,
+          };
+        } catch {
+          // Fall through to the one-at-a-time durable reconciliation below.
+        }
+      }));
+      this.store.save();
+    }
+
+    let usedFallbackReconciliation = false;
+    for (let index = 0; index < plan.length; index++) {
+      const planned = plan[index]!;
+      if (planned.status === "FILLED" || planned.status === "FAILED" || planned.status === "NEVER_ATTEMPTED") continue;
+      if (planned.status === "PENDING") {
+        planned.status = "NEVER_ATTEMPTED";
+        planned.failureReason = "PRE_ENTRY_TIMEOUT_NEVER_ATTEMPTED";
+        if (planned.reservationId) this.releaseExposureReservationFn(planned.reservationId, "PRE_ENTRY_TIMEOUT_NEVER_ATTEMPTED");
+        continue;
+      }
+
+      const fromCancelSnapshot = this.makerCancelSnapshotResolution(planned);
+      if (!fromCancelSnapshot && usedFallbackReconciliation) {
+        this.lastError =
+          `basket ${basket.basketId}: pre-entry timeout is awaiting exchange reconciliation for ${planned.symbol}; ` +
+          "no new entry order will be sent";
+        this.store.save();
+        return;
+      }
+      const resolution = fromCancelSnapshot ?? await this.reconcilePlannedEntry(planned);
+      usedFallbackReconciliation ||= !fromCancelSnapshot;
+      if (resolution.outcome === "INCONCLUSIVE") {
+        this.lastError =
+          `basket ${basket.basketId}: pre-entry timeout is awaiting exchange reconciliation for ${planned.symbol}; ` +
+          "no new entry order will be sent";
+        this.store.save();
+        return;
+      }
+      if (resolution.outcome === "NOT_PLACED") {
+        planned.status = "FAILED";
+        planned.failureReason = "PRE_ENTRY_TIMEOUT_RECONCILED_NOT_PLACED";
+        if (planned.reservationId) this.releaseExposureReservationFn(planned.reservationId, "PRE_ENTRY_TIMEOUT_RECONCILED_NOT_PLACED");
+        this.store.save();
+        continue;
+      }
+      if (resolution.outcome !== "FILLED") continue; // exhaustive safety guard for the type and future states
+
+      if (planned.reservationId) {
+        this.commitExposureReservationFn(planned.reservationId, { qty: resolution.qty, avgPrice: resolution.avgPrice });
+      }
+      basket.legs.push({
+        symbol: planned.symbol,
+        side: planned.side,
+        qty: resolution.qty,
+        entryPrice: resolution.avgPrice,
+        entryOrderId: resolution.orderId,
+        entryOrderIds: resolution.entryOrderIds,
+        entryPriceConfirmed: true,
+        ...(resolution.entryFilledAt ? { entryFilledAt: resolution.entryFilledAt } : {}),
+        ...(resolution.entryLiquidity ? { entryLiquidity: resolution.entryLiquidity } : {}),
+        exitPrice: null,
+        exitOrderId: null,
+        exitPriceConfirmed: null,
+        planIndex: index,
+        signalWeight: planned.signalWeight ?? null,
+        scoreAtOpen: planned.scoreAtOpen ?? null,
+        volatilityAtOpen: planned.volatilityAtOpen ?? null,
+        targetNotionalUsd: planned.targetNotionalUsd ?? null,
+      });
+      this.bindFourBrainActualFill(basket, basket.legs[basket.legs.length - 1]!);
+      planned.status = "FILLED";
+      basket.status = "PARTIALLY_FILLED";
+      this.store.save();
+    }
+
+    basket.status = "ABORTED";
+    basket.closedAt = this.nowIso();
+    basket.closeReason = basket.legs.length > 0
+      ? "PRE_ENTRY_TIMEOUT_ROLLBACK_CONFIRMED_FILL"
+      : "PRE_ENTRY_TIMEOUT_NO_CONFIRMED_FILL";
+    this.store.save();
+    await this.flattenFilledLegs(basket);
+    this.lastError = `basket ${basket.basketId}: ${basket.closeReason}`;
+  }
+
   /**
    * THE CORE GAP this task closes: before this method existed, nothing ever detected a basket that
    * crashed mid-open (persisted RESERVED/PLACING/PARTIALLY_FILLED, fewer legs than its own plan)
@@ -6378,6 +6604,10 @@ export class CrossSectionalExecutor {
       if (!this.claimBasket(basket.basketId)) continue; // owned by a concurrent close — retry next tick
       try {
         const plan = basket.plan!;
+        if (this.preEntryPlacementExpired(basket)) {
+          await this.expirePreEntryPlacement(basket);
+          continue;
+        }
         const startIndex = basket.legs.length;
         if (startIndex >= plan.length) continue; // defensive — nothing left to do
         const ambiguous = plan[startIndex]!;
