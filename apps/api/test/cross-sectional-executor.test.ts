@@ -1261,6 +1261,74 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     ]);
   });
 
+  it("[ENTRY ATTEMPT AUDIT] records an exact durable skip when an unexpected pre-submit error occurs after the watermark", async () => {
+    const signalMs = NOW_MS - 5 * 60_000;
+    const { executor, client, signalStore, store } = makeExecutor({
+      signalMs,
+      // This is deliberately an unexpected coordinator exception, not its normal { ok:false }
+      // result: prior code advanced lastSeenSignalMs then let tick() swallow the error, leaving the
+      // signal as an unexplained `unattributedConsumedSignal` after restart.
+      reserveExposure: () => {
+        throw new Error("forced coordinator exception");
+      },
+    });
+
+    await executor.tick();
+
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().baskets).toHaveLength(0);
+    expect(store.getState().lastSeenSignalMs).toBe(signalMs);
+    const status = executor.getStatus();
+    expect(status.lastError).toContain("unexpected pre-submit failure after watermark: forced coordinator exception");
+    expect(status.entryAttemptAudit.recent).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sourceObservationId: signalStore.all[0]!.observationId,
+        stage: "PRE_SUBMIT_LATCH",
+        outcome: "IN_PROGRESS",
+        watermarkAdvanced: true,
+      }),
+    ]));
+    expect(status.entryAttemptAudit.latest).toMatchObject({
+      sourceObservationId: signalStore.all[0]!.observationId,
+      stage: "PRE_SUBMIT_LATCH",
+      outcome: "SKIPPED",
+      reason: "unexpected pre-submit failure after watermark: forced coordinator exception",
+      watermarkAdvanced: true,
+    });
+    expect(status.entryAttemptAudit.unattributedConsumedSignal).toBeNull();
+  });
+
+  it("[ENTRY ATTEMPT AUDIT] labels a crash-persisted pre-submit checkpoint instead of inventing an unknown guard reason", () => {
+    const signalMs = NOW_MS - 5 * 60_000;
+    const { executor, signalStore, store } = makeExecutor({ signalMs });
+    const signal = signalStore.all[0]!;
+    store.getState().lastSeenSignalMs = signal.openedAtMs;
+    store.getState().entryAttempts?.push({
+      at: NOW,
+      sourceObservationId: signal.observationId,
+      sourceOpenedAtMs: signal.openedAtMs,
+      variant: signal.variant ?? "RAW",
+      signal: signal.signal,
+      longSymbols: signal.longLeg.map((leg) => leg.symbol),
+      shortSymbols: signal.shortLeg.map((leg) => leg.symbol),
+      stage: "PRE_SUBMIT_LATCH",
+      outcome: "IN_PROGRESS",
+      reason: "entry preflight latched before non-retryable watermark; final outcome pending",
+      referencePrices: {},
+      watermarkAdvanced: true,
+    });
+    store.save();
+
+    const status = executor.getStatus();
+    expect(status.entryAttemptAudit.latest).toMatchObject({
+      sourceObservationId: signal.observationId,
+      stage: "PRE_SUBMIT_LATCH",
+      outcome: "IN_PROGRESS",
+      watermarkAdvanced: true,
+    });
+    expect(status.entryAttemptAudit.unattributedConsumedSignal).toBeNull();
+  });
+
   it("honors an innovation basket's own stop without changing the default executor geometry", async () => {
     const { executor, client, signalStore, store } = makeExecutor({
       signalMs: NOW_MS - 5 * 60_000,

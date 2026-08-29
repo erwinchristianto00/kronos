@@ -485,10 +485,17 @@ describe("Dynamic MOM36 executor — asymmetric live lifecycle", () => {
     expect(run.store.getState().baskets).toHaveLength(1);
     expect(run.store.getState().baskets[0]).toMatchObject({ status: "COMPLETE", sourceObservationId: signal.observationId });
     expect(run.client.orders).toHaveLength(6);
-    expect(run.store.getState().entryAttempts?.at(-2)).toMatchObject({
-      outcome: "DEFERRED",
-      watermarkAdvanced: false,
-    });
+    expect(run.store.getState().entryAttempts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        outcome: "DEFERRED",
+        watermarkAdvanced: false,
+      }),
+      expect.objectContaining({
+        stage: "PRE_SUBMIT_LATCH",
+        outcome: "IN_PROGRESS",
+        watermarkAdvanced: true,
+      }),
+    ]));
   }));
 
   it("accounts for asymmetric 5L1S P&L by actual leg dollars and preserves its frozen horizon across restart", async () => withDynamicEnv(async () => {

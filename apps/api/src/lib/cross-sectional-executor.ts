@@ -1605,12 +1605,16 @@ export type CrossSectionalEntryAttemptStage =
   | "LOSS_REENTRY_GUARD"
   | "OVERLAP_GUARD"
   | "SMART_ENTRY_REVALIDATION"
+  /** Durable checkpoint written immediately before the non-retryable entry watermark. */
+  | "PRE_SUBMIT_LATCH"
   | "EXCHANGE_FILTERS"
   | "SIZING"
   | "NOTIONAL_CAP"
   | "EXPOSURE_RESERVATION"
   | "NETTING_GUARD"
   | "BASKET_RESERVED";
+
+export type CrossSectionalEntryAttemptOutcome = "ADMITTED" | "DEFERRED" | "SKIPPED" | "IN_PROGRESS";
 
 export interface CrossSectionalEntryAttemptEvent {
   at: string;
@@ -1621,7 +1625,7 @@ export interface CrossSectionalEntryAttemptEvent {
   longSymbols: string[];
   shortSymbols: string[];
   stage: CrossSectionalEntryAttemptStage;
-  outcome: "ADMITTED" | "DEFERRED" | "SKIPPED";
+  outcome: CrossSectionalEntryAttemptOutcome;
   /** Human-readable, exact guard/exchange reason. Null only for a successful reservation. */
   reason: string | null;
   /** Live marks used by Smart Basket refresh when they were available. */
@@ -2044,6 +2048,16 @@ export class CrossSectionalExecutor {
   private lastError: string | null = null;
   private openHalted: string | null = null;
   /**
+   * Process-local companion to the durable PRE_SUBMIT_LATCH journal record.  It lets tick() turn
+   * an unexpected pre-order exception into an exact durable audit outcome after the watermark has
+   * advanced.  A hard process exit still leaves the durable IN_PROGRESS checkpoint, rather than
+   * an unexplained consumed signal.
+   */
+  private latchedPreSubmitAttempt: {
+    signal: CrossSectionalObservation;
+    referencePrices: Record<string, number>;
+  } | null = null;
+  /**
    * A v3 protective intent is durable, but one tick must never launch two close passes for the
    * same basket (the mark phase runs before the horizon phase).  This transient set is reset at
    * the start of each single-flight tick; a partially filled close is therefore retried on the
@@ -2432,6 +2446,83 @@ export class CrossSectionalExecutor {
   }
 
   /**
+   * Latch the exact signal before advancing its non-retryable watermark.  This is intentionally
+   * saved before any exchange-filter/sizing work: an uncaught exception or a process exit can no
+   * longer turn a consumed signal into an unattributed historical mystery.
+   */
+  private latchPreSubmitAttempt(
+    signal: CrossSectionalObservation,
+    referencePrices: Record<string, number>,
+  ): void {
+    const state = this.store.getState();
+    this.latchedPreSubmitAttempt = { signal, referencePrices: { ...referencePrices } };
+    this.recordEntryAttempt(signal, {
+      stage: "PRE_SUBMIT_LATCH",
+      outcome: "IN_PROGRESS",
+      reason: "entry preflight latched before non-retryable watermark; final outcome pending",
+      referencePrices,
+      watermarkAdvanced: true,
+    });
+    state.lastSeenSignalMs = signal.openedAtMs;
+    this.store.save();
+  }
+
+  private clearPreSubmitAttempt(signal: CrossSectionalObservation): void {
+    if (this.latchedPreSubmitAttempt?.signal.observationId === signal.observationId) {
+      this.latchedPreSubmitAttempt = null;
+    }
+  }
+
+  /**
+   * tick() owns the outer exception boundary.  If pre-submit code throws after the durable latch
+   * but before a basket reservation is journaled, finish the audit as SKIPPED with the real error.
+   * If the basket is already in state, persist its reservation instead; it will be recovered by the
+   * normal incomplete-basket path and must never be relabelled as a skipped signal.
+   */
+  private finalizeUnhandledPreSubmitFailure(error: unknown): string | null {
+    const pending = this.latchedPreSubmitAttempt;
+    if (!pending) return null;
+
+    try {
+      const state = this.store.getState();
+      const reservedBasket = state.baskets.find((basket) => basket.sourceObservationId === pending.signal.observationId);
+      if (reservedBasket) {
+        const reservationAlreadyAudited = (state.entryAttempts ?? []).some(
+          (event) => event.sourceObservationId === pending.signal.observationId &&
+            event.stage === "BASKET_RESERVED" &&
+            event.outcome === "ADMITTED",
+        );
+        if (!reservationAlreadyAudited) {
+          this.recordEntryAttempt(pending.signal, {
+            stage: "BASKET_RESERVED",
+            outcome: "ADMITTED",
+            reason: null,
+            referencePrices: pending.referencePrices,
+            watermarkAdvanced: true,
+          });
+        }
+        this.store.save();
+        return null;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      const reason = `unexpected pre-submit failure after watermark: ${message}`;
+      this.recordEntryAttempt(pending.signal, {
+        stage: "PRE_SUBMIT_LATCH",
+        outcome: "SKIPPED",
+        reason,
+        referencePrices: pending.referencePrices,
+        watermarkAdvanced: true,
+      });
+      this.store.save();
+      this.openHalted = reason;
+      return reason;
+    } finally {
+      this.latchedPreSubmitAttempt = null;
+    }
+  }
+
+  /**
    * A skipped signal must advance the watermark to avoid repeatedly chasing the exact same rank.
    * Keeping that write beside the audit makes the reason restart-durable and prevents a future
    * status call from looking like an unexplained "allowed but no basket" condition.
@@ -2452,6 +2543,7 @@ export class CrossSectionalExecutor {
     });
     state.lastSeenSignalMs = signal.openedAtMs;
     this.store.save();
+    this.clearPreSubmitAttempt(signal);
     this.openHalted = reason;
   }
 
@@ -3039,8 +3131,8 @@ export class CrossSectionalExecutor {
     entryAttemptAudit: {
       latest: CrossSectionalEntryAttemptEvent | null;
       recent: CrossSectionalEntryAttemptEvent[];
-      /** Honest legacy fallback only: the signal was consumed before this audit existed, so no
-       * guard reason is invented. It is computed from persisted watermark/basket facts. */
+      /** Honest historical fallback only: the signal predates the durable pre-submit checkpoint,
+       * so no guard reason is invented. It is computed from persisted watermark/basket facts. */
       unattributedConsumedSignal: {
         sourceObservationId: string;
         openedAt: string;
@@ -3188,7 +3280,7 @@ export class CrossSectionalExecutor {
         ? {
             sourceObservationId: currentSignal.observationId,
             openedAt: currentSignal.openedAt,
-            reason: "Sinyal ini sudah dikonsumsi sebelum audit attempt dipasang; alasan guard asli tidak pernah tersimpan.",
+            reason: "Historical pre-checkpoint signal was consumed without a durable attempt record; original guard reason was not persisted.",
           }
         : null;
     return {
@@ -3898,7 +3990,12 @@ export class CrossSectionalExecutor {
         await this.maybeOpenBasket();
       }
     } catch (error) {
-      this.lastError = (error as Error).message ?? "tick failed";
+      const message = (error as Error).message ?? "tick failed";
+      // An unexpected failure after maybeOpenBasket() has consumed a signal used to leave only
+      // lastSeenSignalMs behind.  Finish the durable attempt record before reporting the tick
+      // error, without retrying or changing any entry/risk decision.
+      const auditedReason = this.finalizeUnhandledPreSubmitFailure(error);
+      this.lastError = auditedReason ?? message;
     } finally {
       this.ticking = false;
     }
@@ -5570,9 +5667,10 @@ export class CrossSectionalExecutor {
       }
     }
 
-    // Watermark BEFORE placing orders: a failed basket must not retry forever.
-    st.lastSeenSignalMs = signal.openedAtMs;
-    this.store.save();
+    // Watermark BEFORE placing orders: a failed basket must not retry forever.  The matching
+    // PRE_SUBMIT_LATCH audit event is persisted in the SAME save, so every consumed signal remains
+    // explainable across a restart or unexpected preflight exception.
+    this.latchPreSubmitAttempt(signal, smartEntry.referencePrices);
 
     let filters: Map<string, FuturesSymbolFilters>;
     try {
@@ -5873,6 +5971,7 @@ export class CrossSectionalExecutor {
       watermarkAdvanced: true,
     });
     this.store.save();
+    this.clearPreSubmitAttempt(signal);
 
     // Placement itself lives in placeRemainingLegs — the SAME method recoverIncompleteBaskets()
     // calls to resume a basket a restart interrupted, starting from index 0 here vs. wherever
