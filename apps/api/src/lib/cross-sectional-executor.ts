@@ -3874,19 +3874,12 @@ export class CrossSectionalExecutor {
       await this.closeDueBaskets();
       this.refreshDynamicV3ForwardCounterfactualLinks();
       await this.ensureOpenBasketLeverage();
-      // Restart-recovery (see recoverIncompleteBaskets' own doc comment): gated on isAllowed() —
-      // the SAME master armed/testnet gate maybeOpenBasket itself requires — because resuming a
-      // stuck placement means placing MORE real entry orders, exactly the same risk category as
-      // opening a brand new basket. Deliberately NOT gated on entryHealth() (the rolling-evidence
-      // quality gate for NEW signals): completing a basket this executor already committed capital
-      // to is a safety operation (resolve dangling naked exposure), not a new-signal-quality
-      // decision, so a "don't open new things" evidence verdict must not leave a stuck basket
-      // stranded. While disarmed, a stuck basket is simply left exactly as-is (its real legs, if
-      // any, stay fully visible via isBasketLive()-gated bookkeeping above and remain flattenable
-      // by closeAllBasketsOrderly regardless of this gate) — never guessed at, never force-resumed.
-      if (this.isAllowed()) {
-        await this.recoverIncompleteBaskets();
-      }
+      // Restart-recovery may only resume a fresh plan while armed. An expired
+      // plan is different: it is a cancellation/reconciliation-only safety
+      // action and is allowed to roll back even while new entry is disarmed.
+      // It is deliberately NOT gated on entryHealth(), which applies only to
+      // a fresh signal, never to containment of already-confirmed exposure.
+      await this.recoverIncompleteBaskets({ allowFreshResume: this.isAllowed() });
       // Health is evaluated together with the actual candidate inside maybeOpenBasket().  That is
       // essential for the traffic light: a YELLOW exception is valid only for a fresh Smart Basket
       // V1 signal, never as a process-wide "health bypass" before we know what would be traded.
@@ -5927,17 +5920,21 @@ export class CrossSectionalExecutor {
       : null;
   }
 
-  /** Flattens every already-filled leg on `basket` that isn't already exited (reduceOnly MARKET,
-   *  one at a time) — the ROLLBACK half of the hedge-vs-rollback decision (see placeRemainingLegs).
+  /** Flattens every already-filled leg on `basket` that isn't already exited (reduceOnly MARKET)
+   *  — the ROLLBACK half of the hedge-vs-rollback decision (see placeRemainingLegs).
    *  Extracted verbatim (same reduceOnly call, same executedQty/shortfall honoring, same
    *  recordOrphanedLeg-on-failure) from what used to be placeRemainingLegs' own inline abort
    *  handler — now shared by BOTH the ordinary-entry-failure rollback and the kill/drain-interrupt
    *  rollback (see ground truth items (d) and (a)/(b)), which is the point: one flatten
    *  implementation, not two copies that can drift. The `exitOrderId !== null` guard is new and
    *  purely defensive — under claimBasket's mutual exclusion (see its own doc comment) nothing else
-   *  can be closing THIS basket's legs while this runs, so it should never trigger, but it costs
-   *  nothing and matches closeBasket's own identical guard on its retry path. */
+  *  can be closing THIS basket's legs while this runs, so it should never trigger, but it costs
+  *  nothing and matches closeBasket's own identical guard on its retry path. */
   private async flattenFilledLegs(basket: ExecutorBasket): Promise<void> {
+    // Submit every risk-reducing order before optional fill-price confirmation.
+    // A congested signed GET must not leave the second/third confirmed leg
+    // exposed merely because the first MARKET acknowledgement carried avgPrice=0.
+    const accepted: Array<{ leg: ExecutorLeg; flat: FuturesOrder }> = [];
     for (const leg of basket.legs) {
       if (leg.exitOrderId !== null) continue; // already flattened by a previous attempt
       try {
@@ -5950,9 +5947,10 @@ export class CrossSectionalExecutor {
           newClientOrderId: `xsec-${basket.basketId.slice(-12)}-a${basket.legs.indexOf(leg)}`,
         });
         leg.exitOrderId = flat.orderId;
-        const resolvedFlat = await this.resolveFillPrice(leg.symbol, flat.orderId, flat.avgPrice, leg.entryPrice);
-        leg.exitPrice = resolvedFlat.price;
-        leg.exitPriceConfirmed = resolvedFlat.confirmed;
+        // The market order is now real. Persist its id before any optional
+        // fill-price lookup so a restart can never submit a second rollback
+        // merely because Testnet's read queue is slow.
+        this.store.save();
         // 2026-07-19 real-money audit follow-up: same executedQty honoring as closeBasket's exit
         // path (see BUG 3) — a genuine partial fill on this rollback-flatten must not be recorded
         // as fully closed. Guarded with `> 0` exactly like the other sites, since an
@@ -5967,6 +5965,7 @@ export class CrossSectionalExecutor {
             new Error(`rollback-flatten partial fill: requested ${leg.qty}, executed ${flatExecutedQty} — residual ${flatShortfall} still open`),
           );
         }
+        accepted.push({ leg, flat });
       } catch (flattenError) {
         // 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): this leg is now a REAL,
         // still-open exchange position (e.g. a sibling XSEC executor already holds the opposite
@@ -5979,6 +5978,12 @@ export class CrossSectionalExecutor {
         // basket's bookkeeping.
         this.recordOrphanedLeg(basket, leg, flattenError);
       }
+    }
+    for (const { leg, flat } of accepted) {
+      const resolvedFlat = await this.resolveFillPrice(leg.symbol, flat.orderId, flat.avgPrice, leg.entryPrice);
+      leg.exitPrice = resolvedFlat.price;
+      leg.exitPriceConfirmed = resolvedFlat.confirmed;
+      this.store.save();
     }
     if (basket.status === "ABORTED") {
       // A rollback is intentionally excluded from the strategy's measured cohort. Even if an
@@ -6440,6 +6445,47 @@ export class CrossSectionalExecutor {
   }
 
   /**
+   * Persist an exchange-confirmed entry discovered while expiring a stale
+   * reservation. This deliberately does not decide the basket's terminal
+   * state: other planned client ids may still need reconciliation, but the
+   * confirmed exposure must become visible and eligible for rollback now.
+   */
+  private adoptExpiredPlannedFill(
+    basket: ExecutorBasket,
+    planned: PlannedLeg,
+    index: number,
+    resolution: Extract<ReconciledPlannedEntry, { outcome: "FILLED" }>,
+  ): void {
+    if (planned.reservationId) {
+      this.commitExposureReservationFn(planned.reservationId, { qty: resolution.qty, avgPrice: resolution.avgPrice });
+    }
+    if (!basket.legs.some((leg) => leg.planIndex === index)) {
+      basket.legs.push({
+        symbol: planned.symbol,
+        side: planned.side,
+        qty: resolution.qty,
+        entryPrice: resolution.avgPrice,
+        entryOrderId: resolution.orderId,
+        entryOrderIds: resolution.entryOrderIds,
+        entryPriceConfirmed: true,
+        ...(resolution.entryFilledAt ? { entryFilledAt: resolution.entryFilledAt } : {}),
+        ...(resolution.entryLiquidity ? { entryLiquidity: resolution.entryLiquidity } : {}),
+        exitPrice: null,
+        exitOrderId: null,
+        exitPriceConfirmed: null,
+        planIndex: index,
+        signalWeight: planned.signalWeight ?? null,
+        scoreAtOpen: planned.scoreAtOpen ?? null,
+        volatilityAtOpen: planned.volatilityAtOpen ?? null,
+        targetNotionalUsd: planned.targetNotionalUsd ?? null,
+      });
+      this.bindFourBrainActualFill(basket, basket.legs[basket.legs.length - 1]!);
+    }
+    planned.status = "FILLED";
+    basket.status = "PARTIALLY_FILLED";
+  }
+
+  /**
    * A timed-out zero-fill reservation is never resumed as a fresh entry.  It
    * first retracts every known maker order and persists Binance's final result;
    * then it reconciles any still-ambiguous client id.  Inconclusive exchange
@@ -6470,6 +6516,35 @@ export class CrossSectionalExecutor {
           // Fall through to the one-at-a-time durable reconciliation below.
         }
       }));
+      this.store.save();
+    }
+
+    // A terminal DELETE response is stronger and cheaper than a later signed
+    // GET. Adopt every known maker fill before looking at an unrelated,
+    // ambiguous plan entry. Otherwise a single delayed status lookup (for a
+    // leg that never even got a maker order id) can leave real partial fills
+    // open for minutes despite already having their final exchange facts.
+    for (let index = 0; index < plan.length; index++) {
+      const planned = plan[index]!;
+      if (planned.status !== "PLACING") continue;
+      const resolution = this.makerCancelSnapshotResolution(planned);
+      if (!resolution) continue;
+      if (resolution.outcome === "FILLED") {
+        this.adoptExpiredPlannedFill(basket, planned, index, resolution);
+        continue;
+      }
+      planned.status = "FAILED";
+      planned.failureReason = "PRE_ENTRY_TIMEOUT_RECONCILED_NOT_PLACED";
+      if (planned.reservationId) this.releaseExposureReservationFn(planned.reservationId, "PRE_ENTRY_TIMEOUT_RECONCILED_NOT_PLACED");
+    }
+    this.store.save();
+
+    // Roll back confirmed exposure immediately, even when another client id
+    // remains inconclusive. The basket stays non-terminal until every plan
+    // entry is reconciled, so no unseen fill can be forgotten; but a known
+    // fill must never be held hostage by that uncertainty.
+    if (basket.legs.some((leg) => leg.exitOrderId === null)) {
+      await this.flattenFilledLegs(basket);
       this.store.save();
     }
 
@@ -6509,32 +6584,7 @@ export class CrossSectionalExecutor {
         continue;
       }
       if (resolution.outcome !== "FILLED") continue; // exhaustive safety guard for the type and future states
-
-      if (planned.reservationId) {
-        this.commitExposureReservationFn(planned.reservationId, { qty: resolution.qty, avgPrice: resolution.avgPrice });
-      }
-      basket.legs.push({
-        symbol: planned.symbol,
-        side: planned.side,
-        qty: resolution.qty,
-        entryPrice: resolution.avgPrice,
-        entryOrderId: resolution.orderId,
-        entryOrderIds: resolution.entryOrderIds,
-        entryPriceConfirmed: true,
-        ...(resolution.entryFilledAt ? { entryFilledAt: resolution.entryFilledAt } : {}),
-        ...(resolution.entryLiquidity ? { entryLiquidity: resolution.entryLiquidity } : {}),
-        exitPrice: null,
-        exitOrderId: null,
-        exitPriceConfirmed: null,
-        planIndex: index,
-        signalWeight: planned.signalWeight ?? null,
-        scoreAtOpen: planned.scoreAtOpen ?? null,
-        volatilityAtOpen: planned.volatilityAtOpen ?? null,
-        targetNotionalUsd: planned.targetNotionalUsd ?? null,
-      });
-      this.bindFourBrainActualFill(basket, basket.legs[basket.legs.length - 1]!);
-      planned.status = "FILLED";
-      basket.status = "PARTIALLY_FILLED";
+      this.adoptExpiredPlannedFill(basket, planned, index, resolution);
       this.store.save();
     }
 
@@ -6595,7 +6645,7 @@ export class CrossSectionalExecutor {
    * skip it for this tick — self-healing, same "never guess, retry later" posture INCONCLUSIVE
    * already uses below, and the very next tick's recovery pass retries once the claim is free.
    */
-  private async recoverIncompleteBaskets(): Promise<void> {
+  private async recoverIncompleteBaskets({ allowFreshResume }: { allowFreshResume: boolean }): Promise<void> {
     const st = this.store.getState();
     const incomplete = st.baskets.filter(
       (b) => (b.status === "RESERVED" || b.status === "PLACING" || b.status === "PARTIALLY_FILLED") && Array.isArray(b.plan),
@@ -6608,6 +6658,10 @@ export class CrossSectionalExecutor {
           await this.expirePreEntryPlacement(basket);
           continue;
         }
+        // A disarmed executor must never resume an ordinary incomplete plan:
+        // doing so would place a new entry. Expired plans took the safe branch
+        // above and are still reconciled/rolled back regardless of this gate.
+        if (!allowFreshResume) continue;
         const startIndex = basket.legs.length;
         if (startIndex >= plan.length) continue; // defensive — nothing left to do
         const ambiguous = plan[startIndex]!;

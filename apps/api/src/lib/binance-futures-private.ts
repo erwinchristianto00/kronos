@@ -733,8 +733,19 @@ export class BinanceFuturesPrivateClient {
     method: "GET" | "POST" | "DELETE",
     path: string,
     params: Record<string, string | number | boolean | undefined> = {},
+    options: { allowUnsyncedRiskReduction?: boolean } = {},
   ): Promise<unknown> {
-    await this.ensureTimeSync();
+    // A cold worker normally proves its server-time offset before it sends any
+    // signed request.  The sole exception is an operation Binance itself
+    // guarantees cannot increase exposure: cancelling an order or a
+    // reduce-only order.  During a Testnet GET backlog, waiting for /time here
+    // used to leave an already-confirmed partial basket unprotected even
+    // though the host clock is ordinarily NTP-synchronised.  Send the
+    // risk-reducing request with the local clock instead; an inaccurate clock
+    // is safely rejected by Binance (-1021), never turned into an entry.
+    if (!(options.allowUnsyncedRiskReduction && this.lastTimeSyncAtMs === 0)) {
+      await this.ensureTimeSync();
+    }
     this.assertClockSkewOk();
     const buildSignedUrl = (): string => {
       const qs = buildQueryString({
@@ -780,10 +791,18 @@ export class BinanceFuturesPrivateClient {
       if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021) {
         // Best-effort resync for the NEXT signed call — this call is failing with -1021 regardless,
         // so a resync failure here must not replace the original error being rethrown below.
-        try {
-          await this.forceTimeSync();
-        } catch {
-          /* best-effort — see GET branch above */
+        if (options.allowUnsyncedRiskReduction && this.lastTimeSyncAtMs === 0) {
+          // Do not turn a rejected *risk-reducing* request into an unbounded
+          // wait behind a cold GET queue. The next attempt can use this
+          // background resync once it finishes; this attempt stays a clean,
+          // visible failure with no order submitted.
+          void this.forceTimeSync().catch(() => { /* best-effort */ });
+        } else {
+          try {
+            await this.forceTimeSync();
+          } catch {
+            /* best-effort — see GET branch above */
+          }
         }
       }
       throw error;
@@ -1116,7 +1135,16 @@ export class BinanceFuturesPrivateClient {
   async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
     // Order placement is execution-critical on both venues.  The Testnet
     // transport honours this priority; Mainnet keeps the same public contract.
-    const filters = await this.getSymbolFilters(params.symbol, "EXECUTION");
+    // A reduce-only MARKET quantity is an exchange-confirmed quantity from the
+    // leg being flattened.  On a cold worker it is therefore safer to submit
+    // that exact quantity than to block a rollback behind exchangeInfo.  Every
+    // entry and every priced/conditional reduce-only order still refreshes the
+    // normal exchange filter cache before it is sent.
+    const canUseKnownReduceOnlyQty = params.reduceOnly === true && params.type === "MARKET";
+    const cachedFilters = this.exchangeFiltersCache && this.nowMs() - this.exchangeFiltersCacheAtMs < EXCHANGE_FILTERS_TTL_MS
+      ? this.exchangeFiltersCache.get(params.symbol) ?? null
+      : null;
+    const filters = canUseKnownReduceOnlyQty ? cachedFilters : await this.getSymbolFilters(params.symbol, "EXECUTION");
     const quantity = filters
       ? formatToStep(params.quantity, filters.stepSize, "down", filters.quantityPrecision)
       : params.quantity;
@@ -1138,7 +1166,7 @@ export class BinanceFuturesPrivateClient {
       newClientOrderId: params.newClientOrderId,
       workingType: params.workingType,
       newOrderRespType: "RESULT",
-    });
+    }, { allowUnsyncedRiskReduction: canUseKnownReduceOnlyQty });
     return this.mapOrder(parsed);
   }
 
@@ -1165,7 +1193,7 @@ export class BinanceFuturesPrivateClient {
   }
 
   async cancelOrder(symbol: string, orderId: string): Promise<void> {
-    await this.requestSigned("DELETE", "/fapi/v1/order", { symbol, orderId });
+    await this.requestSigned("DELETE", "/fapi/v1/order", { symbol, orderId }, { allowUnsyncedRiskReduction: true });
   }
 
   /**
@@ -1173,7 +1201,12 @@ export class BinanceFuturesPrivateClient {
    * can use its actual filled quantity without issuing a separate status GET.
    */
   async cancelOrderAndRead(symbol: string, orderId: string): Promise<FuturesOrder> {
-    const parsed = await this.requestSigned("DELETE", "/fapi/v1/order", { symbol, orderId });
+    const parsed = await this.requestSigned(
+      "DELETE",
+      "/fapi/v1/order",
+      { symbol, orderId },
+      { allowUnsyncedRiskReduction: true },
+    );
     return this.mapOrder(parsed);
   }
 

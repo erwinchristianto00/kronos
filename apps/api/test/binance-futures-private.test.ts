@@ -682,6 +682,52 @@ describe("binance-futures-private signing", () => {
     expect(order.avgPrice).toBeCloseTo(61800.5, 6);
   });
 
+  it("sends a cold cancel without waiting behind server-time synchronisation", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      const u = String(url);
+      urls.push(u);
+      expect(init?.method).toBe("DELETE");
+      expect(u).not.toContain("/fapi/v1/time");
+      return new Response(JSON.stringify({
+        symbol: "BTCUSDT", orderId: "123", clientOrderId: "maker-123", status: "CANCELED", type: "LIMIT", side: "BUY",
+        reduceOnly: false, price: "99", stopPrice: "0", origQty: "1", executedQty: "0", avgPrice: "0", updateTime: 1,
+      }), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl, nowMs: () => 1_700_000_000_000,
+    });
+
+    await expect(client.cancelOrderAndRead("BTCUSDT", "123")).resolves.toMatchObject({ status: "CANCELED", orderId: "123" });
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("/fapi/v1/order?symbol=BTCUSDT&orderId=123");
+  });
+
+  it("sends a cold reduce-only market rollback without fetching filters or server time", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      const u = String(url);
+      urls.push(u);
+      expect(init?.method).toBe("POST");
+      expect(u).not.toContain("/fapi/v1/time");
+      expect(u).not.toContain("/fapi/v1/exchangeInfo");
+      return new Response(JSON.stringify({
+        symbol: "BTCUSDT", orderId: "124", clientOrderId: "rollback-124", status: "FILLED", type: "MARKET", side: "SELL",
+        reduceOnly: true, price: "0", stopPrice: "0", origQty: "1.2345", executedQty: "1.2345", avgPrice: "100", updateTime: 1,
+      }), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl, nowMs: () => 1_700_000_000_000,
+    });
+
+    await expect(client.placeOrder({
+      symbol: "BTCUSDT", side: "SELL", type: "MARKET", quantity: 1.2345, reduceOnly: true, newClientOrderId: "rollback-124",
+    })).resolves.toMatchObject({ status: "FILLED", orderId: "124" });
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("quantity=1.2345");
+    expect(urls[0]).toContain("reduceOnly=true");
+  });
+
   it("still fails closed when the very first time-sync attempt never succeeds", async () => {
     const fetchImpl = (async (url: RequestInfo | URL) => {
       const u = String(url);
