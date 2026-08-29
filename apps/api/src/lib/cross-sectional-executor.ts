@@ -5966,7 +5966,10 @@ export class CrossSectionalExecutor {
    *  purely defensive — under claimBasket's mutual exclusion (see its own doc comment) nothing else
   *  can be closing THIS basket's legs while this runs, so it should never trigger, but it costs
   *  nothing and matches closeBasket's own identical guard on its retry path. */
-  private async flattenFilledLegs(basket: ExecutorBasket): Promise<void> {
+  private async flattenFilledLegs(
+    basket: ExecutorBasket,
+    options: { deferFillPriceResolution?: boolean } = {},
+  ): Promise<void> {
     // Submit every risk-reducing order before optional fill-price confirmation.
     // A congested signed GET must not leave the second/third confirmed leg
     // exposed merely because the first MARKET acknowledgement carried avgPrice=0.
@@ -6015,11 +6018,25 @@ export class CrossSectionalExecutor {
         this.recordOrphanedLeg(basket, leg, flattenError);
       }
     }
-    for (const { leg, flat } of accepted) {
-      const resolvedFlat = await this.resolveFillPrice(leg.symbol, flat.orderId, flat.avgPrice, leg.entryPrice);
-      leg.exitPrice = resolvedFlat.price;
-      leg.exitPriceConfirmed = resolvedFlat.confirmed;
-      this.store.save();
+    // In an expired pre-entry rollback, dispatch protection for every
+    // confirmed fill before waiting on any accounting GET. Testnet can keep a
+    // signed fill-price lookup queued for a minute; it must not delay discovery
+    // and flattening of a later maker leg. The durable exit order id remains
+    // sufficient to prevent a duplicate/reversing close while price is pending.
+    if (!options.deferFillPriceResolution) {
+      const acceptedLegs = new Set(accepted.map(({ leg }) => leg));
+      const pendingResolution: Array<{ leg: ExecutorLeg; orderId: string; avgPrice: number }> = [
+        ...accepted.map(({ leg, flat }) => ({ leg, orderId: flat.orderId, avgPrice: flat.avgPrice })),
+        ...basket.legs
+          .filter((leg) => !acceptedLegs.has(leg) && leg.exitOrderId !== null && leg.exitPrice === null)
+          .map((leg) => ({ leg, orderId: leg.exitOrderId as string, avgPrice: 0 })),
+      ];
+      for (const { leg, orderId, avgPrice } of pendingResolution) {
+        const resolvedFlat = await this.resolveFillPrice(leg.symbol, orderId, avgPrice, leg.entryPrice);
+        leg.exitPrice = resolvedFlat.price;
+        leg.exitPriceConfirmed = resolvedFlat.confirmed;
+        this.store.save();
+      }
     }
     if (basket.status === "ABORTED") {
       // A rollback is intentionally excluded from the strategy's measured cohort. Even if an
@@ -6587,7 +6604,7 @@ export class CrossSectionalExecutor {
     // entry is reconciled, so no unseen fill can be forgotten; but a known
     // fill must never be held hostage by that uncertainty.
     if (basket.legs.some((leg) => leg.exitOrderId === null)) {
-      await this.flattenFilledLegs(basket);
+      await this.flattenFilledLegs(basket, { deferFillPriceResolution: true });
       this.store.save();
     }
 
@@ -6642,7 +6659,7 @@ export class CrossSectionalExecutor {
       // reduce-only exit order id before any optional price lookup, so a later
       // retry cannot submit a duplicate close.
       if (basket.legs.some((leg) => leg.exitOrderId === null)) {
-        await this.flattenFilledLegs(basket);
+        await this.flattenFilledLegs(basket, { deferFillPriceResolution: true });
         this.store.save();
       }
     }

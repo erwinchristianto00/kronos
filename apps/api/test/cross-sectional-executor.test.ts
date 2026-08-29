@@ -4202,7 +4202,6 @@ describe("[PRE-ENTRY TIMEOUT] incomplete reservations", () => {
 
   it("prioritizes an identifiable maker fill over an earlier no-order plan and sends its reduce-only exit before an unrelated reconciliation remains inconclusive", async () => {
     const client = new FakeExecClient();
-    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
     const queried: string[] = [];
     const originalQuery = client.queryOrderByClientId.bind(client);
     client.queryOrderByClientId = async (symbol, clientOrderId) => {
@@ -4240,6 +4239,9 @@ describe("[PRE-ENTRY TIMEOUT] incomplete reservations", () => {
     const basket = store.getState().baskets.find((candidate) => candidate.basketId === "xb-maker-priority")!;
     expect(queried).toEqual(["xsec-maker-priority-e1"]);
     expect(client.placed.filter((order) => order.reduceOnly && order.symbol === "DOGEUSDT")).toHaveLength(1);
+    // The exit acknowledgement intentionally has no avgPrice. A price lookup is a queued signed
+    // GET on Testnet; containment must leave it deferred rather than holding the next known leg.
+    expect(client.queryOrderCallCount).toBe(0);
     expect(basket.legs).toMatchObject([{ symbol: "DOGEUSDT", exitOrderId: expect.any(String) }]);
     expect(basket.status).toBe("PARTIALLY_FILLED");
   });
