@@ -76,6 +76,22 @@ function signalObs(openedAtMs: number): CrossSectionalObservation {
   };
 }
 
+function sixLegSignalObs(openedAtMs: number): CrossSectionalObservation {
+  const observation = signalObs(openedAtMs);
+  observation.k = 3;
+  observation.longLeg = [
+    { symbol: "SOLUSDT", entryPrice: 100, exitPrice: null },
+    { symbol: "ADAUSDT", entryPrice: 1, exitPrice: null },
+    { symbol: "RNDRUSDT", entryPrice: 10, exitPrice: null },
+  ];
+  observation.shortLeg = [
+    { symbol: "DOGEUSDT", entryPrice: 0.1, exitPrice: null },
+    { symbol: "AAVEUSDT", entryPrice: 100, exitPrice: null },
+    { symbol: "FETUSDT", entryPrice: 1, exitPrice: null },
+  ];
+  return observation;
+}
+
 function attachSmartFormation(observation: CrossSectionalObservation, invalidated = false): CrossSectionalObservation {
   observation.longLeg[0]!.volatilityAtOpen = 0.01;
   observation.shortLeg[0]!.volatilityAtOpen = 0.01;
@@ -166,6 +182,8 @@ class FakeExecClient implements CrossSectionalExecClient {
       ["DOGEUSDT", f(1, 1)],
       ["1000PEPEUSDT", f(1, 1)],
       ["RNDRUSDT", f(0.1, 0.1)],
+      ["FETUSDT", f(0.1, 0.1)],
+      ["AAVEUSDT", f(0.01, 0.01)],
     ]);
   }
   async setLeverage(symbol: string, leverage: number): Promise<void> {
@@ -292,6 +310,13 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
   readFuturesMarketReference?: (symbol: string) => FuturesMarketReference | null;
   warmFuturesMarketReference?: (symbol: string) => Promise<FuturesMarketReference | null>;
   futuresReferenceHealth?: FuturesReferenceHealthTracker;
+  onBasketClosed?: (outcome: {
+    basketId: string;
+    netPnlUsd: number;
+    closeReason: string;
+    closedAt: string;
+    legCount: number;
+  }) => void;
 } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
@@ -343,6 +368,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     ...(opts.readFuturesMarketReference ? { readFuturesMarketReference: opts.readFuturesMarketReference } : {}),
     ...(opts.warmFuturesMarketReference ? { warmFuturesMarketReference: opts.warmFuturesMarketReference } : {}),
     ...(opts.futuresReferenceHealth ? { futuresReferenceHealth: opts.futuresReferenceHealth } : {}),
+    ...(opts.onBasketClosed ? { onBasketClosed: opts.onBasketClosed } : {}),
   });
   return { executor, client, signalStore, store, storeDir };
 }
@@ -2143,6 +2169,62 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(basket.netPnlUsd!).toBeLessThan(basket.grossPnlUsd!);
     const closes = client.placed.filter((p) => p.reduceOnly);
     expect(closes.length).toBe(2);
+  });
+
+  it("emits one loss-breaker outcome for a six-leg Cross basket, never one per leg", async () => {
+    const client = new FakeExecClient();
+    for (const [symbol, price] of Object.entries({
+      SOLUSDT: 100,
+      ADAUSDT: 1,
+      RNDRUSDT: 10,
+      DOGEUSDT: 0.1,
+      AAVEUSDT: 100,
+      FETUSDT: 1,
+    })) client.fillPriceBySymbol.set(symbol, price);
+    const outcomes: Array<{
+      basketId: string;
+      netPnlUsd: number;
+      closeReason: string;
+      closedAt: string;
+      legCount: number;
+    }> = [];
+    const { executor, signalStore, store } = makeExecutor({
+      entryHealthAllowed: true,
+      onBasketClosed: (outcome) => outcomes.push(outcome),
+    });
+    signalStore.add(sixLegSignalObs(NOW_MS - 5 * 60_000));
+
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("COMPLETE");
+    expect(basket.legs).toHaveLength(6);
+
+    // All six legs lose. The breaker must still see one completed portfolio decision.
+    for (const [symbol, price] of Object.entries({
+      SOLUSDT: 98,
+      ADAUSDT: 0.98,
+      RNDRUSDT: 9.8,
+      DOGEUSDT: 0.102,
+      AAVEUSDT: 102,
+      FETUSDT: 1.02,
+    })) client.fillPriceBySymbol.set(symbol, price);
+    basket.closesAtMs = NOW_MS - 1;
+    await executor.tick();
+
+    expect(basket.status).toBe("CLOSED");
+    expect(basket.netPnlUsd).toBeLessThan(0);
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]).toMatchObject({
+      basketId: basket.basketId,
+      netPnlUsd: basket.netPnlUsd,
+      closeReason: "HORIZON",
+      closedAt: basket.closedAt,
+      legCount: 6,
+    });
+
+    // A later lifecycle tick must not replay the completed basket to the account-level counter.
+    await executor.tick();
+    expect(outcomes).toHaveLength(1);
   });
 
   it("[MAKER-EXIT] uses concurrent post-only HORIZON exits, records economics, reconciles flat, and never sends a market fallback after full maker fills", async () => {

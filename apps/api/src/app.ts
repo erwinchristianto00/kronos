@@ -2707,6 +2707,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
         futuresReferenceHealth: futuresReferenceHealthTracker,
         cortexRealAttribution: getCortexRealAttributionStore(),
+        // A Cross basket is one portfolio decision. Its executor emits this only after the whole
+        // basket is durably CLOSED, so the account loss-streak breaker never counts its six legs
+        // as six independent losses.
+        onBasketClosed: (outcome) => engineForGate?.recordExternalConsecutiveLossOutcome(outcome.netPnlUsd),
         // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
         // closeBasket() already fetches one getUserTrades page per unique symbol to sum the real
         // commissions and discards every other field of every matched row; this persists them.
@@ -2851,6 +2855,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
         futuresReferenceHealth: futuresReferenceHealthTracker,
         cortexRealAttribution: getCortexRealAttributionStore(),
+        onBasketClosed: (outcome) => engineForGate?.recordExternalConsecutiveLossOutcome(outcome.netPnlUsd),
         // Per-fill execution recorder — see the FILTERED instance above.
         executionFillRecorder: getExecutionFillRecorder(),
         siblingOpenLegs: () => [
@@ -2905,6 +2910,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         warmFuturesMarketReference: (symbol) => futuresMarketReferenceCache.refresh(symbol),
         futuresReferenceHealth: futuresReferenceHealthTracker,
         cortexRealAttribution: getCortexRealAttributionStore(),
+        onBasketClosed: (outcome) => engineForGate?.recordExternalConsecutiveLossOutcome(outcome.netPnlUsd),
         // Per-fill execution recorder — see the FILTERED instance above.
         executionFillRecorder: getExecutionFillRecorder(),
         siblingOpenLegs: () => [

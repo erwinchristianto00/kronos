@@ -2021,6 +2021,20 @@ export interface CrossSectionalExecutorOptions {
   smartMfeGivebackFraction?: () => number;
   /** Status-only enabled marker for executors that have a dedicated feature gate. */
   enabled?: () => boolean;
+  /**
+   * One settled outcome for the COMPLETE cross basket. This deliberately fires only after every
+   * leg is reconciled and the durable basket state is CLOSED; it never fires inside the per-leg
+   * close loop. Account-level loss breakers therefore count a 3L/3S basket once, not six times.
+   * ABORTED / accounting-incomplete baskets do not emit an outcome because their final P&L is not
+   * a trustworthy completed-basket result.
+   */
+  onBasketClosed?: (outcome: {
+    basketId: string;
+    netPnlUsd: number;
+    closeReason: string;
+    closedAt: string;
+    legCount: number;
+  }) => void;
 }
 
 export class CrossSectionalExecutor {
@@ -2097,6 +2111,7 @@ export class CrossSectionalExecutor {
   private readonly smartMfeArmNetReturnFn: () => number;
   private readonly smartMfeGivebackFractionFn: () => number;
   private readonly enabledFn: () => boolean;
+  private readonly onBasketClosed: CrossSectionalExecutorOptions["onBasketClosed"] | null;
 
   constructor(opts: CrossSectionalExecutorOptions) {
     this.client = opts.client;
@@ -2162,6 +2177,7 @@ export class CrossSectionalExecutor {
     this.smartMfeArmNetReturnFn = opts.smartMfeArmNetReturn ?? SMART_MFE_ARM_NET_RETURN;
     this.smartMfeGivebackFractionFn = opts.smartMfeGivebackFraction ?? SMART_MFE_GIVEBACK_FRACTION;
     this.enabledFn = opts.enabled ?? isCrossSectionalExecEnabled;
+    this.onBasketClosed = opts.onBasketClosed ?? null;
   }
 
   /**
@@ -5224,6 +5240,30 @@ export class CrossSectionalExecutor {
       });
     }
     this.store.save();
+    // Account-level consecutive-loss accounting consumes ONE completed basket outcome here, not
+    // the six per-leg exit events above. This is intentionally post-save: a callback failure can
+    // never roll back exchange-settled state, and a terminal basket cannot be closed again by the
+    // normal lifecycle paths.
+    if (
+      this.onBasketClosed &&
+      basket.closedAt &&
+      basket.closeReason &&
+      typeof basket.netPnlUsd === "number" &&
+      Number.isFinite(basket.netPnlUsd)
+    ) {
+      try {
+        this.onBasketClosed({
+          basketId: basket.basketId,
+          netPnlUsd: basket.netPnlUsd,
+          closeReason: basket.closeReason,
+          closedAt: basket.closedAt,
+          legCount: basket.legs.length,
+        });
+      } catch {
+        // The basket is already durably settled. Do not retry a side-effecting loss-counter write
+        // from the executor, because a retry could turn one basket into two counted outcomes.
+      }
+    }
     this.recordCortexRealAttribution(basket);
     // Per-fill execution record (2026-07-27, report-only, fail-safe — see its doc comment). Rows
     // come from the getUserTrades pages the fee sum above already fetched. `fetchComplete` requires
