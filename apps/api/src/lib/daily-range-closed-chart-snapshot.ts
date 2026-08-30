@@ -11,7 +11,7 @@ import { resolve, sep } from "node:path";
 
 import type { FuturesKline } from "./binance-futures-private.js";
 
-export const DAILY_RANGE_CLOSED_CHART_SNAPSHOT_VERSION = "daily-range-closed-chart-svg-v2" as const;
+export const DAILY_RANGE_CLOSED_CHART_SNAPSHOT_VERSION = "daily-range-closed-chart-svg-v3" as const;
 
 export type DailyRangeClosedChartSnapshot = {
   version: typeof DAILY_RANGE_CLOSED_CHART_SNAPSHOT_VERSION;
@@ -71,9 +71,7 @@ export type DailyRangeClosedChartSnapshotClient = Pick<
 >;
 
 const FIVE_MINUTE_MS = 5 * 60_000;
-const FOUR_HOURS_MS = 4 * 60 * 60_000;
 const FIVE_MINUTE_EMA_CONTEXT_BARS = 50;
-const FOUR_HOUR_CONTEXT_BARS = 96;
 
 const COLORS = {
   background: "#071016",
@@ -360,7 +358,8 @@ function renderPanel(input: {
     const row = Math.floor(index / 4);
     const xx = outerX + 16 + column * 375;
     const yy = outerY + height - 52 + row * 16;
-    return `<rect x="${xx}" y="${yy - 9}" width="10" height="3" fill="${item.color}"/><text x="${xx + 15}" y="${yy}" fill="${COLORS.dim}" font-size="11">${escapeXml(item.text)}</text>`;
+    const pillWidth = Math.min(330, 30 + item.text.length * 7);
+    return `<rect x="${xx}" y="${yy - 14}" width="${pillWidth}" height="19" rx="4" fill="#10212a" stroke="${COLORS.border}"/><rect x="${xx + 8}" y="${yy - 7}" width="8" height="3" fill="${item.color}"/><text x="${xx + 22}" y="${yy}" fill="${COLORS.text}" font-size="11">${escapeXml(item.text)}</text>`;
   }).join("");
   return `<g>
     <rect x="${outerX}" y="${outerY}" width="${width}" height="${height}" rx="8" fill="${COLORS.panel}" stroke="${COLORS.border}"/>
@@ -414,45 +413,35 @@ export function pendingDailyRangeClosedChartSnapshot(trade: Pick<DailyRangeClose
 export function renderDailyRangeClosedChartSvg(input: {
   trade: DailyRangeClosedChartSnapshotTrade;
   fiveMinuteCandles: SnapshotCandle[];
+  /** Preserved in the input shape for old callers; V3 deliberately renders 5m only. */
   fourHourCandles: SnapshotCandle[];
   entryAtMs: number;
   exitAtMs: number;
 }): string {
-  const { trade, fiveMinuteCandles, fourHourCandles, entryAtMs, exitAtMs } = input;
+  const { trade, fiveMinuteCandles, entryAtMs, exitAtMs } = input;
   const routeLabel = trade.entryPolicy === "FADE" ? "FADE" : trade.entryPolicy === "CONTINUATION" ? "CONTINUATION" : "LEGACY CONTINUATION";
   const directionText = trade.breakoutDirection ? ` · breakout ${trade.breakoutDirection}` : "";
-  const fiveMinuteStart = Math.min(
+  const signalStart = Math.min(
     entryAtMs,
     trade.confirmationBar1.openTime,
     trade.confirmationBar2.openTime,
-  ) - FIVE_MINUTE_MS;
-  const fourHourStart = fourHourCandles.length ? fourHourCandles[0]!.openTime : entryAtMs - FOUR_HOURS_MS;
-  const referenceStart = finite(trade.referenceRangeOpenTime) ? trade.referenceRangeOpenTime : null;
-  const referenceEnd = finite(trade.referenceRangeCloseTime) ? trade.referenceRangeCloseTime : null;
-  const sessionText = referenceStart !== null && referenceEnd !== null
-    ? `${formatTaipei(referenceStart)}–${formatTaipei(referenceEnd)} ${trade.referenceTimezone === "America/New_York" ? "New York reference" : "UTC reference"}`
-    : "persisted 4H reference";
+  );
+  const fiveMinuteStart = Math.min(
+    signalStart - FIVE_MINUTE_EMA_CONTEXT_BARS * FIVE_MINUTE_MS,
+    fiveMinuteCandles[0]?.openTime ?? signalStart,
+  );
   const breakoutReference = trade.breakoutDirection === "DOWN" || (!trade.breakoutDirection && trade.direction === "SHORT")
     ? { label: "Breakout reference", price: trade.rangeLow, color: COLORS.rangeLow }
     : { label: "Breakout reference", price: trade.rangeHigh, color: COLORS.rangeHigh };
-  const contextLevels: PriceLevel[] = [
-    { label: "4H range high", price: trade.rangeHigh, color: COLORS.rangeHigh },
-    { label: "4H range low", price: trade.rangeLow, color: COLORS.rangeLow },
-    { label: "Entry", price: trade.entryFillPrice!, color: COLORS.entry },
-    ...(positive(trade.stopPrice) ? [{ label: "Native SL", price: trade.stopPrice, color: COLORS.stop }] : []),
-    ...(positive(trade.takeProfitPrice) ? [{ label: "Target / TP", price: trade.takeProfitPrice, color: COLORS.takeProfit }] : []),
-    { label: "Exit fill", price: trade.exitPrice!, color: COLORS.exit },
-  ];
-  // The 5m panel is an execution review, not a 4H range map. Including the
-  // opposite range boundary in its price scale can flatten every relevant
-  // candle when the 4H range is wide. Keep the full context in the 4H panel
-  // and show only the level that actually triggered the trade below.
+  // The snapshot is intentionally a 5m execution review. The Daily Range
+  // reference remains as one breakout level; the opposite 4H boundary must
+  // never flatten the candles or dominate the chart scale.
   const executionLevels: PriceLevel[] = [
     breakoutReference,
     { label: "Entry", price: trade.entryFillPrice!, color: COLORS.entry },
-    ...(positive(trade.stopPrice) ? [{ label: "Native SL", price: trade.stopPrice, color: COLORS.stop }] : []),
-    ...(positive(trade.takeProfitPrice) ? [{ label: "Target / TP", price: trade.takeProfitPrice, color: COLORS.takeProfit }] : []),
-    { label: "Exit fill", price: trade.exitPrice!, color: COLORS.exit },
+    ...(positive(trade.stopPrice) ? [{ label: "Stop", price: trade.stopPrice, color: COLORS.stop }] : []),
+    ...(positive(trade.takeProfitPrice) ? [{ label: "Target", price: trade.takeProfitPrice, color: COLORS.takeProfit }] : []),
+    { label: "Exit", price: trade.exitPrice!, color: COLORS.exit },
   ];
   const breakoutPosition = trade.breakoutDirection === "DOWN" ? "below" : "above" as const;
   const c2Position = trade.breakoutDirection === "DOWN" ? "above" : "below" as const;
@@ -472,33 +461,17 @@ export function renderDailyRangeClosedChartSvg(input: {
       position: c2Position,
       labelAnchor: "end",
     },
-    { label: "ENTRY", at: entryAtMs, price: trade.entryFillPrice!, color: COLORS.entry, position: "middle" },
+    { label: `ENTRY ${trade.direction}`, at: entryAtMs, price: trade.entryFillPrice!, color: COLORS.entry, position: "middle" },
     { label: "EXIT", at: exitAtMs, price: trade.exitPrice!, color: COLORS.exit, position: "middle", labelAnchor: "end" },
   ];
   const zones: RiskZone[] = [
     ...(positive(trade.stopPrice) ? [{ from: trade.entryFillPrice!, to: trade.stopPrice, color: COLORS.stop, label: "risk to SL" }] : []),
     ...(positive(trade.takeProfitPrice) ? [{ from: trade.entryFillPrice!, to: trade.takeProfitPrice, color: COLORS.takeProfit, label: "target to TP" }] : []),
   ];
-  const top = renderPanel({
-    x: 32, y: 108, width: 1536, height: 420,
-    title: "4H · EMA20/EMA50 + structural support / resistance",
-    subtitle: `${trade.symbol} · ${trade.direction} · ${sessionText}`,
-    candles: fourHourCandles,
-    allCandles: fourHourCandles,
-    intervalMs: FOUR_HOURS_MS,
-    viewportStart: fourHourStart,
-    viewportEnd: exitAtMs,
-    levels: contextLevels,
-    markers: [
-      { label: "ENTRY", at: entryAtMs, price: trade.entryFillPrice!, color: COLORS.entry, position: "middle" },
-      { label: "EXIT", at: exitAtMs, price: trade.exitPrice!, color: COLORS.exit, position: "middle", labelAnchor: "end" },
-    ],
-    showStructure: true,
-  });
-  const bottom = renderPanel({
-    x: 32, y: 562, width: 1536, height: 590,
-    title: "5m · final execution path",
-    subtitle: `${routeLabel}${directionText} · completed candles only · entry ${formatTaipei(entryAtMs)} → exit ${formatTaipei(exitAtMs)} Taipei`,
+  const execution = renderPanel({
+    x: 32, y: 74, width: 1536, height: 754,
+    title: "5m · actual execution path",
+    subtitle: `${trade.symbol} · ${trade.direction} · ${routeLabel}${directionText} · C1 → C2 → entry ${formatTaipei(entryAtMs)} → exit ${formatTaipei(exitAtMs)} Taipei`,
     candles: fiveMinuteCandles,
     allCandles: fiveMinuteCandles,
     intervalMs: FIVE_MINUTE_MS,
@@ -509,14 +482,13 @@ export function renderDailyRangeClosedChartSvg(input: {
     zones,
   });
   return `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1184" viewBox="0 0 1600 1184" role="img" aria-labelledby="snapshot-title snapshot-desc">
-  <title id="snapshot-title">${escapeXml(`${trade.symbol} Daily Range 4H closed chart snapshot`)}</title>
-  <desc id="snapshot-desc">Immutable completed-candle chart captured for the confirmed trade close. It starts at the entry context and ends at the exact exit fill.</desc>
-  <rect width="1600" height="1184" fill="${COLORS.background}"/>
-  <text x="32" y="38" fill="${COLORS.text}" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" font-weight="700">DAILY RANGE 4H · CLOSED CHART SNAPSHOT</text>
-  <text x="32" y="66" fill="${COLORS.dim}" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">${escapeXml(`${trade.symbol} · ${trade.direction} · ${routeLabel} · entry ${formatPrice(trade.entryFillPrice!)} · exit ${formatPrice(trade.exitPrice!)} · captured at confirmed close`)}</text>
-  <text x="32" y="88" fill="${COLORS.dim}" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">All candles are completed Binance USD-M candles at or before the confirmed exit. This image never refreshes with later price action.</text>
-  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace">${top}${bottom}</g>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="860" viewBox="0 0 1600 860" role="img" aria-labelledby="snapshot-title snapshot-desc">
+  <title id="snapshot-title">${escapeXml(`${trade.symbol} Daily Range 5m execution snapshot`)}</title>
+  <desc id="snapshot-desc">Readable 5m execution view from completed Binance USD-M candles at or before the confirmed exit. The strategy's 4H reference is shown only as the breakout level.</desc>
+  <rect width="1600" height="860" fill="${COLORS.background}"/>
+  <text x="32" y="32" fill="${COLORS.text}" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" font-weight="700">DAILY RANGE 4H · 5M TRADE SNAPSHOT</text>
+  <text x="32" y="54" fill="${COLORS.dim}" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">Completed candles through confirmed exit · 4H is the strategy reference, not a second chart</text>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace">${execution}</g>
 </svg>`;
 }
 
@@ -542,26 +514,17 @@ export async function captureDailyRangeClosedChartSnapshot(input: {
   const signalStart = Math.min(confirmationBar1.openTime, confirmationBar2.openTime, entryAtMs);
   const fiveMinuteStart = Math.max(0, signalStart - FIVE_MINUTE_EMA_CONTEXT_BARS * FIVE_MINUTE_MS);
   const fiveMinuteEnd = Math.floor((exitAtMs - 1) / FIVE_MINUTE_MS) * FIVE_MINUTE_MS;
-  const fourHourEnd = Math.floor((exitAtMs - 1) / FOUR_HOURS_MS) * FOUR_HOURS_MS;
-  const fourHourStart = Math.max(0, fourHourEnd - (FOUR_HOUR_CONTEXT_BARS - 1) * FOUR_HOURS_MS);
   try {
-    const [fiveMinuteRows, fourHourRows] = await Promise.all([
-      input.client.getKlines(input.trade.symbol, "5m", { startTime: fiveMinuteStart, endTime: fiveMinuteEnd }),
-      input.client.getKlines(input.trade.symbol, "4h", { startTime: fourHourStart, endTime: fourHourEnd }),
-    ]);
+    const fiveMinuteRows = await input.client.getKlines(input.trade.symbol, "5m", { startTime: fiveMinuteStart, endTime: fiveMinuteEnd });
     const fiveMinuteCandles = distinctCandles(
       [...fiveMinuteRows, confirmationBar1, confirmationBar2],
       fiveMinuteStart,
       exitAtMs,
     );
-    const fourHourCandles = distinctCandles(fourHourRows, fourHourStart, exitAtMs);
     if (fiveMinuteCandles.length === 0) {
       return unavailableSnapshot(requestedAt, input.trade.entryFilledAt ?? input.trade.entrySubmittedAt ?? null, input.trade.exitTimestamp, "no completed 5m USD-M candle is available before the exit fill");
     }
-    if (fourHourCandles.length === 0) {
-      return unavailableSnapshot(requestedAt, input.trade.entryFilledAt ?? input.trade.entrySubmittedAt ?? null, input.trade.exitTimestamp, "no completed 4H USD-M candle is available before the exit fill");
-    }
-    const svg = renderDailyRangeClosedChartSvg({ trade: input.trade, fiveMinuteCandles, fourHourCandles, entryAtMs, exitAtMs });
+    const svg = renderDailyRangeClosedChartSvg({ trade: input.trade, fiveMinuteCandles, fourHourCandles: [], entryAtMs, exitAtMs });
     const root = resolve(input.directory);
     mkdirSync(root, { recursive: true });
     const file = resolve(root, assetFile);
@@ -582,7 +545,7 @@ export async function captureDailyRangeClosedChartSnapshot(input: {
       assetFile,
       mimeType: "image/svg+xml",
       fiveMinuteCandleCount: fiveMinuteCandles.length,
-      fourHourCandleCount: fourHourCandles.length,
+      fourHourCandleCount: 0,
       reason: null,
     };
   } catch (error) {

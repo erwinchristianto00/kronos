@@ -35,7 +35,7 @@ function kline(openTime: number, intervalMs: number, close: number): FuturesKlin
 }
 
 describe("Daily Range closed chart snapshot", () => {
-  it("archives only completed USD-M candles through the confirmed exit and renders the existing execution overlays", async () => {
+  it("archives only completed 5m USD-M candles through the confirmed exit and renders one readable execution view", async () => {
     const fiveMinutes = 5 * 60_000;
     const fourHours = 4 * 60 * 60_000;
     const base = Date.UTC(2026, 7, 30, 0, 0, 0);
@@ -94,22 +94,23 @@ describe("Daily Range closed chart snapshot", () => {
       exitAt: trade.exitTimestamp,
     });
     expect(snapshot.fiveMinuteCandleCount).toBeLessThan(fiveMinuteRows.length + 2);
-    expect(calls.map((call) => call.interval).sort()).toEqual(["4h", "5m"]);
+    expect(snapshot.fourHourCandleCount).toBe(0);
+    expect(calls.map((call) => call.interval)).toEqual(["5m"]);
     expect(existsSync(join(archiveDirectory, snapshot.assetFile!))).toBe(true);
     const svg = readFileSync(join(archiveDirectory, snapshot.assetFile!), "utf8");
-    expect(svg).toContain("4H · EMA20/EMA50 + structural support / resistance");
-    expect(svg).toContain("5m · final execution path");
+    expect(svg).toContain("DAILY RANGE 4H · 5M TRADE SNAPSHOT");
+    expect(svg).toContain("5m · actual execution path");
+    expect(svg).not.toContain("4H · EMA20/EMA50 + structural support / resistance");
     expect(svg).toContain("C1 breakout");
     expect(svg).toContain("C2 re-entry");
-    expect(svg).toContain("Native SL");
-    expect(svg).toContain("Target / TP");
+    expect(svg).toContain("Stop");
+    expect(svg).toContain("Target");
     expect(svg).not.toContain("Native 2R TP");
     expect(svg).not.toContain("0.406967644180422R");
-    const executionPanel = svg.slice(svg.indexOf("5m · final execution path"));
-    expect(executionPanel).toContain("Breakout reference");
-    expect(executionPanel).not.toContain("4H range high");
-    expect(executionPanel).not.toContain("4H range low");
-    expect(svg).toContain("ENTRY");
+    expect(svg).toContain("Breakout reference");
+    expect(svg).not.toContain("4H range high");
+    expect(svg).not.toContain("4H range low");
+    expect(svg).toContain("ENTRY LONG");
     expect(svg).toContain("EXIT");
     expect(svg).not.toContain(">777<");
     expect(readDailyRangeClosedChartSnapshotSvg(archiveDirectory, snapshot)).toBe(svg);
