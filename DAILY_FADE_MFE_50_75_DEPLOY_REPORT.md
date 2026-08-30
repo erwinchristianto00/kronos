@@ -1,6 +1,6 @@
 # Deploy report — Testnet
 
-Status at source-preparation time: **pending staged Testnet cutover**.
+Status: **deployed to Testnet**.
 
 ## Candidate checks completed
 
@@ -18,4 +18,19 @@ Before promotion, snapshot the existing account/state, verify the active PM2 rel
 3. the status endpoint exposes `fadeMfe` with zero retrofitted active trades;
 4. health, reconciliation, and account fingerprint match the pre-cutover snapshot.
 
-Post-cutover details are appended only after the actual guarded deployment.
+## Guarded cutover result
+
+- Release: `daily-fade-mfe-50-75-v1-20260830T103820Z`.
+- Guarded cutover completed at `2026-08-30T10:40:23Z`.
+- Account fingerprint matched before and after: 1 position, 0 open orders, `DOTUSDT LONG 29.5`.
+- Process is online with zero PM2 restarts.
+- Dashboard bundle contains the compact `Fade MFE` display.
+- No recent fatal or MFE-path error was found after restart.
+
+## Post-cutover state
+
+- Lane remains `ARMED`; no arm/disarm setting was changed by the release.
+- `fadeMfe` status is active with policy ID `daily-fade-mfe-50-75-v1` and zero retrofitted/open MFE trades.
+- Pre-existing `PROMUSDT` remains `CONTINUATION / ENTRY_RECONCILING / entryFilledAt=null / fadeMfe=null`; no bracket, fill, or selection was changed.
+
+Rollback path: run the incumbent guarded Testnet cutover script with this release as old and `daily-range-closed-chart-snapshot-20260830T100701Z` as new, preserving the same shared state ledger and account-fingerprint check.
