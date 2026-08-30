@@ -1,6 +1,6 @@
 # Deploy report — Testnet
 
-Status: **deployed to Testnet**.
+Status: **deployed to Testnet (final fail-closed follow-up active)**.
 
 ## Candidate checks completed
 
@@ -20,8 +20,9 @@ Before promotion, snapshot the existing account/state, verify the active PM2 rel
 
 ## Guarded cutover result
 
-- Release: `daily-fade-mfe-50-75-v1-20260830T103820Z`.
-- Guarded cutover completed at `2026-08-30T10:40:23Z`.
+- Initial release: `daily-fade-mfe-50-75-v1-20260830T103820Z`, guarded cutover completed at `2026-08-30T10:40:23Z`.
+- Active final release: `daily-fade-mfe-50-75-v1-1-20260830T104506Z`, guarded cutover completed at `2026-08-30T10:46:40Z`.
+- Follow-up hardening makes a stale/interrupted MFE path permanently observation-off for that trade; no later fresh tick can reactivate it.
 - Account fingerprint matched before and after: 1 position, 0 open orders, `DOTUSDT LONG 29.5`.
 - Process is online with zero PM2 restarts.
 - Dashboard bundle contains the compact `Fade MFE` display.
@@ -33,4 +34,4 @@ Before promotion, snapshot the existing account/state, verify the active PM2 rel
 - `fadeMfe` status is active with policy ID `daily-fade-mfe-50-75-v1` and zero retrofitted/open MFE trades.
 - Pre-existing `PROMUSDT` remains `CONTINUATION / ENTRY_RECONCILING / entryFilledAt=null / fadeMfe=null`; no bracket, fill, or selection was changed.
 
-Rollback path: run the incumbent guarded Testnet cutover script with this release as old and `daily-range-closed-chart-snapshot-20260830T100701Z` as new, preserving the same shared state ledger and account-fingerprint check.
+Rollback path: run the active release's guarded Testnet cutover script with `daily-fade-mfe-50-75-v1-1-20260830T104506Z` as old and `daily-range-closed-chart-snapshot-20260830T100701Z` as new, preserving the same shared state ledger and account-fingerprint check.
