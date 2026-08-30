@@ -2644,6 +2644,14 @@ describe("daily-4h-range-acceptance-2r-v1", () => {
     const after = new DailyRangeLaneStore(first.dir, "state.json", now.value).getState().trades[0]!;
     expect(after.fadeMfe).toMatchObject({ stage1Armed: true, stage2Armed: true, mfeExitFloorProgress: 0.5, health: "DEGRADED" });
     expect(client.placed.filter((order) => order.reduceOnly)).toHaveLength(0);
+
+    now.value += 1;
+    client.now = now.value;
+    restarted.ingestContractPricePath({ symbol: "AAAUSDT", price: 98, eventTimeMs: now.value, receivedAtMs: now.value, source: "CONTRACT_AGG_TRADE", streamStartedAtMs: now.value - 10 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const stillDisabled = new DailyRangeLaneStore(first.dir, "state.json", now.value).getState().trades[0]!;
+    expect(stillDisabled.fadeMfe).toMatchObject({ health: "DEGRADED", mfeExitFloorProgress: 0.5 });
+    expect(client.placed.filter((order) => order.reduceOnly)).toHaveLength(0);
   });
 
   it("resumes a durable Fade MFE exit intent after restart without waiting for another price event", async () => {

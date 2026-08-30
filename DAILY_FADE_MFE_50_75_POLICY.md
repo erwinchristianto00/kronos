@@ -33,7 +33,7 @@ When current progress is at or below the active floor, the lane writes one durab
 - Stage 2 reason: `FADE_MFE_STAGE2_GIVEBACK_EXIT`
 - Native structural TP/SL remain live and unchanged throughout.
 - Native TP/SL wins any race; no second reduce-only exit is sent.
-- Stream interruption, stale processing, or incomplete path degrades MFE to observation-off; native structural TP/SL remain the hard protection.
+- Stream interruption, stale processing, or incomplete path permanently degrades MFE to observation-off for that trade; a later fresh tick cannot reactivate it. Native structural TP/SL remain the hard protection.
 
 ## Evidence and telemetry
 
