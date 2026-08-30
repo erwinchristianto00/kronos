@@ -1,6 +1,6 @@
 # Deploy report — Live
 
-Status at source-preparation time: **pending guarded Live promotion after Testnet smoke**.
+Status: **deployed to Live after guarded Testnet smoke**.
 
 ## Candidate checks completed
 
@@ -18,4 +18,20 @@ Before promotion, snapshot the existing account/state, verify the active PM2 rel
 3. the status endpoint exposes `fadeMfe` with zero retrofitted active trades;
 4. health, reconciliation, and account fingerprint match the pre-cutover snapshot.
 
-Post-cutover details are appended only after the actual guarded deployment.
+## Guarded promotion result
+
+- Release: `daily-fade-mfe-50-75-v1-20260830T103820Z`.
+- Guarded cutover completed at `2026-08-30T10:42:33Z`.
+- Account fingerprint matched before and after: 0 positions and 0 open orders.
+- Process is online with zero PM2 restarts.
+- Dashboard bundle contains the compact `Fade MFE` display.
+- No recent fatal or MFE-path error was found after restart.
+
+## Post-cutover state
+
+- Live remains `DISARMED` with the unchanged pre-existing reason: `KILL_SWITCH_PORTFOLIO: max consecutive losses hit (6 within 24h of each other)`.
+- No Daily Range trade was open before or after the promotion.
+- `fadeMfe` status is active with policy ID `daily-fade-mfe-50-75-v1` and zero retrofitted/open MFE trades.
+- Live Continuation remains `SHADOW_ONLY`; only future executable Fade entries can create MFE state after a confirmed fill.
+
+Rollback path: run the incumbent guarded Live cutover script with this release as old and `daily-range-closed-chart-snapshot-20260830T100701Z` as new, preserving the same shared state ledger, Live disarm state, and account-fingerprint check.
