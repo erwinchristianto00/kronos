@@ -105,6 +105,10 @@ describe("Daily Range closed chart snapshot", () => {
     expect(svg).toContain("C2 re-entry");
     expect(svg).toContain("Stop");
     expect(svg).toContain("Target");
+    expect(svg).toContain('text-anchor="end">C1 breakout</text>');
+    expect(svg).toContain('text-anchor="start">C2 re-entry</text>');
+    expect(svg).toContain('text-anchor="end">ENTRY LONG</text>');
+    expect(svg).toContain('text-anchor="start">EXIT</text>');
     expect(svg).not.toContain("Native 2R TP");
     expect(svg).not.toContain("0.406967644180422R");
     expect(svg).toContain("Breakout reference");
