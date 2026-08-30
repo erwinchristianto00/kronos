@@ -1,6 +1,6 @@
 # Deploy report — Live
 
-Status: **deployed to Live after guarded Testnet smoke**.
+Status: **deployed to Live after guarded Testnet smoke (final fail-closed follow-up active)**.
 
 ## Candidate checks completed
 
@@ -20,8 +20,9 @@ Before promotion, snapshot the existing account/state, verify the active PM2 rel
 
 ## Guarded promotion result
 
-- Release: `daily-fade-mfe-50-75-v1-20260830T103820Z`.
-- Guarded cutover completed at `2026-08-30T10:42:33Z`.
+- Initial release: `daily-fade-mfe-50-75-v1-20260830T103820Z`, guarded cutover completed at `2026-08-30T10:42:33Z`.
+- Active final release: `daily-fade-mfe-50-75-v1-1-20260830T104506Z`, guarded cutover completed at `2026-08-30T10:47:45Z`.
+- Follow-up hardening makes a stale/interrupted MFE path permanently observation-off for that trade; no later fresh tick can reactivate it.
 - Account fingerprint matched before and after: 0 positions and 0 open orders.
 - Process is online with zero PM2 restarts.
 - Dashboard bundle contains the compact `Fade MFE` display.
@@ -34,4 +35,4 @@ Before promotion, snapshot the existing account/state, verify the active PM2 rel
 - `fadeMfe` status is active with policy ID `daily-fade-mfe-50-75-v1` and zero retrofitted/open MFE trades.
 - Live Continuation remains `SHADOW_ONLY`; only future executable Fade entries can create MFE state after a confirmed fill.
 
-Rollback path: run the incumbent guarded Live cutover script with this release as old and `daily-range-closed-chart-snapshot-20260830T100701Z` as new, preserving the same shared state ledger, Live disarm state, and account-fingerprint check.
+Rollback path: run the active release's guarded Live cutover script with `daily-fade-mfe-50-75-v1-1-20260830T104506Z` as old and `daily-range-closed-chart-snapshot-20260830T100701Z` as new, preserving the same shared state ledger, Live disarm state, and account-fingerprint check.
