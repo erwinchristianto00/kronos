@@ -1987,6 +1987,12 @@ export class DailyRangeAcceptanceLane {
     if (trade.entryPolicy !== "FADE" || !policy || policy.mfePolicyId !== DAILY_RANGE_FADE_MFE_POLICY_ID) {
       return { changed: false, mustPersist: false };
     }
+    // A confirmed stale event or stream interruption creates an unobserved
+    // interval. That cannot be made causal again by a later fresh tick, so
+    // leave MFE observation-off for this trade and retain native protection.
+    if (policy.health === "DEGRADED" && /^(MFE disabled:|MFE event stale)/.test(policy.degradedReason ?? "")) {
+      return { changed: false, mustPersist: false };
+    }
     // MFE authority is unavailable before protection is OPEN, from recovered
     // OHLC, or after a path gap. Native structural SL/TP remains unchanged.
     if (trade.status !== "OPEN" || event.source !== "CONTRACT_AGG_TRADE" || trade.pathQuality !== "EXACT_STREAM") {
