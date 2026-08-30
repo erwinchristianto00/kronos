@@ -11,7 +11,7 @@ import { resolve, sep } from "node:path";
 
 import type { FuturesKline } from "./binance-futures-private.js";
 
-export const DAILY_RANGE_CLOSED_CHART_SNAPSHOT_VERSION = "daily-range-closed-chart-svg-v1" as const;
+export const DAILY_RANGE_CLOSED_CHART_SNAPSHOT_VERSION = "daily-range-closed-chart-svg-v2" as const;
 
 export type DailyRangeClosedChartSnapshot = {
   version: typeof DAILY_RANGE_CLOSED_CHART_SNAPSHOT_VERSION;
@@ -99,7 +99,14 @@ const COLORS = {
 type OverlayPoint = { openTime: number; value: number };
 type StructuralLine = { kind: "RESISTANCE" | "SUPPORT"; points: OverlayPoint[] };
 type PriceLevel = { label: string; price: number; color: string; dash?: string };
-type SnapshotMarker = { label: string; at: number; price: number; color: string; position: "above" | "below" | "middle" };
+type SnapshotMarker = {
+  label: string;
+  at: number;
+  price: number;
+  color: string;
+  position: "above" | "below" | "middle";
+  labelAnchor?: "start" | "end";
+};
 type RiskZone = { from: number; to: number; color: string; label: string };
 
 function finite(value: unknown): value is number {
@@ -251,7 +258,9 @@ function renderPanel(input: {
   const left = outerX + 72;
   const right = outerX + width - 148;
   const top = outerY + 48;
-  const bottom = outerY + height - 62;
+  // Keep chart labels and the legend in their own footer space. Previously
+  // both occupied the same band, which made the time axis unreadable.
+  const bottom = outerY + height - 102;
   const plotWidth = Math.max(1, right - left);
   const plotHeight = Math.max(1, bottom - top);
   const timeStart = Math.min(viewportStart, viewportEnd - intervalMs);
@@ -336,7 +345,9 @@ function renderPanel(input: {
     const shape = marker.position === "middle"
       ? `<circle cx="${xx}" cy="${yy}" r="5" fill="${marker.color}" stroke="#071016" stroke-width="2"/>`
       : `<polygon points="${triangle}" fill="${marker.color}" stroke="#071016" stroke-width="1"/>`;
-    return `${shape}<text x="${xx + 8}" y="${labelY}" fill="${marker.color}" font-size="12" font-weight="700">${escapeXml(marker.label)}</text>`;
+    const labelAnchor = marker.labelAnchor ?? "start";
+    const labelX = xx + (labelAnchor === "end" ? -8 : 8);
+    return `${shape}<text x="${labelX}" y="${labelY}" fill="${marker.color}" font-size="12" font-weight="700" text-anchor="${labelAnchor}">${escapeXml(marker.label)}</text>`;
   }).join("");
   const legendRows = [
     ...levels.map((level) => ({ color: level.color, text: `${level.label} ${formatPrice(level.price)}` })),
@@ -344,11 +355,11 @@ function renderPanel(input: {
     { color: COLORS.ema50, text: "EMA50" },
     ...(showStructure ? [{ color: COLORS.resistance, text: "Structural resistance" }, { color: COLORS.support, text: "Structural support" }] : []),
   ];
-  const legendSvg = legendRows.slice(0, 10).map((item, index) => {
-    const column = index % 5;
-    const row = Math.floor(index / 5);
-    const xx = outerX + 16 + column * 300;
-    const yy = outerY + height - 34 + row * 13;
+  const legendSvg = legendRows.slice(0, 12).map((item, index) => {
+    const column = index % 4;
+    const row = Math.floor(index / 4);
+    const xx = outerX + 16 + column * 375;
+    const yy = outerY + height - 52 + row * 16;
     return `<rect x="${xx}" y="${yy - 9}" width="10" height="3" fill="${item.color}"/><text x="${xx + 15}" y="${yy}" fill="${COLORS.dim}" font-size="11">${escapeXml(item.text)}</text>`;
   }).join("");
   return `<g>
@@ -421,13 +432,26 @@ export function renderDailyRangeClosedChartSvg(input: {
   const sessionText = referenceStart !== null && referenceEnd !== null
     ? `${formatTaipei(referenceStart)}–${formatTaipei(referenceEnd)} ${trade.referenceTimezone === "America/New_York" ? "New York reference" : "UTC reference"}`
     : "persisted 4H reference";
-  const tpMultiple = finite(trade.rrTarget) && trade.rrTarget > 0 ? trade.rrTarget : 2;
-  const tradeLevels: PriceLevel[] = [
+  const breakoutReference = trade.breakoutDirection === "DOWN" || (!trade.breakoutDirection && trade.direction === "SHORT")
+    ? { label: "Breakout reference", price: trade.rangeLow, color: COLORS.rangeLow }
+    : { label: "Breakout reference", price: trade.rangeHigh, color: COLORS.rangeHigh };
+  const contextLevels: PriceLevel[] = [
     { label: "4H range high", price: trade.rangeHigh, color: COLORS.rangeHigh },
     { label: "4H range low", price: trade.rangeLow, color: COLORS.rangeLow },
     { label: "Entry", price: trade.entryFillPrice!, color: COLORS.entry },
     ...(positive(trade.stopPrice) ? [{ label: "Native SL", price: trade.stopPrice, color: COLORS.stop }] : []),
-    ...(positive(trade.takeProfitPrice) ? [{ label: `Native ${tpMultiple}R TP`, price: trade.takeProfitPrice, color: COLORS.takeProfit }] : []),
+    ...(positive(trade.takeProfitPrice) ? [{ label: "Target / TP", price: trade.takeProfitPrice, color: COLORS.takeProfit }] : []),
+    { label: "Exit fill", price: trade.exitPrice!, color: COLORS.exit },
+  ];
+  // The 5m panel is an execution review, not a 4H range map. Including the
+  // opposite range boundary in its price scale can flatten every relevant
+  // candle when the 4H range is wide. Keep the full context in the 4H panel
+  // and show only the level that actually triggered the trade below.
+  const executionLevels: PriceLevel[] = [
+    breakoutReference,
+    { label: "Entry", price: trade.entryFillPrice!, color: COLORS.entry },
+    ...(positive(trade.stopPrice) ? [{ label: "Native SL", price: trade.stopPrice, color: COLORS.stop }] : []),
+    ...(positive(trade.takeProfitPrice) ? [{ label: "Target / TP", price: trade.takeProfitPrice, color: COLORS.takeProfit }] : []),
     { label: "Exit fill", price: trade.exitPrice!, color: COLORS.exit },
   ];
   const breakoutPosition = trade.breakoutDirection === "DOWN" ? "below" : "above" as const;
@@ -437,7 +461,7 @@ export function renderDailyRangeClosedChartSvg(input: {
       label: "C1 breakout",
       at: trade.confirmationBar1.openTime + FIVE_MINUTE_MS,
       price: trade.confirmationBar1.close,
-      color: COLORS.rangeHigh,
+      color: breakoutReference.color,
       position: breakoutPosition,
     },
     {
@@ -446,9 +470,10 @@ export function renderDailyRangeClosedChartSvg(input: {
       price: trade.confirmationBar2.close,
       color: COLORS.rangeLow,
       position: c2Position,
+      labelAnchor: "end",
     },
     { label: "ENTRY", at: entryAtMs, price: trade.entryFillPrice!, color: COLORS.entry, position: "middle" },
-    { label: "EXIT", at: exitAtMs, price: trade.exitPrice!, color: COLORS.exit, position: "middle" },
+    { label: "EXIT", at: exitAtMs, price: trade.exitPrice!, color: COLORS.exit, position: "middle", labelAnchor: "end" },
   ];
   const zones: RiskZone[] = [
     ...(positive(trade.stopPrice) ? [{ from: trade.entryFillPrice!, to: trade.stopPrice, color: COLORS.stop, label: "risk to SL" }] : []),
@@ -463,10 +488,10 @@ export function renderDailyRangeClosedChartSvg(input: {
     intervalMs: FOUR_HOURS_MS,
     viewportStart: fourHourStart,
     viewportEnd: exitAtMs,
-    levels: tradeLevels,
+    levels: contextLevels,
     markers: [
       { label: "ENTRY", at: entryAtMs, price: trade.entryFillPrice!, color: COLORS.entry, position: "middle" },
-      { label: "EXIT", at: exitAtMs, price: trade.exitPrice!, color: COLORS.exit, position: "middle" },
+      { label: "EXIT", at: exitAtMs, price: trade.exitPrice!, color: COLORS.exit, position: "middle", labelAnchor: "end" },
     ],
     showStructure: true,
   });
@@ -479,7 +504,7 @@ export function renderDailyRangeClosedChartSvg(input: {
     intervalMs: FIVE_MINUTE_MS,
     viewportStart: fiveMinuteStart,
     viewportEnd: exitAtMs,
-    levels: tradeLevels,
+    levels: executionLevels,
     markers,
     zones,
   });
@@ -585,4 +610,3 @@ export function readDailyRangeClosedChartSnapshotSvg(
     return null;
   }
 }
-

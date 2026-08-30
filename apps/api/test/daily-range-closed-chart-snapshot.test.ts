@@ -68,7 +68,9 @@ describe("Daily Range closed chart snapshot", () => {
       rangeLow: 98,
       stopPrice: 100.4,
       takeProfitPrice: 107.6,
-      rrTarget: 2,
+      // A fractional structural target must not leak an unreadable raw
+      // floating-point R value into the visual legend.
+      rrTarget: 0.406967644180422,
       referenceTimezone: "America/New_York",
       referenceRangeOpenTime: base,
       referenceRangeCloseTime: base + fourHours,
@@ -100,7 +102,13 @@ describe("Daily Range closed chart snapshot", () => {
     expect(svg).toContain("C1 breakout");
     expect(svg).toContain("C2 re-entry");
     expect(svg).toContain("Native SL");
-    expect(svg).toContain("Native 2R TP");
+    expect(svg).toContain("Target / TP");
+    expect(svg).not.toContain("Native 2R TP");
+    expect(svg).not.toContain("0.406967644180422R");
+    const executionPanel = svg.slice(svg.indexOf("5m · final execution path"));
+    expect(executionPanel).toContain("Breakout reference");
+    expect(executionPanel).not.toContain("4H range high");
+    expect(executionPanel).not.toContain("4H range low");
     expect(svg).toContain("ENTRY");
     expect(svg).toContain("EXIT");
     expect(svg).not.toContain(">777<");
@@ -137,4 +145,3 @@ describe("Daily Range closed chart snapshot", () => {
     expect(readDailyRangeClosedChartSnapshotSvg(archiveDirectory, snapshot)).toBeNull();
   });
 });
-
