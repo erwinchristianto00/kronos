@@ -539,6 +539,7 @@ function ClosedDailyRangeReport({
   const selectedSnapshot = selectedSnapshotTrade?.closedChartSnapshot ?? null;
   const selectedSnapshotUrl = selectedSnapshotTrade && selectedSnapshot?.status === 'CAPTURED'
     ? apiPrefix + '/live/daily-range-lane/closed-chart-snapshot?tradeId=' + encodeURIComponent(selectedSnapshotTrade.tradeId)
+      + '&render=' + encodeURIComponent(`${selectedSnapshot.version}-${selectedSnapshot.capturedAt ?? selectedSnapshot.requestedAt}`)
     : null;
 
   return <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="daily-range-closed-report">
@@ -612,12 +613,12 @@ function ClosedDailyRangeReport({
       style={{ marginTop: 14, border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden', background: C.sub }}
     >
       <div style={{ padding: '10px 12px', borderBottom: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'baseline' }}>
-        <div><strong style={{ color: C.text }}>{selectedSnapshotTrade.symbol} · final chart at close</strong><small style={{ display: 'block', color: C.dim, marginTop: 3 }}>Entry sampai fill exit · completed USD-M candle only · disimpan {formatTaipei(selectedSnapshot.capturedAt)}</small></div>
+        <div><strong style={{ color: C.text }}>{selectedSnapshotTrade.symbol} · 5m execution chart at close</strong><small style={{ display: 'block', color: C.dim, marginTop: 3 }}>Konteks 5m sampai fill exit · candle USD-M selesai · disimpan {formatTaipei(selectedSnapshot.capturedAt)}</small></div>
         <button type="button" className="daily-range-symbol-button" onClick={() => setSelectedSnapshotTradeId(null)}>tutup</button>
       </div>
       <img
         src={selectedSnapshotUrl}
-        alt={selectedSnapshotTrade.symbol + ' Daily Range 4H immutable chart snapshot from entry to close'}
+        alt={selectedSnapshotTrade.symbol + ' Daily Range 5m execution chart snapshot from entry to close'}
         style={{ display: 'block', width: '100%', height: 'auto', background: '#071016' }}
       />
     </section> : null}
