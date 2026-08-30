@@ -75,7 +75,9 @@ describe("Daily Range closed chart snapshot", () => {
       referenceRangeOpenTime: base,
       referenceRangeCloseTime: base + fourHours,
       confirmationBar1: kline(base + 66 * fiveMinutes, fiveMinutes, 97.8),
-      confirmationBar2: kline(base + 67 * fiveMinutes, fiveMinutes, 98.1),
+      // C2 may accept directly at the 4H boundary. The picture must show
+      // that honestly as one coincident level rather than stacked lines.
+      confirmationBar2: kline(base + 67 * fiveMinutes, fiveMinutes, 98),
     };
 
     const archiveDirectory = directory();
@@ -102,20 +104,21 @@ describe("Daily Range closed chart snapshot", () => {
     expect(svg).toContain("5m · actual execution path");
     expect(svg).not.toContain("4H · EMA20/EMA50 + structural support / resistance");
     expect(svg).toContain("C1 breakout");
-    expect(svg).toContain("C2 re-entry");
+    expect(svg).toContain("C2 acceptance");
     expect(svg).toContain("Stop");
     expect(svg).toContain("Target");
-    expect(svg).toContain('text-anchor="end">C1 breakout</text>');
-    expect(svg).toContain('text-anchor="start">C2 re-entry</text>');
-    expect(svg).toContain('text-anchor="end">ENTRY LONG</text>');
-    expect(svg).toContain('text-anchor="start">EXIT</text>');
+    expect(svg).not.toContain('text-anchor="end">C1 breakout</text>');
+    expect(svg).not.toContain('text-anchor="start">C2 acceptance</text>');
+    expect(svg).not.toContain('text-anchor="end">ENTRY LONG</text>');
+    expect(svg).not.toContain('text-anchor="start">EXIT</text>');
     expect(svg).not.toContain("Native 2R TP");
     expect(svg).not.toContain("0.406967644180422R");
-    expect(svg).toContain("Breakout reference");
+    expect(svg).toContain("4H breakdown = C2 acceptance");
+    expect(svg).toContain("4H ref");
     expect(svg).not.toContain("4H range high");
     expect(svg).not.toContain("4H range low");
-    expect(svg).toContain("ENTRY LONG");
-    expect(svg).toContain("EXIT");
+    expect(svg).toContain("Entry LONG");
+    expect(svg).toContain("Exit");
     expect(svg).not.toContain(">777<");
     expect(readDailyRangeClosedChartSnapshotSvg(archiveDirectory, snapshot)).toBe(svg);
   });
