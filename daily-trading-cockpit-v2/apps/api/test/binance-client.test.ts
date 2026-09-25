@@ -47,6 +47,63 @@ describe("BinanceClient", () => {
     expect(summary.stageTimings.candles_5m?.cacheHitCount).toBe(1);
   });
 
+  it("uses the public USD-M endpoint for futures outcome candles", async () => {
+    const successPayload = makeKlinePayload();
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      expect(url.host).toBe("fapi.binance.com");
+      expect(url.pathname).toBe("/fapi/v1/klines");
+      expect(url.searchParams.get("symbol")).toBe("1000PEPEUSDT");
+      expect(url.searchParams.get("interval")).toBe("15m");
+      expect(url.searchParams.get("limit")).toBe("37");
+      expect(url.searchParams.get("startTime")).toBe("1700000000000");
+      return new Response(JSON.stringify(successPayload), { status: 200 });
+    });
+
+    const client = new BinanceClient(fetchImpl as typeof fetch);
+    const candles = await client.getFuturesCandles("1000PEPEUSDT", "15m", 37, { startTime: 1_700_000_000_000 });
+
+    expect(candles).toHaveLength(3);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry or fan out public USD-M reads after an HTTP 418", async () => {
+    const bannedUntilMs = Date.now() + 5 * 60_000;
+    const fetchImpl = vi.fn(async () => new Response(
+      JSON.stringify({ code: -1003, msg: `Way too much request weight used; IP banned until ${bannedUntilMs}.` }),
+      { status: 418 },
+    ));
+    const client = new BinanceClient(fetchImpl as typeof fetch);
+
+    await expect(client.getFuturesBookTicker("SOLUSDT")).rejects.toMatchObject<Partial<BinanceRequestError>>({
+      failureType: "418",
+      stage: "futures_book_ticker",
+      retryAt: new Date(bannedUntilMs).toISOString(),
+    });
+    // The second caller sees the client-wide circuit before it reaches fetch().
+    await expect(client.getFuturesBookTicker("BTCUSDT")).rejects.toMatchObject<Partial<BinanceRequestError>>({
+      failureType: "418",
+      stage: "futures_book_ticker",
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a short circuit for a USD-M 429 instead of escalating it with immediate retries", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ code: -1003, msg: "Too many requests" }), { status: 429 }));
+    const client = new BinanceClient(fetchImpl as typeof fetch);
+
+    await expect(client.getFuturesBookTicker("SOLUSDT")).rejects.toMatchObject<Partial<BinanceRequestError>>({
+      failureType: "429",
+      stage: "futures_book_ticker",
+      retryAt: expect.any(String),
+    });
+    await expect(client.getFuturesBookTicker("BTCUSDT")).rejects.toMatchObject<Partial<BinanceRequestError>>({
+      failureType: "429",
+      stage: "futures_book_ticker",
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("emits typed failures when no cache exists", async () => {
     const fetchImpl = vi.fn(async () => new Response("missing", { status: 404 }));
     const client = new BinanceClient(fetchImpl as typeof fetch);

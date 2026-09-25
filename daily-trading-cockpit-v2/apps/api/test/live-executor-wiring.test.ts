@@ -1,13 +1,15 @@
 import { describe, it, expect, afterEach } from "vitest";
 import {
   computeExternalManagedNetQty,
+  computeExternalPendingEntryQty,
+  pendingEntryExplainsPosition,
+  shouldAutoRearm,
   computeNotionalPerSymbol,
   maxNotionalPerSymbolAcrossLanes,
   computeClusterOpenSymbols,
   maxClusterPositionsAcrossLanes,
   isNewExecutorLaneAllowed,
-  isTestnetCrossSectionalHorizonLaneAllowed,
-  isTestnetCrossSectionalHorizonSourceAllowed,
+  newExecutorLaneGate,
   rollingNetEntryHealth,
   type LiveExecutorGateEngine,
 } from "../src/lib/live-executor-wiring.js";
@@ -78,31 +80,52 @@ describe("isNewExecutorLaneAllowed", () => {
   });
 });
 
-describe("testnet cross-sectional horizon rollout lock", () => {
-  const locked = { TESTNET_ONLY_CROSS_SECTIONAL_HORIZON: "1" } as NodeJS.ProcessEnv;
-
-  it("allows only the market-neutral cross-sectional horizon lane on testnet", () => {
-    expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", "CROSS_SECTIONAL_MARKET_NEUTRAL", locked)).toBe(true);
-    expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", "CROSS_SECTIONAL_TREND", locked)).toBe(false);
-    expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", "REGIME_COMPOSITE_CONFIRMATION_LONG", locked)).toBe(false);
-    expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", null, locked)).toBe(false);
+describe("newExecutorLaneGate reason plumbing (2026-08 manual-directional canonical-regime enforcement fix)", () => {
+  it("surfaces engine.newEntryBlockReason() verbatim when the engine defines it and canOpenNewEntries() is false", () => {
+    const engine = fakeEngine({
+      canOpenNewEntries: () => false,
+      newEntryBlockReason: () => "canonical regime PANIC active",
+    });
+    expect(newExecutorLaneGate("MY_LANE", "testnet", engine)).toEqual({ allowed: false, reason: "canonical regime PANIC active" });
   });
 
-  it("does not change mainnet or an unlocked testnet", () => {
-    expect(isTestnetCrossSectionalHorizonLaneAllowed("mainnet", "REGIME_COMPOSITE_CONFIRMATION_LONG", locked)).toBe(true);
-    expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", "REGIME_COMPOSITE_CONFIRMATION_LONG", {})).toBe(true);
+  it("falls back to the generic drain string when newEntryBlockReason() itself returns null (`??` is nullish-coalescing, not a presence check — it substitutes for BOTH a missing method and a present method returning null/undefined)", () => {
+    const engine = fakeEngine({
+      canOpenNewEntries: () => false,
+      newEntryBlockReason: () => null,
+    });
+    // In practice this combination (canOpenNewEntries()===false but newEntryBlockReason()===null)
+    // cannot happen on a REAL LiveExecutionEngine — both are sourced from the same
+    // entryGateDecision() by construction (see that method's own doc comment), so they can never
+    // disagree. This test pins the fakeEngine-reachable EDGE behavior precisely (a `??` fallback,
+    // not a stricter `??  only-if-undefined` check some readers might expect from the `?.()` call
+    // immediately to its left) so a future refactor cannot silently change it without this test
+    // noticing either way.
+    expect(newExecutorLaneGate("MY_LANE", "testnet", engine)).toEqual({
+      allowed: false,
+      reason: "new-entry drain is active (operator paused new entries)",
+    });
   });
 
-  it("allows only explicitly configured experimental lane symbols", () => {
-    const env = {
-      TESTNET_ONLY_CROSS_SECTIONAL_HORIZON: "1",
-      TESTNET_CROSS_SECTIONAL_EXTRA_LANES: "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK",
-      TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS: "XRPUSDT,WLDUSDT",
-    } as NodeJS.ProcessEnv;
-    expect(isTestnetCrossSectionalHorizonSourceAllowed("testnet", "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK", "XRPUSDT", env)).toBe(true);
-    expect(isTestnetCrossSectionalHorizonSourceAllowed("testnet", "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK", "WLDUSDT", env)).toBe(true);
-    expect(isTestnetCrossSectionalHorizonSourceAllowed("testnet", "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK", "ADAUSDT", env)).toBe(false);
-    expect(isTestnetCrossSectionalHorizonSourceAllowed("testnet", "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE", "XRPUSDT", env)).toBe(false);
+  it("falls back to the generic drain string when the engine does not define newEntryBlockReason at all (pre-2026-08 fake/engine shape)", () => {
+    const engine = fakeEngine({ canOpenNewEntries: () => false });
+    expect(newExecutorLaneGate("MY_LANE", "testnet", engine)).toEqual({
+      allowed: false,
+      reason: "new-entry drain is active (operator paused new entries)",
+    });
+  });
+
+  it("never consults newEntryBlockReason at all when canOpenNewEntries() is true (reason stays null on the allowed path)", () => {
+    let called = false;
+    const engine = fakeEngine({
+      canOpenNewEntries: () => true,
+      newEntryBlockReason: () => {
+        called = true;
+        return "should never be read";
+      },
+    });
+    expect(newExecutorLaneGate("MY_LANE", "testnet", engine)).toEqual({ allowed: true, reason: null });
+    expect(called).toBe(false);
   });
 });
 
@@ -124,6 +147,21 @@ function fakeBasket(legs: ExecutorBasket["legs"]): ExecutorBasket {
 }
 function fakeLeg(symbol: string, side: "LONG" | "SHORT", qty: number, exitOrderId: number | null = null): ExecutorBasket["legs"][number] {
   return { symbol, side, qty, entryPrice: 1, entryOrderId: 1, entryPriceConfirmed: true, exitPrice: null, exitOrderId, exitPriceConfirmed: null };
+}
+function fakePlannedLeg(
+  planIndex: number, symbol: string, side: "LONG" | "SHORT", requestedQty: number, makerRestingOrderId?: string,
+): NonNullable<ExecutorBasket["plan"]>[number] {
+  return {
+    planIndex, symbol, side, requestedQty, refPrice: 1,
+    reservationId: null, entryClientOrderId: `cid-${planIndex}`,
+    ...(makerRestingOrderId === undefined ? {} : { makerRestingOrderId }),
+  };
+}
+function fakeSingleSymbolExecutorWithPending(pending: Map<string, number>): SingleSymbolLaneExecutor {
+  return { pendingMakerEntryQtyBySymbol: () => pending } as unknown as SingleSymbolLaneExecutor;
+}
+function fakeBasketWithPlan(legs: ExecutorBasket["legs"], plan: NonNullable<ExecutorBasket["plan"]>): ExecutorBasket {
+  return { ...fakeBasket(legs), plan, status: "PLACING" };
 }
 function fakeOrphanedLeg(symbol: string, side: "LONG" | "SHORT", qty: number, entryPrice = 1): OrphanedLeg {
   return {
@@ -193,6 +231,141 @@ describe("computeExternalManagedNetQty", () => {
       const net = computeExternalManagedNetQty([exec], []);
       expect(net.get("ETHUSDT")).toBeCloseTo(-0.7, 9); // -1 (short leg) + 0.3 (orphan)
     });
+  });
+});
+
+describe("2026-08-17 maker-entry disarm: a RESTING entry order is not yet a leg", () => {
+  // Reproduces the incident exactly. Basket xb-msw8ddsf-ltered opened 2026-08-16T20:02:03Z with
+  // legs:[] and six post-only orders resting. WLD filled at 55 before the leg was adopted, reconcile
+  // saw claimed=0, logged "orphan exchange position WLDUSDT amt=55 (not opened by engine)" and
+  // force-disarmed the account, which then sat disarmed 6h24m because nothing re-arms.
+  describe("computeExternalPendingEntryQty", () => {
+    it("reports a resting LONG order as positive pending qty, SHORT as negative", () => {
+      const exec = fakeXsecExecutor([
+        fakeBasketWithPlan([], [fakePlannedLeg(0, "WLDUSDT", "LONG", 55, "mk-1"), fakePlannedLeg(1, "SUIUSDT", "SHORT", 37.4, "mk-2")]),
+      ]);
+      const pending = computeExternalPendingEntryQty([exec]);
+      expect(pending.get("WLDUSDT")).toBeCloseTo(55, 9);
+      expect(pending.get("SUIUSDT")).toBeCloseTo(-37.4, 9);
+    });
+
+    it("stops reporting a leg once it is adopted into basket.legs — else the band would double-count", () => {
+      const planned = fakePlannedLeg(0, "WLDUSDT", "LONG", 55, "mk-1");
+      const adopted = { ...fakeLeg("WLDUSDT", "LONG", 55), planIndex: 0 };
+      const exec = fakeXsecExecutor([fakeBasketWithPlan([adopted], [planned])]);
+      expect(computeExternalPendingEntryQty([exec]).has("WLDUSDT")).toBe(false);
+    });
+
+    it("ignores a planned leg with NO resting order — nothing is on the book to explain", () => {
+      const exec = fakeXsecExecutor([fakeBasketWithPlan([], [fakePlannedLeg(0, "WLDUSDT", "LONG", 55, undefined)])]);
+      expect(computeExternalPendingEntryQty([exec]).size).toBe(0);
+    });
+
+    it("tolerates a basket with no plan at all (persisted before the field existed) and null slots", () => {
+      expect(computeExternalPendingEntryQty([null]).size).toBe(0);
+      expect(computeExternalPendingEntryQty([fakeXsecExecutor([fakeBasket([fakeLeg("BTCUSDT", "LONG", 1)])])]).size).toBe(0);
+    });
+
+    it("counts a directional lane's resting post-only entry too — same hole, wider window (120s)", () => {
+      const lane = fakeSingleSymbolExecutorWithPending(new Map([["SOLUSDT", -12], ["WLDUSDT", 40]]));
+      const pending = computeExternalPendingEntryQty([], [lane]);
+      expect(pending.get("SOLUSDT")).toBeCloseTo(-12, 9);
+      expect(pending.get("WLDUSDT")).toBeCloseTo(40, 9);
+    });
+
+    it("adds a directional lane's resting order to a basket's on the SAME symbol", () => {
+      const xsec = fakeXsecExecutor([fakeBasketWithPlan([], [fakePlannedLeg(0, "WLDUSDT", "LONG", 55, "mk-1")])]);
+      const lane = fakeSingleSymbolExecutorWithPending(new Map([["WLDUSDT", 40]]));
+      expect(computeExternalPendingEntryQty([xsec], [lane]).get("WLDUSDT")).toBeCloseTo(95, 9);
+    });
+
+    it("sums two executors resting on the SAME symbol", () => {
+      const a = fakeXsecExecutor([fakeBasketWithPlan([], [fakePlannedLeg(0, "UNIUSDT", "LONG", 7, "mk-a")])]);
+      const b = fakeXsecExecutor([fakeBasketWithPlan([], [fakePlannedLeg(0, "UNIUSDT", "LONG", 3, "mk-b")])]);
+      expect(computeExternalPendingEntryQty([a, b]).get("UNIUSDT")).toBeCloseTo(10, 9);
+    });
+  });
+
+  describe("pendingEntryExplainsPosition", () => {
+    const EPS = 1e-6;
+
+    it("explains nothing filled yet, a partial, and a full fill of a resting LONG order", () => {
+      expect(pendingEntryExplainsPosition(0, 0, 55, EPS)).toBe(true); // untouched
+      expect(pendingEntryExplainsPosition(20, 0, 55, EPS)).toBe(true); // partial
+      expect(pendingEntryExplainsPosition(55, 0, 55, EPS)).toBe(true); // full
+    });
+
+    it("explains the exact TAO partials the incident logged (0.088 then 0.167 of a planned 0.167)", () => {
+      expect(pendingEntryExplainsPosition(0.088, 0, 0.167, EPS)).toBe(true);
+      expect(pendingEntryExplainsPosition(0.167, 0, 0.167, EPS)).toBe(true);
+    });
+
+    it("explains the SHORT side symmetrically", () => {
+      expect(pendingEntryExplainsPosition(-15, 0, -37.4, EPS)).toBe(true);
+      expect(pendingEntryExplainsPosition(-37.4, 0, -37.4, EPS)).toBe(true);
+    });
+
+    it("still disarms on a position BIGGER than the plan — the band is bounded by what we requested", () => {
+      expect(pendingEntryExplainsPosition(56, 0, 55, EPS)).toBe(false);
+      expect(pendingEntryExplainsPosition(-38, 0, -37.4, EPS)).toBe(false);
+    });
+
+    it("still disarms on a position on the OPPOSITE side of the plan", () => {
+      expect(pendingEntryExplainsPosition(-1, 0, 55, EPS)).toBe(false);
+      expect(pendingEntryExplainsPosition(1, 0, -37.4, EPS)).toBe(false);
+    });
+
+    it("does NOTHING when nothing is resting — the pre-existing exact-match contract stays strict", () => {
+      expect(pendingEntryExplainsPosition(55, 55, 0, EPS)).toBe(false);
+      expect(pendingEntryExplainsPosition(0, 0, 0, EPS)).toBe(false);
+      expect(pendingEntryExplainsPosition(999, 0, 0, EPS)).toBe(false);
+    });
+
+    it("bands from an ALREADY-filled claim, not from zero: 3 of 6 legs adopted, 3 still resting", () => {
+      // claimed=20 already adopted, 35 still on the book → exchange may show 20..55, never 19 or 56.
+      expect(pendingEntryExplainsPosition(20, 20, 35, EPS)).toBe(true);
+      expect(pendingEntryExplainsPosition(40, 20, 35, EPS)).toBe(true);
+      expect(pendingEntryExplainsPosition(55, 20, 35, EPS)).toBe(true);
+      expect(pendingEntryExplainsPosition(19, 20, 35, EPS)).toBe(false);
+      expect(pendingEntryExplainsPosition(56, 20, 35, EPS)).toBe(false);
+    });
+  });
+});
+
+describe("2026-08-17 auto-rearm: only a transient exchange error recovers on its own", () => {
+  // The error-streak guard was right but LATCHED, and nothing re-arms (LIVE_AUTO_ARM=0), so ~75s of
+  // Binance trouble took testnet down until a human noticed hours later. Recovery is now allowed for
+  // that ONE cause. These tests exist to keep every other cause latched.
+  const REQ = 4, MAX = 3;
+
+  it("recovers once the exchange has been clean for the required run of ticks", () => {
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 4, 0, REQ, MAX)).toBe(true);
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 9, 1, REQ, MAX)).toBe(true);
+  });
+
+  it("waits — one good tick is not recovery", () => {
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 1, 0, REQ, MAX)).toBe(false);
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 3, 0, REQ, MAX)).toBe(false);
+  });
+
+  it("NEVER recovers a latched cause — orphan position, failed flatten, operator disarm, kill switch", () => {
+    expect(shouldAutoRearm(false, "LATCHED", 999, 0, REQ, MAX)).toBe(false);
+  });
+
+  it("NEVER recovers an unrecognised kind — a new disarm cause is latched until someone opts it in", () => {
+    expect(shouldAutoRearm(false, "SOMETHING_NEW", 999, 0, REQ, MAX)).toBe(false);
+    expect(shouldAutoRearm(false, null, 999, 0, REQ, MAX)).toBe(false);
+    expect(shouldAutoRearm(false, undefined, 999, 0, REQ, MAX)).toBe(false);
+  });
+
+  it("does nothing when the engine is already armed", () => {
+    expect(shouldAutoRearm(true, "TRANSIENT_EXCHANGE_ERROR", 999, 0, REQ, MAX)).toBe(false);
+  });
+
+  it("stops recovering once the flap budget is spent, so a flapping exchange cannot arm/disarm forever", () => {
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 999, 2, REQ, MAX)).toBe(true);
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 999, 3, REQ, MAX)).toBe(false);
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 999, 4, REQ, MAX)).toBe(false);
   });
 });
 

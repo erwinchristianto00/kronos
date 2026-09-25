@@ -22,6 +22,49 @@ button {
   font: inherit;
 }
 
+.closed-report-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0 0;
+  border-top: 1px solid #20313a;
+  color: #7d97a3;
+  font-size: 12px;
+}
+
+.closed-report-pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.closed-report-pagination button {
+  border: 1px solid #20313a;
+  border-radius: 6px;
+  padding: 5px 9px;
+  background: #0f1c23;
+  color: #dbe7ec;
+  cursor: pointer;
+}
+
+.closed-report-pagination button:hover:not(:disabled) {
+  border-color: #6fb3d6;
+}
+
+.closed-report-pagination button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+@media (max-width: 640px) {
+  .closed-report-pagination {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
 #root {
   min-height: 100vh;
 }

@@ -35,7 +35,8 @@
  * ENTRY_TIER2_BAR_MS` (entry-brain-tier2-simulated-resolver.ts's own forward-walk + wait-window budget —
  * the same deadline that resolver's own simulation horizon is built around). Past that deadline, Tier 2
  * (resolveEntryTier2Row) is attempted with a small, bounded, per-row candle fetch (fetchEntryTier2Candles
- * — deduped within the cycle by `${symbol}:${asOfMs}`, since two lanes can share a signal), capped at
+ * — deduped within the cycle by `${symbol}:${asOfMs}`, since two lanes can share a signal). An empty/
+ * transient fetch receives one immediate retry before it is reported as unavailable, capped at
  * maxEntryTier2AttemptsPerCycle so a large backlog can never stall the 15-min cycle:
  *   - Tier 2 succeeds → terminal RESOLVED (TIER2_SIMULATED): store it, remove, advance.
  *   - Tier 2 fails (no candles, or the row's own geometry is unusable) → TRANSIENT
@@ -71,6 +72,7 @@ import {
 } from "./entry-brain-tier2-simulated-resolver.js";
 import { DirectionEntryOutcomeStore, type DirectionOutcomeRecord, type EntryOutcomeRecord } from "./direction-entry-outcome-store.js";
 import { fourBrainInstanceAllowed, fourBrainShadowActive } from "./four-brain-live-gather-bindings.js";
+import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
 
 // ── Gating (3 layers, ALL required — see module doc / task design) ─────────────────────────────────
 // (a) a brand-new, SEPARATE env flag: enabling four-brain shadow mode alone must NOT turn this job on.
@@ -98,11 +100,31 @@ export function directionEntryReconcilerActive(env: NodeJS.ProcessEnv = process.
  *  never hand-tuned separately. */
 export const ENTRY_TIER2_ELIGIBLE_AFTER_MS = ENTRY_TIER2_HORIZON_MS + ENTRY_TIER2_WAIT_WINDOW_BARS * ENTRY_TIER2_BAR_MS;
 
-/** Per-cycle work bounds — a large backlog must never stall the 15-min cycle. Mirrors
- *  exit-brain-shadow.ts's DEFAULT_MAX_TRADES_PER_CYCLE idiom. */
+/** Per-cycle work bounds — a large backlog must never stall the 15-min cycle.  The entry ceiling is
+ * deliberately above the observed 5-minute shadow-decision ingress on the focused testnet lanes, so
+ * normal traffic drains instead of accumulating permanently. Mirrors exit-brain-shadow.ts's
+ * DEFAULT_MAX_TRADES_PER_CYCLE idiom. */
 export const DEFAULT_MAX_DIRECTION_PER_CYCLE = 500;
-export const DEFAULT_MAX_ENTRY_TIER2_ATTEMPTS_PER_CYCLE = 200;
+export const DEFAULT_MAX_ENTRY_TIER2_ATTEMPTS_PER_CYCLE = 400;
 export const DEFAULT_ENTRY_TIER2_FETCH_CONCURRENCY = 4;
+
+/** Tier 2 remains report-only, but its backlog should resolve the choices closest to a possible
+ * executable action first.  Exact actual-fill binding still wins before this queue is considered. */
+const ENTRY_TIER2_ACTION_PRIORITY: Record<PendingEntryRow["action"], number> = {
+  ENTER_NOW: 0,
+  WAIT_PULLBACK: 1,
+  WAIT_BREAKOUT: 1,
+  WAIT_CONFIRMATION: 1,
+  SKIP: 2,
+};
+
+function tier2PriorityOrder(a: PendingEntryRow, b: PendingEntryRow): number {
+  const actionDelta = ENTRY_TIER2_ACTION_PRIORITY[a.action] - ENTRY_TIER2_ACTION_PRIORITY[b.action];
+  if (actionDelta !== 0) return actionDelta;
+  const timeDelta = a.asOfMs - b.asOfMs;
+  if (timeDelta !== 0) return timeDelta;
+  return a.decisionId.localeCompare(b.decisionId);
+}
 
 export interface OutcomeLedgerLike {
   getPendingDirectionRows(): PendingDirectionRow[];
@@ -123,6 +145,8 @@ export interface DirectionEntryReconcilerDeps {
   /** Per-row Tier 2 candle fetch (15m bars from the row's own asOfMs). Deduped within the cycle by
    *  `${symbol}:${asOfMs}`. */
   fetchEntryTier2Candles: (symbolOrBasketId: string, sinceMs: number) => Promise<PathCandle[] | null>;
+  /** Exact executor-fill binding. It wins over the legacy time-window path matcher. */
+  actualFillBindings?: FourBrainActualFillBindingStore;
   now?: () => number;
   maxDirectionPerCycle?: number;
   maxEntryTier2AttemptsPerCycle?: number;
@@ -135,6 +159,7 @@ export interface DirectionEntryReconcilerResult {
   entryProcessed: number;
   directionSkippedNotDue: number;
   entrySkippedNotDue: number;
+  directActualFillProcessed: number;
   tier1Diagnostics: EntryBrainTier1Diagnostics | null;
   error: string | null;
 }
@@ -150,15 +175,25 @@ async function prefetchEntryTier2Candles(args: {
   const worker = async (): Promise<void> => {
     while (cursor < args.requests.length) {
       const request = args.requests[cursor++]!;
-      try {
-        const candles = await args.fetch(request.symbolOrBasketId, request.sinceMs);
-        args.cache.set(request.cacheKey, candles ?? null);
-      } catch (err) {
-        args.errors.push(
-          `entry-tier2-candles:${request.decisionId}:${err instanceof Error ? err.message : String(err)}`,
-        );
-        args.cache.set(request.cacheKey, null);
+      let candles: PathCandle[] | null = null;
+      let lastError: unknown = null;
+      // A single public-candle miss is often transport/rate jitter. Retry once in the same bounded
+      // worker before labelling this decision's source unavailable; the retry count never changes the
+      // number of scheduled decisions or any trading path.
+      for (let attempt = 0; attempt < 2 && !candles; attempt += 1) {
+        try {
+          const fetched = await args.fetch(request.symbolOrBasketId, request.sinceMs);
+          if (Array.isArray(fetched) && fetched.length > 0) candles = fetched;
+        } catch (err) {
+          lastError = err;
+        }
       }
+      if (!candles && lastError !== null) {
+        args.errors.push(
+          `entry-tier2-candles:${request.decisionId}:${lastError instanceof Error ? lastError.message : String(lastError)}`,
+        );
+      }
+      args.cache.set(request.cacheKey, candles);
     }
   };
   const workerCount = Math.min(
@@ -188,6 +223,7 @@ export async function runDirectionEntryReconciliationCycle(
   let entryProcessed = 0;
   let directionSkippedNotDue = 0;
   let entrySkippedNotDue = 0;
+  let directActualFillProcessed = 0;
   let tier1Diagnostics: EntryBrainTier1Diagnostics | null = null;
 
   try {
@@ -227,6 +263,9 @@ export async function runDirectionEntryReconciliationCycle(
             win: outcome.win,
             regretR: outcome.regretR,
             calibrationGapR: outcome.calibrationGapR,
+            canonicalRegimeFamily: row.canonicalRegimeFamily ?? null,
+            scannerRegime: row.scannerRegime ?? null,
+            marketContextSnapshotId: row.marketContextSnapshotId ?? null,
           };
           const booked = deps.store.recordDirectionOutcome(record, HORIZON_MS[row.horizon], { deferSave: true });
           toRemoveDirection.add(row.decisionId);
@@ -252,6 +291,18 @@ export async function runDirectionEntryReconciliationCycle(
       closedPaths = [];
     }
 
+    // A direct binding is causal: it was captured from the exact same signal identity at the
+    // moment a real executor fill landed.  It takes precedence over the older window matcher;
+    // an OPEN binding also suppresses Tier 2 so a real position is never relabelled by candles.
+    const directMeasuredByDecisionId = new Map(
+      (deps.actualFillBindings?.listClosedMeasuredOutcomes() ?? []).map((outcome) => [outcome.decisionId, outcome]),
+    );
+    const directUnmeasuredByDecisionId = new Map(
+      (deps.actualFillBindings?.listClosedUnmeasuredOutcomes() ?? []).map((outcome) => [outcome.decisionId, outcome]),
+    );
+    const hasOpenDirectBinding = (decisionId: string): boolean =>
+      deps.actualFillBindings?.hasOpenBindingForDecisionId(decisionId) === true;
+
     // Exclude any close already claimed by a PRIOR cycle's Tier 1 match (store.hasClaimedTier1CloseKey —
     // persisted cross-cycle memory). listClosedPositionPaths() is a rolling window (position-path-
     // recorder.ts's own MAX_CLOSED_PATHS=300) that keeps re-offering the same real close across many
@@ -267,7 +318,13 @@ export async function runDirectionEntryReconciliationCycle(
 
     let tier1Rows: EntryBrainTier1Row[] = [];
     try {
-      const tier1Result = resolveEntryBrainTier1RealizedWithDiagnostics(pendingEntry, claimableClosedPaths);
+      const legacyPending = pendingEntry.filter(
+        (row) =>
+          !directMeasuredByDecisionId.has(row.decisionId) &&
+          !directUnmeasuredByDecisionId.has(row.decisionId) &&
+          !hasOpenDirectBinding(row.decisionId),
+      );
+      const tier1Result = resolveEntryBrainTier1RealizedWithDiagnostics(legacyPending, claimableClosedPaths);
       tier1Rows = tier1Result.rows;
       tier1Diagnostics = tier1Result.diagnostics;
       deps.store.setTier1Diagnostics(tier1Diagnostics, { deferSave: true });
@@ -279,23 +336,31 @@ export async function runDirectionEntryReconciliationCycle(
 
     const toRemoveEntry = new Set<string>();
     let entryMissingCount = 0;
-    let tier2Attempts = 0;
     const tier2CandleCache = new Map<string, PathCandle[] | null>();
     const tier2PrefetchRequests = new Map<
       string,
       { cacheKey: string; symbolOrBasketId: string; sinceMs: number; decisionId: string }
     >();
-    let plannedTier2Attempts = 0;
-    for (const row of pendingEntry) {
-      if (tier1ByDecisionId.get(row.decisionId)?.status === "RESOLVED") continue;
-      if (nowMs < row.asOfMs + ENTRY_TIER2_ELIGIBLE_AFTER_MS || !row.symbolOrBasketId) continue;
-      if (plannedTier2Attempts >= maxEntryTier2) break;
-      plannedTier2Attempts += 1;
-      const cacheKey = `${row.symbolOrBasketId}:${row.asOfMs}`;
+    const tier2EligibleRows = pendingEntry
+      .filter((row) => {
+        if (directMeasuredByDecisionId.has(row.decisionId) || directUnmeasuredByDecisionId.has(row.decisionId) || hasOpenDirectBinding(row.decisionId)) return false;
+        if (tier1ByDecisionId.get(row.decisionId)?.status === "RESOLVED") return false;
+        return nowMs >= row.asOfMs + ENTRY_TIER2_ELIGIBLE_AFTER_MS && Boolean(row.symbolOrBasketId);
+      })
+      .sort(tier2PriorityOrder);
+    const tier2ScheduledRows = tier2EligibleRows.slice(0, Math.max(0, maxEntryTier2));
+    const tier2ScheduledIds = new Set(tier2ScheduledRows.map((row) => row.decisionId));
+    const entryTier2DeferredCount = Math.max(0, tier2EligibleRows.length - tier2ScheduledRows.length);
+    for (const row of tier2ScheduledRows) {
+      // `tier2EligibleRows` filters these out, but keep the local guard so this boundary remains
+      // type-safe and resilient if the predicate is ever changed.
+      const symbolOrBasketId = row.symbolOrBasketId;
+      if (!symbolOrBasketId) continue;
+      const cacheKey = `${symbolOrBasketId}:${row.asOfMs}`;
       if (!tier2PrefetchRequests.has(cacheKey)) {
         tier2PrefetchRequests.set(cacheKey, {
           cacheKey,
-          symbolOrBasketId: row.symbolOrBasketId,
+          symbolOrBasketId,
           sinceMs: row.asOfMs,
           decisionId: row.decisionId,
         });
@@ -310,6 +375,67 @@ export async function runDirectionEntryReconciliationCycle(
     });
 
     for (const row of pendingEntry) {
+      const direct = directMeasuredByDecisionId.get(row.decisionId);
+      if (direct) {
+        const record: EntryOutcomeRecord = {
+          decisionId: row.decisionId,
+          tier: "TIER1_REALIZED",
+          laneId: direct.laneId,
+          symbolOrBasketId: direct.symbolOrBasketId,
+          side: direct.side,
+          action: row.action,
+          confidence: "MEASURED",
+          asOfMs: direct.asOfMs,
+          status: "RESOLVED",
+          expectedNetR: direct.expectedNetR,
+          realizedNetR: direct.realizedNetR,
+          realizedRSource: "actual_fill_binding",
+          horizonTruncated: null,
+          matchedCloseKey: direct.matchedCloseKey,
+          canonicalRegimeFamily: direct.canonicalRegimeFamily,
+          scannerRegime: direct.scannerRegime,
+          marketContextSnapshotId: direct.marketContextSnapshotId,
+        };
+        const booked = deps.store.recordEntryOutcome(record, { deferSave: true });
+        toRemoveEntry.add(row.decisionId);
+        if (booked) {
+          entryProcessed += 1;
+          directActualFillProcessed += 1;
+        }
+        continue;
+      }
+      const directUnmeasured = directUnmeasuredByDecisionId.get(row.decisionId);
+      if (directUnmeasured) {
+        // An actual fill existed, but its close economics could not be verified.  Do not let a
+        // later simulated candle outcome overwrite that honest limitation.
+        const record: EntryOutcomeRecord = {
+          decisionId: row.decisionId,
+          tier: null,
+          laneId: directUnmeasured.laneId,
+          symbolOrBasketId: directUnmeasured.symbolOrBasketId,
+          side: directUnmeasured.side,
+          action: row.action,
+          confidence: "EXPERIMENTAL_COST_OF_CAUTION",
+          asOfMs: directUnmeasured.asOfMs,
+          status: "EXPIRED_UNRESOLVABLE",
+          expectedNetR: directUnmeasured.expectedNetR,
+          realizedNetR: null,
+          realizedRSource: null,
+          horizonTruncated: null,
+          matchedCloseKey: null,
+          canonicalRegimeFamily: directUnmeasured.canonicalRegimeFamily,
+          scannerRegime: directUnmeasured.scannerRegime,
+          marketContextSnapshotId: directUnmeasured.marketContextSnapshotId,
+        };
+        const booked = deps.store.recordEntryOutcome(record, { deferSave: true });
+        toRemoveEntry.add(row.decisionId);
+        if (booked) entryProcessed += 1;
+        continue;
+      }
+      if (hasOpenDirectBinding(row.decisionId)) {
+        entrySkippedNotDue += 1;
+        continue;
+      }
       const t1 = tier1ByDecisionId.get(row.decisionId);
       if (t1 && t1.status === "RESOLVED") {
         const record: EntryOutcomeRecord = {
@@ -327,6 +453,9 @@ export async function runDirectionEntryReconciliationCycle(
           realizedRSource: t1.realizedRSource,
           horizonTruncated: null,
           matchedCloseKey: t1.matchedCloseKey,
+          canonicalRegimeFamily: row.canonicalRegimeFamily ?? null,
+          scannerRegime: row.scannerRegime ?? null,
+          marketContextSnapshotId: row.marketContextSnapshotId ?? null,
         };
         const booked = deps.store.recordEntryOutcome(record, { deferSave: true });
         toRemoveEntry.add(row.decisionId);
@@ -362,6 +491,9 @@ export async function runDirectionEntryReconciliationCycle(
             realizedRSource: null,
             horizonTruncated: null,
             matchedCloseKey: null,
+            canonicalRegimeFamily: row.canonicalRegimeFamily ?? null,
+            scannerRegime: row.scannerRegime ?? null,
+            marketContextSnapshotId: row.marketContextSnapshotId ?? null,
           };
           const booked = deps.store.recordEntryOutcome(record, { deferSave: true });
           toRemoveEntry.add(row.decisionId);
@@ -372,11 +504,12 @@ export async function runDirectionEntryReconciliationCycle(
         continue;
       }
 
-      if (tier2Attempts >= maxEntryTier2) {
-        entryMissingCount += 1; // bounded work this cycle; retried next cycle
+      if (!tier2ScheduledIds.has(row.decisionId)) {
+        // The bounded scheduler intentionally left this due row in the queue.  It was not fetched,
+        // so reporting it as an instrument-data failure would turn healthy backlog into a false red
+        // health signal.  The aggregate deferred gauge is set once after the loop.
         continue;
       }
-      tier2Attempts += 1;
 
       const cacheKey = `${row.symbolOrBasketId}:${row.asOfMs}`;
       const candles = tier2CandleCache.get(cacheKey) ?? null;
@@ -410,6 +543,9 @@ export async function runDirectionEntryReconciliationCycle(
           // until 2026-07-28, which is why SKIP could never be judged despite being 97% of decisions.
           opportunityCostR: tier2Result.result.opportunityCostR ?? null,
           matchedCloseKey: null,
+          canonicalRegimeFamily: row.canonicalRegimeFamily ?? null,
+          scannerRegime: row.scannerRegime ?? null,
+          marketContextSnapshotId: row.marketContextSnapshotId ?? null,
         };
         const booked = deps.store.recordEntryOutcome(record, { deferSave: true });
         toRemoveEntry.add(row.decisionId);
@@ -430,6 +566,9 @@ export async function runDirectionEntryReconciliationCycle(
           realizedRSource: null,
           horizonTruncated: null,
           matchedCloseKey: null,
+          canonicalRegimeFamily: row.canonicalRegimeFamily ?? null,
+          scannerRegime: row.scannerRegime ?? null,
+          marketContextSnapshotId: row.marketContextSnapshotId ?? null,
         };
         const booked = deps.store.recordEntryOutcome(record, { deferSave: true });
         toRemoveEntry.add(row.decisionId);
@@ -439,6 +578,7 @@ export async function runDirectionEntryReconciliationCycle(
       }
     }
     deps.store.setCurrentEntryInstrumentDataMissing(entryMissingCount, { deferSave: true });
+    deps.store.setCurrentEntryTier2Deferred(entryTier2DeferredCount, { deferSave: true });
     deps.ledger.removeEntryByIds(toRemoveEntry);
 
     const lastError = errors.length > 0 ? errors.join("; ").slice(0, 4000) : null;
@@ -451,6 +591,7 @@ export async function runDirectionEntryReconciliationCycle(
       entryProcessed,
       directionSkippedNotDue,
       entrySkippedNotDue,
+      directActualFillProcessed,
       tier1Diagnostics,
       error: lastError,
     };
@@ -468,6 +609,7 @@ export async function runDirectionEntryReconciliationCycle(
       entryProcessed,
       directionSkippedNotDue,
       entrySkippedNotDue,
+      directActualFillProcessed,
       tier1Diagnostics,
       error: message,
     };

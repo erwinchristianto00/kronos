@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,6 +10,7 @@ import {
   recordForwardOpportunity,
   recordForwardOutcome,
   recordForwardOutcomes,
+  readForwardCausalEventsStrict,
   resolveCanonicalPolicyContext,
   resolveCausalCollectionActivation,
   withResolvedCausalIdentity,
@@ -44,6 +45,34 @@ function shadowEnv(dir: string): NodeJS.ProcessEnv {
 }
 
 describe("forward causal collection", () => {
+  it("strict reader accepts one torn final append tail but blocks malformed historical rows", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-strict-")); dirs.push(dir);
+    const env = shadowEnv(dir); const o = order();
+    o.scanBatchId = "cortex-batch-1";
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const journal = forwardCausalJournalPath(env)!;
+    appendFileSync(journal, "{torn");
+    expect(readForwardCausalEventsStrict(journal)).toMatchObject({ status: "VALID", ignoredTornTail: true });
+    appendFileSync(journal, "\n{bad}\n");
+    expect(readForwardCausalEventsStrict(journal).status).toBe("FORWARD_CAUSAL_JOURNAL_CORRUPTED");
+  });
+  it("strict reader rejects structurally incomplete decision/open rows and conflicting event IDs", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-strict-schema-")); dirs.push(dir);
+    const env = shadowEnv(dir); const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const journal = forwardCausalJournalPath(env)!;
+    const rows = readFileSync(journal, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    rows[0].cortexTraining = { ...rows[0].cortexTraining, status: "PRESENT", featureVector: [Number.NaN] };
+    appendFileSync(journal, `${JSON.stringify(rows[0])}\n`);
+    expect(readForwardCausalEventsStrict(journal).status).toBe("FORWARD_CAUSAL_SCHEMA_MISMATCH");
+
+    const clean = join(dir, "clean.jsonl");
+    const first = JSON.parse(readFileSync(journal, "utf8").split("\n")[0]!);
+    appendFileSync(clean, `${JSON.stringify(first)}\n${JSON.stringify({ ...first, marketState: { regime: "OTHER", status: "PRESENT" } })}\n`);
+    expect(readForwardCausalEventsStrict(clean).status).toBe("FORWARD_CAUSAL_DUPLICATE_CONFLICT");
+  });
   it("is default-off and hard-blocks 3103 without filesystem I/O", () => {
     const dir = mkdtempSync(join(tmpdir(), "causal-off-")); dirs.push(dir);
     const env = { PORT: "3102", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir };
@@ -53,6 +82,182 @@ describe("forward causal collection", () => {
     expect(recordForwardOpportunity(o, env)).toBe(false);
     expect(existsSync(join(dir, "causal-experience"))).toBe(false);
     expect(resolveCausalCollectionActivation({ ...env, PORT: "3103", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow" }).reason).toBe("live-3103-blocked");
+  });
+
+  // 2026-08-05 hotfix, found during Phase 1 closure verification against REAL active-instance data:
+  // adding logicalRole to CausalIdentity (identity-spoofing fix) broke every identity persisted
+  // before that field existed — confirmed live, active 3102's real causal journal had 11,370 of
+  // 11,432 events (everything predating the fix, spanning 2026-08-01 through the fix's deploy) go
+  // FORWARD_CAUSAL_SCHEMA_MISMATCH, an all-or-nothing gate that also silently rejected the handful of
+  // genuinely NEW, correctly-shaped events in the same file. This test constructs the EXACT legacy
+  // shape (a real pre-fix event has no `logicalRole` key at all, not merely `null`) and proves both
+  // affected paths now accept it: the strict reader, and identity reuse across a simulated restart.
+  it("[2026-08-05 hotfix] a legacy identity written before logicalRole existed (key absent, not null) is accepted by the strict reader and reused (not re-minted) on the next call — never treated as schema-mismatched or stale", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-legacy-role-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const journal = forwardCausalJournalPath(env)!;
+
+    // Rewrite the journal to the REAL legacy shape: strip logicalRole from every event's identity
+    // entirely (delete the key, not set it to null) — exactly what a pre-2026-08-05 writer produced.
+    const rows = readFileSync(journal, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    for (const row of rows) delete row.identity.logicalRole;
+    writeFileSync(journal, `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
+
+    // The strict reader (operator-facing, gates learning eligibility) must accept this file, not
+    // reject the whole thing as FORWARD_CAUSAL_SCHEMA_MISMATCH.
+    const strict = readForwardCausalEventsStrict(journal);
+    expect(strict.status).toBe("VALID");
+    expect(strict.events.length).toBe(rows.length);
+
+    // Identity reuse: an order rehydrated with this legacy-shaped (key-absent) identity, on an
+    // instance whose activation resolves logicalRole:null (3102, direct allowlist match — no grant
+    // needed), must be treated as CURRENT, not stale — reused byte-for-byte, never re-minted.
+    const legacyOrder = { ...o, causalIdentity: JSON.parse(JSON.stringify(rows[0].identity)) };
+    expect("logicalRole" in legacyOrder.causalIdentity).toBe(false);
+    const reused = prepareForwardCausalIdentity(legacyOrder, env);
+    expect(reused).toEqual(legacyOrder.causalIdentity);
+  });
+
+  // 2026-08-05 hotfix, found in the SAME real-journal check as the logicalRole one above (3,666 of
+  // 11,432 real events on active 3102): a "no CORTEX link" identity from before
+  // allocationSnapshotId/canonicalCortexLaneId/cortexFeatureSchemaVersion were all consistently
+  // written together set only cortexDecisionId to explicit null, leaving the other three ABSENT
+  // rather than also null.
+  it("[2026-08-05 hotfix] a legacy 'no CORTEX link' identity (cortexDecisionId: null, the other 3 cortex fields absent, not null) is accepted by the strict reader", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-legacy-cortex-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const journal = forwardCausalJournalPath(env)!;
+
+    const rows = readFileSync(journal, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    for (const row of rows) {
+      expect(row.identity.cortexDecisionId).toBeNull(); // sanity: this fixture never had a cortex snapshot
+      delete row.identity.allocationSnapshotId;
+      delete row.identity.canonicalCortexLaneId;
+      delete row.identity.cortexFeatureSchemaVersion;
+    }
+    writeFileSync(journal, `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
+
+    const strict = readForwardCausalEventsStrict(journal);
+    expect(strict.status).toBe("VALID");
+    expect(strict.events.length).toBe(rows.length);
+  });
+
+  // 2026-08-05 hotfix (3rd instance of the same class, found in the SAME real-journal check
+  // immediately after the two above): 1,404 of the 11,432 real events on active 3102 are
+  // DECISION_SNAPSHOT rows whose cortexTraining.status is "MISSING" with every other field explicit
+  // null but snapshotAtMs simply absent — the MISSING-branch literal that builds this object predates
+  // snapshotAtMs being included in it (every other MISSING field reported zero problems on the real
+  // journal, confirmed via a per-field diagnostic before writing this fix, not guessed).
+  it("[2026-08-05 hotfix] a legacy 'no CORTEX snapshot' decision event (cortexTraining.status: MISSING, snapshotAtMs absent, not null) is accepted by the strict reader", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-legacy-snapshot-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const journal = forwardCausalJournalPath(env)!;
+
+    const rows = readFileSync(journal, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const decision = rows.find((r) => r.eventType === "DECISION_SNAPSHOT");
+    expect(decision.cortexTraining.status).toBe("MISSING"); // sanity: this fixture never had a cortex snapshot
+    expect(decision.cortexTraining.snapshotAtMs).toBeNull();
+    delete decision.cortexTraining.snapshotAtMs;
+    writeFileSync(journal, `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
+
+    const strict = readForwardCausalEventsStrict(journal);
+    expect(strict.status).toBe("VALID");
+    expect(strict.events.length).toBe(rows.length);
+  });
+
+  // 2026-08-05 (identity-spoofing fix): the ONLY correct way to authorize an isolated staging mirror
+  // physically running on a non-3101/3102 port is an explicit FOUR_BRAIN_LOGICAL_ROLE grant — never
+  // FOUR_BRAIN_INSTANCE_ID=3101/3102, which makes resolveFourBrainInstanceId LIE and propagates a
+  // false identity into the journal permanently. See CausalIdentity.logicalRole's own doc comment.
+  describe("staging identity — role-based authorization, never relabeled instanceId", () => {
+    it("[fail-closed] instanceId=3111, no role grant: activation fails closed, never mints, never emits instanceId=3101", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-none-")); dirs.push(dir);
+      const env: NodeJS.ProcessEnv = { PORT: "3111", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
+      const activation = resolveCausalCollectionActivation(env);
+      expect(activation).toMatchObject({ active: false, instanceId: "3111", logicalRole: null, reason: "unknown-instance-fail-closed" });
+      expect(prepareForwardCausalIdentity(order(), env)).toBeNull();
+      expect(recordForwardOpportunity(order(), env)).toBe(false);
+      expect(existsSync(join(dir, "causal-experience"))).toBe(false);
+    });
+
+    it("[research-staging] instanceId=3111 + FOUR_BRAIN_LOGICAL_ROLE=RESEARCH: activates, and every emitted identity/journal event carries instanceId=3111 — NEVER 3101", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-research-")); dirs.push(dir);
+      const env: NodeJS.ProcessEnv = { PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
+      const activation = resolveCausalCollectionActivation(env);
+      expect(activation).toMatchObject({ active: true, instanceId: "3111", logicalRole: "RESEARCH", reason: "shadow-active" });
+      const identity = prepareForwardCausalIdentity(order(), env);
+      expect(identity).toMatchObject({ instanceId: "3111", logicalRole: "RESEARCH" });
+      expect(identity!.instanceId).not.toBe("3101");
+      const o = order(); o.causalIdentity = identity;
+      expect(recordForwardOpportunity(o, env)).toBe(true);
+      const events = readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(events.length).toBeGreaterThan(0);
+      for (const event of events) {
+        expect(event.identity.instanceId).toBe("3111");
+        expect(event.identity.instanceId).not.toBe("3101");
+        expect(event.identity.logicalRole).toBe("RESEARCH");
+      }
+    });
+
+    it("[testnet-staging] instanceId=3112 + FOUR_BRAIN_LOGICAL_ROLE=TESTNET: activates, and every emitted identity/journal event carries instanceId=3112 — NEVER 3102", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-testnet-")); dirs.push(dir);
+      const env: NodeJS.ProcessEnv = { PORT: "3112", FOUR_BRAIN_LOGICAL_ROLE: "TESTNET", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
+      const activation = resolveCausalCollectionActivation(env);
+      expect(activation).toMatchObject({ active: true, instanceId: "3112", logicalRole: "TESTNET", reason: "shadow-active" });
+      const identity = prepareForwardCausalIdentity(order(), env);
+      expect(identity).toMatchObject({ instanceId: "3112", logicalRole: "TESTNET" });
+      expect(identity!.instanceId).not.toBe("3102");
+      const o = order(); o.causalIdentity = identity;
+      expect(recordForwardOpportunity(o, env)).toBe(true);
+      const events = readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(events.length).toBeGreaterThan(0);
+      for (const event of events) {
+        expect(event.identity.instanceId).toBe("3112");
+        expect(event.identity.instanceId).not.toBe("3102");
+        expect(event.identity.logicalRole).toBe("TESTNET");
+      }
+    });
+
+    it("[fail-closed, 3103 survives a role grant] a role grant can never reach the live instance — instanceId=3103 stays hard-blocked even with FOUR_BRAIN_LOGICAL_ROLE set, and even when PORT alone (id unset) says 3103", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-3103-")); dirs.push(dir);
+      const base = { CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT } as const;
+      expect(resolveCausalCollectionActivation({ ...base, PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv))
+        .toMatchObject({ active: false, reason: "live-3103-blocked" });
+      expect(resolveCausalCollectionActivation({ ...base, PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "TESTNET" } as NodeJS.ProcessEnv))
+        .toMatchObject({ active: false, reason: "live-3103-blocked" });
+      expect(prepareForwardCausalIdentity(order(), { ...base, PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv)).toBeNull();
+    });
+
+    it("[fail-closed, unknown role string] an unrecognized FOUR_BRAIN_LOGICAL_ROLE value is treated as no grant at all — never a silent wildcard authorization", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-unknown-")); dirs.push(dir);
+      const env: NodeJS.ProcessEnv = { PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "ADMIN", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
+      expect(resolveCausalCollectionActivation(env)).toMatchObject({ active: false, reason: "unknown-instance-fail-closed" });
+    });
+
+    it("[restart, role-based] a persisted role-authorized identity is re-validated on every read, exactly like the 3101/3102 path — a role that has since been revoked or changed invalidates it, never silently reused", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-restart-")); dirs.push(dir);
+      const env: NodeJS.ProcessEnv = { PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
+      const o = order();
+      o.causalIdentity = prepareForwardCausalIdentity(o, env);
+      expect(o.causalIdentity).not.toBeNull();
+      // "Restart" with the exact same role: identity is reused byte-for-byte, never re-minted.
+      expect(prepareForwardCausalIdentity(o, env)).toEqual(o.causalIdentity);
+      // "Restart" with the role since revoked (operator turned the grant off): the persisted identity
+      // is now stale and must not be reused — mirrors the existing policy-version staleness behavior.
+      const { FOUR_BRAIN_LOGICAL_ROLE: _drop, ...revoked } = env;
+      expect(prepareForwardCausalIdentity(o, revoked as NodeJS.ProcessEnv)).toBeNull();
+      // "Restart" with the role changed to TESTNET: also stale, never silently migrated to the new role.
+      expect(prepareForwardCausalIdentity(o, { ...env, FOUR_BRAIN_LOGICAL_ROLE: "TESTNET" })).toBeNull();
+    });
   });
 
   it("refuses to mint a forward identity without all exact current policy stamps", () => {
@@ -157,6 +362,7 @@ describe("forward causal collection", () => {
   it("emits a CORTEX sample only from an exact persisted CORTEX snapshot and direct three-id chain", () => {
     const dir = mkdtempSync(join(tmpdir(), "causal-cortex-")); dirs.push(dir);
     const env = shadowEnv(dir); const o = order();
+    o.scanBatchId = "cortex-batch-1";
     o.cortexDecisionSnapshot = {
       decisionId: "cortex-decision:900:1:CG_WIDE_FAST_LONG",
       allocationSnapshotId: "cortex-allocation:cortex-decision:900:1:CG_WIDE_FAST_LONG",
@@ -169,8 +375,16 @@ describe("forward causal collection", () => {
       eligible: true,
       finalPct: 0,
       evalFinalPct: 0,
+      scanBatchId: "cortex-batch-1", sourceScanBatchId: "cortex-batch-1",
     };
+    o.cortexDecisionId = o.cortexDecisionSnapshot.decisionId;
+    o.cortexAllocationSnapshotId = o.cortexDecisionSnapshot.allocationSnapshotId;
+    o.canonicalCortexLaneId = o.cortexDecisionSnapshot.laneId;
     o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(o.causalIdentity).toMatchObject({
+      cortexDecisionId: o.cortexDecisionSnapshot.decisionId,
+      allocationSnapshotId: o.cortexDecisionSnapshot.allocationSnapshotId,
+    });
     recordForwardOpportunity(o, env);
     o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;
     o.causalIdentity = withResolvedCausalIdentity(o);
@@ -181,6 +395,9 @@ describe("forward causal collection", () => {
     expect(bridge.outcomes).toHaveLength(1);
     expect(bridge.outcomes[0]?.decisionId).toBe(o.cortexDecisionSnapshot.decisionId);
     expect(bridge.rejected).toEqual({});
+    const decision = events.find((event) => event.eventType === "DECISION_SNAPSHOT") as Extract<ForwardCausalEvent, { eventType: "DECISION_SNAPSHOT" }>;
+    expect(decision.cortexTraining.snapshotAtMs).toBe(o.cortexDecisionSnapshot.atMs);
+    expect(decision.cortexTraining.snapshotAtMs).toBeLessThanOrEqual(decision.asOfMs);
   });
 
   it("rejects legacy, identity-mismatched, schema-mismatched, and future-decision chains", () => {
@@ -209,6 +426,8 @@ describe("forward causal collection", () => {
       featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION, featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0.5],
       regimeFamily: "BULL", eligible: true, finalPct: 0, evalFinalPct: 0,
     };
+    o.cortexDecisionId = o.cortexDecisionSnapshot.decisionId;
+    o.cortexAllocationSnapshotId = o.cortexDecisionSnapshot.allocationSnapshotId;
     o.causalIdentity = prepareForwardCausalIdentity(o, env); recordForwardOpportunity(o, env);
     o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;
     o.causalIdentity = withResolvedCausalIdentity(o); recordForwardOutcome(o, env);
@@ -304,6 +523,8 @@ describe("closes the stale-identity-reuse bypass", () => {
       atMs: 900, laneId: "CG_WIDE_FAST_LONG", direction: "LONG", featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
       featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0.5], regimeFamily: "BULL", eligible: true, finalPct: 0, evalFinalPct: 0,
     };
+    o.cortexDecisionId = o.cortexDecisionSnapshot.decisionId;
+    o.cortexAllocationSnapshotId = o.cortexDecisionSnapshot.allocationSnapshotId;
     o.causalIdentity = prepareForwardCausalIdentity(o, env);
     recordForwardOpportunity(o, env);
     o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;

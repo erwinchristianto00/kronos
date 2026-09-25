@@ -38,7 +38,7 @@ import {
   type CortexStoreState,
 } from "./cortex-brain.js";
 import { engineLaneIdForStaticWeight } from "./cortex-live-gather.js";
-import { cortexAllocationSnapshotId, cortexDecisionId, publishCortexDecisionSnapshots } from "./cortex-decision-snapshot.js";
+import { cortexAllocationSnapshotId, cortexDecisionId, publishCortexDecisionSnapshots, type CortexDecisionSnapshot } from "./cortex-decision-snapshot.js";
 
 /** Strict, read-only decoder for operators/auditors. Runtime deliberately seeds on a bad file so
  * an unavailable shadow learner cannot stop trading; an operator must instead fail closed. */
@@ -303,6 +303,8 @@ export function runCortexShadowTick(deps: {
   journal: CortexDecisionJournal;
   context: CortexContext;
   nowIso: string;
+  /** Exact scanner batch that supplied this CORTEX context, if one exists. */
+  scanBatchId?: string | null;
   mode: CortexBrainMode;
   resolvedThisCycle?: number;
   promotion?: {
@@ -318,7 +320,7 @@ export function runCortexShadowTick(deps: {
      *  is eligible (fails safe to fully static, never the reverse). */
     learningActiveLaneIds?: Set<string>;
   } | null;
-}): { decision: CortexDecision; invariants: CortexInvariantResult; promotedWeights: Record<string, number> | null } {
+}): { decision: CortexDecision; invariants: CortexInvariantResult; snapshots: readonly CortexDecisionSnapshot[]; promotedWeights: Record<string, number> | null } {
   if (deps.resolvedThisCycle && deps.resolvedThisCycle > 0) deps.store.addResolved(deps.resolvedThisCycle, deps.nowIso);
   const state = deps.store.get();
   // OPERATIONAL decision = the β=0 post-veto incumbent — what would drive live (drives NOTHING in shadow).
@@ -334,8 +336,8 @@ export function runCortexShadowTick(deps: {
     buildCortexDecisionRecord({ atIso: deps.nowIso, mode: deps.mode, ctx: deps.context, decision, invariants, evalDecision, evaluationBeta: evalBeta }),
   );
   const decisionAtMs = Date.parse(deps.nowIso);
-  if (Number.isFinite(decisionAtMs)) {
-    publishCortexDecisionSnapshots(decision.lanes.map((lane) => {
+  const snapshots: readonly CortexDecisionSnapshot[] = Number.isFinite(decisionAtMs)
+    ? decision.lanes.map((lane) => {
       const decisionId = cortexDecisionId(decisionAtMs, lane.laneId, decision.featureSchemaVersion);
       return {
         decisionId,
@@ -349,9 +351,11 @@ export function runCortexShadowTick(deps: {
         eligible: lane.eligible,
         finalPct: lane.finalPct,
         evalFinalPct: evalDecision.lanes.find((candidate) => candidate.laneId === lane.laneId)?.finalPct ?? lane.finalPct,
+        sourceScanBatchId: deps.scanBatchId ?? null,
       };
-    }));
-  }
+    })
+    : [];
+  publishCortexDecisionSnapshots(snapshots);
 
   let promotedWeights: Record<string, number> | null = null;
   if (deps.mode === "live" && deps.promotion && !deps.promotion.envBlocked) {
@@ -473,5 +477,5 @@ export function runCortexShadowTick(deps: {
       }
     }
   }
-  return { decision, invariants, promotedWeights };
+  return { decision, invariants, snapshots, promotedWeights };
 }

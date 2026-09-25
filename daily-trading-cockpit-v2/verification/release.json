@@ -1,0 +1,18 @@
+{
+  "releaseId": "live-preference-protection-v1-20260905T074135Z",
+  "oldRoot": "/root/kronos-live-releases/live-basket-pnl-full-notional-v1-20260905T035903Z/daily-trading-cockpit-v2",
+  "newRoot": "/root/kronos-live-releases/live-preference-protection-v1-20260905T074135Z/daily-trading-cockpit-v2",
+  "sourceDigest": "adb153fabcb9162e700dc3a116f0e5bd1fae550f9915d29fd1a8a85646d5d7f5",
+  "policyVersion": "cross-preference-formation-v1+cross-profit-protection-v1+midquote-1m-rolling",
+  "preparedAt": "2026-09-05T07:41:35Z",
+  "changedFiles": [
+    "apps/api/src/lib/cross-sectional-edge.ts",
+    "apps/api/src/lib/cross-sectional-executor.ts",
+    "apps/api/src/lib/dynamic-mom36-shock-strategy.ts",
+    "apps/api/src/lib/cross-profit-protection-v1.ts",
+    "apps/api/test/dynamic-mom36-shock-executor.test.ts",
+    "apps/api/test/preference-formation-integration.test.ts",
+    "apps/api/test/cross-profit-protection-v1.test.ts",
+    "deploy/required-env.json"
+  ]
+}

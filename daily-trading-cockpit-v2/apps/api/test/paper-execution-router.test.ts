@@ -81,13 +81,21 @@ function routerOf(regime: string | null) {
   });
 }
 
-/** Build a VM store with 60 winning SHORT signals so CG_WIDE_STOP_TP_WIDE row passes economics gates. */
+/** Build a VM store with 80 winning SHORT signals so CG_WIDE_STOP_TP_WIDE row passes economics gates. */
 async function buildWinningVmStore(dir: string): Promise<CurrentGuardVariantMatrixStore> {
   const vmStore = new CurrentGuardVariantMatrixStore(dir);
   // Entries must be FRESH at creation: isFreshValid = (now − openedAt) ≤ FRESH_ENTRY_MAX_MINUTES (10).
-  // Pack all 60 within the last ~5 min so every obs is fresh-valid and clears the economics sample gate.
-  const recentBase = Date.now() - 5 * 60_000;
-  const signals: VariantMatrixSignal[] = Array.from({ length: 60 }, (_, i) => ({
+  // Pack all 80 within the last ~7 min so every obs is fresh-valid and clears the economics sample gate.
+  // Point 4d (current-guard-variant-matrix): `freshValid` is the FULL fresh-valid population and is
+  // never scoped to a proof window, so all 80 rows count — measured, [10]'s `scaleoutRow.freshValid`
+  // reads 80 exactly, and [17] runs off this same store.
+  // SUPERSEDED MODEL, recorded so the old arithmetic is not re-derived: this comment used to say
+  // freshValid was the dev-only slice, floor(count*HOLDOUT_DEV_FRACTION), and justified 80-over-60 by
+  // floor(80*0.7)=56. That single-cut model and both of its constants (HOLDOUT_DEV_FRACTION,
+  // HOLDOUT_CUT_MIN_FRESH) were DELETED this round; development/holdout separation now lives in the
+  // per-stage `stableProof`/`promotionProof` windows, which the freshValid≥50 bar never reads.
+  const recentBase = Date.now() - 7 * 60_000;
+  const signals: VariantMatrixSignal[] = Array.from({ length: 80 }, (_, i) => ({
     sourceSignalId: `sig-${i}`,
     symbol: `SYM${String(i).padStart(3, "0")}USDT`,
     direction: "SHORT" as const,
@@ -101,6 +109,10 @@ async function buildWinningVmStore(dir: string): Promise<CurrentGuardVariantMatr
     entryVariant: "base_current_entry",
     openedAt: new Date(recentBase + i * 5_000).toISOString(),
     closedAt: null,
+    // Point 3b: exact-context proof requires the fresh-feed axis stamp (posture + regimeDirection).
+    // Without it these rows are legacy-shaped and can never stand alone as exact-context proof.
+    posture: "TACTICAL",
+    regimeDirection: "SHORT",
   }));
   mirrorVariantMatrixSignals(signals, vmStore, new Date().toISOString());
   // Resolve them all as wins so CG_WIDE has positive economics.
@@ -496,6 +508,45 @@ describe("paper-execution-router", () => {
     // The actual regression check: ONE flush for the whole admission pass.
     expect(flushSpy).toHaveBeenCalledTimes(1);
     flushSpy.mockRestore();
+  });
+
+  it("persists only an exact same-opportunity CORTEX snapshot handoff", () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const now = new Date();
+    const openedAt = new Date(now.getTime() - 60_000).toISOString();
+    store.ensurePaperStartAt(new Date(now.getTime() - 120_000).toISOString());
+    const snapshot = {
+      decisionId: "cortex-decision-1", allocationSnapshotId: "cortex-allocation-1", atMs: now.getTime() - 70_000,
+      laneId: H6_TREND_PAPER_LANE_ID, direction: "LONG" as const, featureSchemaVersion: 1,
+      featureVector: [0.1, 0, 0, 0, 0, 0, 0, 0, 0, 0], regimeFamily: "BULLISH", eligible: true, finalPct: 1, evalFinalPct: 0, scanBatchId: "snapshot", sourceScanBatchId: "snapshot",
+    };
+    const base = {
+      scanBatchId: "snapshot", direction: "LONG" as const, regime: "Bullish expansion", laneId: H6_TREND_PAPER_LANE_ID,
+      variantId: H6_TREND_PAPER_LANE_ID, controllerMode: "LONG_ONLY", entryPrice: 100, stopLoss: 95,
+      takeProfitLevels: [108], plannedStopDistanceBps: 500, oosUnconfirmed: true,
+      paperRiskLabel: "EXPERIMENTAL" as const, paperOrderMode: "HEADLINE" as const, openedAt,
+      provenance: null, provenanceFieldMissing: [], cortexDecisionSnapshot: snapshot, canonicalCortexLaneId: H6_TREND_PAPER_LANE_ID,
+    };
+    const result = admitPaperOpportunities({
+      store,
+      opportunities: [
+        { ...base, sourceCandidateId: "snapshot-exact", symbol: "BTCUSDT", cortexDecisionId: snapshot.decisionId, cortexAllocationSnapshotId: snapshot.allocationSnapshotId },
+        { ...base, sourceCandidateId: "snapshot-wrong-allocation", symbol: "ETHUSDT", cortexDecisionId: snapshot.decisionId, cortexAllocationSnapshotId: "other" },
+        { ...base, sourceCandidateId: "snapshot-wrong-decision", symbol: "SOLUSDT", cortexDecisionId: "other", cortexAllocationSnapshotId: snapshot.allocationSnapshotId },
+        { ...base, sourceCandidateId: "snapshot-wrong-direction", symbol: "XRPUSDT", cortexDecisionSnapshot: { ...snapshot, direction: "SHORT" }, cortexDecisionId: snapshot.decisionId, cortexAllocationSnapshotId: snapshot.allocationSnapshotId },
+        { ...base, sourceCandidateId: "snapshot-prior-cycle", symbol: "BNBUSDT", cortexDecisionSnapshot: { ...snapshot, atMs: now.getTime() - 10 * 60_000 }, cortexDecisionId: snapshot.decisionId, cortexAllocationSnapshotId: snapshot.allocationSnapshotId },
+      ],
+      routerReport: routerOf("Bullish expansion"), gateReport: emptyGate(), now: now.toISOString(),
+    });
+    expect(result.admitted).toBe(5);
+    const orders = store.all.filter((order) => order.sourceCandidateId?.startsWith("snapshot-"));
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-exact")?.cortexDecisionSnapshot).toMatchObject({ decisionId: snapshot.decisionId, allocationSnapshotId: snapshot.allocationSnapshotId, atMs: snapshot.atMs });
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-exact")).toMatchObject({ cortexDecisionId: snapshot.decisionId, cortexAllocationSnapshotId: snapshot.allocationSnapshotId });
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-wrong-allocation")?.cortexDecisionSnapshot).toBeUndefined();
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-wrong-decision")?.cortexDecisionSnapshot).toBeUndefined();
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-wrong-direction")?.cortexDecisionSnapshot).toBeUndefined();
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-prior-cycle")?.cortexDecisionSnapshot).toBeUndefined();
   });
 
   // [10] Bearish SHORT_ONLY + scaleout (headline) eligible

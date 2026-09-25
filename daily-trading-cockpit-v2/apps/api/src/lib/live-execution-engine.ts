@@ -55,8 +55,11 @@ import {
 } from "./regime-flip-rescue.js";
 import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./derivatives-crowding.js";
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
+import { pendingEntryExplainsPosition, shouldAutoRearm } from "./live-executor-wiring.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
+import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
+import { normalizeFourBrainTestnetLane, type FourBrainBridgeCandidate, type FourBrainBridgeDecision } from "./four-brain-testnet-bridge.js";
 import type { PositionPathRecorder } from "./position-path-recorder.js";
 import type { BinanceClient } from "./binance.js";
 import type { PaperOrder } from "./paper-execution-router.js";
@@ -80,7 +83,11 @@ import {
   isDirectionalTechnicalSignalFresh,
   type SymbolVolatilityCacheStore,
 } from "./directional-symbol-sizing.js";
-import { isTestnetCrossSectionalHorizonSourceAllowed } from "./live-executor-wiring.js";
+import {
+  isMfeGivebackLaneId,
+  isTestnetCrossSectionalHorizonSourceAllowed,
+  isTestnetMfeGivebackSymbolAllowed,
+} from "./live-executor-wiring.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
 
@@ -727,8 +734,61 @@ export interface LiveIntent {
    *  terminal intent and a double-booking (FIFO eviction, LIVE_MAX_STORED_INTENTS raised above the
    *  FIFO cap, or a lost/corrupt attribution file are all covered by this flag). */
   cortexAttributed?: boolean;
+  /**
+   * A deliberate operator void for REPORTING only — same contract as
+   * isCrossSectionalBasketReportingExcluded in cross-sectional-executor.ts.
+   *
+   * The Binance orders, fills and this intent's own realizedPnlUsd/feesUsd stay untouched, so the
+   * ledger can always be reconciled back against the exchange. Lane performance, the timeline and
+   * the displayed realized total act as though the close never happened.
+   *
+   * DELIBERATELY NOT subtracted from dailyLedger/totalRealizedPnlUsd: those accumulators feed the
+   * daily-loss, consecutive-loss and drawdown KILL SWITCHES, on the same code path that runs
+   * live/3103 with real money. Voiding a real loss out of a safety accumulator would make the
+   * protection less sensitive than the account actually warrants. The excluded amount is carried
+   * here so a reader can subtract it for DISPLAY and still show both numbers.
+   */
+  reportingExclusion?: {
+    kind: "OPERATOR_VOID";
+    voidedAt: string;
+    reason: string;
+    excludedRealizedPnlUsd: number;
+    excludedFeesUsd: number;
+  } | null;
   /** Optional immutable review lineage. Its absence never blocks incumbent execution. */
   executiveReviewLink?: ExecutiveReviewExecutionLink;
+  /** Immutable CORTEX/PaperOrder lineage identity, copied verbatim from the PRIMARY paper.causalIdentity
+   *  at openIntent() and never overwritten afterward — an intent is opened exactly once. Absent when the
+   *  primary PaperOrder carried no causalIdentity at open time (e.g. non-mirror/operator-copy opens).
+   *  Late-binding review attachment (executive-review-admission.ts) must compare against this, never
+   *  re-derive or guess, and must fail closed (not overwrite) if the PaperOrder's current causalIdentity
+   *  has since diverged (see paper-execution-router.ts's `if (identity && identity !== order.causalIdentity)
+   *  store.update(...)` re-price path — causalIdentity CAN be reassigned post-admission). */
+  causalLineage?: LiveIntentCausalLineage;
+}
+
+/** Immutable subset of CausalIdentity (forward-causal-collection.ts) captured on a LiveIntent at open
+ *  time, so a late-binding Executive Review attach can compare against exactly what this intent was
+ *  opened for, without ever re-deriving or reading a PaperOrder's (possibly since-reassigned)
+ *  causalIdentity as the source of truth. */
+export interface LiveIntentCausalLineage {
+  opportunityId: string;
+  cortexDecisionId: string | null;
+  allocationSnapshotId: string | null;
+  canonicalCortexLaneId: string | null;
+  instanceId: string;
+  policyDeploymentAt: string;
+  /** PaperOrder identity/lineage fields captured directly off the order (not via causalIdentity) —
+   *  see lineageFromPaperOrder's doc comment for why these are read straight from `order`. */
+  paperOrderId: string;
+  sourceObservationId: string;
+  scanBatchId: string | null;
+  /** Value comes from PaperOrder.selectedLaneId — the canonical persisted lane-ownership field.
+   *  This is a distinct concept from the `paperLaneId` identifier used elsewhere in
+   *  paper-cortex-lane-mapping.ts; do not confuse the two. */
+  paperLaneId: string;
+  symbol: string;
+  direction: "LONG" | "SHORT";
 }
 
 export interface LiveIntentSource {
@@ -741,10 +801,39 @@ export interface LiveIntentSource {
   controllerMode?: string | null;
   controllerConfidence?: string | null;
   executiveReviewLink?: ExecutiveReviewExecutionLink;
+  /** Same immutable lineage contract as LiveIntent.causalLineage, but for THIS source order — a
+   *  non-primary netted/pyramid source's PaperOrder can carry distinct/independently-drifting
+   *  lineage from the primary, so each source order gets its own snapshot taken at the moment it is
+   *  added to sourcePaperOrders (open, or a later pyramid add), never overwritten afterward. */
+  causalLineage?: LiveIntentCausalLineage;
+}
+
+/** Snapshots a PaperOrder's causalIdentity into the immutable subset a LiveIntent/LiveIntentSource
+ *  persists, at the exact moment the order becomes (or is added to) an intent. Undefined when the
+ *  order carried no causalIdentity at that moment — never fabricated, never re-derived later. */
+function lineageFromPaperOrder(order: PaperOrder): LiveIntentCausalLineage | undefined {
+  const identity = order.causalIdentity;
+  if (!identity) return undefined;
+  return {
+    opportunityId: identity.opportunityId,
+    cortexDecisionId: identity.cortexDecisionId,
+    allocationSnapshotId: identity.allocationSnapshotId,
+    canonicalCortexLaneId: identity.canonicalCortexLaneId,
+    instanceId: identity.instanceId,
+    policyDeploymentAt: identity.policyDeploymentAt,
+    paperOrderId: order.paperOrderId,
+    sourceObservationId: order.sourceObservationId,
+    scanBatchId: order.scanBatchId ?? null,
+    paperLaneId: order.selectedLaneId,
+    symbol: order.symbol,
+    direction: order.direction,
+  };
 }
 
 export type LivePerformanceView = "hourly" | "daily" | "weekly" | "monthly" | "yearly";
 export type LivePerformancePeriod = "fixed";
+/** Calendar used only by the operator-facing performance read model. Execution and risk remain UTC. */
+export type LivePerformanceTimeZone = "UTC" | "Asia/Taipei";
 export type LivePerformanceRegimeFilter =
   | "all"
   | "long"
@@ -783,6 +872,8 @@ export interface LiveLanePerformanceSeriesLane {
   losses: number;
   winRatePct: number | null;
   symbols: string[];
+  /** Latest proven close contributing to this row. External lanes do not appear in account.closedLanes. */
+  lastClosedAt?: string | null;
   regimes: Array<{
     family: LiveRegimeFamily;
     bucket: LiveRegimeBucket;
@@ -801,13 +892,14 @@ export interface LiveLanePerformanceSeriesReport {
   since: string;
   until: string;
   anchor: string | null;
+  timeZone: LivePerformanceTimeZone;
   regimeFilter: LivePerformanceRegimeFilter;
   regimeOptions: Array<{ value: LivePerformanceRegimeFilter; label: string }>;
   bucketStarts: string[];
   lanes: LiveLanePerformanceSeriesLane[];
 }
 
-interface LiveDailyLedger {
+export interface LiveDailyLedger {
   dateUtc: string;
   realizedPnlUsd: number;
   wins: number;
@@ -917,9 +1009,9 @@ interface LiveExecutionState {
   newEntriesPaused: boolean;
   newEntriesPausedAt: string | null;
   newEntriesPauseReason: string | null;
-  /** Symbol → re-entry time after a responsive MFE reversal exit. */
+  /** Symbol"yy re-entry time after a responsive MFE reversal exit. */
   mfeReversalReentryBlockedUntil: Record<string, string>;
-  /** Symbol → last responsive MFE reversal exit. Limits fee-churn exits to one per 2h. */
+  /** Symbol+uR last responsive MFE reversal exit; caps churn exits to one per 2h. */
   mfeReversalLastExitAt: Record<string, string>;
 }
 
@@ -1114,7 +1206,72 @@ export type LivePrivateClient = Pick<
   | "cancelAllAlgoOrders"
   | "getUserTrades"
   | "getIncomeHistory"
->;
+> & Partial<Pick<BinanceFuturesPrivateClient, "getRateLimitStatus">>;
+
+/** Same as sumLiveIntentReportingExclusions but scoped to ONE UTC day, so a "today" headline can be
+ *  corrected without also subtracting voids from earlier days. Matches how dailyLedger rolls. */
+/**
+ * What "today" should REPORT, given a ledger that may not have rolled yet.
+ *
+ * `dailyLedger` only rolls inside `rollDailyLedger()`, which the kill-switch path calls before
+ * every read. The status endpoint does not — it returned `st.dailyLedger` verbatim, date field and
+ * all, and the dashboard printed `.realizedPnlUsd` under the label "today" without ever comparing
+ * that date to the actual date. So on any day the engine has not closed anything, the card showed
+ * YESTERDAY's realized P&L as today's, indefinitely: a quiet week after a -50 close would have
+ * displayed "today -50" seven days running. The kill switch was never affected — it rolls first —
+ * which is exactly why the two numbers could diverge without anything looking broken.
+ *
+ * Pure on purpose. The status path must not mutate the ledger the kill switch owns, so this
+ * returns what a reader should SEE and leaves `st.dailyLedger` alone; the next roll (or close)
+ * updates the real thing. `staleLedgerDateUtc` is carried so a reader can tell "no trades today"
+ * apart from "ledger belongs to another day", rather than inferring it from a zero.
+ */
+export function reportedDailyLedger(
+  ledger: LiveDailyLedger,
+  todayUtc: string,
+): LiveDailyLedger & { staleLedgerDateUtc?: string } {
+  if (ledger.dateUtc === todayUtc) return ledger;
+  return { dateUtc: todayUtc, realizedPnlUsd: 0, wins: 0, losses: 0, scratches: 0, staleLedgerDateUtc: ledger.dateUtc };
+}
+
+export function sumLiveIntentReportingExclusionsForDate(
+  intents: ReadonlyArray<{ closedAt?: string | null; updatedAt?: string | null; reportingExclusion?: { kind: "OPERATOR_VOID"; excludedRealizedPnlUsd: number; excludedFeesUsd: number } | null }>,
+  dateUtc: string,
+): { count: number; realizedPnlUsd: number; feesUsd: number } {
+  let count = 0, realizedPnlUsd = 0, feesUsd = 0;
+  for (const intent of intents) {
+    const ex = intent.reportingExclusion;
+    if (ex?.kind !== "OPERATOR_VOID") continue;
+    const closed = intent.closedAt ?? intent.updatedAt ?? null;
+    if (typeof closed !== "string" || closed.slice(0, 10) !== dateUtc) continue;
+    count += 1;
+    if (Number.isFinite(ex.excludedRealizedPnlUsd)) realizedPnlUsd += ex.excludedRealizedPnlUsd;
+    if (Number.isFinite(ex.excludedFeesUsd)) feesUsd += ex.excludedFeesUsd;
+  }
+  return { count, realizedPnlUsd, feesUsd };
+}
+
+/** True when a closed intent is retained for audit but must never influence reporting or learning. */
+export function isLiveIntentReportingExcluded(
+  intent: { reportingExclusion?: { kind: "OPERATOR_VOID" } | null },
+): boolean {
+  return intent.reportingExclusion?.kind === "OPERATOR_VOID";
+}
+
+/** What the operator has voided out of reporting, so a display can subtract it AND show it. */
+export function sumLiveIntentReportingExclusions(
+  intents: ReadonlyArray<{ reportingExclusion?: { kind: "OPERATOR_VOID"; excludedRealizedPnlUsd: number; excludedFeesUsd: number } | null }>,
+): { count: number; realizedPnlUsd: number; feesUsd: number } {
+  let count = 0, realizedPnlUsd = 0, feesUsd = 0;
+  for (const intent of intents) {
+    const ex = intent.reportingExclusion;
+    if (ex?.kind !== "OPERATOR_VOID") continue;
+    count += 1;
+    if (Number.isFinite(ex.excludedRealizedPnlUsd)) realizedPnlUsd += ex.excludedRealizedPnlUsd;
+    if (Number.isFinite(ex.excludedFeesUsd)) feesUsd += ex.excludedFeesUsd;
+  }
+  return { count, realizedPnlUsd, feesUsd };
+}
 
 export interface LiveExecutionEngineOptions {
   config: LiveExecutionConfig;
@@ -1142,8 +1299,28 @@ export interface LiveExecutionEngineOptions {
    *  disarmed, defeating auto-arm every boot). Positions fully explained by these claims are not
    *  orphans; anything beyond the claimed qty still disarms exactly as before. */
   externalManagedNetQty?: () => Map<string, number>;
+  /** Signed qty per symbol for external entry orders RESTING on the exchange but not yet filled
+   *  into a leg (post-only maker entry). Used ONLY to widen reconcile()'s orphan tolerance into a
+   *  band — never as a net claim, which would corrupt every netting consumer. See
+   *  live-executor-wiring.ts's computeExternalPendingEntryQty for why the split exists. */
+  externalPendingEntryQty?: () => Map<string, number>;
+  /**
+   * Narrow symbol-ownership veto for an isolated Testnet lane. Unlike the
+   * ordinary netting guard, a same-side entry is also unsafe because one-way
+   * Binance has no lot ownership and could change that lane's bracket quantity.
+   * Omitted by every incumbent configuration, preserving existing behavior.
+   */
+  externalEntryBlockReason?: (symbol: string) => string | null;
   /** Shared strategy/regime admission gate. It affects NEW exposure only; exits always continue. */
   newEntryGate?: () => LiveNewEntryGateDecision;
+  /** 2026-08 manual-directional canonical-regime enforcement fix: an ADDITIONAL, independent gate
+   *  consulted ONLY inside canOpenNewEntries()'s manual-directional branch, AND-ed with
+   *  isManualDirectionalEntryEnabled() — see that method's own doc comment for why. Omit (tests, or
+   *  a hypothetical future construction site that forgets to wire it) to default to always-allowed,
+   *  matching newEntryGate's own default-permissive convention above — the one real production call
+   *  site (app.ts's buildManualDirectionalRegimeSafetyGate) always wires the real
+   *  canonical-regime-backed function, so this default is theoretical, not live risk. */
+  regimeSafetyGate?: () => LiveNewEntryGateDecision;
   /**
    * Real realized P&L (today's UTC-day total + all-time) from every CrossSectionalExecutor and
    * SingleSymbolLaneExecutor instance — lanes that are separate classes with their own stores and
@@ -1200,11 +1377,40 @@ export interface LiveExecutionEngineOptions {
    *  optional-dep posture as the two recorders above: omit and the engine is byte-for-byte
    *  unchanged; every use is wrapped so a failure can NEVER affect trading. */
   executionFillRecorder?: ExecutionFillRecorder;
+  /** Exact Four-Brain decision -> fill lineage for the narrowly-scoped testnet cohort. */
+  fourBrainActualFillBindings?: FourBrainActualFillBindingStore;
+  /** Negative-evidence pilot gate. Omitted on every environment outside the focused testnet. */
+  fourBrainEntryGate?: (candidate: FourBrainBridgeCandidate) => FourBrainBridgeDecision;
   /** Optional shadow-only Executive Review resolver sink. app.ts never injects it on 3103. */
   executiveReviewStore?: ExecutiveReviewStore;
 }
 
-const ERROR_STREAK_DISARM = 3;
+/** 2026-08-17: was 3. tick() runs every 25s, so 3 meant ~75s of exchange trouble latched the account
+ *  off permanently — a single brief Binance blip took testnet down until a human noticed. 6 is ~2.5
+ *  minutes of SUSTAINED failure, which is a real outage rather than a hiccup. */
+const ERROR_STREAK_DISARM = 6;
+/**
+ * How long without a COMPLETED tick before the engine disarms itself.
+ *
+ * The error-streak latch above only counts ticks that ran and FAILED. A tick wedged inside an
+ * await never fails, never returns, and never increments anything — so on 2026-09-04 both 3103 and
+ * 3102 sat armed and completely blind for the better part of an hour with errorStreak 0,
+ * lastTickError null, and no rate-limit cooldown. Every health field was green. `lastTickAt` was
+ * recorded and displayed the whole time; nothing ever compared it to the clock.
+ *
+ * Testnet gets a far looser bound on purpose: its reads are paced by a host-wide 30s lease, so a
+ * single tick legitimately takes minutes there. Both are overridable with
+ * LIVE_TICK_STALL_DISARM_MS for an instance whose cadence is deliberately different.
+ */
+const TICK_STALL_DISARM_DEFAULT_MS = { mainnet: 900_000, testnet: 2_700_000 } as const;
+/** Why the engine disarmed. Only TRANSIENT_EXCHANGE_ERROR is allowed to recover on its own. */
+type DisarmKind = "TRANSIENT_EXCHANGE_ERROR" | "LATCHED";
+/** Consecutive clean ticks (~100s at a 25s interval) before a TRANSIENT_EXCHANGE_ERROR disarm is
+ *  allowed to recover on its own. Only that one cause recovers — see maybeAutoRearmAfterTransient. */
+const AUTO_REARM_HEALTHY_TICKS = 4;
+/** Flap guard. If the exchange keeps failing and recovering, auto-recovery would arm and disarm
+ *  forever; after this many self-recoveries the engine stays down until a human arms it. */
+const AUTO_REARM_MAX_PER_PROCESS = 3;
 const REGIME_EXIT_SNAPSHOT_MAX_AGE_MS = 15 * 60 * 1000;
 const OPEN_INTENT_STATES: ReadonlySet<LiveIntentState> = new Set(["MIRRORED", "ENTRY_PLACED", "OPEN", "TP1_FILLED_BE_SET"]);
 const MIRRORABLE_PAPER_STATUSES: ReadonlySet<string> = new Set(["CREATED", "PAPER_SUBMITTED"]);
@@ -1431,6 +1637,10 @@ function normalizePerformancePeriod(_raw: string | null | undefined): LivePerfor
   return "fixed";
 }
 
+function normalizePerformanceTimeZone(raw: string | null | undefined): LivePerformanceTimeZone {
+  return raw === "Asia/Taipei" ? "Asia/Taipei" : "UTC";
+}
+
 function normalizeRegimeFilter(raw: string | null | undefined): LivePerformanceRegimeFilter {
   return LIVE_PERFORMANCE_REGIME_OPTIONS.some((option) => option.value === raw)
     ? raw as LivePerformanceRegimeFilter
@@ -1523,10 +1733,16 @@ function bucketStartForMs(ms: number, bucketStartsMs: number[], untilMs: number)
   return picked;
 }
 
-function performanceWindow(input: {
+/**
+ * Builds calendar buckets without changing any execution timestamp.  The engine ledger is UTC,
+ * but the dashboard is operated in Taipei; adding a fixed offset before calendar arithmetic and
+ * removing it afterward makes an Asia/Taipei "day" run from 16:00Z to 16:00Z.  Taipei has no DST.
+ */
+export function performanceWindow(input: {
   view: LivePerformanceView;
   anchor?: string | null;
   nowMs: number;
+  timeZone?: LivePerformanceTimeZone;
 }): {
   sinceMs: number;
   untilMs: number;
@@ -1536,91 +1752,97 @@ function performanceWindow(input: {
   bucketStartsMs: number[];
   bucketForMs: (ms: number) => number | null;
 } {
-  const nowDayStart = startOfUtcDay(input.nowMs);
-  if (input.view === "hourly") {
-    const sinceMs = parseAnchorDay(input.anchor, input.nowMs);
-    const untilMs = sinceMs + DAY_MS;
-    const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, HOUR_MS);
+  const offsetMs = input.timeZone === "Asia/Taipei" ? 8 * HOUR_MS : 0;
+  const toCalendarMs = (utcMs: number) => utcMs + offsetMs;
+  const fromCalendarMs = (calendarMs: number) => calendarMs - offsetMs;
+  const nowCalendarMs = toCalendarMs(input.nowMs);
+  const buildWindow = (
+    sinceCalendarMs: number,
+    untilCalendarMs: number,
+    bucketStartsCalendarMs: number[],
+    anchor: string | null,
+    periodLabel: string,
+    bucketMs: number | null,
+  ) => {
+    const sinceMs = fromCalendarMs(sinceCalendarMs);
+    const untilMs = fromCalendarMs(untilCalendarMs);
+    const bucketStartsMs = bucketStartsCalendarMs.map(fromCalendarMs);
     return {
       sinceMs,
       untilMs,
-      anchor: isoDay(sinceMs),
-      periodLabel: isoDay(sinceMs),
-      bucketMs: HOUR_MS,
+      anchor,
+      periodLabel,
+      bucketMs,
       bucketStartsMs,
-      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
+      bucketForMs: (ms: number) => bucketStartForMs(ms, bucketStartsMs, untilMs),
     };
+  };
+  if (input.view === "hourly") {
+    const sinceCalendarMs = parseAnchorDay(input.anchor, nowCalendarMs);
+    const untilCalendarMs = sinceCalendarMs + DAY_MS;
+    return buildWindow(
+      sinceCalendarMs,
+      untilCalendarMs,
+      buildFixedBucketStarts(sinceCalendarMs, untilCalendarMs, HOUR_MS),
+      isoDay(sinceCalendarMs),
+      isoDay(sinceCalendarMs),
+      HOUR_MS,
+    );
   }
   if (input.view === "monthly") {
-    const sinceMs = parseAnchorYear(input.anchor, input.nowMs);
-    const untilMs = addUtcMonths(sinceMs, 12);
-    const bucketStartsMs = Array.from({ length: 12 }, (_, index) => addUtcMonths(sinceMs, index));
-    return {
-      sinceMs,
-      untilMs,
-      anchor: isoYear(sinceMs),
-      periodLabel: isoYear(sinceMs),
-      bucketMs: null,
-      bucketStartsMs,
-      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
-    };
+    const sinceCalendarMs = parseAnchorYear(input.anchor, nowCalendarMs);
+    const untilCalendarMs = addUtcMonths(sinceCalendarMs, 12);
+    return buildWindow(
+      sinceCalendarMs,
+      untilCalendarMs,
+      Array.from({ length: 12 }, (_, index) => addUtcMonths(sinceCalendarMs, index)),
+      isoYear(sinceCalendarMs),
+      isoYear(sinceCalendarMs),
+      null,
+    );
   }
   if (input.view === "yearly") {
-    const sinceMs = parseAnchorEndYear(input.anchor, input.nowMs);
-    const bucketStartsMs = Array.from({ length: 3 }, (_, index) => Date.UTC(new Date(sinceMs).getUTCFullYear() + index, 0, 1));
-    const untilMs = Date.UTC(new Date(sinceMs).getUTCFullYear() + 3, 0, 1);
-    const startYear = isoYear(sinceMs);
+    const sinceCalendarMs = parseAnchorEndYear(input.anchor, nowCalendarMs);
+    const bucketStartsCalendarMs = Array.from({ length: 3 }, (_, index) => Date.UTC(new Date(sinceCalendarMs).getUTCFullYear() + index, 0, 1));
+    const untilCalendarMs = Date.UTC(new Date(sinceCalendarMs).getUTCFullYear() + 3, 0, 1);
+    const startYear = isoYear(sinceCalendarMs);
     const endYear = `${Number(startYear) + 2}`;
-    return {
-      sinceMs,
-      untilMs,
-      anchor: endYear,
-      periodLabel: `${startYear}-${endYear}`,
-      bucketMs: null,
-      bucketStartsMs,
-      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
-    };
+    return buildWindow(sinceCalendarMs, untilCalendarMs, bucketStartsCalendarMs, endYear, `${startYear}-${endYear}`, null);
   }
   if (input.view === "daily") {
-    const sinceMs = parseAnchorMonth(input.anchor, input.nowMs);
-    const untilMs = addUtcMonths(sinceMs, 1);
-    const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, DAY_MS);
-    return {
-      sinceMs,
-      untilMs,
-      anchor: isoMonth(sinceMs),
-      periodLabel: isoMonth(sinceMs),
-      bucketMs: DAY_MS,
-      bucketStartsMs,
-      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
-    };
+    const sinceCalendarMs = parseAnchorMonth(input.anchor, nowCalendarMs);
+    const untilCalendarMs = addUtcMonths(sinceCalendarMs, 1);
+    return buildWindow(
+      sinceCalendarMs,
+      untilCalendarMs,
+      buildFixedBucketStarts(sinceCalendarMs, untilCalendarMs, DAY_MS),
+      isoMonth(sinceCalendarMs),
+      isoMonth(sinceCalendarMs),
+      DAY_MS,
+    );
   }
   if (input.view === "weekly") {
-    const sinceMs = parseAnchorMonth(input.anchor, input.nowMs);
-    const untilMs = addUtcMonths(sinceMs, 1);
-    const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, WEEK_MS);
-    return {
-      sinceMs,
-      untilMs,
-      anchor: isoMonth(sinceMs),
-      periodLabel: isoMonth(sinceMs),
-      bucketMs: WEEK_MS,
-      bucketStartsMs,
-      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
-    };
+    const sinceCalendarMs = parseAnchorMonth(input.anchor, nowCalendarMs);
+    const untilCalendarMs = addUtcMonths(sinceCalendarMs, 1);
+    return buildWindow(
+      sinceCalendarMs,
+      untilCalendarMs,
+      buildFixedBucketStarts(sinceCalendarMs, untilCalendarMs, WEEK_MS),
+      isoMonth(sinceCalendarMs),
+      isoMonth(sinceCalendarMs),
+      WEEK_MS,
+    );
   }
-  const untilMs = nowDayStart + DAY_MS;
-  const sinceMs = nowDayStart;
-  const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, DAY_MS);
-  return {
-    sinceMs,
-    untilMs,
-    anchor: null,
-    periodLabel: isoDay(sinceMs),
-    bucketMs: DAY_MS,
-    bucketStartsMs,
-    bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
-  };
+  const sinceCalendarMs = startOfUtcDay(nowCalendarMs);
+  const untilCalendarMs = sinceCalendarMs + DAY_MS;
+  return buildWindow(
+    sinceCalendarMs,
+    untilCalendarMs,
+    buildFixedBucketStarts(sinceCalendarMs, untilCalendarMs, DAY_MS),
+    null,
+    isoDay(sinceCalendarMs),
+    DAY_MS,
+  );
 }
 
 function classifyLivePerformanceRegime(input: {
@@ -1826,12 +2048,7 @@ export const MFE_REVERSAL_CONFIRMATIONS_REQUIRED = 2;
 export const MFE_REVERSAL_REENTRY_COOLDOWN_MS = 15 * 60 * 1000;
 export const MFE_REVERSAL_EXIT_COOLDOWN_MS = 2 * 60 * 60 * 1000;
 
-/**
- * A responsive MFE exit is allowed only after two separate NEW observations
- * agree that the open direction has been invalidated: the scanner is WAIT and
- * both Kronos and whale point the other way. Two lane variants emitted from the
- * same observation count once, so duplication cannot manufacture confirmation.
- */
+/** Two independent fresh observations must agree before a responsive MFE exit. */
 export function mfeResponsiveReversalConfirmed(
   direction: "LONG" | "SHORT",
   papers: readonly Pick<PaperOrder, "sourceObservationId" | "createdAt" | "provenance">[],
@@ -1945,13 +2162,18 @@ export class LiveExecutionEngine {
   private readonly marketDataClient?: Pick<BinanceClient, "getFuturesFlow" | "getCandles" | "getBookTicker">;
   private readonly fillConfirmRetryDelayMs: number;
   private readonly externalManagedNetQty: () => Map<string, number>;
+  private readonly externalPendingEntryQty: () => Map<string, number>;
+  private readonly externalEntryBlockReason: (symbol: string) => string | null;
   private readonly newEntryGate: () => LiveNewEntryGateDecision;
+  private readonly regimeSafetyGate: () => LiveNewEntryGateDecision;
   private readonly getExternalRealizedPnlUsd: () => { today: number; allTime: number };
   private readonly onKillSwitchEngaged: ((reason: string) => Promise<void>) | null;
   private readonly laneDirectionForId: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
   private readonly cortexRealAttribution: CortexRealAttributionStore | null;
   private readonly positionPathRecorder: PositionPathRecorder | null;
   private readonly executionFillRecorder: ExecutionFillRecorder | null;
+  private readonly fourBrainActualFillBindings: FourBrainActualFillBindingStore | null;
+  private readonly fourBrainEntryGate: ((candidate: FourBrainBridgeCandidate) => FourBrainBridgeDecision) | null;
   private readonly executiveReviewStore: ExecutiveReviewStore | null;
 
   /** In-memory ONLY — restart always boots disarmed. */
@@ -1959,8 +2181,20 @@ export class LiveExecutionEngine {
   private errorStreak = 0;
   private lastTickAt: string | null = null;
   private lastTickError: string | null = null;
+  /** Survives the `lastTickError` reset at the top of every tick, so the reason a latched disarm
+   *  happened is still readable from the API long after the exchange recovered. `kind` is what
+   *  decides whether it may recover on its own: ONLY TRANSIENT_EXCHANGE_ERROR ever does. Every
+   *  other cause — kill switch, reconciliation mismatch, failed emergency flatten, an operator
+   *  pressing disarm — is LATCHED and waits for a human, which is the entire point of those paths. */
+  private lastDisarm: { at: string; reason: string; kind: DisarmKind } | null = null;
+  private healthyTickStreak = 0;
+  private autoRearmCount = 0;
   private reconcileIssues: string[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Latch so a continuing stall logs once and disarms once, not every interval. */
+  private tickStallDisarmed = false;
+  /** Clock origin for the very first tick, which has no `lastTickAt` to age against. */
+  private tickStallBaselineMs = 0;
   private ticking = false;
   /** 2026-07-11 real-money audit fix: `this.ticking` only blocks a second concurrent tick() — it
    *  does NOT block manualCloseIntent()/kill()/flattenAllExchangePositions(), which the dashboard
@@ -2009,13 +2243,18 @@ export class LiveExecutionEngine {
     this.marketDataClient = options.marketDataClient;
     this.fillConfirmRetryDelayMs = options.fillConfirmRetryDelayMs ?? 400;
     this.externalManagedNetQty = options.externalManagedNetQty ?? (() => new Map());
+    this.externalPendingEntryQty = options.externalPendingEntryQty ?? (() => new Map());
+    this.externalEntryBlockReason = options.externalEntryBlockReason ?? (() => null);
     this.newEntryGate = options.newEntryGate ?? (() => ({ allowed: true, reason: null }));
+    this.regimeSafetyGate = options.regimeSafetyGate ?? (() => ({ allowed: true, reason: null }));
     this.getExternalRealizedPnlUsd = options.getExternalRealizedPnlUsd ?? (() => ({ today: 0, allTime: 0 }));
     this.onKillSwitchEngaged = options.onKillSwitchEngaged ?? null;
     this.laneDirectionForId = options.laneDirectionForId ?? (() => null);
     this.cortexRealAttribution = options.cortexRealAttribution ?? null;
     this.positionPathRecorder = options.positionPathRecorder ?? null;
     this.executionFillRecorder = options.executionFillRecorder ?? null;
+    this.fourBrainActualFillBindings = options.fourBrainActualFillBindings ?? null;
+    this.fourBrainEntryGate = options.fourBrainEntryGate ?? null;
     this.executiveReviewStore = options.executiveReviewStore ?? null;
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
@@ -2048,9 +2287,72 @@ export class LiveExecutionEngine {
     return { ok: true, reason: null };
   }
 
-  disarm(reason: string): void {
+  disarm(reason: string, kind: DisarmKind = "LATCHED"): void {
     this.armed = false;
+    this.lastDisarm = { at: this.nowIso(), reason, kind };
     this.pushReconcileIssues(`disarmed: ${reason}`);
+    // 2026-08-17: a disarm is LATCHED (nothing re-arms — LIVE_AUTO_ARM=0) and every trace of it is
+    // in-memory: reconcileIssues dies on restart and `lastTickError` is cleared at the top of the
+    // NEXT tick, so one healthy tick erases the reason forever. Twice in one day the account was
+    // found disarmed with no way to tell why. pm2's log is the only record that outlives a restart.
+    console.error(`[live-engine] DISARMED at ${this.lastDisarm.at}: ${reason}`);
+  }
+
+  /**
+   * Re-arms ONLY after a disarm the engine itself caused by losing sight of the exchange, and only
+   * once the exchange has been answering cleanly again for AUTO_REARM_HEALTHY_TICKS in a row.
+   *
+   * 2026-08-17. The error-streak guard is right — trading blind is not allowed — but it LATCHED,
+   * and nothing re-arms (LIVE_AUTO_ARM=0). So ~75s of Binance trouble took testnet down until a
+   * human noticed hours later. That is an availability bug wearing a safety guard's clothes: the
+   * condition it protects against (blind) is gone the moment ticks succeed again.
+   *
+   * Everything else stays latched, deliberately:
+   *   - kill switch      → `arm()` refuses while killedAt is set, so this cannot punch through it
+   *   - reconciliation mismatch (an orphan position) → a REAL unexplained position; needs a human
+   *   - failed emergency flatten                     → real unprotected exposure; needs a human
+   *   - operator pressed disarm                      → the operator's decision, not ours to undo
+   * All of those call disarm() with the default LATCHED kind, so they never reach the check below.
+   *
+   * Routing through arm() rather than setting `armed` directly is what buys the kill-switch and
+   * hedge-mode refusals for free — writing `this.armed = true` here would bypass both.
+   */
+  private async maybeAutoRearmAfterTransient(): Promise<void> {
+    const previous = this.lastDisarm;
+    if (
+      !previous ||
+      !shouldAutoRearm(
+        this.armed,
+        previous.kind,
+        this.healthyTickStreak,
+        this.autoRearmCount,
+        AUTO_REARM_HEALTHY_TICKS,
+        AUTO_REARM_MAX_PER_PROCESS,
+      )
+    ) {
+      return;
+    }
+    const result = await this.arm();
+    if (!result.ok) {
+      // Kill switch latched, or hedge mode — leave it down and say why, once per attempt.
+      console.error(`[live-engine] auto-rearm declined: ${result.reason}`);
+      return;
+    }
+    this.autoRearmCount += 1;
+    this.lastDisarm = null;
+    this.pushReconcileIssues(
+      `auto-rearmed after ${this.healthyTickStreak} healthy ticks (was: ${previous.reason})`,
+    );
+    console.error(
+      `[live-engine] AUTO-REARMED (${this.autoRearmCount}/${AUTO_REARM_MAX_PER_PROCESS}) after ` +
+        `${this.healthyTickStreak} healthy ticks — original disarm at ${previous.at}: ${previous.reason}`,
+    );
+    if (this.autoRearmCount >= AUTO_REARM_MAX_PER_PROCESS) {
+      console.error(
+        `[live-engine] auto-rearm budget spent — the exchange is flapping. Any further ` +
+          `transient-error disarm will STAY down until a human arms it.`,
+      );
+    }
   }
 
   /** Appends to reconcileIssues WITHOUT letting it grow unbounded. A persistent condition (e.g.
@@ -2266,29 +2568,131 @@ export class LiveExecutionEngine {
     }
   }
 
-  /** Armed means exits/reconcile are active. This stricter method controls NEW exposure only. */
-  canOpenNewEntries(): boolean {
+  /** 2026-08 manual-directional canonical-regime enforcement fix: the SAME fail-closed try/catch
+   *  shape as strategyEntryGate() above, wrapping the injected regimeSafetyGate — the canonical
+   *  regime-policy check (panic/coverage) manual mode used to bypass entirely. Consulted ONLY from
+   *  entryGateDecision()'s manual-directional branch below; never replaces
+   *  isManualDirectionalEntryEnabled(), only ANDs with it. */
+  private manualRegimeSafetyGate(): LiveNewEntryGateDecision {
+    try {
+      const result = this.regimeSafetyGate();
+      return result && typeof result.allowed === "boolean"
+        ? { allowed: result.allowed, reason: result.reason ?? null }
+        : { allowed: false, reason: "invalid manual regime-safety gate response" };
+    } catch (error) {
+      return { allowed: false, reason: `manual regime-safety gate failed: ${(error as Error).message}` };
+    }
+  }
+
+  /**
+   * A USD-M 418 means Binance has told this account's transport to stop.  This gate is deliberately
+   * independent from strategy/manual selection: it blocks only NEW exposure while preserving the
+   * existing fail-closed behaviour for reconciliation and exits.  Once the client cooldown ends,
+   * the normal strategy gate decides again; nothing is auto-opened from this status alone.
+   */
+  private transportAvailabilityGate(): LiveNewEntryGateDecision {
+    const rateLimit = this.client.getRateLimitStatus?.();
+    if (!rateLimit?.coolingDown) return { allowed: true, reason: null };
+    return {
+      allowed: false,
+      reason: `Binance USD-M transport is cooling down after HTTP ${rateLimit.lastHttpStatus ?? 418} until ${rateLimit.retryAt ?? "an unknown time"}`,
+    };
+  }
+
+  /** Single source of truth for BOTH canOpenNewEntries()'s boolean and newEntryBlockReason()'s
+   *  explanation, so the two can never drift apart — see live-executor-wiring.ts's
+   *  newExecutorLaneGate header comment for the exact incident class (a hand-maintained mirror of a
+   *  predicate's branch order silently falling one edit behind) this same shape exists to end here
+   *  too. Branch order and every condition are UNCHANGED from the pre-2026-08 canOpenNewEntries()
+   *  body; `!this.armed || st.killedAt` is split into two sequential ifs (both pure reads, no side
+   *  effects) purely to attach distinct reasons. The only actual behavior change is the manual
+   *  branch gaining a second, AND-ed condition (manualRegimeSafetyGate() — 2026-08 fix, see its own
+   *  doc comment and app.ts's buildManualDirectionalRegimeSafetyGate). */
+  private entryGateDecision(): LiveNewEntryGateDecision {
     const st = this.store.getState();
-    if (!this.armed || st.killedAt) return false;
-    if (this.isNewEntryDrainActive()) return false;
+    if (!this.armed) return { allowed: false, reason: "engine is not ARMED" };
+    if (st.killedAt) return { allowed: false, reason: st.killReason ?? "kill switch latched" };
+    if (this.isNewEntryDrainActive()) {
+      return { allowed: false, reason: "new-entry drain is active (operator paused new entries)" };
+    }
+    const transport = this.transportAvailabilityGate();
+    if (!transport.allowed) return transport;
     // Testnet collect-all still honours arm/disarm, the kill switch, and an
     // operator drain. It deliberately does not inherit strategy admission.
-    if (this.config.mirrorAllPaperOrders) return true;
-    // Manual mode bypasses strategy/admission blockers only when the scanner has produced a current
-    // directional Entry Decision. Exchange health, stop/TP placement, caps, and the kill switch remain.
-    if (st.manualSelectorMode && st.manualDirectionalAllocations) return this.isManualDirectionalEntryEnabled();
-    return this.strategyEntryGate().allowed;
+    if (this.config.mirrorAllPaperOrders) return { allowed: true, reason: null };
+    if (st.manualSelectorMode && st.manualDirectionalAllocations) {
+      // Manual mode bypasses strategy/admission blockers only when the scanner has produced a
+      // current directional Entry Decision. Exchange health, stop/TP placement, caps, and the kill
+      // switch remain (all checked above, unconditionally, before this branch is ever reached).
+      if (!this.isManualDirectionalEntryEnabled()) {
+        return {
+          allowed: false,
+          reason: "manual-directional mode is waiting for a fresh Entry Decision (no current directional bias)",
+        };
+      }
+      // 2026-08 manual-directional canonical-regime enforcement fix: manual mode may relax MATURITY
+      // only (isManualDirectionalEntryEnabled() above) — it must never bypass the canonical regime
+      // engine's own panic/coverage safety check the way it previously did. AND, never OR: for any
+      // input, this can only narrow what manual mode admits relative to the old behavior, never
+      // widen it.
+      const safety = this.manualRegimeSafetyGate();
+      return safety.allowed ? { allowed: true, reason: null } : safety;
+    }
+    return this.strategyEntryGate();
+  }
+
+  /** Armed means exits/reconcile are active. This stricter method controls NEW exposure only. */
+  canOpenNewEntries(): boolean {
+    return this.entryGateDecision().allowed;
+  }
+
+  /** The explanation half of canOpenNewEntries() — which specific condition is holding new entries
+   *  false right now, computed from the SAME decision canOpenNewEntries() reads (entryGateDecision()
+   *  above) so the boolean and its reason can never disagree. null means every condition passed.
+   *  Surfaced via getStatus().newEntries.blockReason and, for SingleSymbolLaneExecutor lanes
+   *  specifically, via live-executor-wiring.ts's newExecutorLaneGate -> app.ts's
+   *  legacyEntryBlockReason -> each lane's own getStatus().entryBlockReason field. */
+  newEntryBlockReason(): string | null {
+    return this.entryGateDecision().reason;
+  }
+
+  /**
+   * Account-safety-only entry gate for independent lanes.  It deliberately does
+   * not inherit the mirror/Dynamic strategy admission policy, but it still
+   * honours arm state, a latched kill, the operator drain, and transport
+   * cooldown.  Independent lanes use this only as an additional AND gate.
+   */
+  private accountEntryGateDecision(): LiveNewEntryGateDecision {
+    const st = this.store.getState();
+    if (!this.armed) return { allowed: false, reason: "engine is not ARMED" };
+    if (st.killedAt) return { allowed: false, reason: st.killReason ?? "kill switch latched" };
+    if (this.isNewEntryDrainActive()) {
+      return { allowed: false, reason: "new-entry drain is active (operator paused new entries)" };
+    }
+    return this.transportAvailabilityGate();
+  }
+
+  canOpenNewAccountEntries(): boolean {
+    return this.accountEntryGateDecision().allowed;
+  }
+
+  newAccountEntryBlockReason(): string | null {
+    return this.accountEntryGateDecision().reason;
   }
 
   /** Same as canOpenNewEntries() but never delegates to the manual-directional bias gate — for
    *  baskets (e.g. CROSS_SECTIONAL_MARKET_NEUTRAL) whose own signal has no single-symbol
    *  directional bias to align with, so the manual selector's LONG/SHORT allocation is simply
    *  irrelevant to them. Manual mode still resolves via strategyEntryGate() below, exactly as
-   *  when manual mode is off — this only removes the mode-specific short-circuit. */
+   *  when manual mode is off — this only removes the mode-specific short-circuit. Unaffected by the
+   *  2026-08 manual-directional canonical-regime enforcement fix above: this method never took the
+   *  manual short-circuit to begin with, so it already always ran the full
+   *  canonical-regime-backed strategyEntryGate() check. */
   canOpenNewEntriesIgnoringManualDirectional(): boolean {
     const st = this.store.getState();
     if (!this.armed || st.killedAt) return false;
     if (this.isNewEntryDrainActive()) return false;
+    if (!this.transportAvailabilityGate().allowed) return false;
     if (this.config.mirrorAllPaperOrders) return true;
     return this.strategyEntryGate().allowed;
   }
@@ -2320,9 +2724,66 @@ export class LiveExecutionEngine {
 
   start(intervalMs = 25_000): void {
     if (this.timer) return;
+    this.tickStallBaselineMs = Date.parse(this.nowIso());
     this.timer = setInterval(() => {
+      // Deliberately BEFORE tick(). tick() early-returns while `this.ticking` is latched, and a
+      // tick wedged inside an await never reaches its own finally to clear it — so this callback
+      // is the only code still running, and therefore the only place that can notice.
+      this.assertTicksAreLanding(intervalMs);
       void this.tick();
     }, intervalMs);
+  }
+
+  /**
+   * Disarm when no tick has COMPLETED for too long.
+   *
+   * Disarmed as TRANSIENT_EXCHANGE_ERROR rather than LATCHED: the condition is "we cannot see the
+   * exchange", which is gone the moment ticks land again, and the auto-rearm path already demands
+   * healthy ticks to prove it. Latching here would turn an availability blip into a manual
+   * recovery, which is the bug the auto-rearm was written to fix.
+   */
+  private assertTicksAreLanding(intervalMs: number): void {
+    const configured = Number.parseInt(process.env.LIVE_TICK_STALL_DISARM_MS ?? "", 10);
+    const limitMs = Number.isFinite(configured) && configured > 0
+      ? configured
+      : Math.max(
+        this.config.env === "testnet"
+          ? TICK_STALL_DISARM_DEFAULT_MS.testnet
+          : TICK_STALL_DISARM_DEFAULT_MS.mainnet,
+        intervalMs * 8,
+      );
+    const lastMs = this.lastTickAt ? Date.parse(this.lastTickAt) : this.tickStallBaselineMs;
+    const nowMs = Date.parse(this.nowIso());
+    if (!Number.isFinite(lastMs) || !Number.isFinite(nowMs) || lastMs <= 0) return;
+    const ageMs = nowMs - lastMs;
+    if (ageMs < limitMs / 2) {
+      this.tickStallDisarmed = false;
+      return;
+    }
+    if (ageMs < limitMs) {
+      // One warning at the halfway mark, so a human sees it coming rather than only the disarm.
+      if (!this.tickStallDisarmed) {
+        console.error(
+          `[live-engine] TICK STALL WARNING: no completed tick for ${Math.round(ageMs / 1000)}s `
+          + `(disarm at ${Math.round(limitMs / 1000)}s). errorStreak stays 0 for a wedged tick, so `
+          + "this is the only signal.",
+        );
+      }
+      return;
+    }
+    if (this.tickStallDisarmed) return;
+    this.tickStallDisarmed = true;
+    console.error(
+      `[live-engine] TICK STALL: no completed tick for ${Math.round(ageMs / 1000)}s `
+      + `(last ${this.lastTickAt ?? "never"}, ticking=${this.ticking}).`,
+    );
+    if (this.armed) {
+      this.disarm(
+        `no completed tick for ${Math.round(ageMs / 1000)}s — trading blind is not allowed `
+        + `(ticking=${this.ticking}, errorStreak=${this.errorStreak})`,
+        "TRANSIENT_EXCHANGE_ERROR",
+      );
+    }
   }
 
   stop(): void {
@@ -2343,6 +2804,11 @@ export class LiveExecutionEngine {
       armed: this.armed,
       newEntries: {
         allowed: this.canOpenNewEntries(),
+        // 2026-08 manual-directional canonical-regime enforcement fix: surfaces WHICH condition is
+        // holding `allowed` false right now (armed/kill/drain/manual-decision-stale/regime-safety/
+        // strategy-gate) — same source as `allowed` (entryGateDecision()), so they can never
+        // disagree. See newEntryBlockReason()'s own doc comment.
+        blockReason: this.newEntryBlockReason(),
         drainActive: this.isNewEntryDrainActive(),
         persistedDrain: st.newEntriesPaused === true,
         pausedAt: st.newEntriesPausedAt ?? null,
@@ -2376,6 +2842,8 @@ export class LiveExecutionEngine {
         clockSkewMs: this.client.getClockSkewMs?.() ?? null,
         lastTickAt: this.lastTickAt,
         lastTickError: this.lastTickError,
+        lastDisarm: this.lastDisarm,
+        rateLimit: this.client.getRateLimitStatus?.() ?? null,
       },
       controller,
       reconcileIssues: this.reconcileIssues.slice(-10),
@@ -2433,9 +2901,15 @@ export class LiveExecutionEngine {
               : null,
         };
       })(),
-      closedToday: st.dailyLedger,
+      closedToday: reportedDailyLedger(st.dailyLedger, this.nowIso().slice(0, 10)),
       consecutiveLosses: st.consecutiveLosses,
       totalRealizedPnlUsd: st.totalRealizedPnlUsd,
+      // Raw accumulator above is the KILL-SWITCH number and stays exchange-true. The two fields
+      // below let a display show the cohort figure without ever hiding what really happened.
+      reportingExcluded: sumLiveIntentReportingExclusions(st.intents),
+      reportingExcludedToday: sumLiveIntentReportingExclusionsForDate(st.intents, this.nowIso().slice(0, 10)),
+      totalRealizedPnlUsdExcludingVoids:
+        st.totalRealizedPnlUsd - sumLiveIntentReportingExclusions(st.intents).realizedPnlUsd,
       limits: {
         riskUsdPerTrade: this.config.riskUsdPerTrade,
         maxConcurrentPositions: this.config.maxConcurrentPositions,
@@ -2595,6 +3069,20 @@ export class LiveExecutionEngine {
     accountEquity: number | null;
     openPositionCount: number;
     openOrderCount: number;
+    /**
+     * True only when this snapshot included the account-wide USD-M algo-order
+     * read.  Keeping it explicit lets report-only lane annotations fill a
+     * reconciled protection count without pretending the dashboard performed
+     * an extra private exchange query.
+     */
+    openAlgoOrdersObserved: boolean;
+    openOrderCountCoverage:
+      | "EXCHANGE_OPEN_ORDERS"
+      | "EXCHANGE_OPEN_AND_ALGO_ORDERS"
+      | "EXCHANGE_OPEN_ORDERS_PLUS_RECONCILED_DAILY_RANGE_BRACKETS"
+      | "EXCHANGE_OPEN_ORDERS_DAILY_RANGE_RECONCILIATION_REQUIRED";
+    /** Null means the Daily Range lane is absent or its bracket reconciliation is not healthy. */
+    dailyRangeReconciledProtectiveOrderCount: number | null;
     positions: Array<{
       symbol: string;
       direction: "LONG" | "SHORT";
@@ -2625,6 +3113,22 @@ export class LiveExecutionEngine {
        *  field rather than reusing targetTpPrice so the dashboard can render it honestly instead of
        *  as a fabricated "TP target" (2026-07-09 audit finding). */
       singleSymbolStopPrice: number | null;
+      /** Isolated daily 4h range-acceptance share. Filled only by the report-only
+       * route annotation after an exact side/quantity reconciliation against the
+       * lane's durable claim; never inferred from an exchange symbol alone. */
+      dailyRangeTradeId: string | null;
+      dailyRangeQty: number | null;
+      dailyRangeEntryPrice: number | null;
+      dailyRangeUnrealizedPnl: number | null;
+      dailyRangeStopPrice: number | null;
+      dailyRangeTakeProfitPrice: number | null;
+      dailyRangeOpenedAt: string | null;
+      dailyRangeStatus: string | null;
+      dailyRangeEntryPolicy: string | null;
+      dailyRangeExitPolicyId: string | null;
+      dailyRangeTpMultipleR: number | null;
+      dailyRangeThesisInvalidationType: string | null;
+      dailyRangeLastReconcileError: string | null;
     }>;
     lanes: Array<{
       laneId: string;
@@ -2653,10 +3157,15 @@ export class LiveExecutionEngine {
     const positions = rawPositions.filter((position) => Math.abs(position.positionAmt) > 1e-12);
     const openIntents = liveState.intents.filter((intent) => OPEN_INTENT_STATES.has(intent.state));
     const paperById = this.paperOrderById();
-    const activeSymbols = Array.from(new Set(openIntents.map((intent) => intent.symbol)));
-    const openAlgoOrders = (
-      await Promise.all(activeSymbols.map((symbol) => this.client.getOpenAlgoOrders(symbol)))
-    ).flat();
+    // `openAlgoOrders` accepts no symbol and returns the complete USD-M account set (the same
+    // shape already used by the emergency-flatten path).  The dashboard previously made one
+    // signed request PER open intent merely to count these orders.  Besides under-reporting an
+    // external algo order, that fanned a normal account refresh into N requests and was a direct
+    // contributor to HTTP 418 bans when several /live panels polled together.
+    const openAlgoOrdersObserved = openIntents.length > 0;
+    const openAlgoOrders = openAlgoOrdersObserved
+      ? await this.client.getOpenAlgoOrders()
+      : [];
     const intentBySymbol = new Map(openIntents.map((intent) => [intent.symbol, intent]));
     const laneMap = new Map<string, {
       sourceOrderCount: number;
@@ -2722,6 +3231,19 @@ export class LiveExecutionEngine {
         basketQty: null,
         basketUnrealizedPnl: null,
         singleSymbolStopPrice: null,
+        dailyRangeTradeId: null,
+        dailyRangeQty: null,
+        dailyRangeEntryPrice: null,
+        dailyRangeUnrealizedPnl: null,
+        dailyRangeStopPrice: null,
+        dailyRangeTakeProfitPrice: null,
+        dailyRangeOpenedAt: null,
+        dailyRangeStatus: null,
+        dailyRangeEntryPolicy: null,
+        dailyRangeExitPolicyId: null,
+        dailyRangeTpMultipleR: null,
+        dailyRangeThesisInvalidationType: null,
+        dailyRangeLastReconcileError: null,
       };
     });
     const unrealizedPnl = positions.reduce((sum, position) => sum + position.unRealizedProfit, 0);
@@ -2736,6 +3258,7 @@ export class LiveExecutionEngine {
     }>();
     for (const intent of liveState.intents) {
       if (intent.realizedPnlUsd === null) continue;
+      if (isLiveIntentReportingExcluded(intent)) continue;
       const sources = this.intentSources(intent, paperById);
       const totalQty = sources.reduce((sum, source) => sum + source.qty, 0);
       const realized = intent.realizedPnlUsd;
@@ -2787,6 +3310,11 @@ export class LiveExecutionEngine {
       accountEquity: balance ? balance.walletBalance + unrealizedPnl : null,
       openPositionCount: positions.length,
       openOrderCount: openOrders.length + openAlgoOrders.length,
+      openAlgoOrdersObserved,
+      openOrderCountCoverage: openAlgoOrdersObserved
+        ? "EXCHANGE_OPEN_AND_ALGO_ORDERS"
+        : "EXCHANGE_OPEN_ORDERS",
+      dailyRangeReconciledProtectiveOrderCount: null,
       positions: positionRows,
       lanes: Array.from(laneMap, ([laneId, row]) => ({
         laneId,
@@ -2812,6 +3340,8 @@ export class LiveExecutionEngine {
     view?: string | null;
     period?: string | null;
     anchor?: string | null;
+    /** Calendar boundary for this presentation query only; ledger timestamps stay UTC. */
+    timeZone?: string | null;
     regime?: string | null;
     /** Optional narrow cohort. Empty means the complete, auditable live ledger. */
     laneIds?: readonly string[] | null;
@@ -2823,12 +3353,14 @@ export class LiveExecutionEngine {
     const period = normalizePerformancePeriod(options.period);
     const viewConfig = LIVE_PERFORMANCE_VIEWS[view];
     const regimeFilter = normalizeRegimeFilter(options.regime);
+    const timeZone = normalizePerformanceTimeZone(options.timeZone);
     const untilMs = new Date(this.nowIso()).getTime();
     const safeNowMs = Number.isFinite(untilMs) ? untilMs : Date.now();
     const window = performanceWindow({
       view,
       anchor: options.anchor,
       nowMs: safeNowMs,
+      timeZone,
     });
     const requestedSinceMs = options.since ? Date.parse(options.since) : Number.NaN;
     const cohortSinceMs = Number.isFinite(requestedSinceMs)
@@ -2848,10 +3380,12 @@ export class LiveExecutionEngine {
       symbols: Set<string>;
       regimeCounts: Map<string, { family: LiveRegimeFamily; bucket: LiveRegimeBucket; count: number }>;
       buckets: Map<string, Omit<LiveLanePerformanceSeriesPoint, "cumulativePnlUsd">>;
+      lastClosedAt: string | null;
     }>();
 
     for (const intent of this.store.getState().intents) {
       if (intent.realizedPnlUsd === null) continue;
+      if (isLiveIntentReportingExcluded(intent)) continue;
       const closedAt = intent.closedAt ?? intent.updatedAt;
       const closedMs = new Date(closedAt).getTime();
       if (!Number.isFinite(closedMs) || closedMs < cohortSinceMs || closedMs >= window.untilMs) continue;
@@ -2901,6 +3435,7 @@ export class LiveExecutionEngine {
           symbols: new Set<string>(),
           regimeCounts: new Map<string, { family: LiveRegimeFamily; bucket: LiveRegimeBucket; count: number }>(),
           buckets: new Map<string, Omit<LiveLanePerformanceSeriesPoint, "cumulativePnlUsd">>(),
+          lastClosedAt: null,
         };
         row.realizedPnlUsd += allocatedRealized;
         row.feesUsd += fees * share;
@@ -2908,6 +3443,7 @@ export class LiveExecutionEngine {
         if (allocatedRealized > 0) row.wins += 1;
         if (allocatedRealized < 0) row.losses += 1;
         row.symbols.add(intent.symbol);
+        if (row.lastClosedAt === null || closedAt > row.lastClosedAt) row.lastClosedAt = closedAt;
 
         const regimeKey = `${classified.family}|${classified.bucket}`;
         const regimeRow = row.regimeCounts.get(regimeKey) ?? { ...classified, count: 0 };
@@ -2955,6 +3491,7 @@ export class LiveExecutionEngine {
         losses: row.losses,
         winRatePct: row.closedCount > 0 ? (row.wins / row.closedCount) * 100 : null,
         symbols: Array.from(row.symbols).sort(),
+        lastClosedAt: row.lastClosedAt,
         regimes: Array.from(row.regimeCounts.values()).sort((left, right) => right.count - left.count),
         points,
       };
@@ -2970,6 +3507,7 @@ export class LiveExecutionEngine {
       since: new Date(cohortSinceMs).toISOString(),
       until: new Date(window.untilMs).toISOString(),
       anchor: window.anchor,
+      timeZone,
       regimeFilter,
       regimeOptions: LIVE_PERFORMANCE_REGIME_OPTIONS,
       bucketStarts,
@@ -3007,6 +3545,14 @@ export class LiveExecutionEngine {
     this.ticking = true;
     this.lastTickError = null;
     try {
+      const rateLimit = this.client.getRateLimitStatus?.();
+      if (rateLimit?.coolingDown) {
+        this.healthyTickStreak = 0;
+        this.lastTickError =
+          `Binance USD-M transport cooldown after HTTP ${rateLimit.lastHttpStatus ?? 418}; ` +
+          `no request sent until ${rateLimit.retryAt ?? "the cooldown expires"}`;
+        return;
+      }
       await this.client.ensureTimeSync();
 
       // 1. Kill-switch evaluation FIRST (uses persisted ledger; no exchange call needed).
@@ -3037,6 +3583,10 @@ export class LiveExecutionEngine {
       // reader on the same tick it settles.
       this.sweepPositionPathRecorder();
 
+      // 3.61. Exact Four-Brain decision -> actual-fill outcome sweep. Independent from the path
+      // recorder so causal Tier-1 learning remains active even when dense path telemetry is off.
+      this.sweepFourBrainActualFillBindings();
+
       // 3.65. Exact Executive Review intent -> position linkage. This is shadow bookkeeping only:
       // it cannot create an outcome from USD P&L, cannot change an order, and is never injected on 3103.
       this.sweepExecutiveReviewPositions();
@@ -3065,11 +3615,23 @@ export class LiveExecutionEngine {
       await this.mirrorNewSignals();
 
       this.errorStreak = 0;
+      this.healthyTickStreak += 1;
+      await this.maybeAutoRearmAfterTransient();
     } catch (error) {
       this.errorStreak += 1;
       this.lastTickError = (error as Error).message ?? "unknown";
+      // Log EVERY failure, not just the one that trips the latch. The tick runs every 25s and
+      // ERROR_STREAK_DISARM is 3, so ~75s of exchange trouble latches the account off — and until
+      // this line existed nothing anywhere recorded what the trouble was.
+      console.error(`[live-engine] tick failed (streak ${this.errorStreak}/${ERROR_STREAK_DISARM}): ${this.lastTickError}`);
+      this.healthyTickStreak = 0;
       if (this.errorStreak >= ERROR_STREAK_DISARM && this.armed) {
-        this.disarm(`exchange error streak ${this.errorStreak} — trading blind is not allowed`);
+        // Carry the message INTO the reason — `lastTickError` is cleared at the top of the next
+        // tick, so a bare "streak 6" is unreadable the moment the exchange recovers.
+        this.disarm(
+          `exchange error streak ${this.errorStreak} — trading blind is not allowed (last error: ${this.lastTickError})`,
+          "TRANSIENT_EXCHANGE_ERROR",
+        );
       }
     } finally {
       this.lastTickAt = this.nowIso();
@@ -3527,10 +4089,18 @@ export class LiveExecutionEngine {
     // explained by an external executor's claim is NOT an orphan; a position exceeding the claim
     // still is (the unexplained remainder could be a manual/foreign position).
     const engineSymbols = new Set(st.intents.filter((i) => OPEN_INTENT_STATES.has(i.state)).map((i) => i.symbol));
+    const pendingEntry = this.externalPendingEntryQty();
     for (const pos of positions) {
       if (Math.abs(pos.positionAmt) <= 1e-12 || engineSymbols.has(pos.symbol)) continue;
       const claimed = external.get(pos.symbol) ?? 0;
       if (claimed !== 0 && Math.abs(pos.positionAmt - claimed) <= EXTERNAL_QTY_EPS) continue;
+      // 2026-08-17: an external entry order is RESTING on this symbol (post-only maker entry). Until
+      // it fills and is adopted onto a leg, the exchange can legitimately show anything from
+      // `claimed` (nothing new filled) through `claimed + pending` (filled in full) — every partial
+      // in between included. Explain the position iff it lies inside that band. Bounded by the qty
+      // WE requested and signed, so a position bigger than the plan, or on the opposite side of it,
+      // still disarms. Without this the account force-disarmed itself mid-basket and stayed down.
+      if (pendingEntryExplainsPosition(pos.positionAmt, claimed, pendingEntry.get(pos.symbol) ?? 0, EXTERNAL_QTY_EPS)) continue;
       issues.push(
         claimed !== 0
           ? `orphan exchange position ${pos.symbol} amt=${pos.positionAmt} (external executor claims only ${claimed})`
@@ -3613,12 +4183,22 @@ export class LiveExecutionEngine {
           if (liveBreakeven.closed) continue;
         }
 
-        if (pos && intent.state === "OPEN") {
+
+        // The testnet XRP/WLD CG_MFE_GIVEBACK rollout is deliberately a
+        // pure-geometry exit experiment. Regime harvest, USD profit-bank,
+        // breakeven, and losing-hold overlays already skip this cohort; keep
+        // the responsive-reversal overlay out too so its policy-managed exit
+        // cannot be pre-empted by MFE_RESPONSIVE_REVERSAL_EXIT. Exchange-side
+        // protective stop reconciliation remains intact.
+        if (
+          pos &&
+          intent.state === "OPEN" &&
+          !(this.config.env === "testnet" && this.isCgmfeGivebackIntent(intent))
+        ) {
           const reversal = await this.maybeCloseMfeResponsiveReversal(intent, amt);
           if (reversal.changed) dirty = true;
           if (reversal.closed) continue;
         }
-
         if (
           pos &&
           intent.state === "OPEN" &&
@@ -4558,13 +5138,13 @@ export class LiveExecutionEngine {
     if (Number.isFinite(lastExitMs) && nowMs - lastExitMs < MFE_REVERSAL_EXIT_COOLDOWN_MS) return { changed: false, closed: false };
 
     const openedAtMs = Date.parse(intent.createdAt);
-    const postEntryMfeObservations = this.paperStore.all.filter((paper) =>
+    const observations = this.paperStore.all.filter((paper) =>
       paper.symbol === intent.symbol &&
       this.paperExitRule(paper) === "mfe_giveback" &&
       (paper.selectedLaneId === "CG_MFE_GIVEBACK" || paper.selectedLaneId.endsWith(":CG_MFE_GIVEBACK")) &&
       Number.isFinite(Date.parse(paper.createdAt)) && Date.parse(paper.createdAt) > openedAtMs,
     );
-    if (!mfeResponsiveReversalConfirmed(intent.direction, postEntryMfeObservations)) return { changed: false, closed: false };
+    if (!mfeResponsiveReversalConfirmed(intent.direction, observations)) return { changed: false, closed: false };
 
     try {
       if (intent.stopOrderId !== null) await this.client.cancelAlgoOrder(intent.stopOrderId);
@@ -5175,6 +5755,72 @@ export class LiveExecutionEngine {
     return `intent:${intent.paperOrderId}:${intent.createdAt}`;
   }
 
+  /** A netted/multi-source intent cannot honestly belong to one Entry Brain decision. */
+  private exactFourBrainSource(intent: LiveIntent): LiveIntentSource | null {
+    const sources = intent.sourcePaperOrders ?? [];
+    if (sources.length !== 1) return null;
+    const source = sources[0]!;
+    return typeof source.sourceObservationId === "string" && source.sourceObservationId.length > 0 ? source : null;
+  }
+
+  private bindFourBrainActualFill(intent: LiveIntent): void {
+    try {
+      const source = this.exactFourBrainSource(intent);
+      const entry = intent.filledEntryPrice;
+      const openedAtMs = Date.parse(intent.entryFilledAt ?? "");
+      const riskUsd = typeof entry === "number" && Number.isFinite(entry)
+        ? Math.abs(entry - intent.stopLossPrice) * intent.qty
+        : null;
+      if (!source || !Number.isFinite(openedAtMs)) return;
+      this.fourBrainActualFillBindings?.bindActualFill({
+        bindingKey: this.positionPathKeyForIntent(intent),
+        source: "ENGINE",
+        laneId: normalizeFourBrainTestnetLane(source.laneId, intent.direction),
+        symbol: intent.symbol,
+        side: intent.direction,
+        signalId: source.sourceObservationId!,
+        openedAtMs,
+        entryPrice: entry,
+        entryPriceConfirmed: intent.entryPriceConfirmed === true,
+        riskUsd,
+      });
+    } catch {
+      // Exchange execution remains authoritative even if shadow provenance fails.
+    }
+  }
+
+  /**
+   * One terminal sweep covers every engine close path.  It deliberately accepts only complete,
+   * exchange-sourced settlement and a confirmed original entry fill; all other direct bindings are
+   * terminally UNMEASURED and never fall through into a simulated outcome.
+   */
+  private sweepFourBrainActualFillBindings(): void {
+    if (!this.fourBrainActualFillBindings) return;
+    try {
+      for (const intent of this.store.getState().intents) {
+        if (OPEN_INTENT_STATES.has(intent.state) || !this.exactFourBrainSource(intent)) continue;
+        const measured =
+          intent.entryPriceConfirmed === true &&
+          intent.settlementFetchComplete === true &&
+          intent.pageSaturated !== true &&
+          intent.feeSource === "EXCHANGE" &&
+          Array.isArray(intent.confirmedEntryFills) &&
+          intent.confirmedEntryFills.length > 0 &&
+          typeof intent.realizedPnlUsd === "number" &&
+          Number.isFinite(intent.realizedPnlUsd);
+        this.fourBrainActualFillBindings.completeActualFill({
+          bindingKey: this.positionPathKeyForIntent(intent),
+          closedAtMs: Date.parse(intent.closedAt ?? intent.updatedAt),
+          netPnlUsd: measured ? intent.realizedPnlUsd : null,
+          settlementConfirmed: measured,
+          reason: measured ? intent.closeReason : "EXCHANGE_SETTLEMENT_INCOMPLETE",
+        });
+      }
+    } catch {
+      // Causal bookkeeping cannot affect live lifecycle management.
+    }
+  }
+
   /** Dense R-path sample for one OPEN intent (2026-07-22, report-only — see
    *  position-path-recorder.ts). currentR uses the exact formula manageMfeGiveback derives its
    *  favorableR from (entry vs mark over the entry→stop risk distance, sign-normalized so
@@ -5434,6 +6080,24 @@ export class LiveExecutionEngine {
     const override = this.paperLaneGate(paper);
     if (override !== null) return override;
     return this.laneSelectionAllowsLane(paper.selectedLaneId ?? "");
+  }
+
+  /**
+   * The XRP/WLD MFE rollout is an explicit testnet cohort, not a general
+   * "unproven symbol" override. Its source is already locked by the exact
+   * lane+symbol gate, so it may pass the generic book-proof filter and collect
+   * its own real outcomes. All other unproven sources remain blocked.
+   */
+  private isApprovedTestnetMfeGivebackPaper(
+    paper: Pick<PaperOrder, "selectedLaneId" | "symbol">,
+  ): boolean {
+    return this.config.env === "testnet" &&
+      isMfeGivebackLaneId(paper.selectedLaneId) &&
+      isTestnetCrossSectionalHorizonSourceAllowed(
+        this.config.env,
+        paper.selectedLaneId,
+        paper.symbol,
+      );
   }
 
   /** Unified orchestration deliberately consumes a chosen diagnostic recipe directly instead of
@@ -5781,10 +6445,16 @@ export class LiveExecutionEngine {
     if (this.store.getState().killedAt) return { ok: false, reason: "kill switch latched" };
     if (!this.armed) return { ok: false, reason: "live engine is DISARMED — arm it first, then copy" };
     if (!this.canOpenNewEntries()) {
-      const gate = this.strategyEntryGate();
+      // 2026-08 adversarial-review follow-up (manual-directional canonical-regime enforcement
+      // fix): this used to re-derive its reason from this.strategyEntryGate() — the NON-manual
+      // gate, which knows nothing about manual mode's own regimeSafetyGate block. When manual mode
+      // was the actual, specific cause, that produced a misleading generic fallback instead of the
+      // real reason. newEntryBlockReason() is entryGateDecision()'s own explanation — the exact
+      // same source canOpenNewEntries() just read above — so it is correct for manual AND non-
+      // manual causes alike, with no separate re-derivation to drift out of sync.
       const reason = this.isNewEntryDrainActive()
         ? "new-entry drain is active — exits remain managed, but copy/open is blocked"
-        : gate.reason ?? "new-entry gate is closed";
+        : this.newEntryBlockReason() ?? "new-entry gate is closed";
       return { ok: false, reason };
     }
     if (!(req.qty > 0) || !(req.entryPrice > 0) || !(req.stopLossPrice > 0) || !(req.tp1Price > 0)) {
@@ -5984,6 +6654,9 @@ export class LiveExecutionEngine {
         if (!this.isPaperOrderLiveEligible(o, now)) return "not_live_eligible";
       }
       if (!this.config.mirrorAllPaperOrders && o.diagnosticLabel != null) return "diagnostic_label";
+      if (!isTestnetMfeGivebackSymbolAllowed(this.config.env, o.selectedLaneId, o.symbol)) {
+        return "mfe_symbol_not_allowed";
+      }
       if (!this.laneAllowedForMirror(o)) return "lane_not_allowed";
       if (!MIRRORABLE_PAPER_STATUSES.has(o.paperStatus)) return `status_${o.paperStatus}`;
       if (!this.config.mirrorAllPaperOrders && !(o.createdAt > st.lastSeenCreatedAt)) return "behind_watermark";
@@ -6049,7 +6722,9 @@ export class LiveExecutionEngine {
     };
     if (provenOnly) {
       for (const c of ranked) {
-        if (c.tier > 1) latchReason(c.paper.paperOrderId, "unproven_symbol");
+        if (c.tier > 1 && !this.isApprovedTestnetMfeGivebackPaper(c.paper)) {
+          latchReason(c.paper.paperOrderId, "unproven_symbol");
+        }
       }
     }
     const priorityOrderedCandidates = ranked
@@ -6057,7 +6732,7 @@ export class LiveExecutionEngine {
       // (tier 0/1) may open the directional slot; an unproven-symbol candidate is dropped rather
       // than admitted last. This is the ONE deliberate exception to "never rejects, only reorders"
       // (flag off = the default reorder-only behavior is unchanged).
-      .filter((c) => !provenOnly || c.tier <= 1)
+      .filter((c) => !provenOnly || c.tier <= 1 || this.isApprovedTestnetMfeGivebackPaper(c.paper))
       .sort((a, b) => {
         // Priority tier first (0=curated whitelist, 1=proven-elsewhere, 2=no data), then BEST
         // measured book performance within the tier ("buka simbol dengan performa terbaik, bukan
@@ -6205,16 +6880,38 @@ export class LiveExecutionEngine {
         }
         continue;
       }
+      // First Four-Brain execution bridge: consider only a genuinely new, single-source intent.
+      // A pyramid add or a netted multi-source order has no one-decision causal identity, so it
+      // stays entirely under the incumbent engine until a future, separately validated design.
+      if (!oppositeIntent && lanePapers.length === 1 && this.fourBrainEntryGate) {
+        const candidate = lanePapers[0]!;
+        if (candidate.sourceObservationId) {
+          const bridge = this.fourBrainEntryGate({
+            laneId: candidate.selectedLaneId ?? "UNKNOWN",
+            symbol: candidate.symbol,
+            side: candidate.direction,
+            signalId: candidate.sourceObservationId,
+            nowMs,
+            entryPrice: candidate.entryPrice,
+            stopPrice: candidate.stopLoss,
+            openedAtMs: nowMs,
+          });
+          if (!bridge.allowed) {
+            latchReason(candidate.paperOrderId, "four_brain_pilot_negative_veto");
+            continue;
+          }
+        }
+      }
       const isMfeGiveback = oppositeIntent
         ? this.intentExitRule(oppositeIntent) === "mfe_giveback"
         : lanePapers.some((paper) => this.paperExitRule(paper) === "mfe_giveback");
       if (isMfeGiveback) {
+        const blockReason = mfeGivebackSignalBlockReason(oppositeIntent?.direction ?? first.direction, lanePapers);
         const reentryBlockedUntilMs = Date.parse(st.mfeReversalReentryBlockedUntil[first.symbol] ?? "");
         if (!oppositeIntent && Number.isFinite(reentryBlockedUntilMs) && nowMs < reentryBlockedUntilMs) {
           for (const paper of lanePapers) latchReason(paper.paperOrderId, "mfe_reversal_reentry_cooldown");
           continue;
         }
-        const blockReason = mfeGivebackSignalBlockReason(oppositeIntent?.direction ?? first.direction, lanePapers);
         if (blockReason !== null) {
           for (const paper of lanePapers) latchReason(paper.paperOrderId, blockReason);
           continue;
@@ -6507,6 +7204,11 @@ export class LiveExecutionEngine {
     const paper = planned[0]!.paper;
     const plan = this.combinedPlan(planned, filters);
     if (!plan.ok) return;
+    const ownershipBlock = this.externalEntryBlockReason(paper.symbol);
+    if (ownershipBlock) {
+      console.warn(`[live-execution-engine] skip ${paper.direction} ${paper.symbol}: ${ownershipBlock}`);
+      return;
+    }
     // ENTRY-side netting guard (2026-07-08 REAL-MONEY incident: a SHORT SUI intent opened while
     // two baskets held LONG SUI — in one-way mode the "entry" order just SOLD 47.5 of the baskets'
     // longs, its reduce-only exits then -2022-rejected against the still-net-long position, and
@@ -6564,6 +7266,9 @@ export class LiveExecutionEngine {
       cortexAppliedWeightPct: planned[0]!.cortexAppliedWeightPct,
       cortexRawStaticWeightPct: planned[0]!.cortexRawStaticWeightPct,
       executiveReviewLink: paper.executiveReviewLink ?? undefined,
+      // Immutable lineage snapshot, taken once here at intent creation — see LiveIntent.causalLineage's
+      // doc comment. Never revisited by any later mutation of this intent.
+      causalLineage: lineageFromPaperOrder(paper),
       createdAt: now,
       updatedAt: now,
       closedAt: null,
@@ -6578,6 +7283,7 @@ export class LiveExecutionEngine {
         controllerMode: source.controllerMode ?? null,
         controllerConfidence: source.controllerConfidence ?? null,
         executiveReviewLink: source.executiveReviewLink ?? undefined,
+        causalLineage: lineageFromPaperOrder(source),
       })),
     };
     st.intents.push(intent);
@@ -6659,6 +7365,7 @@ export class LiveExecutionEngine {
       intent.state = "ENTRY_PLACED";
       intent.updatedAt = this.nowIso();
       this.store.save();
+      this.bindFourBrainActualFill(intent);
 
       // Protect at the REPRICED stop/target (derived from the ACTUAL fill, already stored on the
       // intent above), never the stale paper-entry geometry in `plan`. When price gaps past the
@@ -6859,6 +7566,7 @@ export class LiveExecutionEngine {
           controllerMode: paper.controllerMode ?? null,
           controllerConfidence: paper.controllerConfidence ?? null,
           executiveReviewLink: paper.executiveReviewLink ?? undefined,
+          causalLineage: lineageFromPaperOrder(paper),
         })),
       ];
 

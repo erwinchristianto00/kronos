@@ -12,7 +12,7 @@ import { readCortexBrainStoreStrict } from "./cortex-brain-store.js";
 import { emptyCortexState, type CortexStoreState } from "./cortex-brain.js";
 import { EXECUTIVE_SCHEMA_VERSION } from "./four-brain-types.js";
 import { resolveFourBrainInstanceId } from "./four-brain-live-gather-bindings.js";
-import { ExecutiveReviewStore, type ExecutiveReviewOutcome } from "./executive-review-store.js";
+import { readExecutiveReviewStoreStrict, type ExecutiveReviewOutcome } from "./executive-review-store.js";
 import {
   CORTEX_SHADOW_REFIT_DEFAULT_EPOCH,
   CORTEX_SHADOW_REFIT_REGISTRY_FILE,
@@ -22,7 +22,7 @@ import {
 } from "./cortex-shadow-refit.js";
 import {
   forwardCausalJournalPath,
-  readForwardCausalEvents,
+  readForwardCausalEventsStrict,
   resolveCanonicalPolicyContext,
   type CanonicalPolicyContext,
   type ForwardEvent,
@@ -44,7 +44,7 @@ export interface CortexOperatorReport {
   readonly blockers: readonly string[];
   readonly invocation: { readonly mode: CortexOperatorMode; readonly requestedInstance: string | null; readonly runtimeInstance: string | null; readonly cwd: string; readonly dataDir: string | null; readonly codeVersion: string | null; readonly codeVersionSource: string | null; readonly verifiedCodeVersion: string | null; readonly verifiedCodeSource: string | null; readonly verifiedSourceFiles: readonly CortexOperatorFile[]; readonly resetEpoch: string; readonly generatedAt: string; };
   readonly policy: (CanonicalPolicyContext & { readonly fourBrainPolicyVersion: string }) | null;
-  readonly sourceSnapshot: { readonly stable: boolean; readonly files: readonly CortexOperatorFile[]; readonly executiveOutcomeCount: number; readonly forwardEventCount: number; };
+  readonly sourceSnapshot: { readonly stable: boolean; readonly files: readonly CortexOperatorFile[]; readonly executiveOutcomeCount: number; readonly forwardEventCount: number; readonly executiveValidation: { readonly status: string; readonly malformed: number; readonly duplicates: number }; readonly forwardValidation: { readonly status: string; readonly rejected: number; readonly ignoredTornTail: boolean }; };
   readonly incumbent: { readonly generation: number | null; readonly generationZeroProven: boolean; readonly featureSchemaVersion: number | null; readonly coefficientFingerprint: string | null; readonly archetypes: Record<string, { readonly nEff: number; readonly refitAt: string | null }> | null; };
   readonly registry: { readonly path: string | null; readonly exists: boolean; readonly schemaVersion: string | null; readonly integrityStatus: string | null; readonly latestCandidateGeneration: string | null; readonly latestAuditStatus: string | null; };
   readonly prospective: { readonly status: string | null; readonly datasetHash: string | null; readonly generationFingerprint: string | null; readonly candidateGenerationId: string | null; readonly totalExamined: number; readonly directEligible: number; readonly archivedPreEpoch: number; readonly rejected: Readonly<Record<string, number>>; readonly beta: { readonly evaluationBeta: 0; readonly liveBeta: 0 }; readonly promotion: "OFF"; };
@@ -262,7 +262,7 @@ function strictIncumbentBlocker(status: ReturnType<typeof readCortexBrainStoreSt
 }
 
 function blank(mode: CortexOperatorMode, requestedInstance: string | null, cwd: string, nowMs: number): CortexOperatorReport {
-  return { schemaVersion: "cortex-operator-runner/1", verdict: "CORTEX_OPERATOR_BLOCKED", exitCode: CORTEX_OPERATOR_EXIT.BLOCKED, blockers: [], invocation: { mode, requestedInstance, runtimeInstance: null, cwd, dataDir: null, codeVersion: null, codeVersionSource: null, verifiedCodeVersion: null, verifiedCodeSource: null, verifiedSourceFiles: [], resetEpoch: CORTEX_SHADOW_REFIT_DEFAULT_EPOCH, generatedAt: new Date(nowMs).toISOString() }, policy: null, sourceSnapshot: { stable: false, files: [], executiveOutcomeCount: 0, forwardEventCount: 0 }, incumbent: { generation: null, generationZeroProven: false, featureSchemaVersion: null, coefficientFingerprint: null, archetypes: null }, registry: { path: null, exists: false, schemaVersion: null, integrityStatus: null, latestCandidateGeneration: null, latestAuditStatus: null }, prospective: { status: null, datasetHash: null, generationFingerprint: null, candidateGenerationId: null, totalExamined: 0, directEligible: 0, archivedPreEpoch: 0, rejected: {}, beta: { evaluationBeta: 0, liveBeta: 0 }, promotion: "OFF" }, mutationPlan: { writeAuthorized: false, filesToChange: [], persisted: false } };
+  return { schemaVersion: "cortex-operator-runner/1", verdict: "CORTEX_OPERATOR_BLOCKED", exitCode: CORTEX_OPERATOR_EXIT.BLOCKED, blockers: [], invocation: { mode, requestedInstance, runtimeInstance: null, cwd, dataDir: null, codeVersion: null, codeVersionSource: null, verifiedCodeVersion: null, verifiedCodeSource: null, verifiedSourceFiles: [], resetEpoch: CORTEX_SHADOW_REFIT_DEFAULT_EPOCH, generatedAt: new Date(nowMs).toISOString() }, policy: null, sourceSnapshot: { stable: false, files: [], executiveOutcomeCount: 0, forwardEventCount: 0, executiveValidation: { status: "NOT_READ", malformed: 0, duplicates: 0 }, forwardValidation: { status: "NOT_READ", rejected: 0, ignoredTornTail: false } }, incumbent: { generation: null, generationZeroProven: false, featureSchemaVersion: null, coefficientFingerprint: null, archetypes: null }, registry: { path: null, exists: false, schemaVersion: null, integrityStatus: null, latestCandidateGeneration: null, latestAuditStatus: null }, prospective: { status: null, datasetHash: null, generationFingerprint: null, candidateGenerationId: null, totalExamined: 0, directEligible: 0, archivedPreEpoch: 0, rejected: {}, beta: { evaluationBeta: 0, liveBeta: 0 }, promotion: "OFF" }, mutationPlan: { writeAuthorized: false, filesToChange: [], persisted: false } };
 }
 
 export function runCortexShadowRefitOperator(argv: readonly string[], deps: CortexOperatorDeps = {}): CortexOperatorReport {
@@ -315,15 +315,20 @@ export function runCortexShadowRefitOperator(argv: readonly string[], deps: Cort
       const message = error instanceof Error ? error.message : String(error);
       return { ...report, blockers: [message.split(":")[0]!] };
     }
-    const executiveStore = new ExecutiveReviewStore(executiveFile); const outcomes = executiveStore.get().tier1 as readonly ExecutiveReviewOutcome[];
-    const events = readForwardCausalEvents(journal); const strictIncumbent = readCortexBrainStoreStrict(brainFile); deps.onAfterRead?.();
+    const executiveStrict = readExecutiveReviewStoreStrict(executiveFile);
+    const forwardStrict = readForwardCausalEventsStrict(journal);
+    report = { ...report, sourceSnapshot: { ...report.sourceSnapshot, executiveValidation: { status: executiveStrict.status, malformed: executiveStrict.counts.malformed, duplicates: executiveStrict.counts.duplicates }, forwardValidation: { status: forwardStrict.status, rejected: forwardStrict.malformed + forwardStrict.duplicates, ignoredTornTail: forwardStrict.ignoredTornTail } } };
+    if (executiveStrict.status !== "VALID") return { ...report, blockers: [executiveStrict.status] };
+    if (forwardStrict.status !== "VALID") return { ...report, blockers: [forwardStrict.status] };
+    const outcomes = executiveStrict.outcomes as readonly ExecutiveReviewOutcome[];
+    const events = forwardStrict.events as readonly ForwardEvent[]; const strictIncumbent = readCortexBrainStoreStrict(brainFile); deps.onAfterRead?.();
     if (!files.every(unchanged)) return { ...report, blockers: ["SOURCE_SNAPSHOT_CHANGED"] };
     if (strictIncumbent.status !== "VALID") return { ...report, blockers: [strictIncumbentBlocker(strictIncumbent.status)] };
     const incumbent = strictIncumbent.state;
     const incumbentGeneration = generation(incumbent); const archetypes = Object.fromEntries(["BREADTH", "NEUTRAL", "TACTICAL"].map((a) => [a, { nEff: incumbent.archetypes[a as keyof typeof incumbent.archetypes].nEff, refitAt: incumbent.archetypes[a as keyof typeof incumbent.archetypes].refitAt }]));
     const registry = new CortexShadowRefitRegistryStore(registryFile); const registryState = registry.get();
     const initialRegistryIdentity = registryIdentity(registryFile, registry);
-    report = { ...report, sourceSnapshot: { stable: true, files, executiveOutcomeCount: outcomes.length, forwardEventCount: events.length }, incumbent: { generation: incumbentGeneration.generation, generationZeroProven: incumbentGeneration.proven, featureSchemaVersion: incumbent.featureSchemaVersion, coefficientFingerprint: coefficientFingerprint(incumbent), archetypes }, registry: { path: registryFile, exists: existsSync(registryFile), schemaVersion: registryState.schemaVersion, integrityStatus: registryState.integrityStatus, latestCandidateGeneration: registryState.candidates.at(-1)?.generationId ?? null, latestAuditStatus: registryState.lastAudit?.status ?? null } };
+    report = { ...report, sourceSnapshot: { ...report.sourceSnapshot, stable: true, files, executiveOutcomeCount: outcomes.length, forwardEventCount: events.length }, incumbent: { generation: incumbentGeneration.generation, generationZeroProven: incumbentGeneration.proven, featureSchemaVersion: incumbent.featureSchemaVersion, coefficientFingerprint: coefficientFingerprint(incumbent), archetypes }, registry: { path: registryFile, exists: existsSync(registryFile), schemaVersion: registryState.schemaVersion, integrityStatus: registryState.integrityStatus, latestCandidateGeneration: registryState.candidates.at(-1)?.generationId ?? null, latestAuditStatus: registryState.lastAudit?.status ?? null } };
     if (!incumbentGeneration.proven || incumbentGeneration.generation == null) return { ...report, blockers: ["INCUMBENT_GENERATION_UNRESOLVED"] };
     if (registry.isCorrupted()) return { ...report, blockers: ["REGISTRY_CORRUPTED"] };
     const plan: CortexShadowRefitPlan = planCortexShadowRefit({ outcomes, forwardEvents: events, policy, incumbent, registry, nowMs, codeVersion: provenance.sha, incumbentGeneration: incumbentGeneration.generation });

@@ -102,6 +102,14 @@ describe("runFourBrainShadowCycle — gate + candle prewarm + report-only", () =
     expect(r.ran).toBe(true); // fail-open: MISSING candles, cycle still completes
   });
 
+  it("a hanging prewarm times out and cannot block future shadow cycles", async () => {
+    const never = new Promise<Candle[] | null>(() => {});
+    const h = harness({ fetchCandles: () => never, prewarmTimeoutMs: 1 });
+    const r = await runFourBrainShadowCycle(h.deps);
+    expect(r.ran).toBe(true);
+    expect(h.metrics.summary().ticks.completed).toBe(1);
+  });
+
   it("kill latched ⇒ cycle still runs and every entry candidate is risk-blocked (mutates nothing)", async () => {
     const h = harness({ buildDeps: () => baseDeps({ killLatched: true, killReason: "daily loss" }) });
     const r = await runFourBrainShadowCycle(h.deps);

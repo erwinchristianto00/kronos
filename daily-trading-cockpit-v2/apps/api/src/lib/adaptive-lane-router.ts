@@ -27,6 +27,7 @@ import {
   VARIANT_MATRIX_DEFINITIONS,
   WATCHABLE_MIN_FRESH,
   exactLaneContextFor,
+  type ContextLaneStatus,
   type ExactLaneContext,
   type CurrentGuardVariantMatrixReport,
 } from "./current-guard-variant-matrix.js";
@@ -85,6 +86,24 @@ export interface CandidateLane {
   blockers: string[];
   /** True for W** controller-aligned parent / W*** filtered-edge negative lanes. */
   isLegacyNegative?: boolean;
+  /**
+   * Upper bound this router's own maturity classification may not exceed.
+   *
+   * Set ONLY for candidates whose numbers come from the variant matrix's exact-context evidence, in
+   * which case it carries that evidence row's authoritative status. `classifyLaneMaturity` applies
+   * raw-row floors (STABLE_MIN_FRESH=100 / PROMOTION_MIN_FRESH=200 against `freshValid`) and knows
+   * nothing about immutable stage proof windows, independent-episode counts or holdouts — it is a
+   * coarser, strictly weaker ladder that happens to reuse the same status names. Without a ceiling
+   * it would advertise `maturity=STABLE_CANDIDATE` for a lane the authoritative ladder has not
+   * granted, which is an operator-visible falsehood in the brief and in `currentPermission`.
+   *
+   * Direction matters: this can only DOWNGRADE. The router's extra gates (legacy-negative lanes,
+   * concentration, drawdown) remain free to rank a lane below its matrix status.
+   *
+   * Left undefined for paper-derived and post-cutover candidates, whose `freshValid` never came
+   * from the matrix and for whom the matrix status is not the right authority.
+   */
+  maturityCeiling?: LaneMaturity;
 }
 
 export interface RankedCandidate {
@@ -252,8 +271,36 @@ function isLegacyNegativeLane(lane: CandidateLane): boolean {
 /**
  * Classify a candidate lane's maturity using the documented anti-overfit gates.
  * `infraReady` only matters for PROMOTION_CANDIDATE.
+ *
+ * RAW ROWS, NOT EPISODES. `freshValid` here is a raw close count and WATCHABLE_MIN_FRESH /
+ * STABLE_MIN_FRESH / PROMOTION_MIN_FRESH are raw-row floors — which is what those three constants
+ * have always meant. This ladder deliberately does NOT re-implement the variant matrix's stage proof
+ * windows (immutable dev/holdout cuts, independent-episode floors, per-stage holdout proofs). For
+ * matrix-sourced candidates that gap is closed by `lane.maturityCeiling`, which caps the result at
+ * whatever the authoritative ladder actually granted — see the field's doc on CandidateLane.
  */
 export function classifyLaneMaturity(lane: CandidateLane, infraReady: boolean): LaneMaturity {
+  const ceiling = lane.maturityCeiling;
+  const capped = (maturity: LaneMaturity): LaneMaturity => {
+    if (ceiling === undefined) return maturity;
+    // REJECT is not a rung on the ladder — it is a verdict, and it must survive capping in either
+    // direction. This branch is REDUNDANT TODAY and is kept as a deliberate guard, not because the
+    // rank comparison below gets it wrong: `maturityRank("REJECT")` is -1, which is less than every
+    // other rung, so `rank(maturity) <= rank(ceiling) ? maturity : ceiling` already returns REJECT
+    // both when the router rejected (-1 <= n, yields maturity) and when the ceiling rejects
+    // (n <= -1 is false, yields ceiling). The branch pins that behaviour to the VERDICT rather than
+    // to REJECT happening to sort lowest, so re-encoding maturityRank cannot silently turn a
+    // rejection into a rung. Mutating it alone therefore changes no output — the coverage that
+    // matters is [MC-CEILING-REJECT] / [MC-REJECT-ABSORBING] over the whole cap.
+    if (maturity === "REJECT" || ceiling === "REJECT") return "REJECT";
+    return maturityRank(maturity) <= maturityRank(ceiling) ? maturity : ceiling;
+  };
+  return capped(classifyLaneMaturityUncapped(lane, infraReady));
+}
+
+/** The router's own ladder, before `maturityCeiling` is applied. Not exported: every caller must go
+ *  through `classifyLaneMaturity` so the ceiling can never be bypassed by accident. */
+function classifyLaneMaturityUncapped(lane: CandidateLane, infraReady: boolean): LaneMaturity {
   if (isLegacyNegativeLane(lane)) return "REJECT";
   const st = (lane.status ?? "").toUpperCase();
   if (st === "REJECT" || st.includes("DEPRIORIT") || st.includes("NEGATIVE")) return "REJECT";
@@ -662,6 +709,30 @@ function paperEvidenceForLane(
   };
 }
 
+/**
+ * Translate the variant matrix's authoritative per-context verdict into the ceiling this router's
+ * own ladder may not exceed.
+ *
+ * `NOT_APPLICABLE` maps to COLLECTING rather than REJECT: a lane that is simply out of scope for a
+ * context has not been judged negative, and mapping it to REJECT would silently kill candidates the
+ * matrix never expressed an opinion about.
+ */
+function maturityCeilingForContextStatus(status: ContextLaneStatus): LaneMaturity {
+  switch (status) {
+    case "PROMOTION_CANDIDATE":
+      return "PROMOTION_CANDIDATE";
+    case "STABLE_CANDIDATE":
+      return "STABLE_CANDIDATE";
+    case "WATCHABLE":
+      return "WATCHABLE";
+    case "REJECT":
+      return "REJECT";
+    case "COLLECTING":
+    case "NOT_APPLICABLE":
+      return "COLLECTING";
+  }
+}
+
 function lanesFromVariantMatrix(
   vm: CurrentGuardVariantMatrixReport,
   _paperOrders: readonly PaperOrder[],
@@ -701,6 +772,15 @@ function lanesFromVariantMatrix(
         topSymbolShare: paperEvidence?.topSymbolShare ?? evidence?.topSymbolPnlShare ?? null,
         status: paperEvidence?.status ?? evidence?.status ?? "COLLECTING",
         blockers: paperEvidence?.blockers ?? evidence?.blockers ?? ["missing exact-context evidence"],
+        // Cap this router's coarser raw-row ladder at whatever the variant matrix's authoritative
+        // stage-proof ladder actually granted — but ONLY when the numbers above genuinely came from
+        // the matrix. When `paperEvidence` supplied them, the matrix status is not the authority for
+        // this candidate and no ceiling applies. See CandidateLane.maturityCeiling.
+        maturityCeiling: paperEvidence
+          ? undefined
+          : evidence
+            ? maturityCeilingForContextStatus(evidence.status)
+            : "COLLECTING",
       }];
     });
   });

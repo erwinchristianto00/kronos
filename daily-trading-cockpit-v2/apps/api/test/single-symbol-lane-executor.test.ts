@@ -21,6 +21,7 @@ import {
   type SingleSymbolExecClient,
   type SingleSymbolExitPolicy,
   type SingleSymbolFreshSignal,
+  type SingleSymbolPosition,
 } from "../src/lib/single-symbol-lane-executor.js";
 
 const NOW = "2026-07-08T03:00:00.000Z";
@@ -54,6 +55,12 @@ class FakeClient implements SingleSymbolExecClient {
   algosPlaced: PlaceAlgoOrderParams[] = [];
   algosCancelled: string[] = [];
   failOnSymbol: string | null = null;
+  /** [2026-08-04 exposure-reservation test support] Symbol whose ENTRY (non-reduceOnly) placeOrder
+   *  throws an UNAMBIGUOUS BinanceFuturesPrivateError (failureType "binance_error") — distinct from
+   *  `failOnSymbol` above, which throws a plain, ambiguous Error (simulating a network/timeout
+   *  failure where whether the order reached the exchange is genuinely unknown). Mirrors
+   *  cross-sectional-executor.test.ts's FakeExecClient field of the same name. */
+  failOnSymbolWithBinanceError: string | null = null;
   failAlgoOnce = false;
   /** Reject the NEXT reduceOnly placeOrder call with the given Binance error code (e.g. -2022),
    *  then clear itself. Non-reduceOnly retries are NOT rejected. */
@@ -120,6 +127,12 @@ class FakeClient implements SingleSymbolExecClient {
     return symbol ? entries.filter((p) => p.symbol === symbol) : entries;
   }
   async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
+    if (this.failOnSymbolWithBinanceError === params.symbol && !params.reduceOnly) {
+      throw new BinanceFuturesPrivateError("binance_error", `Binance error HTTP 400 code -2019: Margin is insufficient.`, {
+        httpStatus: 400,
+        binanceCode: -2019,
+      });
+    }
     if (this.failOnSymbol === params.symbol) throw new Error(`exchange rejected ${params.symbol}`);
     if (this.failAllPlaceOrders) throw new Error("exchange rejected (persistent, non-recoverable)");
     if (params.reduceOnly && this.rejectNextReduceOnlyWithCode !== null) {
@@ -131,6 +144,14 @@ class FakeClient implements SingleSymbolExecClient {
     const orderId = String(this.orderSeq++);
     const avgPrice = this.fillPriceBySymbol.get(params.symbol) ?? 0;
     return this.buildOrder(params.symbol, params.side, params.quantity, params.reduceOnly, orderId, avgPrice);
+  }
+  /** 2026-08-18: drives reconcilePendingMakerEntries. Default THROWS -2013 ("order does not
+   *  exist"), which is the honest default for an order that was never placed in a test. */
+  byClientId = new Map<string, FuturesOrder>();
+  async queryOrderByClientId(symbol: string, origClientOrderId: string): Promise<FuturesOrder> {
+    const hit = this.byClientId.get(origClientOrderId);
+    if (hit) return hit;
+    throw new BinanceFuturesPrivateError("binance_error", "Order does not exist.", { httpStatus: 404, binanceCode: -2013 });
   }
   async queryOrder(symbol: string, orderId: string): Promise<FuturesOrder> {
     const avgPrice = this.queryOrderAvgPriceBySymbol.get(symbol) ?? 0;
@@ -224,7 +245,18 @@ function makeExecutor(opts: {
   sharedGetPositions?: () => ReturnType<FakeClient["getPositions"]>;
   tryClaimEntrySymbol?: (symbol: string) => boolean;
   releaseEntrySymbol?: (symbol: string) => void;
+  preventSameSymbolPyramiding?: boolean;
+  useOwnLotPnlAttribution?: boolean;
   timelineEntryGate?: (signal: SingleSymbolFreshSignal, direction: "LONG" | "SHORT") => Promise<{ allowed: boolean; reason: string | null }>;
+  reserveExposure?: (req: {
+    executorId: string;
+    symbol: string;
+    direction: "LONG" | "SHORT";
+    requestedNotionalUsd: number;
+    clientOrderId: string;
+  }) => { ok: boolean; reservationId: string | null; reason?: string };
+  commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
+  releaseExposureReservation?: (reservationId: string, reason: string) => void;
 } = {}) {
   const client = opts.client ?? new FakeClient();
   const storeDir = tmpDir();
@@ -254,10 +286,247 @@ function makeExecutor(opts: {
     ...(opts.sharedGetPositions ? { sharedGetPositions: opts.sharedGetPositions } : {}),
     ...(opts.tryClaimEntrySymbol ? { tryClaimEntrySymbol: opts.tryClaimEntrySymbol } : {}),
     ...(opts.releaseEntrySymbol ? { releaseEntrySymbol: opts.releaseEntrySymbol } : {}),
+    ...(opts.preventSameSymbolPyramiding ? { preventSameSymbolPyramiding: true } : {}),
+    ...(opts.useOwnLotPnlAttribution ? { useOwnLotPnlAttribution: true } : {}),
     ...(opts.timelineEntryGate ? { timelineEntryGate: opts.timelineEntryGate } : {}),
+    ...(opts.reserveExposure ? { reserveExposure: opts.reserveExposure } : {}),
+    ...(opts.commitExposureReservation ? { commitExposureReservation: opts.commitExposureReservation } : {}),
+    ...(opts.releaseExposureReservation ? { releaseExposureReservation: opts.releaseExposureReservation } : {}),
   });
   return { executor, client, store, storeDir };
 }
+
+/** Minimal in-memory stand-in for AccountExposureCoordinator's reserve/commit/release contract —
+ *  NOT a reimplementation of its capacity math (that is exhaustively covered by
+ *  account-exposure-coordinator.test.ts's own 45 tests). This exists purely to verify the WIRING:
+ *  does the executor call reserve() at the right point with the right data, commit from the actual
+ *  fill, and release on every failure path (never only the happy path) — exactly the property that
+ *  testing the coordinator in isolation cannot exercise. */
+function makeFakeReservationLedger() {
+  const reservations = new Map<
+    string,
+    {
+      status: "RESERVED" | "COMMITTED" | "RELEASED";
+      req: { executorId: string; symbol: string; direction: "LONG" | "SHORT"; requestedNotionalUsd: number; clientOrderId: string };
+      committed?: { qty: number; avgPrice: number };
+      releaseReason?: string;
+    }
+  >();
+  let seq = 0;
+  let forceNextRejectReason: string | null = null;
+  return {
+    reservations,
+    forceNextReserveRejection(reason: string) {
+      forceNextRejectReason = reason;
+    },
+    reserveExposure: (req: {
+      executorId: string;
+      symbol: string;
+      direction: "LONG" | "SHORT";
+      requestedNotionalUsd: number;
+      clientOrderId: string;
+    }) => {
+      if (forceNextRejectReason !== null) {
+        const reason = forceNextRejectReason;
+        forceNextRejectReason = null;
+        return { ok: false, reservationId: null, reason };
+      }
+      const reservationId = `res-${++seq}`;
+      reservations.set(reservationId, { status: "RESERVED", req });
+      return { ok: true, reservationId };
+    },
+    commitExposureReservation: (reservationId: string, filled: { qty: number; avgPrice: number }) => {
+      const r = reservations.get(reservationId);
+      if (!r || r.status !== "RESERVED") return; // idempotent no-op, matches the real coordinator
+      r.status = "COMMITTED";
+      r.committed = filled;
+    },
+    releaseExposureReservation: (reservationId: string, reason: string) => {
+      const r = reservations.get(reservationId);
+      if (!r || r.status !== "RESERVED") return; // idempotent no-op, matches the real coordinator
+      r.status = "RELEASED";
+      r.releaseReason = reason;
+    },
+  };
+}
+
+describe("SingleSymbolLaneExecutor — account-exposure reservation wiring (2026-08-04)", () => {
+  it("reserves before placing the order (with the SAME clientOrderId placeOrder submits) and commits from the actual fill, not requested qty", async () => {
+    const ledger = makeFakeReservationLedger();
+    const client = new FakeClient();
+    client.fillPriceBySymbol.set("BTCUSDT", 59_950); // avgPrice differs from signal.entryPrice
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [signal()],
+      legUsd: 120_000,
+      laneWeightPct: 50, // effective legUsd 60,000 -> qty 1.0 exactly
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(1);
+    expect(ledger.reservations.size).toBe(1);
+    const [reservationId, record] = [...ledger.reservations.entries()][0]!;
+    expect(record.status).toBe("COMMITTED");
+    expect(record.req.executorId).toBe("SHORT_FADE_EXHAUSTION_CROWDED");
+    expect(record.req.symbol).toBe("BTCUSDT");
+    expect(record.req.direction).toBe("SHORT");
+    expect(record.req.requestedNotionalUsd).toBeCloseTo(60_000, 6);
+    // The reconciliation join key: reserve()'s clientOrderId must be the EXACT string placeOrder
+    // submitted, not merely a similarly-shaped one.
+    expect(client.placed[0]!.newClientOrderId).toBe(record.req.clientOrderId);
+    // Committed from the REAL fill (order.executedQty/avgPrice), never the requested qty/price.
+    expect(record.committed!.qty).toBeCloseTo(1, 6);
+    expect(record.committed!.avgPrice).toBe(59_950);
+    void reservationId;
+  });
+
+  it("a rejected reservation blocks the entry entirely (no order placed) and surfaces the coordinator's reason", async () => {
+    const ledger = makeFakeReservationLedger();
+    ledger.forceNextReserveRejection("BTCUSDT: correlation-cluster cap (L1, cap 3) reached");
+    const client = new FakeClient();
+    const sig = signal();
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [sig],
+      legUsd: 10_000,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().positions).toHaveLength(0);
+    expect(ledger.reservations.size).toBe(0); // reserve() itself refused to insert anything
+    expect(executor.getStatus().lastEntrySkipReason).toContain("correlation-cluster cap");
+    // Not permanently blacklisted — a capacity rejection is transient (see maxNotionalPerSymbolAcrossLanes's
+    // own doc comment on this exact convention), so the same signal must remain retryable.
+    expect(store.getState().attemptedObservationIds ?? []).not.toContain(sig.observationId);
+  });
+
+  it("[FRESH_POSITION_EXISTS] releases the reservation when the final pre-placement exchange recheck finds a real position", async () => {
+    const ledger = makeFakeReservationLedger();
+    const client = new FakeClient();
+    client.positionAmtBySymbol.set("BTCUSDT", 0.02); // only visible to the FRESH (uncached) check
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [signal()],
+      legUsd: 10_000,
+      sharedGetPositions: async () => [], // the cached/stale check sees flat
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().positions).toHaveLength(0);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/fresh exchange position/);
+    expect(ledger.reservations.size).toBe(1);
+    const record = [...ledger.reservations.values()][0]!;
+    expect(record.status).toBe("RELEASED");
+    expect(record.releaseReason).toBe("FRESH_POSITION_EXISTS");
+  });
+
+  it("[STRUCTURAL REJECTION] a signal that fails exchange minNotional releases its reservation instead of leaking it as RESERVED", async () => {
+    // Same fixture as "skips an entry that clears minQty but fails MIN_NOTIONAL" above.
+    const ledger = makeFakeReservationLedger();
+    const dogeSignal = signal({ observationId: "sf:DOGEUSDT:1", symbol: "DOGEUSDT", entryPrice: 0.1, stopPrice: 0.103 });
+    const { executor, store } = makeExecutor({
+      signals: [dogeSignal],
+      legUsd: 0.5,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(0);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/below exchange minNotional/i);
+    expect(ledger.reservations.size).toBe(1);
+    const record = [...ledger.reservations.values()][0]!;
+    // This is the exact gap a naive implementation (matching only the wiringPlan's literal prose,
+    // which calls out FRESH_POSITION_EXISTS and the catch block but not this structural branch)
+    // would leave RESERVED for up to RESERVATION_STALE_MS despite no order ever being attempted.
+    expect(record.status).toBe("RELEASED");
+    expect(record.releaseReason).toBe("ENTRY_REJECTED:below_min_notional");
+  });
+
+  it("[AMBIGUOUS FAILURE] leaves the reservation RESERVED (not released) via the catch path when placeOrder throws a plain, non-Binance error", async () => {
+    // [2026-08-04] failOnSymbol throws a plain Error — simulates a network/timeout blip where
+    // whether the order actually reached the exchange is genuinely unknown. Releasing capacity here
+    // would reopen the oversubscription race the coordinator exists to close, so the reservation
+    // must stay RESERVED for the periodic staleness sweep (reconcileStaleReservations) to resolve
+    // against Binance directly. Mirrors cross-sectional-executor.test.ts's own
+    // "[AMBIGUOUS FAILURE] leaves the failed leg's reservation RESERVED..." test.
+    const ledger = makeFakeReservationLedger();
+    const client = new FakeClient();
+    client.failOnSymbol = "BTCUSDT";
+    const sig = signal();
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [sig],
+      legUsd: 10_000,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(0);
+    // Same transient-retry contract as the pre-existing [ENTRY-RETRY] test above — retry-eligibility
+    // is orthogonal to reservation-release and unaffected by this fix.
+    expect(store.getState().attemptedObservationIds ?? []).not.toContain(sig.observationId);
+    expect(ledger.reservations.size).toBe(1);
+    const record = [...ledger.reservations.values()][0]!;
+    expect(record.status).toBe("RESERVED");
+    expect(record.releaseReason).toBeUndefined();
+  });
+
+  it("[UNAMBIGUOUS FAILURE] releases the reservation via the catch path when placeOrder throws a typed, in-band Binance rejection", async () => {
+    // [2026-08-04] failOnSymbolWithBinanceError throws BinanceFuturesPrivateError with
+    // failureType "binance_error" — Binance received the request and explicitly answered no, so no
+    // order was created. This is the one case where releasing immediately is safe.
+    const ledger = makeFakeReservationLedger();
+    const client = new FakeClient();
+    client.failOnSymbolWithBinanceError = "BTCUSDT";
+    const sig = signal();
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [sig],
+      legUsd: 10_000,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(0);
+    expect(store.getState().attemptedObservationIds ?? []).not.toContain(sig.observationId);
+    expect(ledger.reservations.size).toBe(1);
+    const record = [...ledger.reservations.values()][0]!;
+    expect(record.status).toBe("RELEASED");
+    expect(record.releaseReason).toMatch(/^ENTRY_FAILED:/);
+  });
+
+  it("defaults to a no-op coordinator when reserveExposure/commit/release are omitted — existing behavior is byte-for-byte unaffected", async () => {
+    // No ledger wired at all. If this executor's ONLY option were `reserveExposure` without a safe
+    // default, this test (and every other test in this file that predates 2026-08-04) would throw.
+    const { executor, store, client } = makeExecutor({ signals: [signal()], legUsd: 10_000 });
+    await executor.tick();
+    expect(store.getState().positions).toHaveLength(1);
+    expect(client.placed).toHaveLength(1);
+  });
+});
 
 describe("makeFixedRewardExitPolicy (SHORT_FADE_EXHAUSTION geometry)", () => {
   const policy = makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 });
@@ -288,6 +557,124 @@ describe("makeFixedRewardExitPolicy (SHORT_FADE_EXHAUSTION geometry)", () => {
   });
 });
 
+describe("makeMfeGivebackExitPolicy — staticTpR (full TP, 2026-08-17)", () => {
+  const g = { entryPrice: 100, stopPrice: 98 };            // stop 2% -> 1R = 2.00
+  const atR = (r: number) => g.entryPrice + r * (g.entryPrice - g.stopPrice);
+  const tp = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, profitLockR: 0.15, staticTpR: 1.5 });
+  const noTp = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, profitLockR: 0.15 });
+
+  it("[TP-R] closes the WHOLE position at the level — there is no remainder", () => {
+    const d = tp({ direction: "LONG", ...g, currentPrice: atR(1.5), peakFavorableR: 1.5, msHeld: 0 });
+    expect(d.shouldExit).toBe(true);
+    expect(d.reason).toBe("STATIC_TP");
+  });
+
+  it("[TP-R] fires BEFORE lock and giveback — it is the highest level of the three", () => {
+    // Peak 2R, price back at 1.5R: the giveback line sits at 1.4R and the lock at 0.15R, so without
+    // the TP this path books strictly less. Checking the TP first is what makes it worth having.
+    const withTp = tp({ direction: "LONG", ...g, currentPrice: atR(1.5), peakFavorableR: 2, msHeld: 0 });
+    expect(withTp.reason).toBe("STATIC_TP");
+    const without = noTp({ direction: "LONG", ...g, currentPrice: atR(1.5), peakFavorableR: 2, msHeld: 0 });
+    expect(without.shouldExit).toBe(false); // 1.5R is above the 1.4R giveback line — still running
+  });
+
+  it("[TP-R] does nothing below the level, and unset behaves exactly as before", () => {
+    expect(tp({ direction: "LONG", ...g, currentPrice: atR(1.49), peakFavorableR: 1.49, msHeld: 0 }).shouldExit).toBe(false);
+    for (const r of [0.5, 1.0, 1.49]) {
+      const ctx = { direction: "LONG" as const, ...g, currentPrice: atR(r), peakFavorableR: r, msHeld: 0 };
+      expect(tp(ctx)).toEqual(noTp(ctx));
+    }
+  });
+
+  it("[TP-R] SHORT reaches it by falling, not rising", () => {
+    const sg = { entryPrice: 100, stopPrice: 102 };
+    const px = (r: number) => sg.entryPrice - r * (sg.stopPrice - sg.entryPrice);
+    const t2 = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, staticTpR: 1.5 });
+    expect(t2({ direction: "SHORT", ...sg, currentPrice: px(1.5), peakFavorableR: 1.5, msHeld: 0 }).reason).toBe("STATIC_TP");
+    expect(t2({ direction: "SHORT", ...sg, currentPrice: px(1.0), peakFavorableR: 1.0, msHeld: 0 }).shouldExit).toBe(false);
+  });
+
+  it("[TP-R] the stop still wins over the TP — it is checked first and must stay that way", () => {
+    const d = tp({ direction: "LONG", ...g, currentPrice: g.stopPrice, peakFavorableR: 2, msHeld: 0 });
+    expect(d.reason).toBe("INITIAL_STOP");
+  });
+});
+
+describe("makeMfeGivebackExitPolicy — profitLockR (R-denominated, 2026-08-16)", () => {
+  // THE DEFECT THIS CLOSES, in the two real shapes it took on testnet:
+  //   ETHUSDT stop 0.47% of entry -> profitLockNetReturn 0.005 meant a 1.15R lock
+  //   SOLUSDT stop 2.18% of entry -> the SAME config meant a 0.25R lock
+  // Same operator intent, reward:risk 4.6x apart, decided by volatility rather than by anyone.
+  const tight = { entryPrice: 100, stopPrice: 99.53 };   // 0.47% stop, like the ETH position
+  const wide = { entryPrice: 100, stopPrice: 97.82 };    // 2.18% stop, like the SOL position
+  const atR = (g: { entryPrice: number; stopPrice: number }, r: number) =>
+    g.entryPrice + r * (g.entryPrice - g.stopPrice);
+
+  const priced = makeMfeGivebackExitPolicy({
+    armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000,
+    profitLockNetReturn: 0.005, estimatedCloseCostPct: 0.0004,
+  });
+  const inR = makeMfeGivebackExitPolicy({
+    armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, profitLockR: 0.5,
+  });
+
+  it("[LOCK-R] the price-denominated lock fires at a different R on each stop width", () => {
+    // Pins the DEFECT itself, so it fails loudly if the old behavior is ever changed silently.
+    // IDENTICAL geometry in R on both: peaked at 0.6R, now retraced to 0.24R, giveback unarmed
+    // (0.6 < armR 0.75). The only difference is how wide the stop happens to be.
+    const ctx = (g: { entryPrice: number; stopPrice: number }) =>
+      ({ direction: "LONG" as const, ...g, currentPrice: atR(g, 0.24), peakFavorableR: 0.6, msHeld: 0 });
+    // wide stop -> the 0.5% lock lands at ~0.25R, which 0.6R cleared and 0.24R has fallen back through
+    const w = priced(ctx(wide));
+    expect(w.shouldExit).toBe(true);
+    expect(w.reason).toBe("MFE_PROFIT_LOCK");
+    // tight stop -> the SAME 0.5% lock lands at ~1.15R, so a 0.6R peak never armed it at all
+    expect(priced(ctx(tight)).shouldExit).toBe(false);
+    // and profitLockR removes the divergence: same input, same verdict on both widths
+    expect(inR(ctx(wide)).reason).toBe(inR(ctx(tight)).reason);
+  });
+
+  it("[LOCK-R] profitLockR gives BOTH stop widths the identical 0.5R geometry", () => {
+    for (const g of [tight, wide]) {
+      // peak reached the lock and price came back through it -> exit, on either width
+      const hit = inR({ direction: "LONG", ...g, currentPrice: atR(g, 0.5), peakFavorableR: 0.6, msHeld: 0 });
+      expect(hit.shouldExit).toBe(true);
+      expect(hit.reason).toBe("MFE_PROFIT_LOCK");
+      // peak never reached the lock -> hold, on either width
+      expect(inR({ direction: "LONG", ...g, currentPrice: atR(g, 0.3), peakFavorableR: 0.45, msHeld: 0 }).shouldExit).toBe(false);
+    }
+  });
+
+  it("[LOCK-R] SHORT geometry is identical, not mirrored by accident", () => {
+    const g = { entryPrice: 100, stopPrice: 102 };
+    const px = (r: number) => g.entryPrice - r * (g.stopPrice - g.entryPrice);
+    const hit = inR({ direction: "SHORT", ...g, currentPrice: px(0.5), peakFavorableR: 0.6, msHeld: 0 });
+    expect(hit.reason).toBe("MFE_PROFIT_LOCK");
+    expect(inR({ direction: "SHORT", ...g, currentPrice: px(0.3), peakFavorableR: 0.45, msHeld: 0 }).shouldExit).toBe(false);
+  });
+
+  it("[LOCK-R] lock 0.5 and arm 0.75 TILE — a big peak trails on giveback, never snaps back to the lock", () => {
+    // peak 2R, giveback line = 2*0.7 = 1.4R. At 1.5R nothing fires; at 1.4R the giveback does.
+    // If the lock shadowed the giveback this runner would have been cut at 0.5R instead of 1.4R.
+    expect(inR({ direction: "LONG", ...wide, currentPrice: atR(wide, 1.5), peakFavorableR: 2, msHeld: 0 }).shouldExit).toBe(false);
+    const gb = inR({ direction: "LONG", ...wide, currentPrice: atR(wide, 1.4), peakFavorableR: 2, msHeld: 0 });
+    expect(gb.shouldExit).toBe(true);
+    expect(gb.reason).toBe("MFE_GIVEBACK");
+  });
+
+  it("[LOCK-R] stop and max-hold still win, and an unset profitLockR changes nothing", () => {
+    expect(inR({ direction: "LONG", ...wide, currentPrice: wide.stopPrice, peakFavorableR: 2, msHeld: 0 }).reason).toBe("INITIAL_STOP");
+    expect(inR({ direction: "LONG", ...wide, currentPrice: atR(wide, 0.1), peakFavorableR: 0.1, msHeld: 24 * 3_600_000 }).reason).toBe("MAX_HOLD_MTM");
+    // additive guarantee: lanes that never pass profitLockR keep byte-identical behavior
+    const legacy = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, profitLockNetReturn: 0.005, estimatedCloseCostPct: 0.0004 });
+    const zero = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, profitLockNetReturn: 0.005, estimatedCloseCostPct: 0.0004, profitLockR: 0 });
+    for (const r of [0.2, 0.5, 0.9, 1.2]) {
+      const ctx = { direction: "LONG" as const, ...wide, currentPrice: atR(wide, r), peakFavorableR: Math.max(r, 0.8), msHeld: 0 };
+      expect(zero(ctx)).toEqual(legacy(ctx));
+    }
+  });
+});
+
 describe("makeMfeGivebackExitPolicy (INTRADAY_MOMENTUM_BREAKOUT geometry)", () => {
   const policy = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.5, maxHoldMs: 24 * 3_600_000 });
 
@@ -311,6 +698,23 @@ describe("makeMfeGivebackExitPolicy (INTRADAY_MOMENTUM_BREAKOUT geometry)", () =
     const d = policy({ direction: "LONG", entryPrice: 100, stopPrice: 90, currentPrice: 100.5, peakFavorableR: 0.1, msHeld: 24 * 3_600_000 });
     expect(d.shouldExit).toBe(true);
     expect(d.reason).toBe("MAX_HOLD_MTM");
+  });
+
+  it("locks a +0.50% estimated-net winner only after it has first run above the lock", () => {
+    const lockPolicy = makeMfeGivebackExitPolicy({
+      armR: 10,
+      givebackFrac: 0.5,
+      maxHoldMs: 24 * 3_600_000,
+      profitLockNetReturn: 0.005,
+      estimatedCloseCostPct: 0.002,
+    });
+    // Risk = 1% of entry.  100.80 = +0.80% gross / +0.60% net: runner stays open.
+    const running = lockPolicy({ direction: "LONG", entryPrice: 100, stopPrice: 99, currentPrice: 100.8, peakFavorableR: 0, msHeld: 0 });
+    expect(running.shouldExit).toBe(false);
+    // It then returns to +0.70% gross / +0.50% net: lock is enforced.
+    const locked = lockPolicy({ direction: "LONG", entryPrice: 100, stopPrice: 99, currentPrice: 100.7, peakFavorableR: running.nextPeakFavorableR, msHeld: 60_000 });
+    expect(locked.shouldExit).toBe(true);
+    expect(locked.reason).toBe("MFE_PROFIT_LOCK");
   });
 });
 
@@ -728,6 +1132,26 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     expect(store.getState().positions.length).toBe(1); // no 2nd position record created at all
   });
 
+  it("[DIRECTIONAL NO-PYRAMID] refuses a fresh second observation for a symbol this lane already owns", async () => {
+    const signals: SingleSymbolFreshSignal[] = [signal({ observationId: "sf:BTCUSDT:first", openedAtMs: NOW_MS - 4 * 60_000 })];
+    const { executor, client, store } = makeExecutor({
+      signals,
+      legUsd: 10_000,
+      maxOpenPositions: 3,
+      preventSameSymbolPyramiding: true,
+    });
+
+    await executor.tick();
+    expect(store.getState().positions.filter((p) => p.status === "OPEN")).toHaveLength(1);
+    signals.push(signal({ observationId: "sf:BTCUSDT:second", openedAtMs: NOW_MS - 1 * 60_000 }));
+
+    await executor.tick();
+
+    expect(store.getState().positions.filter((p) => p.status === "OPEN")).toHaveLength(1);
+    expect(client.placed).toHaveLength(1);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/same-symbol directional position.*no pyramiding/i);
+  });
+
   it("[MAX-OPEN-DIAGNOSTIC, 2026-07-19 fix] sets lastEntrySkipReason (instead of silently leaving it null) when the maxOpenPositions cap blocks a fresh candidate", async () => {
     const { executor, store } = makeExecutor({
       // maxOpenPositions defaults to 1 in makeExecutor; seed the store directly so the cap is
@@ -807,6 +1231,82 @@ describe("SingleSymbolLaneExecutor — exits", () => {
     expect(pos.closeReason).toBe("TP_HIT");
     expect(client.algosCancelled).toContain(algoId);
     expect(client.placed.some((p) => p.reduceOnly === true)).toBe(true);
+  });
+
+  // ── 2026-08-04 fail-closed innovation campaign control ────────────────────────────────────
+  // The campaign gate (innovation-campaign.ts) is wired ONLY into isAllowed() at app.ts's 13
+  // innovation-executor construction sites — never into tick()'s monitorOpenPositions() prefix,
+  // and never into the outer construction gate. These two tests are the load-bearing proof that
+  // holds: an absent/expired/disabled campaign (isAllowed() false) can only ever block a NEW
+  // entry, never the management or closing of a position that is already OPEN.
+  describe("[FAIL-CLOSED CAMPAIGN] position management/closing continues even with no active innovation campaign", () => {
+    function openShortPosition(over: Partial<SingleSymbolPosition> = {}) {
+      return {
+        positionId: "seed-nocamp", sourceObservationId: "seed-nocamp", symbol: "BTCUSDT", direction: "SHORT" as const,
+        qty: 0.001, entryPrice: 60000, entryOrderId: "1", entryPriceConfirmed: true, stopPrice: 61800,
+        stopAlgoOrderId: "900", stopFailureCount: 0, stopUnprotectedSinceIso: null, closeFailureCount: 0,
+        closeFailureSinceIso: null, peakFavorableR: 0, openedAt: NOW, status: "OPEN" as const, closedAt: null,
+        closeReason: null, exitPrice: null, exitOrderId: null, exitPriceConfirmed: false,
+        grossPnlUsd: null, feeEstimateUsd: 0, netPnlUsd: null,
+        ...over,
+      };
+    }
+
+    it("monitorOpenPositions still closes an already-OPEN position via the exit policy when isAllowed() is false the whole time (no active campaign)", async () => {
+      const client = new FakeClient();
+      const { executor, store } = makeExecutor({ client, allowed: false });
+      store.getState().positions.push(openShortPosition());
+      // 0.5R favorable for the SHORT (entry 60000, stop 61800 -> risk 1800, target 59100) -> TP_HIT.
+      client.markPriceBySymbol.set("BTCUSDT", 59000);
+
+      await executor.tick();
+
+      const pos = store.getState().positions[0]!;
+      expect(pos.status).toBe("CLOSED");
+      expect(pos.closeReason).toBe("TP_HIT");
+      expect(client.placed.some((p) => p.reduceOnly === true)).toBe(true);
+      // The campaign gate itself is still doing its job — NEW entries stay blocked throughout.
+      expect(executor.getStatus().allowed).toBe(false);
+    });
+
+    it("[RESTART] a freshly constructed executor (simulating a process restart) still loads and closes an already-OPEN position from disk even though isAllowed() reflects 'no active campaign' from the very first tick", async () => {
+      const storeDir = tmpDir();
+      const fileName = "restart-campaign.json";
+
+      // "Process A": a position opens and is persisted; the process then ends.
+      const store1 = new SingleSymbolLaneExecutorStore(storeDir, fileName);
+      store1.getState().positions.push(openShortPosition());
+      store1.save();
+
+      // "Process B" (restart): a BRAND NEW store instance re-reads the SAME directory/file — this
+      // is exactly what app.ts's construction gate does on every process start, unconditionally,
+      // regardless of campaign state (see innovation-campaign.ts's module doc comment and the
+      // outer `if (liveEngine && isInnovationTestnetExecutionEnabled(...))` gate in app.ts, which
+      // this design never touches).
+      const store2 = new SingleSymbolLaneExecutorStore(storeDir, fileName);
+      expect(store2.getState().positions.find((p) => p.positionId === "seed-nocamp")?.status).toBe("OPEN");
+
+      const client2 = new FakeClient();
+      client2.markPriceBySymbol.set("BTCUSDT", 59000);
+      const executor2 = new SingleSymbolLaneExecutor({
+        client: client2,
+        store: store2,
+        laneId: "FUNDING_CARRY_NEUTRAL_PAIR",
+        direction: "SHORT",
+        getOpenSignals: () => [],
+        exitPolicy: makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 }),
+        isAllowed: () => false, // no active campaign — the ONLY gate this design ever touches
+        legUsd: () => 25,
+        leverage: () => 3,
+        nowIso: () => NOW,
+        fillConfirmRetryDelayMs: 0,
+      });
+
+      await executor2.tick();
+
+      const pos = store2.getState().positions.find((p) => p.positionId === "seed-nocamp")!;
+      expect(pos.status).toBe("CLOSED"); // position management survives the restart, campaign or no campaign
+    });
   });
 
   it("[STOP-TRIGGERED] settles from getUserTrades when the exchange-side stop has actually fired", async () => {
@@ -1461,3 +1961,154 @@ describe("SingleSymbolLaneExecutor — getUserTrades fee window (2026-07-26 fix)
     expect(closed.feeEstimateUsd).toBeCloseTo(0.03, 9);
   });
 });
+
+describe("SingleSymbolLaneExecutor — own-lot P&L attribution", () => {
+  it("reports a directional lot from its own fills instead of the account-netted exchange realizedPnl", async () => {
+    const client = new FakeClient();
+    client.fillPriceBySymbol.set("BTCUSDT", 60_000);
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [signal()],
+      legUsd: 60_000, // exactly one BTC in this fixture
+      useOwnLotPnlAttribution: true,
+    });
+
+    await executor.tick();
+    const open = store.getState().positions[0]!;
+    client.seedTrade(open.entryOrderId, { price: 60_000, qty: 1, commission: 0.02, realizedPnl: 0 });
+    // The exchange's account-netted realizedPnl is deliberately positive because
+    // a sibling basket had an older, lower-price short. This directional lot was
+    // actually closed higher and therefore lost $100 before its own fees.
+    client.fillPriceBySymbol.set("BTCUSDT", 60_100);
+    client.seedTrade("101", { price: 60_100, qty: 1, commission: 0.03, realizedPnl: 7 });
+
+    const result = await executor.manualClosePosition(open.positionId);
+    const durable = store.getState().positions[0]!;
+    const reported = executor.getClosedPositions()[0]!;
+
+    expect(durable.netPnlUsd).toBeCloseTo(6.95, 9); // raw exchange-account settlement, retained for audit
+    expect(result.netPnlUsd).toBeCloseTo(-100.05, 9);
+    expect(reported.netPnlUsd).toBeCloseTo(-100.05, 9);
+    expect(reported.grossPnlUsd).toBeCloseTo(-100, 9);
+    expect(reported.feeEstimateUsd).toBeCloseTo(0.05, 9);
+    expect(reported.exchangeAccountNetPnlUsd).toBeCloseTo(6.95, 9);
+    expect(reported.pnlAttribution).toBe("OWN_LOT");
+    expect(reported.pnlAttributionComplete).toBe(true);
+    expect(executor.getStatus().totalNetPnlUsd).toBeCloseTo(-100.05, 9);
+  });
+});
+
+describe("[SS-PENDING] an entry order that filled while the process was down", () => {
+    // Before 2026-08-18 the resting order's id lived only in a local variable inside
+    // placeEntryMakerFirst. A restart inside the 120s post-only window lost it: the order stayed
+    // REAL on the exchange, and a later fill became a live position with no stop and no tracking.
+    const pending = (clientOrderId: string) => ({
+      clientOrderId, symbol: "BTCUSDT", direction: "SHORT" as const, qty: 0.01,
+      // Fresh: a recovered position whose maxHold already elapsed is CORRECTLY closed on the same
+      // tick, so a stale timestamp here would measure the max-hold path instead of adoption.
+      placedAt: new Date().toISOString(), sourceObservationId: "obs-1",
+      stopPrice: 61000, targetPrice: 58000, maxHoldMs: 3_600_000,
+    });
+    const restart = (dir: string, file: string, client: FakeClient) =>
+      new SingleSymbolLaneExecutor({
+        client, store: new SingleSymbolLaneExecutorStore(dir, file),
+        laneId: "SHORT_FADE_EXHAUSTION_CROWDED", direction: "SHORT",
+        getOpenSignals: () => [],
+        exitPolicy: makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 }),
+        isAllowed: () => false,
+      });
+
+    it("is ADOPTED as a tracked position and stopped, instead of staying invisible", async () => {
+      const dir = tmpDir(), file = "pending-fill.json";
+      const s1 = new SingleSymbolLaneExecutorStore(dir, file);
+      s1.addPendingMakerEntry(pending("ssle-abc-e"));   // process dies here
+
+      const client = new FakeClient();
+      // Mark == entry: no PnL, so the exit policy cannot legitimately close it this same tick and
+      // the assertion below measures ADOPTION rather than the exit path.
+      client.markPriceBySymbol.set("BTCUSDT", 60500);
+      // The exchange must also REPORT the position, otherwise monitorOpenPositions correctly
+      // reconciles the freshly adopted row away as a position that is not really there.
+      client.positionAmtBySymbol.set("BTCUSDT", -0.01);
+      client.byClientId.set("ssle-abc-e", {
+        orderId: "777", symbol: "BTCUSDT", side: "SELL", status: "FILLED",
+        executedQty: 0.01, avgPrice: 60500, price: 60500, clientOrderId: "ssle-abc-e",
+      } as unknown as FuturesOrder);
+
+      const ex = restart(dir, file, client);
+      await ex.tick();
+
+      const st = new SingleSymbolLaneExecutorStore(dir, file).getState();
+      const pos = st.positions.find((p) => p.entryOrderId === "777");
+      expect(pos, "the filled order must become a tracked position").toBeTruthy();
+      expect(pos!.status).toBe("OPEN");
+      expect(pos!.qty).toBe(0.01);
+      expect(pos!.stopPrice).toBe(61000);   // carried from the pending record, not invented
+      expect(st.pendingMakerEntries ?? []).toHaveLength(0); // handle consumed
+      expect(client.algosPlaced.length, "a recovered position must be STOPPED").toBeGreaterThan(0);
+    });
+
+    it("is RECORDED before the order is sent, and SURVIVES an ambiguous failure", async () => {
+      // The scenario the whole mechanism exists for. placeOrder times out: we do not know whether
+      // the order reached the book. The handle must already be on disk, and must NOT be dropped —
+      // only an unambiguous in-band rejection proves no order exists.
+      const client = new FakeClient();
+      client.markPriceBySymbol.set("BTCUSDT", 60000);
+      client.placeOrder = async () => {
+        throw new BinanceFuturesPrivateError("timeout", "request timed out after 10000ms");
+      };
+      const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 1_000 });
+      await executor.tick();
+      const pending = store.getState().pendingMakerEntries ?? [];
+      expect(pending, "an ambiguous placement must leave a searchable handle").toHaveLength(1);
+      expect(pending[0]!.symbol).toBe("BTCUSDT");
+      expect(pending[0]!.stopPrice).toBe(61800); // carried from the signal, ready to stop a fill
+    });
+
+    it("DROPS the handle when Binance explicitly rejects the order in-band", async () => {
+      // The mirror case: Binance answered "no", so no order exists and the handle is noise.
+      const client = new FakeClient();
+      client.markPriceBySymbol.set("BTCUSDT", 60000);
+      client.placeOrder = async () => {
+        throw new BinanceFuturesPrivateError("binance_error", "Margin is insufficient.", { binanceCode: -2019 });
+      };
+      const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 1_000 });
+      await executor.tick();
+      expect(store.getState().pendingMakerEntries ?? []).toHaveLength(0);
+    });
+
+    it("drops the handle when Binance proves the order never existed (-2013)", async () => {
+      const dir = tmpDir(), file = "pending-absent.json";
+      new SingleSymbolLaneExecutorStore(dir, file).addPendingMakerEntry(pending("ssle-gone-e"));
+      const client = new FakeClient(); // byClientId empty -> throws -2013
+      await restart(dir, file, client).tick();
+      const st = new SingleSymbolLaneExecutorStore(dir, file).getState();
+      expect(st.pendingMakerEntries ?? []).toHaveLength(0);
+      expect(st.positions).toHaveLength(0); // nothing invented
+    });
+
+    it("KEEPS the handle when the answer is ambiguous — never guesses the order away", async () => {
+      const dir = tmpDir(), file = "pending-unknown.json";
+      new SingleSymbolLaneExecutorStore(dir, file).addPendingMakerEntry(pending("ssle-wait-e"));
+      const client = new FakeClient();
+      client.queryOrderByClientId = async () => { throw new Error("network down"); };
+      await restart(dir, file, client).tick();
+      const st = new SingleSymbolLaneExecutorStore(dir, file).getState();
+      expect(st.pendingMakerEntries ?? []).toHaveLength(1); // still pending, retried next tick
+      expect(st.positions).toHaveLength(0);
+    });
+
+    it("keeps the handle while the order is still RESTING with nothing filled", async () => {
+      const dir = tmpDir(), file = "pending-resting.json";
+      new SingleSymbolLaneExecutorStore(dir, file).addPendingMakerEntry(pending("ssle-rest-e"));
+      const client = new FakeClient();
+      client.byClientId.set("ssle-rest-e", {
+        orderId: "888", symbol: "BTCUSDT", side: "SELL", status: "NEW",
+        executedQty: 0, avgPrice: 0, price: 60500, clientOrderId: "ssle-rest-e",
+      } as unknown as FuturesOrder);
+      await restart(dir, file, client).tick();
+      const st = new SingleSymbolLaneExecutorStore(dir, file).getState();
+      expect(st.pendingMakerEntries ?? []).toHaveLength(1);
+      expect(st.positions).toHaveLength(0);
+    });
+  });

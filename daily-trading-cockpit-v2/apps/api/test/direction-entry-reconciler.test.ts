@@ -371,6 +371,64 @@ describe("runDirectionEntryReconciliationCycle — Tier 1 vs Tier 2 routing (nev
     expect(result.entryProcessed).toBe(10);
     expect(result.entrySkippedNotDue).toBe(0);
   });
+
+  it("keeps Tier-2 scheduler deferrals separate from actual missing candle data", async () => {
+    const rows = Array.from({ length: 4 }, (_, index): PendingEntryRow => ({
+      decisionId: `entry-deferred-${index}`,
+      asOfMs: index,
+      symbolOrBasketId: `SYM${index}USDT`,
+      laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL",
+      side: "LONG",
+      action: index === 0 ? "ENTER_NOW" : "SKIP",
+      targetEntry: 100,
+      initialStopPrice: 95,
+      expectedNetR: 0.1,
+    }));
+    const store = new DirectionEntryOutcomeStore(tmp());
+    await runDirectionEntryReconciliationCycle(
+      baseDeps({
+        ledger: fakeLedger({ entry: rows }),
+        store,
+        now: () => 24 * HOUR_MS,
+        maxEntryTier2AttemptsPerCycle: 1,
+        fetchEntryTier2Candles: async () => null,
+      }),
+    );
+
+    expect(store.getState().entry.currentInstrumentDataMissing).toBe(1);
+    expect(store.getState().entry.currentTier2Deferred).toBe(3);
+  });
+
+  it("retries one empty Tier-2 candle fetch before marking the source unavailable", async () => {
+    const row: PendingEntryRow = {
+      decisionId: "entry-retry-empty-fetch",
+      asOfMs: 0,
+      symbolOrBasketId: "BTCUSDT",
+      laneId: "CROSS_SECTIONAL_DIRECTIONAL_LONG",
+      side: "LONG",
+      action: "ENTER_NOW",
+      targetEntry: 100,
+      initialStopPrice: 95,
+      expectedNetR: 0.1,
+    };
+    const store = new DirectionEntryOutcomeStore(tmp());
+    let calls = 0;
+    const result = await runDirectionEntryReconciliationCycle(
+      baseDeps({
+        ledger: fakeLedger({ entry: [row] }),
+        store,
+        now: () => 24 * HOUR_MS,
+        fetchEntryTier2Candles: async (_symbol, sinceMs) => {
+          calls += 1;
+          return calls === 1 ? null : flatCandles(sinceMs, 40, 100) as PathCandle[];
+        },
+      }),
+    );
+
+    expect(calls).toBe(2);
+    expect(result.entryProcessed).toBe(1);
+    expect(store.getState().entry.currentInstrumentDataMissing).toBe(0);
+  });
 });
 
 describe("runDirectionEntryReconciliationCycle — cycleMeta reflects a real error, never silently frozen", () => {

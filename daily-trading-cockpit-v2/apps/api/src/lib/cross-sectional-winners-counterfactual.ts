@@ -143,7 +143,7 @@ export async function buildWinnersCounterfactualReport(
   const nowIso = opts.nowIso ?? (() => new Date().toISOString());
   const costReturn = CROSS_SECTIONAL_ROUNDTRIP_BPS / 10_000;
 
-  const closed = store.all.filter(
+  const closed = store.reportable.filter(
     (o) => o.status === "CLOSED" && (o.variant ?? "RAW") === variant,
   );
   let excludedIncompleteLegs = 0;

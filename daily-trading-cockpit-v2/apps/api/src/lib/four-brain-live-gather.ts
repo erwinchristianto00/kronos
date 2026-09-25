@@ -14,7 +14,7 @@
  *   • unknown lanes are surfaced (not silently dropped) and duplicate identities are REJECTED from the tick
  *     and recorded.
  */
-import { classifySource, type DirectionHorizon, type MarketBias, type SourceStatus } from "./four-brain-types.js";
+import { classifySource, type DirectionHorizon, type FourBrainExecutionReinforcement, type MarketBias, type MarketStateAuthority, type SourceStatus } from "./four-brain-types.js";
 import type { MarketSafetyEvent, MarketStateInput } from "./market-state-brain.js";
 import type { DirectionInput } from "./direction-brain.js";
 import type { EntryInput } from "./entry-brain.js";
@@ -108,6 +108,16 @@ export interface FourBrainIdentity {
   positionId: string | null;
   horizon: string | null;
   decisionAtMs: number;
+  /**
+   * Report-only entry-candidate provenance tag (see FourBrainBindingDeps.openSignals' doc comment
+   * in four-brain-live-gather-bindings.ts for the full contract). "PAPER_ORDER_OWNED" candidates
+   * carry THE canonical ownership key and are attachable to a real Executive Review;
+   * "VARIANT_MATRIX_SHADOW" candidates are shadow-tape diagnostics only and structurally cannot
+   * attach. null for exit candidates (positionId-identified) and legacy named-lane entry
+   * candidates whose ownership chain is untouched by this stage. Never read by any brain's
+   * decision logic — visibility only.
+   */
+  sourceKind?: "PAPER_ORDER_OWNED" | "VARIANT_MATRIX_SHADOW" | null;
 }
 
 /** A canonical key for duplicate detection. Two candidates with the SAME (laneId, symbol, side, signalId|
@@ -171,6 +181,8 @@ export interface ExecContext {
   marketContext: MarketContextLineage;
   laneEligibleIncumbent: boolean;
   directionHurdlePassed?: boolean;
+  /** Exact Tier-1 testnet-fill evidence, advisory-only and never an execution authority. */
+  executionReinforcement?: FourBrainExecutionReinforcement | null;
   killLatched: boolean;
   riskBlockedReason: string | null; // edge veto / concentration / daily-loss — incumbent rail block
   hardExitTriggered?: boolean;
@@ -215,6 +227,8 @@ export interface DirectionRawReadings {
    *  straight through to DirectionInput; see direction-brain.ts. */
   fourBrainLongVeto?: boolean;
   fourBrainShortVeto?: boolean;
+  /** Resolved Direction outcomes for this exact evaluation horizon. */
+  horizonResolvedN?: number | null;
   validityMs: number;
 }
 
@@ -280,6 +294,7 @@ export interface FourBrainGatherInput {
   nowMs: number;
   supportedLanes: ReadonlySet<string>;
   marketState: MarketStateRawReadings;
+  marketStateAuthority?: MarketStateAuthority | null;
   directions: DirectionRawReadings[];
   entryCandidatesRaw: EntryCandidateRaw[];
   exitCandidatesRaw: ExitCandidateRaw[];
@@ -300,6 +315,7 @@ export interface FourBrainGatheredTick {
   instanceId: string;
   asOfMs: number;
   marketStateInput: MarketStateInput;
+  marketStateAuthority: MarketStateAuthority | null;
   marketReadings: SourceReading[];
   directionInputs: { horizon: DirectionHorizon; input: DirectionInput; readings: SourceReading[] }[];
   entryCandidates: AssembledEntryCandidate[];
@@ -396,6 +412,7 @@ export function assembleFourBrainTick(input: FourBrainGatherInput): FourBrainGat
       shortVeto: d.shortVeto,
       fourBrainLongVeto: d.fourBrainLongVeto,
       fourBrainShortVeto: d.fourBrainShortVeto,
+      horizonResolvedN: d.horizonResolvedN,
     };
     return { horizon: d.horizon, input: di, readings: Object.values(readings) };
   });
@@ -473,6 +490,7 @@ export function assembleFourBrainTick(input: FourBrainGatherInput): FourBrainGat
     instanceId: input.instanceId,
     asOfMs: nowMs,
     marketStateInput,
+    marketStateAuthority: input.marketStateAuthority ?? null,
     marketReadings,
     directionInputs,
     entryCandidates,

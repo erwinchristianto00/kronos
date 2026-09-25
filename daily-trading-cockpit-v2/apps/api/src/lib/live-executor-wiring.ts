@@ -13,12 +13,25 @@ export interface LiveExecutorGateEngine {
   canOpenNewEntries(): boolean;
   laneSelectionExplicitlyIncludesLane(laneId: string): boolean;
   laneSelectionAllowsLane(laneId: string): boolean;
+  /** 2026-08 manual-directional canonical-regime enforcement fix: the explanation half of
+   *  canOpenNewEntries() (LiveExecutionEngine.newEntryBlockReason()) — optional so existing fakes
+   *  in tests that predate this field (e.g. live-executor-wiring.test.ts's fakeEngine()) keep
+   *  compiling unchanged and keep newExecutorLaneGate's prior fallback-string behavior. Real
+   *  LiveExecutionEngine instances always define it, so real callers get an accurate, specific
+   *  reason instead of the generic drain-string fallback below. */
+  newEntryBlockReason?(): string | null;
 }
 
 export const TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV = "TESTNET_ONLY_CROSS_SECTIONAL_HORIZON";
 export const CROSS_SECTIONAL_HORIZON_LANE_ID = "CROSS_SECTIONAL_MARKET_NEUTRAL";
+export const CROSS_SECTIONAL_DIRECTIONAL_REGIME_EXEC_ENABLED_ENV = "CROSS_SECTIONAL_DIRECTIONAL_REGIME_EXEC_ENABLED";
+export const CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID = "CROSS_SECTIONAL_DIRECTIONAL_SHORT";
+export const CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID = "CROSS_SECTIONAL_DIRECTIONAL_LONG";
 export const TESTNET_CROSS_SECTIONAL_EXTRA_LANES_ENV = "TESTNET_CROSS_SECTIONAL_EXTRA_LANES";
 export const TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS_ENV = "TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS";
+/** Dedicated execution scope for the only CG MFE Giveback rollout approved on testnet. */
+export const TESTNET_MFE_GIVEBACK_SYMBOLS_ENV = "TESTNET_MFE_GIVEBACK_SYMBOLS";
+export const TESTNET_MFE_GIVEBACK_VARIANT_ID = "CG_MFE_GIVEBACK";
 
 function csvSet(value: string | undefined): ReadonlySet<string> {
   return new Set((value ?? "").split(",").map((part) => part.trim().toUpperCase()).filter(Boolean));
@@ -31,6 +44,38 @@ function laneMatchesAllowlist(laneId: string | null | undefined, allowlist: Read
   return allowlist.has(normalized) || allowlist.has(variantId);
 }
 
+/** True for either raw or namespaced CG MFE Giveback lane IDs. */
+export function isMfeGivebackLaneId(laneId: string | null | undefined): boolean {
+  return laneMatchesAllowlist(laneId, new Set([TESTNET_MFE_GIVEBACK_VARIANT_ID]));
+}
+
+/**
+ * During the cross-sectional testnet rollout, CG_MFE_GIVEBACK has its OWN
+ * symbol scope. It is deliberately separate from presentation/cohort filters:
+ * every candidate and every execution path must enforce the same XRP/WLD-only
+ * boundary. Missing configuration fails closed while the rollout lock is on.
+ */
+export function isTestnetMfeGivebackSymbolAllowed(
+  env: "testnet" | "mainnet" | null,
+  laneId: string | null | undefined,
+  symbol: string | null | undefined,
+  envVars: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (
+    env !== "testnet" ||
+    envVars[TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV] !== "1" ||
+    !isMfeGivebackLaneId(laneId)
+  ) return true;
+  const normalizedSymbol = symbol?.trim().toUpperCase();
+  // Keep the dedicated variable authoritative, while retaining the previously
+  // deployed extra-symbol value as a backward-compatible fallback.
+  const allowed = csvSet(
+    envVars[TESTNET_MFE_GIVEBACK_SYMBOLS_ENV] ??
+      envVars[TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS_ENV],
+  );
+  return Boolean(normalizedSymbol && allowed.has(normalizedSymbol));
+}
+
 /** Testnet rollout switch: only the FILTERED cross-sectional horizon executor may open new risk. */
 export function isTestnetCrossSectionalHorizonLaneAllowed(
   env: "testnet" | "mainnet" | null,
@@ -39,20 +84,20 @@ export function isTestnetCrossSectionalHorizonLaneAllowed(
 ): boolean {
   if (env !== "testnet" || envVars[TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV] !== "1") return true;
   if (laneId === CROSS_SECTIONAL_HORIZON_LANE_ID) return true;
+  const directionalAllowed = envVars[CROSS_SECTIONAL_DIRECTIONAL_REGIME_EXEC_ENABLED_ENV] === "1" &&
+    (laneId === CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID || laneId === CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID);
+  if (directionalAllowed) return true;
   return laneMatchesAllowlist(laneId, csvSet(envVars[TESTNET_CROSS_SECTIONAL_EXTRA_LANES_ENV]));
 }
 
-/**
- * Symbol-level companion to the testnet horizon lock. Extra lanes remain fail-closed unless
- * BOTH the lane and the symbol are explicitly allowlisted. This keeps an experimental testnet
- * rollout such as CG_MFE_GIVEBACK/XRP+WLD from opening the rest of that lane's universe.
- */
+/** Extra testnet lanes remain fail-closed unless the symbol is explicitly allowlisted too. */
 export function isTestnetCrossSectionalHorizonSourceAllowed(
   env: "testnet" | "mainnet" | null,
   laneId: string | null | undefined,
   symbol: string | null | undefined,
   envVars: NodeJS.ProcessEnv = process.env,
 ): boolean {
+  if (!isTestnetMfeGivebackSymbolAllowed(env, laneId, symbol, envVars)) return false;
   if (env !== "testnet" || envVars[TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV] !== "1") return true;
   if (laneId === CROSS_SECTIONAL_HORIZON_LANE_ID) return true;
   if (!isTestnetCrossSectionalHorizonLaneAllowed(env, laneId, envVars)) return false;
@@ -94,7 +139,15 @@ export function newExecutorLaneGate(
   opts: { mainnetEntryEligible?: boolean } = {},
 ): { allowed: boolean; reason: string | null } {
   if (!engine?.isArmed()) return { allowed: false, reason: "engine is not ARMED" };
-  if (!engine.canOpenNewEntries()) return { allowed: false, reason: "new-entry drain is active (operator paused new entries)" };
+  if (!engine.canOpenNewEntries()) {
+    // 2026-08 manual-directional canonical-regime enforcement fix: this used to hard-code the
+    // drain string for EVERY cause of canOpenNewEntries()===false (kill switch, a non-manual
+    // strategy-gate block, and — now that manual mode is also gated by the canonical regime-policy
+    // check — a manual-mode regime-safety block too). engine.newEntryBlockReason(), when present,
+    // reports the actual condition that bound; the drain string remains the fallback for engines
+    // (or test fakes) that don't define it.
+    return { allowed: false, reason: engine.newEntryBlockReason?.() ?? "new-entry drain is active (operator paused new entries)" };
+  }
   if (!isTestnetCrossSectionalHorizonLaneAllowed(env, laneId)) {
     return { allowed: false, reason: "testnet is locked to the cross-sectional horizon lane" };
   }
@@ -196,6 +249,109 @@ export function computeExternalManagedNetQty(
     }
   }
   return net;
+}
+
+/**
+ * Signed qty per symbol for entry orders ALREADY RESTING on the exchange whose fill has not yet
+ * been adopted onto the basket. Post-only (maker) entry places the order on the book and waits:
+ * it can fill in one piece, in several pieces, or not at all, minutes after placement.
+ *
+ * 2026-08-17 testnet disarm. computeExternalManagedNetQty above reads `basket.legs` — the FILLED
+ * record. A basket is created with `legs: []` and its plan then goes out as resting GTX orders, so
+ * between "filled on the exchange" and "pushed to basket.legs" the position is REAL and claimed by
+ * nobody. reconcile() logged `orphan exchange position WLDUSDT amt=55 (not opened by engine)` and
+ * force-disarmed the account, which then sat disarmed for 6h24m because nothing re-arms. With taker
+ * entry that window was milliseconds; maker entry stretched it to the whole maker wait, and partial
+ * fills made it visible mid-flight — TAO was reported orphaned at 0.088 and again at 0.167 of a
+ * planned 0.167, i.e. the SAME leg caught twice while filling.
+ *
+ * Deliberately NOT folded into computeExternalManagedNetQty. A resting order is exposure the
+ * account MIGHT take, not exposure it has, and that map feeds every netting consumer (engine share
+ * = positionAmt − claim, the kill-switch's own share, the correlated-alt cap). Adding an unfilled
+ * qty there would make the engine believe it owns a NEGATIVE share of a symbol it is still trying
+ * to enter — a far worse failure than the disarm this fixes. reconcile() consumes this as a
+ * tolerance BAND instead, bounded by the qty we ourselves requested: a position larger than the
+ * plan, or on the opposite side of it, still disarms exactly as before.
+ */
+/**
+ * May a disarmed engine re-arm itself right now?
+ *
+ * The ONLY recoverable cause is "TRANSIENT_EXCHANGE_ERROR" — the engine disarmed because it lost
+ * sight of the exchange, and the exchange is answering again. Every other cause (kill switch,
+ * an orphan position reconcile could not explain, a failed emergency flatten, an operator pressing
+ * disarm) waits for a human, because each of those means something real is wrong that a healthy
+ * tick does not fix. `kind` is compared exactly: an unrecognised kind never recovers.
+ *
+ * Extracted from the engine so the safety contract is executable rather than asserted in a comment.
+ */
+export function shouldAutoRearm(
+  armed: boolean,
+  lastDisarmKind: string | null | undefined,
+  healthyTickStreak: number,
+  autoRearmCount: number,
+  healthyTicksRequired: number,
+  maxPerProcess: number,
+): boolean {
+  if (armed) return false;
+  if (lastDisarmKind !== "TRANSIENT_EXCHANGE_ERROR") return false;
+  if (healthyTickStreak < healthyTicksRequired) return false;
+  if (autoRearmCount >= maxPerProcess) return false;
+  return true;
+}
+
+/**
+ * Is an exchange position fully explained by what an external executor has already filled
+ * (`claimed`) plus what it still has RESTING on the book (`pending`)?
+ *
+ * The band runs from `claimed` (the resting order has not filled at all) to `claimed + pending`
+ * (it filled in full), and every partial sits between the two. Both ends are inclusive within eps.
+ *
+ * What this must NOT do, and the tests pin each one: explain a position bigger than the plan,
+ * explain a position on the opposite side of the plan, or do anything at all when nothing is
+ * resting (pending === 0) — that last case is the pre-existing exact-match contract and must stay
+ * exactly as strict as it was, or the orphan check stops protecting the account.
+ */
+export function pendingEntryExplainsPosition(
+  positionAmt: number,
+  claimed: number,
+  pending: number,
+  eps: number,
+): boolean {
+  if (pending === 0) return false;
+  const lo = Math.min(claimed, claimed + pending) - eps;
+  const hi = Math.max(claimed, claimed + pending) + eps;
+  return positionAmt >= lo && positionAmt <= hi;
+}
+
+export function computeExternalPendingEntryQty(
+  crossSectionalExecutors: ReadonlyArray<CrossSectionalExecutor | null>,
+  singleSymbolExecutors: ReadonlyArray<SingleSymbolLaneExecutor | null> = [],
+): Map<string, number> {
+  const pending = new Map<string, number>();
+  for (const exec of crossSectionalExecutors) {
+    if (!exec) continue;
+    for (const basket of exec.getStatus().openBaskets) {
+      const plan = Array.isArray(basket.plan) ? basket.plan : [];
+      for (const planned of plan) {
+        if (!planned.makerRestingOrderId) continue;
+        // Already adopted into basket.legs → it is a real filled claim and computeExternalManagedNetQty
+        // owns it. Counting it here too would double the band and start explaining foreign positions.
+        if (basket.legs.some((leg) => leg.planIndex === planned.planIndex)) continue;
+        const signed = planned.side === "LONG" ? planned.requestedQty : -planned.requestedQty;
+        pending.set(planned.symbol, (pending.get(planned.symbol) ?? 0) + signed);
+      }
+    }
+  }
+  // The directional lanes run post-only entry too (CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY=1, a
+  // 120s wait), with the same hole: the order rests, fills in pieces, and nothing claims it until
+  // the position is booked. Same disarm, different lane.
+  for (const exec of singleSymbolExecutors) {
+    if (!exec) continue;
+    for (const [symbol, qty] of exec.pendingMakerEntryQtyBySymbol()) {
+      pending.set(symbol, (pending.get(symbol) ?? 0) + qty);
+    }
+  }
+  return pending;
 }
 
 /**

@@ -87,9 +87,10 @@ export function selectBestLaneReportForDirection(
 export function buildLiveBestLaneReportForDirection(
   dataDir: string,
   ceBucketsOnce: () => CEBucketStatsList,
+  nowMs: number = Date.now(),
 ): (direction: "LONG" | "SHORT") => LaneReportLike | null {
   return (direction) =>
     selectBestLaneReportForDirection(direction, FOUR_BRAIN_LANE_SUPPORT, (laneId) =>
-      liveLaneReport(laneId, dataDir, ceBucketsOnce),
+      liveLaneReport(laneId, dataDir, ceBucketsOnce, nowMs),
     );
 }

@@ -1,3 +1,5 @@
+import { threeLegStrategyAllowed, threeLegRegimeReason, buildThreeLegFallback, validThreeLegQualityAudit, dynamicExpectedLegCount, threeLegRuntimeContext, type ThreeLegContext, type ThreeLegAudit } from "./dynamic-three-leg-fallback.js";
+import { rankDynamicMom36Allocations, dynamicAllocationSelectionMode, type DynamicAllocationSelectionMode, type DynamicAllocationRankingAudit } from "./dynamic-mom36-allocation-ranking.js";
 /**
  * Cross-sectional market-neutral measurement lane (report-only).
  *
@@ -10,10 +12,73 @@
  * dispersion (the fuel) can collapse in risk-on/off; prove OOS across bull AND bear before any read.
  */
 import type { Candle } from "@dtc/shared";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import { clusterOf, isMajorCluster } from "./correlation-clusters.js";
+import type { CrossSectionalAutoPoolSnapshot } from "./cross-sectional-auto-pool.js";
+import { recordRejectedBasket } from "./rejected-basket-recorder.js";
+import { evaluateMarketStandDown, standDownThresholdPct } from "./market-drawdown-standdown.js";
+import {
+  isCrossSectionalSymbolReliabilityEnabled,
+  reliabilityStatusFor,
+  type SymbolReliabilityFormationCandidate,
+  type SymbolReliabilityFormationDecision,
+  type SymbolReliabilityPersistence,
+  type SymbolReliabilitySide,
+  type SymbolReliabilitySnapshot,
+} from "./cross-sectional-symbol-reliability.js";
+import {
+  crossSectionalFilteredSideTrendAlignment,
+  isCrossSectionalSmartBasketLifecycleEnabled,
+  isCrossSectionalSmartFormationRerankEnabled,
+  type CrossSectionalFormationMode,
+  type CrossSectionalSideTrendAlignment,
+} from "./cross-sectional-runtime-mode.js";
+import {
+  DYNAMIC_MOM36_SHOCK_36H_V1,
+  DYNAMIC_MOM36_HORIZON_MS,
+  DYNAMIC_MOM36_LOOKBACK_BARS,
+  DYNAMIC_MOM36_SHOCK_SIGNAL,
+  DYNAMIC_MOM36_SHOCK_VARIANT,
+  buildDynamicMom36Formation,
+  applyDynamicMom36Preference,
+  canonicalMom36Ranks,
+  dynamicMom36ClusterAllowed,
+  crossSectionalStrategyVersion,
+  dynamicMom36AllocationPolicy,
+  dynamicMom36SlowFastMode,
+  isDynamicMom36FinalAllocationAdmissionVersion,
+  isDynamicMom36OneSidedDirectionalQualityVersion,
+  isDynamicMom36ContinuationStrategy,
+  isDynamicMom36ContinuationVersion,
+  isDynamicMom36SlowFastStrictVersion,
+  isDynamicMom36ShockStrategy,
+  type DynamicMom36StrategyVersion,
+  type DynamicMom36CandidateSelectionAudit,
+  type DynamicMom36DirectionalFeasibility,
+  type DynamicMom36SelectionSource,
+  type DynamicMom36SlowFastPolicy,
+  type FrozenContinuationOverlay,
+  resolveFrozenRuntimeShockOverlay,
+  type DynamicMom36Allocation,
+  type DynamicMom36ExecutionBlockReason,
+  type DynamicMom36RankedSymbol,
+  type DynamicMom36ShockState,
+} from "./dynamic-mom36-shock-strategy.js";
+import {
+  evaluateOneSidedDirectionalQuality,
+  type OneSidedDirectionalQuality,
+  type OneSidedDirectionalQualityContext,
+  type OneSidedBreadthScan,
+} from "./dynamic-mom36-one-sided-directional-quality.js";
+import {
+  DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES,
+  evaluateDynamicMom36Continuation,
+  type DynamicMom36ContinuationRuntimeResult,
+} from "./dynamic-mom36-continuation-runtime.js";
+import { DYNAMIC_MOM36_SLOW_FAST_FAST_BARS } from "./dynamic-mom36-slowfast.js";
 
 function envNumPos(key: string, fallback: number): number {
   const v = Number(process.env[key]);
@@ -24,6 +89,8 @@ const CROSS_SECTIONAL_MAX_STORED_OBSERVATIONS = envNumPos(
   "CROSS_SECTIONAL_EDGE_MAX_STORED_OBSERVATIONS",
   5000,
 );
+/** Distinct completed 1h formation scans, not 7-minute poll duplicates. */
+const DYNAMIC_MOM36_FORMATION_HISTORY_MAX = 512;
 
 function envNumNonNeg(key: string, fallback: number): number {
   const v = Number(process.env[key]);
@@ -41,6 +108,12 @@ const INTERVAL_MS: Record<string, number> = {
 
 export const CROSS_SECTIONAL_INTERVAL = process.env.CROSS_SECTIONAL_INTERVAL || "1h";
 export const CROSS_SECTIONAL_MOMENTUM_BARS = envNumPos("CROSS_SECTIONAL_MOMENTUM_BARS", 24); // ROC lookback
+/** 2026-08-17: CAPPED_SCORE_RANK added. The three original models all size by volatility or not
+ *  at all, so the leg carrying the most signal can end up with the LEAST capital — measured on the
+ *  live 2026-08-16 basket, WLD (+4.674% MOM36) got weight 0.132 while TAO (+0.051%) got 0.219,
+ *  because TAO was the calmest. CAPPED_SCORE_RANK sizes by score RANK within the side instead. */
+export type CrossSectionalWeightingModel = "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL" | "CAPPED_SCORE_RANK";
+
 export const CROSS_SECTIONAL_K = envNumPos("CROSS_SECTIONAL_K", 3); // legs per side (long-k / short-k)
 
 // --- Regime-skewed composition (2026-07-08, operator-requested) ---
@@ -151,6 +224,20 @@ export const CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP = envNumNonNeg("CROSS_SECTIO
 // the basket is supposed to be. Caps how many of a side's selected legs may share a cluster
 // (BTC/ETH majors exempt, same convention as the directional concentration cap). 0 disables.
 export const CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER", 2);
+/**
+ * Smart Basket v1 is a lifecycle switch, not a formation switch.  It keeps entry revalidation,
+ * durable provenance, and ghost telemetry for FILTERED baskets; formation reranking is controlled
+ * exclusively by CROSS_SECTIONAL_SMART_FORMATION_RERANK.
+ */
+export function isCrossSectionalSmartBasketV1Enabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isCrossSectionalSmartBasketLifecycleEnabled(env);
+}
+const CROSS_SECTIONAL_SMART_CANDIDATE_POOL = Math.max(
+  CROSS_SECTIONAL_K,
+  Math.floor(envNumPos("CROSS_SECTIONAL_SMART_CANDIDATE_POOL", 5)),
+);
+const CROSS_SECTIONAL_SMART_FAST_BARS = Math.max(1, Math.floor(envNumPos("CROSS_SECTIONAL_SMART_FAST_BARS", 4)));
+const CROSS_SECTIONAL_SMART_EXTENSION_BARS = Math.max(2, Math.floor(envNumPos("CROSS_SECTIONAL_SMART_EXTENSION_BARS", 8)));
 // 2026-08-12: liquidity floor for the FILTERED basket's candidate pool, in USD of quote volume per
 // 1h bar (median over the trailing window). 0 = DISABLED, which is the default on purpose — this
 // module is shared by research/testnet/live via rsync, so a non-zero default here would silently
@@ -160,6 +247,46 @@ export const CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER = envNumNonNeg("CROSS_SECT
 // A 187-day replay of this module's own functions over real 1h klines measured the widened pool at
 // +0.270%/day and the widened pool PLUS this floor at +0.287%/day with the worst drawdown improving
 // from -8.4% to -7.0%; the floor's real job is that drawdown number, not the mean.
+/**
+ * Guard against a PRICE-SCALE mismatch between a leg's entry and its exit.
+ *
+ * 2026-08-15: 15 baskets booked `1000PEPEUSDT` with entry at the 1000x-multiplier contract price
+ * (~0.0028) and exit at the bare PEPE spot price (~0.0000027). Returns are ratios so the 1000x
+ * normally cancels — but only when BOTH ends come from the same series. Each such SHORT leg booked
+ * as +99.9%, and the lane's measured average read +975bps instead of its true +146bps. It sat
+ * undetected in the store for three days and was only caught because the number was too good to be
+ * a market move.
+ *
+ * Deliberately RATIO-based, not return-based: a 50x price ratio is arithmetically impossible for a
+ * liquid perp over one horizon, whereas a return threshold would also fire on genuine violent moves
+ * in a meme coin. This catches unit errors and nothing else.
+ */
+export const CROSS_SECTIONAL_LEG_SCALE_MAX_RATIO = envNumPos("CROSS_SECTIONAL_LEG_SCALE_MAX_RATIO", 50);
+
+export function crossSectionalLegScaleAnomaly(
+  entryPrice: number,
+  exitPrice: number | null,
+  maxRatio: number = CROSS_SECTIONAL_LEG_SCALE_MAX_RATIO,
+): boolean {
+  if (!(entryPrice > 0) || exitPrice === null || !(exitPrice > 0) || !(maxRatio > 1)) return false;
+  const ratio = entryPrice / exitPrice;
+  return ratio > maxRatio || ratio < 1 / maxRatio;
+}
+
+/** Human-readable descriptions of every scale-mismatched leg, for the void reason. Empty = clean. */
+export function crossSectionalScaleAnomalies(
+  legs: ReadonlyArray<{ symbol: string; entryPrice: number; exitPrice: number | null }>,
+  maxRatio: number = CROSS_SECTIONAL_LEG_SCALE_MAX_RATIO,
+): string[] {
+  const out: string[] = [];
+  for (const leg of legs) {
+    if (crossSectionalLegScaleAnomaly(leg.entryPrice, leg.exitPrice, maxRatio)) {
+      out.push(leg.symbol + " entry=" + leg.entryPrice + " exit=" + leg.exitPrice);
+    }
+  }
+  return out;
+}
+
 export const CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR = envNumNonNeg("CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR", 0);
 // 168 bars = 7d of 1h candles. NOT 720 (~30d): runCrossSectionalCycleGuarded's caller fetches
 // `CROSS_SECTIONAL_MOMENTUM_BARS + 5` candles per symbol, so a lookback longer than what is
@@ -396,7 +523,17 @@ export const CROSS_SECTIONAL_HORIZON_MS = CROSS_SECTIONAL_HORIZON_BARS * BAR_MS;
 const EXPIRY_MS = CROSS_SECTIONAL_HORIZON_MS * 3; // give up on a basket missing prices well past its horizon
 
 export type CrossSectionalStatus = "OPEN" | "CLOSED" | "EXPIRED";
-export type CrossSectionalVariant = "RAW" | "FILTERED" | "TREND_BETA_VOL" | "MIXED_MEAN_REVERSION";
+export type CrossSectionalVariant = "RAW" | "FILTERED" | "DYNAMIC_MOM36_SHOCK" | "TREND_BETA_VOL" | "MIXED_MEAN_REVERSION";
+
+/** A basket the minScoreGap gate refused, captured for later evaluation of the gate itself. */
+export interface CrossSectionalGapRejection {
+  openedAtMs: number;
+  signal: string;
+  scoreGap: number;
+  minScoreGap: number;
+  longs: Array<{ symbol: string; score: number; price: number; volatility: number | null }>;
+  shorts: Array<{ symbol: string; score: number; price: number; volatility: number | null }>;
+}
 export type CrossSectionalStrategyFamily = "MOMENTUM_DISPERSION" | "MEAN_REVERSION";
 export type CrossSectionalRegimeClass = "TREND_LONG" | "TREND_SHORT" | "MIXED_CHOP" | "UNKNOWN";
 export type CrossSectionalExitReason = "HORIZON" | "TAKE_PROFIT" | "STOP_LOSS" | "REGIME_FLIP" | "EXPIRED";
@@ -410,6 +547,12 @@ export interface CrossSectionalLeg {
   /** Frozen rank inputs make later sizing evaluation auditable without reconstructing old scans. */
   scoreAtOpen?: number;
   volatilityAtOpen?: number | null;
+  /** Short-horizon confirmation frozen at formation. Positive is favorable for LONG; see the
+   * corresponding signed diagnostic in smartFormation for SHORT. Optional keeps legacy reports
+   * honest instead of backfilling a history that was never observed. */
+  fastReturnAtOpen?: number | null;
+  /** Price extension from its short trailing mean, expressed in own realized-vol units. */
+  extensionVolAtOpen?: number | null;
 }
 
 export interface CrossSectionalRegimeContext {
@@ -419,6 +562,166 @@ export interface CrossSectionalRegimeContext {
   confidence: string | null;
   capturedAt: string | null;
   regimeClass: CrossSectionalRegimeClass;
+}
+
+export interface CrossSectionalSmartFormationCandidate {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  /** Raw MOM score — retained for audit; the optimizer never replaces the underlying ranking. */
+  score: number;
+  /** Signed to the candidate's side: positive supports continuation, negative contradicts it. */
+  fastSupport: number | null;
+  /** Signed to the candidate's side: positive means the entry is extended/adverse. */
+  adverseExtensionVol: number | null;
+  utility: number;
+  selected: boolean;
+  cluster: string;
+}
+
+/**
+ * Formation provenance for the testnet-only Smart Basket policy.  This is not a new filter: the
+ * raw-score candidate pool is still the source of truth.  It records enough to audit why a close
+ * candidate was preferred over a very similarly-ranked but stretched/reversing name later.
+ */
+export interface CrossSectionalSmartFormation {
+  version: "SMART_BASKET_V1";
+  candidatePoolSize: number;
+  axisScore: number | null;
+  objectiveScore: number;
+  candidates: CrossSectionalSmartFormationCandidate[];
+}
+
+export type DynamicMom36ScoreGapReason =
+  | "TWO_SIDED_FINAL_ALLOCATION"
+  | "ONE_SIDED_FINAL_ALLOCATION"
+  | "FINAL_ALLOCATION_INFEASIBLE";
+
+export type DynamicMom36AdmissionReason =
+  | "ADMISSION_PASSED"
+  /** Legacy Dynamic versions still use the retired synthetic 3L/3S probe. Never emitted by V6.1. */
+  | "ADMISSION_NOT_PASSED"
+  | "ADMISSION_SCORE_GAP_FAIL"
+  | "ADMISSION_FINAL_ALLOCATION_INFEASIBLE"
+  | "ADMISSION_SELECTED_LEG_INVALID"
+  | "ADMISSION_CLUSTER_GUARD"
+  | "ADMISSION_LOSS_REENTRY_GUARD"
+  | "ADMISSION_EXTERNAL_GUARD"
+  | "ADMISSION_SKEW_CONTINUATION_UNCONFIRMED"
+  | "ONE_SIDED_ADMISSION_PASSED"
+  | "ONE_SIDED_QUALITY_BELOW_MIN"
+  | "ONE_SIDED_STRONG_REVERSAL_CONFLICT"
+  | "ONE_SIDED_INSUFFICIENT_STRICT_LEGS";
+
+/** Immutable formation evidence for the live Dynamic MOM36 policy. */
+export interface DynamicMom36FormationSnapshot {
+  /** Recent-strength preference provenance; null when no preference ran. */
+  recentStrengthPreference?: unknown;
+  allocationRanking?: DynamicAllocationRankingAudit;
+  threeLegFallback?: ThreeLegAudit;
+  strategyVersion: DynamicMom36StrategyVersion;
+  /** Timestamp at which the immutable breadth/continuation/ranking snapshot was formed. */
+  formationTimestamp: string;
+  featureTimestamp: string;
+  decisionInformationCutoff: string;
+  /** Deterministic identity binding formation, admission, and later execution to one exact plan. */
+  formationId?: string | null;
+  /** Deterministic hash of the exact selected side/symbol lists. */
+  selectedCandidateHash?: string | null;
+  activeUniverse: Array<{
+    symbol: string;
+    cluster: string;
+    mom36: number;
+    price: number;
+    fastReturn?: number | null;
+    slowSourceTimestampMs?: number | null;
+    slowStartTimestampMs?: number | null;
+    fastSourceTimestampMs?: number | null;
+    fastStartTimestampMs?: number | null;
+    slowFastDataValid?: boolean | null;
+    longExecutionBlockReason?: string | null;
+    shortExecutionBlockReason?: string | null;
+    longEligible: boolean;
+    shortEligible: boolean;
+    shortBlocked: boolean;
+  }>;
+  positiveCount: number;
+  negativeCount: number;
+  zeroCount: number;
+  baseAllocation: DynamicMom36Allocation;
+  shockModelArtifact: string;
+  shockRawOutput: Record<string, unknown>;
+  shockState: DynamicMom36ShockState;
+  shockReason: string | null;
+  /**
+   * Continuation trajectory evidence. Null for the retained v1 shock policy; unavailable V3+
+   * reads persist a NO_EDGE object rather than blocking the canonical MOM36 basket.
+   */
+  continuation: FrozenContinuationOverlay | null;
+  /** Null/disabled on retained v1/v3 observations; V4/V5 freeze the recovered legacy predicate and its mode. */
+  slowFast?: DynamicMom36SlowFastPolicy;
+  /** Base-only legs are retained even when the bounded shock overlay changes the final rung. */
+  baseSelectedLongs: string[];
+  baseSelectedShorts: string[];
+  baseSelectionInsufficientReason: string | null;
+  /** Current V3 counterfactual after the frozen continuation allocation but before per-leg SLOW_AND_FAST gating. */
+  rawV3SelectedLongs?: string[];
+  rawV3SelectedShorts?: string[];
+  rawV3SelectionInsufficientReason?: string | null;
+  rawV3CandidateAudit?: {
+    long: DynamicMom36CandidateSelectionAudit[];
+    short: DynamicMom36CandidateSelectionAudit[];
+  };
+  /** Strict V4/V5 attempt, retained even when V5 executes the complete raw-V3 fallback. */
+  slowFastStrictSelectedLongs?: string[];
+  slowFastStrictSelectedShorts?: string[];
+  slowFastStrictSelectionInsufficientReason?: string | null;
+  slowFastStrictCandidateAudit?: {
+    long: DynamicMom36CandidateSelectionAudit[];
+    short: DynamicMom36CandidateSelectionAudit[];
+  };
+  /** Original breadth/continuation allocation, before V6's strict feasibility resolver. */
+  requestedAllocation?: DynamicMom36Allocation;
+  /** V6-only proof that a directional allocation was fully strict-valid or that the candidate abstained. */
+  directionalFeasibility?: DynamicMom36DirectionalFeasibility;
+  finalAllocation: DynamicMom36Allocation;
+  /** Exact selector that supplied the recorded final legs. */
+  selectionSource?: DynamicMom36SelectionSource;
+  selectedLongs: string[];
+  selectedShorts: string[];
+  blockedShortsSkipped: string[];
+  /** Full final selection trail, including SLOW_FAST_* skip reasons when strict selection supplied the legs. */
+  selectionCandidateAudit?: {
+    long: DynamicMom36CandidateSelectionAudit[];
+    short: DynamicMom36CandidateSelectionAudit[];
+  };
+  selectionInsufficientReason?: string | null;
+  requiredLongs?: number;
+  requiredShorts?: number;
+  availableAlignedLongs?: number;
+  availableAlignedShorts?: number;
+  availableExecutionEligibleAlignedLongs?: number;
+  availableExecutionEligibleAlignedShorts?: number;
+  /** V6.2-only final-plan opinion. Absent for every two-sided and legacy formation by design. */
+  oneSidedDirectionalQuality?: OneSidedDirectionalQuality;
+  /** Why this candidate was not made executable; emitted even when no observation/basket exists. */
+  noEntryReason?: string | null;
+  /** Final-allocation-aware admission evidence. Legacy persisted rows may omit V6.1-only fields. */
+  admission: {
+    scoreGap: number | null;
+    scoreGapFloor: number;
+    clusterCap: number;
+    passed: boolean;
+    scoreGapApplicable?: boolean;
+    scoreGapReason?: DynamicMom36ScoreGapReason;
+    reason?: DynamicMom36AdmissionReason;
+    /** Existing upstream safety reason, retained separately from the stable public admission code. */
+    externalReason?: string | null;
+    formationId?: string | null;
+    selectedCandidateHash?: string | null;
+    finalLongCount?: number;
+    finalShortCount?: number;
+    oneSidedDirectionalQuality?: OneSidedDirectionalQuality;
+  };
 }
 
 export interface CrossSectionalObservation {
@@ -443,7 +746,7 @@ export interface CrossSectionalObservation {
   regimeClassAtOpen?: CrossSectionalRegimeClass | null;
   longCapitalWeight?: number | null;
   shortCapitalWeight?: number | null;
-  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL" | null;
+  weightingModel?: CrossSectionalWeightingModel | null;
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
   /** The R-denominator FROZEN at open (fraction). CORTEX #218 divides realized netReturn by THIS to get
@@ -453,6 +756,14 @@ export interface CrossSectionalObservation {
    *  basket (the SAME divisor the x-side CORTEX_XSEC_STOP_RETURN uses, kept consistent + config-proof). */
   riskDistanceAtOpen?: number | null;
   regimeFlipExit?: boolean | null;
+  /** Effective formation that selected the symbols, frozen for audit at the source signal. */
+  formationMode?: CrossSectionalFormationMode;
+  /** Present only when Smart Formation utility reranking actually selected the basket. */
+  smartFormation?: CrossSectionalSmartFormation | null;
+  /** Present only on post-deploy Dynamic MOM36 baskets. Never backfilled onto old observations. */
+  dynamicMom36?: DynamicMom36FormationSnapshot | null;
+  /** Frozen Symbol Reliability V1 provenance. It is eligibility-only and never alters MOM36 scores. */
+  symbolReliability?: SymbolReliabilityFormationDecision | null;
   exitReason?: CrossSectionalExitReason | null;
   /** Return on deployed capital after market-beta cancels = the cross-sectional dispersion. */
   grossReturn: number | null;
@@ -461,12 +772,33 @@ export interface CrossSectionalObservation {
   longLegReturn: number | null;
   shortLegReturn: number | null;
   resolvedAt: string | null;
+  /** Retains the raw measured observation, but removes it from normal reports, adaptive filters,
+   * Cortex learning, and Four-Brain measurement projections after an explicit operator void. */
+  reportingExclusion?: {
+    kind: "OPERATOR_VOID";
+    voidedAt: string;
+    reason: string;
+    sourceBasketId?: string;
+  } | null;
+}
+
+/** Raw observations remain auditable on disk; only this explicit marker removes one from learning/report readers. */
+export function isCrossSectionalObservationReportingExcluded(
+  observation: Pick<CrossSectionalObservation, "reportingExclusion">,
+): boolean {
+  return observation.reportingExclusion?.kind === "OPERATOR_VOID";
 }
 
 export interface ScoredSymbol {
   symbol: string;
   score: number;
   price: number;
+  /** Current short-horizon return, independent of the slower MOM rank. */
+  fastReturn?: number | null;
+  /** Realized volatility over the same input candles, used only to normalize soft diagnostics. */
+  volatility?: number | null;
+  /** Price versus its short trailing mean, in volatility units. */
+  extensionVol?: number | null;
 }
 
 interface CrossSectionalBasketOpts {
@@ -488,18 +820,28 @@ interface CrossSectionalBasketOpts {
   shortAllowlist?: ReadonlySet<string> | null;
   shortBlocklist?: ReadonlySet<string> | null;
   minScoreGap?: number;
+  /** Fires INSTEAD of a silent `return null` when minScoreGap rejects the basket. Optional: when
+   *  absent, behaviour is byte-identical to before. See the call site for why this is a callback and
+   *  not a stored observation. */
+  onGapReject?: (info: CrossSectionalGapRejection) => void;
   /** Max legs per side allowed to share a correlation cluster (BTC/ETH majors exempt). Undefined/0
    *  disables — every existing caller (that never sets it) keeps today's pure top-k/bottom-k sort. */
   maxPerCluster?: number;
   longCapitalWeight?: number;
   shortCapitalWeight?: number;
-  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL";
+  weightingModel?: CrossSectionalWeightingModel;
   volBySymbol?: Record<string, number>;
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
   /** Override the frozen-at-open R-denominator. Defaults to stopLossReturn, else the config stop-unit. */
   riskDistanceAtOpen?: number | null;
   regimeFlipExit?: boolean;
+  /** Explicit effective mode.  The default follows smartFormation for direct/research callers. */
+  formationMode?: CrossSectionalFormationMode;
+  /** FILTERED-only hard side-direction eligibility. OFF preserves the historical rank-only selector. */
+  sideTrendAlignment?: CrossSectionalSideTrendAlignment;
+  /** Soft candidate-combination optimizer for the FILTERED formation mode only. */
+  smartFormation?: { enabled: boolean; axisScore?: number | null } | null;
 }
 
 function mean(xs: number[]): number {
@@ -526,6 +868,176 @@ function selectWithClusterCap(sorted: ScoredSymbol[], k: number, maxPerCluster?:
   return selected;
 }
 
+function finiteOrNull(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * A relative rank alone does not make a valid short or long: in an all-green market the least
+ * positive name is still rising, and in an all-red market the least negative name is still
+ * falling.  When enabled, a FILTERED long must be positive on both MOM36 and the current fast
+ * return; a short must be negative on both. Missing fast data fails closed rather than forcing a
+ * side with incomplete direction evidence.
+ */
+function sideTrendAligned(
+  candidate: ScoredSymbol,
+  side: "LONG" | "SHORT",
+  alignment: CrossSectionalSideTrendAlignment,
+): boolean {
+  if (alignment === "OFF") return true;
+  const fastReturn = finiteOrNull(candidate.fastReturn);
+  if (fastReturn === null) return false;
+  return side === "LONG"
+    ? candidate.score > 0 && fastReturn > 0
+    : candidate.score < 0 && fastReturn < 0;
+}
+
+function clamp(value: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, value));
+}
+
+/** The candidate's short-horizon return expressed in its own realized-vol units and signed to
+ * the proposed side.  Missing volatility simply means "no extra opinion", never exclusion. */
+function smartFastSupport(candidate: ScoredSymbol, side: "LONG" | "SHORT"): number | null {
+  const fast = finiteOrNull(candidate.fastReturn);
+  if (fast === null) return null;
+  const vol = finiteOrNull(candidate.volatility);
+  const normalized = vol !== null && vol > 0 ? fast / vol : fast;
+  return side === "LONG" ? normalized : -normalized;
+}
+
+/** Positive means that entry would chase an already extended move for this side. */
+function smartAdverseExtensionVol(candidate: ScoredSymbol, side: "LONG" | "SHORT"): number | null {
+  const extension = finiteOrNull(candidate.extensionVol);
+  if (extension === null) return null;
+  return side === "LONG" ? extension : -extension;
+}
+
+function sampleStd(values: number[]): number {
+  if (values.length < 2) return 0;
+  const m = mean(values);
+  return Math.sqrt(values.reduce((sum, value) => sum + (value - m) ** 2, 0) / values.length);
+}
+
+function smartCandidateUtility(
+  candidate: ScoredSymbol,
+  pool: readonly ScoredSymbol[],
+  side: "LONG" | "SHORT",
+  axisScore: number | null | undefined,
+): number {
+  const directional = (value: ScoredSymbol): number => side === "LONG" ? value.score : -value.score;
+  const scores = pool.map(directional);
+  const scale = Math.max(sampleStd(scores), 1e-6);
+  // The raw cross-sectional rank remains dominant.  Fast confirmation and extension are bounded
+  // tie-breakers, deliberately too small to turn a clearly inferior raw score into a selection.
+  const rawRank = (directional(candidate) - mean(scores)) / scale;
+  const fastSupport = smartFastSupport(candidate, side);
+  const adverseExtension = smartAdverseExtensionVol(candidate, side);
+  let utility = rawRank;
+  if (fastSupport !== null) utility += 0.22 * clamp(fastSupport, -2, 2);
+  if (adverseExtension !== null) utility -= 0.20 * Math.max(0, clamp(adverseExtension, -2, 3));
+  // When the canonical axis leans against one hedge side, do not veto that side (this remains a
+  // market-neutral basket).  Reward only the names on that side whose *own* fast move confirms
+  // them, instead of mechanically buying a rebound just because its slower MOM score is high.
+  const axis = finiteOrNull(axisScore);
+  const sideSign = side === "LONG" ? 1 : -1;
+  const counterAxis = axis !== null && axis * sideSign < -0.12;
+  if (counterAxis && fastSupport !== null) utility += 0.08 * clamp(fastSupport, -2, 2);
+  return utility;
+}
+
+function combinations<T>(values: readonly T[], k: number): T[][] {
+  if (k <= 0) return [[]];
+  const out: T[][] = [];
+  const walk = (start: number, chosen: T[]): void => {
+    if (chosen.length === k) {
+      out.push(chosen);
+      return;
+    }
+    for (let index = start; index <= values.length - (k - chosen.length); index++) {
+      walk(index + 1, [...chosen, values[index]!]);
+    }
+  };
+  walk(0, []);
+  return out;
+}
+
+function respectsClusterCap(candidates: readonly ScoredSymbol[], maxPerCluster?: number): boolean {
+  if (!maxPerCluster || maxPerCluster <= 0) return true;
+  const counts = new Map<string, number>();
+  for (const candidate of candidates) {
+    const cluster = clusterOf(candidate.symbol);
+    if (isMajorCluster(cluster)) continue;
+    const next = (counts.get(cluster) ?? 0) + 1;
+    if (next > maxPerCluster) return false;
+    counts.set(cluster, next);
+  }
+  return true;
+}
+
+function smartClusterPenalty(candidates: readonly ScoredSymbol[]): number {
+  const counts = new Map<string, number>();
+  for (const candidate of candidates) {
+    const cluster = clusterOf(candidate.symbol);
+    if (!isMajorCluster(cluster)) counts.set(cluster, (counts.get(cluster) ?? 0) + 1);
+  }
+  // Existing max-per-cluster is still the hard safety rail.  This small extra term only decides
+  // close calls, so two correlated L1 names can remain selected when their raw scores truly win.
+  return [...counts.values()].reduce((sum, count) => sum + Math.max(0, count - 1) * 0.18, 0);
+}
+
+interface SmartSelection {
+  selected: ScoredSymbol[];
+  objective: number;
+  candidates: CrossSectionalSmartFormationCandidate[];
+}
+
+function selectSmartWithClusterCap(
+  sorted: ScoredSymbol[],
+  k: number,
+  side: "LONG" | "SHORT",
+  maxPerCluster: number | undefined,
+  axisScore: number | null | undefined,
+): SmartSelection {
+  const poolSize = Math.max(k, CROSS_SECTIONAL_SMART_CANDIDATE_POOL);
+  const pool = sorted.slice(0, poolSize);
+  // A concentrated top-five must be allowed to look one or two places deeper to find a valid
+  // cluster-capped combination; otherwise Smart Basket would accidentally make the pool stricter.
+  for (let index = pool.length; index < sorted.length && selectWithClusterCap(pool, k, maxPerCluster).length < k; index++) {
+    pool.push(sorted[index]!);
+  }
+  const utilityBySymbol = new Map(pool.map((candidate) => [candidate.symbol, smartCandidateUtility(candidate, pool, side, axisScore)]));
+  let selected: ScoredSymbol[] | null = null;
+  let objective = Number.NEGATIVE_INFINITY;
+  for (const choice of combinations(pool, k)) {
+    if (!respectsClusterCap(choice, maxPerCluster)) continue;
+    const value = choice.reduce((sum, candidate) => sum + (utilityBySymbol.get(candidate.symbol) ?? 0), 0) - smartClusterPenalty(choice);
+    if (value > objective) {
+      selected = choice;
+      objective = value;
+    }
+  }
+  const fallback = selectWithClusterCap(sorted, k, maxPerCluster);
+  const chosen = selected && selected.length === k ? selected : fallback;
+  const chosenSet = new Set(chosen.map((candidate) => candidate.symbol));
+  return {
+    selected: chosen,
+    objective: Number.isFinite(objective)
+      ? objective
+      : chosen.reduce((sum, candidate) => sum + (utilityBySymbol.get(candidate.symbol) ?? 0), 0) - smartClusterPenalty(chosen),
+    candidates: pool.map((candidate) => ({
+      symbol: candidate.symbol,
+      side,
+      score: candidate.score,
+      fastSupport: smartFastSupport(candidate, side),
+      adverseExtensionVol: smartAdverseExtensionVol(candidate, side),
+      utility: utilityBySymbol.get(candidate.symbol) ?? 0,
+      selected: chosenSet.has(candidate.symbol),
+      cluster: clusterOf(candidate.symbol),
+    })),
+  };
+}
+
 function allowed(symbol: string, allowlist?: ReadonlySet<string> | null, blocklist?: ReadonlySet<string> | null): boolean {
   const s = symbol.toUpperCase();
   if (blocklist?.has(s)) return false;
@@ -543,13 +1055,52 @@ function scoreGapFor(longLeg: ScoredSymbol[], shortLeg: ScoredSymbol[]): number 
 function weightedLegs(
   legs: ScoredSymbol[],
   sideCapital: number,
-  opts: { weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL"; volBySymbol?: Record<string, number> },
+  opts: { weightingModel?: CrossSectionalWeightingModel; volBySymbol?: Record<string, number>; side?: "LONG" | "SHORT" },
 ): CrossSectionalLeg[] {
   if (legs.length === 0) return [];
   const equalWeight = sideCapital / legs.length;
+  if (opts.weightingModel === "CAPPED_SCORE_RANK") {
+    // Size by score RANK within this side, not by volatility. `sign` makes "strongest" mean the
+    // HIGHEST score on the long side and the MOST NEGATIVE on the short side, so both sides tilt
+    // toward conviction rather than toward whichever name happens to be calm.
+    //
+    // Raw runs 0.5 (weakest leg) to 1.5 (strongest), then the SAME 0.75–1.25 clip as
+    // CAPPED_INVERSE_VOL. The clip is what keeps this from becoming a single-name bet: at k=3 the
+    // extremes always land on the clip, so the strongest leg gets 1.25/0.75 = 1.67x the weakest and
+    // never more. Measured over 2 years / 372 independent 48h blocks this beat CAPPED_INVERSE_VOL
+    // (+0.2126% vs +0.1602% per basket, blocked t 2.00 vs 1.75) and beat running a second k=2
+    // basket alongside (+0.1892%) at half the capital and half the fees.
+    const sign = opts.side === "SHORT" ? -1 : 1;
+    const directional = legs.map((s) => sign * s.score);
+    const lo = Math.min(...directional);
+    const hi = Math.max(...directional);
+    const raw = directional.map((value) => (hi <= lo ? 1 : (value - lo) / (hi - lo) + 0.5));
+    const rawMean = raw.reduce((a, b) => a + b, 0) / raw.length || 1;
+    const clipped = raw.map((value) => Math.max(0.75, Math.min(1.25, value / rawMean)));
+    const denom = clipped.reduce((a, b) => a + b, 0) || legs.length;
+    return legs.map((s, i) => ({
+      symbol: s.symbol,
+      entryPrice: s.price,
+      exitPrice: null,
+      weight: sideCapital * clipped[i]! / denom,
+      scoreAtOpen: s.score,
+      volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? s.volatility ?? null,
+      fastReturnAtOpen: finiteOrNull(s.fastReturn),
+      extensionVolAtOpen: finiteOrNull(s.extensionVol),
+    }));
+  }
   if (opts.weightingModel !== "BETA_VOL_PROXY") {
     if (opts.weightingModel !== "CAPPED_INVERSE_VOL") {
-      return legs.map((s) => ({ symbol: s.symbol, entryPrice: s.price, exitPrice: null, weight: equalWeight, scoreAtOpen: s.score, volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? null }));
+      return legs.map((s) => ({
+        symbol: s.symbol,
+        entryPrice: s.price,
+        exitPrice: null,
+        weight: equalWeight,
+        scoreAtOpen: s.score,
+        volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? s.volatility ?? null,
+        fastReturnAtOpen: finiteOrNull(s.fastReturn),
+        extensionVolAtOpen: finiteOrNull(s.extensionVol),
+      }));
     }
     // Inverse-vol within each side, but clip to 0.75–1.25x equal sizing before normalizing.
     // Risk parity must not become a hidden concentration trade in the calmest constituent.
@@ -566,7 +1117,9 @@ function weightedLegs(
       exitPrice: null,
       weight: sideCapital * clipped[i]! / denom,
       scoreAtOpen: s.score,
-      volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? null,
+      volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? s.volatility ?? null,
+      fastReturnAtOpen: finiteOrNull(s.fastReturn),
+      extensionVolAtOpen: finiteOrNull(s.extensionVol),
     }));
   }
   const raw = legs.map((s) => {
@@ -578,9 +1131,11 @@ function weightedLegs(
     symbol: s.symbol,
     entryPrice: s.price,
     exitPrice: null,
-    weight: sideCapital * raw[i]! / denom,
-    scoreAtOpen: s.score,
-    volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? null,
+      weight: sideCapital * raw[i]! / denom,
+      scoreAtOpen: s.score,
+      volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? s.volatility ?? null,
+      fastReturnAtOpen: finiteOrNull(s.fastReturn),
+      extensionVolAtOpen: finiteOrNull(s.extensionVol),
   }));
 }
 
@@ -616,6 +1171,839 @@ export function crossSectionalMomentumScore(candles: Candle[], bars: number): { 
   return { score: (price - past) / past, price };
 }
 
+/**
+ * Dynamic MOM36 is strict about information time: do not use an in-progress candle merely because
+ * Binance returned it.  Every retained candle must have closed by the decision cutoff, and every
+ * selected input must share the same latest fully closed bar. A missing/stale input is excluded
+ * before ranking and recorded; formation continues only when at least six synchronous executable
+ * rows remain. It is never silently mixed into breadth, ranking, or a selected basket.
+ */
+export function completedCandlesForDynamicMom36(
+  candles: readonly Candle[],
+  decisionInformationCutoffMs: number,
+): { candles: Candle[]; featureTimestampMs: number } | null {
+  if (!(Number.isFinite(decisionInformationCutoffMs) && decisionInformationCutoffMs > 0)) return null;
+  const complete = candles.filter((candle) =>
+    Number.isFinite(candle.openTime) && candle.openTime + BAR_MS <= decisionInformationCutoffMs,
+  );
+  const last = complete[complete.length - 1];
+  if (!last) return null;
+  const featureTimestampMs = last.openTime + BAR_MS;
+  if (featureTimestampMs > decisionInformationCutoffMs) return null;
+  return { candles: complete, featureTimestampMs };
+}
+
+const ONE_SIDED_MOM36_PERCENTILE_REQUIRED_HOURS = 90 * 24;
+
+/** Last completed 1h close-to-close return. `completedCandlesForDynamicMom36` already enforced causality. */
+function dynamicMom36OneHourReturn(candles: readonly Candle[]): number | null {
+  const latest = candles.at(-1);
+  const prior = candles.at(-2);
+  if (!latest || !prior || !(latest.close > 0) || !(prior.close > 0)) return null;
+  const value = latest.close / prior.close - 1;
+  return Number.isFinite(value) ? value : null;
+}
+
+/** Completed causal FAST4H close-to-close return, aligned with the canonical strict fast input. */
+function dynamicMom36Fast4hReturn(candles: readonly Candle[]): number | null {
+  const latest = candles.at(-1);
+  const prior = candles.at(-5);
+  if (!latest || !prior || !(latest.close > 0) || !(prior.close > 0)) return null;
+  const value = latest.close / prior.close - 1;
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Causal percentile of the current absolute MOM36 score against its preceding 90d 1h values.
+ * A shorter transport payload is intentionally reported but scored neutral; V1 must not call a
+ * 9-day sample "90th percentile" and turn a missing long history into a hidden gate.
+ */
+function dynamicMom36AbsPercentile(candles: readonly Candle[]): {
+  percentile: number | null;
+  availableHours: number;
+} {
+  const bars = DYNAMIC_MOM36_LOOKBACK_BARS;
+  const currentIndex = candles.length - 1;
+  if (currentIndex < bars || !(candles[currentIndex]?.close > 0) || !(candles[currentIndex - bars]?.close > 0)) {
+    return { percentile: null, availableHours: 0 };
+  }
+  const availableHours = Math.max(0, currentIndex - bars);
+  if (availableHours < ONE_SIDED_MOM36_PERCENTILE_REQUIRED_HOURS) {
+    return { percentile: null, availableHours };
+  }
+  const current = Math.abs(candles[currentIndex]!.close / candles[currentIndex - bars]!.close - 1);
+  if (!Number.isFinite(current)) return { percentile: null, availableHours };
+  const start = Math.max(bars, currentIndex - ONE_SIDED_MOM36_PERCENTILE_REQUIRED_HOURS);
+  const historic: number[] = [];
+  for (let index = start; index < currentIndex; index++) {
+    const close = candles[index]?.close;
+    const prior = candles[index - bars]?.close;
+    if (!(close && prior && close > 0 && prior > 0)) continue;
+    const value = Math.abs(close / prior - 1);
+    if (Number.isFinite(value)) historic.push(value);
+  }
+  if (historic.length < ONE_SIDED_MOM36_PERCENTILE_REQUIRED_HOURS) {
+    return { percentile: null, availableHours };
+  }
+  return { percentile: historic.filter((value) => value <= current).length / historic.length, availableHours };
+}
+
+function validDynamicMom36BreadthScan(snapshot: DynamicMom36FormationSnapshot): OneSidedBreadthScan | null {
+  const counts = [snapshot.positiveCount, snapshot.negativeCount, snapshot.zeroCount];
+  if (!counts.every(Number.isFinite) || counts.some((count) => count < 0) || counts.reduce((sum, count) => sum + count, 0) <= 0) {
+    return null;
+  }
+  const featureMs = Date.parse(snapshot.featureTimestamp);
+  const cutoffMs = Date.parse(snapshot.decisionInformationCutoff);
+  if (!Number.isFinite(featureMs) || !Number.isFinite(cutoffMs) || featureMs > cutoffMs) return null;
+  return {
+    featureTimestamp: snapshot.featureTimestamp,
+    positiveCount: snapshot.positiveCount,
+    negativeCount: snapshot.negativeCount,
+    zeroCount: snapshot.zeroCount,
+  };
+}
+
+/** Frozen inputs for one Dynamic MOM36 formation attempt. */
+export type DynamicMom36FormationInput = {
+  activeUniverse: DynamicMom36RankedSymbol[];
+  now: string;
+  openedAtMs: number;
+  horizonMs: number;
+  featureTimestampMs: number;
+  decisionInformationCutoffMs: number;
+  maxPerCluster: number;
+  /** Frozen executable geometry; omitted retains the historical breadth ladder. */
+  allowedLongCounts?: readonly number[];
+  allocationSelectionMode?: DynamicAllocationSelectionMode;
+  threeLegContext?: ThreeLegContext;
+  threeLegCandlesBySymbol?: Readonly<Record<string,readonly Candle[]>>;
+  /** Test policy gate: an unbalanced 4L2S/2L4S plan needs matching continuation confirmation. */
+  requireSkewContinuationConfirmation?: boolean;
+  admissionScoreGapFloor: number;
+  /** Score semantics remain MOM36/adaptive-score based, but are now read only for final selected legs. */
+  admissionScoreBySymbol?: Readonly<Record<string, number>>;
+  /** Non-score admission guards evaluated upstream (e.g. liquidity/stand-down); null means they passed. */
+  admissionExternalReason?: string | null;
+  /**
+   * Frozen legacy probe evidence, used only by pre-V6.1 strategy identities so this delta cannot
+   * rewrite their historical admission semantics. V6.1 intentionally ignores these fields.
+   */
+  legacyAdmissionScoreGap?: number | null;
+  legacyAdmissionPassed?: boolean;
+  strategyVersion?: DynamicMom36StrategyVersion;
+  continuationRuntime?: DynamicMom36ContinuationRuntimeResult | null;
+  /**
+   * Read-only contextual evidence for V6.2's final one-sided admission only. It is built from
+   * the same completed 1h candle path (FAST4H for BTC/ETH, 1h trajectory for selected legs) and
+   * durable formation history as this cycle; no selector state is ever passed back through this object.
+   */
+  oneSidedQualityContext?: Omit<OneSidedDirectionalQualityContext, "breadthScans"> & {
+    breadthScans?: readonly OneSidedBreadthScan[];
+  };
+};
+
+/**
+ * One attempt is evaluated once, then the exact same frozen result is used for both observation
+ * construction and no-entry audit persistence.  This avoids a second selection walk with subtly
+ * different guards, pool membership, or continuation output.
+ */
+export type DynamicMom36FormationEvaluation = {
+  formation: ReturnType<typeof buildDynamicMom36Formation> | null;
+  snapshot: DynamicMom36FormationSnapshot | null;
+  basket: CrossSectionalObservation | null;
+  noEntryReason: string | null;
+};
+
+/** The immutable final plan is the sole input to Dynamic MOM36 admission and execution. */
+export type DynamicMom36FinalFormationPlan = {
+  formationId: string;
+  selectedCandidateHash: string;
+  strategyVersion: DynamicMom36StrategyVersion;
+  formationTimestamp: string;
+  baseAllocation: DynamicMom36Allocation;
+  requestedAllocation: DynamicMom36Allocation;
+  finalAllocation: DynamicMom36Allocation;
+  selectedLongs: readonly DynamicMom36RankedSymbol[];
+  selectedShorts: readonly DynamicMom36RankedSymbol[];
+  threeLegFallback?: ThreeLegAudit;
+  strictLongEligibleCount: number;
+  strictShortEligibleCount: number;
+  selectionInsufficientReason: string | null;
+  selectionGuardReason: DynamicMom36AdmissionReason | null;
+};
+
+type DynamicMom36FinalAdmission = {
+  formationId: string;
+  selectedCandidateHash: string;
+  finalLongCount: number;
+  finalShortCount: number;
+  scoreGapApplicable?: boolean;
+  scoreGap: number | null;
+  scoreGapFloor: number;
+  scoreGapReason?: DynamicMom36ScoreGapReason;
+  passed: boolean;
+  reason: DynamicMom36AdmissionReason;
+  externalReason: string | null;
+  oneSidedDirectionalQuality?: OneSidedDirectionalQuality;
+};
+
+function dynamicMom36Hash(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function selectedCandidateHash(
+  selectedLongs: readonly DynamicMom36RankedSymbol[],
+  selectedShorts: readonly DynamicMom36RankedSymbol[],
+): string {
+  return dynamicMom36Hash({
+    long: selectedLongs.map((row) => row.symbol),
+    short: selectedShorts.map((row) => row.symbol),
+  });
+}
+
+function dynamicMom36FormationId(
+  formationTimestamp: string,
+  strategyVersion: DynamicMom36StrategyVersion,
+  finalAllocation: DynamicMom36Allocation,
+  candidateHash: string,
+): string {
+  return "dmfp-" + dynamicMom36Hash({
+    formationTimestamp,
+    strategyVersion,
+    finalLongCount: finalAllocation.longCount,
+    finalShortCount: finalAllocation.shortCount,
+    selectedCandidateHash: candidateHash,
+  }).slice(0, 24);
+}
+
+function buildDynamicMom36FinalFormationPlan(
+  input: DynamicMom36FormationInput,
+  strategyVersion: DynamicMom36StrategyVersion,
+  formation: ReturnType<typeof buildDynamicMom36Formation>,
+): DynamicMom36FinalFormationPlan {
+  const selectedLongs = [...formation.selection.selectedLongs];
+  const selectedShorts = [...formation.selection.selectedShorts];
+  const candidateHash = selectedCandidateHash(selectedLongs, selectedShorts);
+  const selectionSkips = [
+    ...formation.selection.candidateAudit.long,
+    ...formation.selection.candidateAudit.short,
+  ].map((candidate) => candidate.skipReason);
+  const selectionGuardReason = formation.selection.insufficientReason
+    ? selectionSkips.includes("CLUSTER_GUARD")
+      ? "ADMISSION_CLUSTER_GUARD" as const
+      : selectionSkips.includes("LOSS_REENTRY_GUARD")
+        ? "ADMISSION_LOSS_REENTRY_GUARD" as const
+        : null
+    : null;
+  const formationId = dynamicMom36FormationId(
+    input.now,
+    strategyVersion,
+    formation.finalAllocation,
+    candidateHash,
+  );
+  return {
+    formationId,
+    selectedCandidateHash: candidateHash,
+    strategyVersion,
+    formationTimestamp: input.now,
+    baseAllocation: formation.baseAllocation,
+    requestedAllocation: formation.requestedAllocation,
+    finalAllocation: formation.finalAllocation,
+    selectedLongs,
+    selectedShorts,
+    threeLegFallback: formation.threeLegFallback,
+    strictLongEligibleCount: formation.selection.availableExecutionEligibleAlignedLongs,
+    strictShortEligibleCount: formation.selection.availableExecutionEligibleAlignedShorts,
+    selectionInsufficientReason: formation.selection.insufficientReason,
+    selectionGuardReason,
+  };
+}
+
+function finalPlanAllocationIsExact(plan: DynamicMom36FinalFormationPlan): boolean {
+  return plan.selectionInsufficientReason === null &&
+    plan.finalAllocation.longCount >= 0 &&
+    plan.finalAllocation.shortCount >= 0 &&
+    plan.finalAllocation.longCount + plan.finalAllocation.shortCount === dynamicExpectedLegCount(plan) &&
+    plan.selectedLongs.length === plan.finalAllocation.longCount &&
+    plan.selectedShorts.length === plan.finalAllocation.shortCount &&
+    plan.selectedLongs.length + plan.selectedShorts.length === dynamicExpectedLegCount(plan) &&
+    new Set([...plan.selectedLongs, ...plan.selectedShorts].map((row) => row.symbol)).size === dynamicExpectedLegCount(plan);
+}
+
+function finalPlanStrictLegsAreValid(
+  plan: DynamicMom36FinalFormationPlan,
+): boolean {
+  if (!isDynamicMom36SlowFastStrictVersion(plan.strategyVersion)) return true;
+  const validLong = (row: DynamicMom36RankedSymbol): boolean =>
+    row.longEligible && row.slowFastDataValid !== false &&
+    Number.isFinite(row.mom36) && row.mom36 > 0 &&
+    Number.isFinite(row.fastReturn) && row.fastReturn! > 0;
+  const validShort = (row: DynamicMom36RankedSymbol): boolean =>
+    row.shortEligible && !row.shortBlocked && row.slowFastDataValid !== false &&
+    Number.isFinite(row.mom36) && row.mom36 < 0 &&
+    Number.isFinite(row.fastReturn) && row.fastReturn! < 0;
+  return plan.selectedLongs.every(validLong) && plan.selectedShorts.every(validShort);
+}
+
+function finalPlanRespectsClusterCap(plan: DynamicMom36FinalFormationPlan, maxPerCluster: number): boolean {
+  if (!(maxPerCluster > 0)) return true;
+  // Preserve selector semantics exactly: the cap is per side and MAJORS remain exempt. Admission
+  // only verifies the frozen selection; it must not introduce a stricter cross-side concentration
+  // rule after V6 has already formed a valid plan.
+  const sideRespectsCap = (rows: readonly DynamicMom36RankedSymbol[]): boolean => {
+    const selected: DynamicMom36RankedSymbol[] = [];
+    for (const row of rows) {
+      if (!dynamicMom36ClusterAllowed(row.symbol, selected, maxPerCluster)) return false;
+      selected.push(row);
+    }
+    return true;
+  };
+  return sideRespectsCap(plan.selectedLongs) && sideRespectsCap(plan.selectedShorts);
+}
+
+function scoreForFinalPlan(row: DynamicMom36RankedSymbol, input: DynamicMom36FormationInput): number {
+  const configured = input.admissionScoreBySymbol?.[row.symbol];
+  return typeof configured === "number" && Number.isFinite(configured) ? configured : row.mom36;
+}
+
+function evaluateDynamicMom36FinalAdmission(
+  input: DynamicMom36FormationInput,
+  plan: DynamicMom36FinalFormationPlan,
+  formation: ReturnType<typeof buildDynamicMom36Formation>,
+): DynamicMom36FinalAdmission {
+  const exactPlan = finalPlanAllocationIsExact(plan) && finalPlanRespectsClusterCap(plan, input.maxPerCluster);
+  const strictLegsValid = exactPlan && finalPlanStrictLegsAreValid(plan);
+  const oneSided = plan.finalAllocation.longCount === 0 || plan.finalAllocation.shortCount === 0;
+  const oneSidedQualityVersion = isDynamicMom36OneSidedDirectionalQualityVersion(plan.strategyVersion);
+  const oneSidedDirection = plan.finalAllocation.longCount === 6 ? "LONG" as const
+    : plan.finalAllocation.shortCount === 6 ? "SHORT" as const
+      : null;
+  const strictEligibleCount = oneSidedDirection === "LONG"
+    ? plan.strictLongEligibleCount
+    : oneSidedDirection === "SHORT"
+      ? plan.strictShortEligibleCount
+      : null;
+  const scoreGapApplicable = plan.finalAllocation.longCount > 0 && plan.finalAllocation.shortCount > 0;
+  const scoreGapReason: DynamicMom36ScoreGapReason = !exactPlan
+    ? "FINAL_ALLOCATION_INFEASIBLE"
+    : scoreGapApplicable
+      ? "TWO_SIDED_FINAL_ALLOCATION"
+      : "ONE_SIDED_FINAL_ALLOCATION";
+  const longScores = plan.selectedLongs.map((row) => scoreForFinalPlan(row, input));
+  const shortScores = plan.selectedShorts.map((row) => scoreForFinalPlan(row, input));
+  const scoreGap = scoreGapApplicable && longScores.every(Number.isFinite) && shortScores.every(Number.isFinite)
+    ? Math.abs(mean(longScores) - mean(shortScores))
+    : null;
+  let reason: DynamicMom36AdmissionReason = "ADMISSION_PASSED";
+  let passed = true;
+  let oneSidedDirectionalQuality: OneSidedDirectionalQuality | undefined;
+  if (!exactPlan) {
+    reason = oneSidedQualityVersion && oneSided && strictEligibleCount !== null && strictEligibleCount < 6
+      ? "ONE_SIDED_INSUFFICIENT_STRICT_LEGS"
+      : plan.selectionGuardReason ?? "ADMISSION_FINAL_ALLOCATION_INFEASIBLE";
+    passed = false;
+  } else if (!strictLegsValid) {
+    reason = oneSidedQualityVersion && oneSided ? "ONE_SIDED_INSUFFICIENT_STRICT_LEGS" : "ADMISSION_SELECTED_LEG_INVALID";
+    passed = false;
+  } else if (input.admissionExternalReason) {
+    reason = "ADMISSION_EXTERNAL_GUARD";
+    passed = false;
+  } else if (dynamicExpectedLegCount(plan) === 3) {
+    passed = formation.threeLegFallback?.allowed === true && !!input.threeLegContext
+      && threeLegStrategyAllowed(input.threeLegContext, plan.strategyVersion)
+      && threeLegRegimeReason(input.threeLegContext, formation.threeLegFallback.direction!, formation.threeLegFallback.policyId) === null;
+    reason = passed ? "ONE_SIDED_ADMISSION_PASSED" : "ADMISSION_SELECTED_LEG_INVALID";
+  } else if (
+    input.requireSkewContinuationConfirmation === true &&
+    plan.finalAllocation.longCount !== plan.finalAllocation.shortCount &&
+    !(
+      (plan.finalAllocation.longCount > plan.finalAllocation.shortCount && formation.continuation?.decision === "CONFIRM_LONG") ||
+      (plan.finalAllocation.shortCount > plan.finalAllocation.longCount && formation.continuation?.decision === "CONFIRM_SHORT")
+    )
+  ) {
+    reason = "ADMISSION_SKEW_CONTINUATION_UNCONFIRMED";
+    passed = false;
+  } else if (scoreGapApplicable && (scoreGap === null || scoreGap < input.admissionScoreGapFloor)) {
+    reason = "ADMISSION_SCORE_GAP_FAIL";
+    passed = false;
+  } else if (
+    oneSided &&
+    oneSidedDirection !== null &&
+    strictEligibleCount !== null &&
+    oneSidedQualityVersion
+  ) {
+    const currentBreadth: OneSidedBreadthScan = {
+      featureTimestamp: new Date(input.featureTimestampMs).toISOString(),
+      positiveCount: formation.positiveCount,
+      negativeCount: formation.negativeCount,
+      zeroCount: formation.zeroCount,
+    };
+    const context = input.oneSidedQualityContext;
+    oneSidedDirectionalQuality = evaluateOneSidedDirectionalQuality({
+      direction: oneSidedDirection,
+      selected: oneSidedDirection === "LONG" ? plan.selectedLongs : plan.selectedShorts,
+      strictEligibleCount,
+      context: {
+        breadthScans: [currentBreadth, ...(context?.breadthScans ?? [])],
+        btcFast4hReturn: context?.btcFast4hReturn ?? null,
+        ethFast4hReturn: context?.ethFast4hReturn ?? null,
+        selectedOneHourReturnBySymbol: context?.selectedOneHourReturnBySymbol ?? {},
+        absMom36PercentileBySymbol: context?.absMom36PercentileBySymbol ?? {},
+        percentileWindowHours: context?.percentileWindowHours ?? null,
+        percentileRequiredWindowHours: context?.percentileRequiredWindowHours ?? 90 * 24,
+        percentileSource: context?.percentileSource ?? null,
+      },
+      continuationDecision: formation.continuation?.decision,
+      shockState: formation.shock.state,
+    });
+    reason = oneSidedDirectionalQuality.reason;
+    passed = oneSidedDirectionalQuality.decision === "PASS";
+  }
+  return {
+    formationId: plan.formationId,
+    selectedCandidateHash: plan.selectedCandidateHash,
+    finalLongCount: plan.finalAllocation.longCount,
+    finalShortCount: plan.finalAllocation.shortCount,
+    scoreGapApplicable,
+    scoreGap,
+    scoreGapFloor: input.admissionScoreGapFloor,
+    scoreGapReason,
+    passed,
+    reason,
+    externalReason: input.admissionExternalReason ?? null,
+    oneSidedDirectionalQuality,
+  };
+}
+
+/**
+ * Compatibility adapter for pre-V6.1 signals.  Its synthetic balanced probe is intentionally
+ * retained only so this targeted V6.1 repair does not silently change older policy identities.
+ * New V6.1 formation never enters this function.
+ */
+function evaluateLegacyDynamicMom36Admission(
+  input: DynamicMom36FormationInput,
+  plan: DynamicMom36FinalFormationPlan,
+): DynamicMom36FinalAdmission {
+  const passed = input.legacyAdmissionPassed === true;
+  return {
+    formationId: plan.formationId,
+    selectedCandidateHash: plan.selectedCandidateHash,
+    finalLongCount: plan.finalAllocation.longCount,
+    finalShortCount: plan.finalAllocation.shortCount,
+    scoreGap: input.legacyAdmissionScoreGap ?? null,
+    scoreGapFloor: input.admissionScoreGapFloor,
+    passed,
+    reason: passed ? "ADMISSION_PASSED" : "ADMISSION_NOT_PASSED",
+    externalReason: null,
+  };
+}
+
+export type DynamicMom36FormationAdmissionParity = {
+  valid: boolean;
+  reason: string | null;
+  formationId: string | null;
+};
+
+/**
+ * Fail-closed boundary used immediately before Dynamic MOM36 execution.  V6.1 persists a plan
+ * identity at formation, repeats it at admission, then passes the same frozen snapshot to the
+ * executor.  This check catches accidental mutation, stale serialization, or any future attempt
+ * to insert an admission-side replacement/reallocation after formation.
+ */
+export function validateDynamicMom36FormationAdmissionParity(
+  snapshot: DynamicMom36FormationSnapshot | null | undefined,
+): DynamicMom36FormationAdmissionParity {
+  if (!snapshot) return { valid: false, reason: "MISSING_DYNAMIC_FORMATION", formationId: null };
+  const formationId = snapshot.formationId ?? null;
+  const candidateHash = snapshot.selectedCandidateHash ?? null;
+  if (!formationId || !candidateHash) {
+    return { valid: false, reason: "MISSING_FORMATION_IDENTITY", formationId };
+  }
+  const recomputedCandidateHash = dynamicMom36Hash({
+    long: snapshot.selectedLongs,
+    short: snapshot.selectedShorts,
+  });
+  if (recomputedCandidateHash !== candidateHash) {
+    return { valid: false, reason: "FORMATION_SELECTED_CANDIDATE_HASH_MISMATCH", formationId };
+  }
+  const finalAllocation = snapshot.finalAllocation;
+  if (
+    snapshot.selectedLongs.length !== finalAllocation.longCount ||
+    snapshot.selectedShorts.length !== finalAllocation.shortCount ||
+    snapshot.selectedLongs.length + snapshot.selectedShorts.length !== dynamicExpectedLegCount(snapshot)
+  ) {
+    return { valid: false, reason: "FORMATION_SELECTED_LEG_COUNT_MISMATCH", formationId };
+  }
+  const recomputedFormationId = dynamicMom36FormationId(
+    snapshot.formationTimestamp,
+    snapshot.strategyVersion,
+    finalAllocation,
+    candidateHash,
+  );
+  if (recomputedFormationId !== formationId) {
+    return { valid: false, reason: "FORMATION_ID_RECOMPUTE_MISMATCH", formationId };
+  }
+  if (
+    snapshot.admission.formationId !== formationId ||
+    snapshot.admission.selectedCandidateHash !== candidateHash ||
+    snapshot.admission.finalLongCount !== finalAllocation.longCount ||
+    snapshot.admission.finalShortCount !== finalAllocation.shortCount
+  ) {
+    return { valid: false, reason: "FORMATION_ADMISSION_PLAN_MISMATCH", formationId };
+  }
+  const oneSided = finalAllocation.longCount === 0 || finalAllocation.shortCount === 0;
+  if (oneSided) {
+    if (
+      snapshot.admission.scoreGapApplicable !== false ||
+      snapshot.admission.scoreGap !== null ||
+      snapshot.admission.scoreGapReason !== "ONE_SIDED_FINAL_ALLOCATION"
+    ) {
+      return { valid: false, reason: "FORMATION_ADMISSION_ONE_SIDED_SCOREGAP_MISMATCH", formationId };
+    }
+    if (dynamicExpectedLegCount(snapshot) === 3) {
+      const probe = snapshot.threeLegFallback!;
+      const selected = [...snapshot.selectedLongs, ...snapshot.selectedShorts];
+      if (!validThreeLegQualityAudit(probe) || (probe.quality && probe.quality.cutoffMs!==Date.parse(snapshot.decisionInformationCutoff)) || probe.reason !== "THREE_LEG_ADMISSION_PASSED" || probe.selectedSymbols.join("|") !== selected.join("|")) return {valid:false,reason:"THREE_LEG_PLAN_MISMATCH",formationId};
+    } else if (isDynamicMom36OneSidedDirectionalQualityVersion(snapshot.strategyVersion)) {
+      const quality = snapshot.admission.oneSidedDirectionalQuality ?? snapshot.oneSidedDirectionalQuality;
+      const selected = finalAllocation.longCount === 6 ? snapshot.selectedLongs : snapshot.selectedShorts;
+      if (
+        !quality ||
+        quality.decision !== "PASS" ||
+        quality.reason !== "ONE_SIDED_ADMISSION_PASSED" ||
+        quality.selectedSymbols.join("|") !== selected.join("|")
+      ) {
+        return { valid: false, reason: "FORMATION_ONE_SIDED_QUALITY_MISMATCH", formationId };
+      }
+    }
+  } else if (
+    snapshot.admission.scoreGapApplicable !== true ||
+    snapshot.admission.scoreGapReason !== "TWO_SIDED_FINAL_ALLOCATION"
+  ) {
+    return { valid: false, reason: "FORMATION_ADMISSION_TWO_SIDED_SCOREGAP_MISMATCH", formationId };
+  }
+  const oneSidedAdmissionPass = oneSided && snapshot.admission.reason === "ONE_SIDED_ADMISSION_PASSED";
+  if (!snapshot.admission.passed || (snapshot.admission.reason !== "ADMISSION_PASSED" && !oneSidedAdmissionPass)) {
+    return { valid: false, reason: "FORMATION_ADMISSION_NOT_PASSED", formationId };
+  }
+  return { valid: true, reason: null, formationId };
+}
+
+function noEntryReasonForDynamicFormation(
+  formation: ReturnType<typeof buildDynamicMom36Formation>,
+  admission: DynamicMom36FinalAdmission,
+): string | null {
+  if (formation.vetoed) return "FROZEN_SHOCK_MAPPING_VETOED";
+  if (formation.selection.insufficientReason) {
+    // Pre-V6.1 snapshots retain their historical selector reason verbatim. V6.1 adds explicit
+    // final-plan guard reasons (for example cluster) because admission is now the downstream
+    // authority for that exact immutable plan.
+    return admission.scoreGapApplicable !== undefined
+      ? admission.reason
+      : formation.selection.insufficientReason;
+  }
+  if (!admission.passed) {
+    return admission.reason === "ADMISSION_EXTERNAL_GUARD" && admission.externalReason
+      ? `${admission.reason}:${admission.externalReason}`
+      : admission.reason;
+  }
+  if (formation.selection.selectedLongs.length + formation.selection.selectedShorts.length !== dynamicExpectedLegCount(formation)) {
+    return "DYNAMIC_MOM36_EXACT_SIX_LEG_INVARIANT_FAILED";
+  }
+  return null;
+}
+
+function dynamicMom36Snapshot(
+  input: DynamicMom36FormationInput,
+  strategyVersion: DynamicMom36StrategyVersion,
+  formation: ReturnType<typeof buildDynamicMom36Formation>,
+  plan: DynamicMom36FinalFormationPlan,
+  admission: DynamicMom36FinalAdmission,
+  noEntryReason: string | null,
+): DynamicMom36FormationSnapshot {
+  const selectionEvidence = (longs: readonly DynamicMom36RankedSymbol[], shorts: readonly DynamicMom36RankedSymbol[]) => {
+    const side = (rows: readonly DynamicMom36RankedSymbol[], direction: "LONG" | "SHORT") => {
+      const ranks = canonicalMom36Ranks(formation.activeUniverse, direction);
+      return rows.map((row) => ({
+        symbol: row.symbol, canonicalRank: ranks.get(row.symbol)!, mom36: row.mom36,
+        weight: 1 / dynamicExpectedLegCount(formation), sideWeight: 1 / rows.length,
+        oneHourReturn: row.oneHourReturn ?? null, fastReturn: row.fastReturn ?? null,
+        oneHourStartTimestampMs: row.oneHourStartTimestampMs ?? null,
+        fastStartTimestampMs: row.fastStartTimestampMs ?? null,
+        sourceTimestampMs: row.fastSourceTimestampMs ?? null,
+      }));
+    };
+    return { longs: side(longs, "LONG"), shorts: side(shorts, "SHORT") };
+  };
+  return {
+    strategyVersion,
+    formationTimestamp: input.now,
+    featureTimestamp: new Date(input.featureTimestampMs).toISOString(),
+    decisionInformationCutoff: new Date(input.decisionInformationCutoffMs).toISOString(),
+    formationId: plan.formationId,
+    selectedCandidateHash: plan.selectedCandidateHash,
+    activeUniverse: formation.activeUniverse.map((row) => ({
+      symbol: row.symbol,
+      cluster: clusterOf(row.symbol),
+      mom36: row.mom36,
+      price: row.price,
+      fastReturn: row.fastReturn,
+      slowSourceTimestampMs: row.slowSourceTimestampMs ?? null,
+      slowStartTimestampMs: row.slowStartTimestampMs ?? null,
+      fastSourceTimestampMs: row.fastSourceTimestampMs ?? null,
+      fastStartTimestampMs: row.fastStartTimestampMs ?? null,
+      slowFastDataValid: row.slowFastDataValid ?? null,
+      longExecutionBlockReason: row.longExecutionBlockReason ?? null,
+      shortExecutionBlockReason: row.shortExecutionBlockReason ?? null,
+      longEligible: row.longEligible,
+      shortEligible: row.shortEligible,
+      shortBlocked: row.shortBlocked,
+    })),
+    positiveCount: formation.positiveCount,
+    negativeCount: formation.negativeCount,
+    zeroCount: formation.zeroCount,
+    baseAllocation: formation.baseAllocation,
+    shockModelArtifact: formation.shock.modelArtifactId,
+    shockRawOutput: formation.shock.rawOutput,
+    shockState: formation.shock.state,
+    shockReason: formation.shock.reason,
+    continuation: formation.continuation,
+    slowFast: formation.slowFast,
+    baseSelectedLongs: formation.baseSelection.selectedLongs.map((row) => row.symbol),
+    baseSelectedShorts: formation.baseSelection.selectedShorts.map((row) => row.symbol),
+    baseSelectionInsufficientReason: formation.baseSelection.insufficientReason,
+    rawV3SelectedLongs: formation.rawV3Selection.selectedLongs.map((row) => row.symbol),
+    rawV3SelectedShorts: formation.rawV3Selection.selectedShorts.map((row) => row.symbol),
+    rawV3SelectionInsufficientReason: formation.rawV3Selection.insufficientReason,
+    rawV3CandidateAudit: formation.rawV3Selection.candidateAudit,
+    slowFastStrictSelectedLongs: formation.slowFastStrictSelection?.selectedLongs.map((row) => row.symbol) ?? [],
+    slowFastStrictSelectedShorts: formation.slowFastStrictSelection?.selectedShorts.map((row) => row.symbol) ?? [],
+    slowFastStrictSelectionInsufficientReason: formation.slowFastStrictSelection?.insufficientReason ?? null,
+    slowFastStrictCandidateAudit: formation.slowFastStrictSelection?.candidateAudit,
+    requestedAllocation: formation.requestedAllocation,
+    directionalFeasibility: formation.directionalFeasibility,
+    finalAllocation: formation.finalAllocation,
+    selectionSource: formation.selectionSource,
+    // Recent-strength preference provenance. `actualSelection` is what the order plan uses; the
+    // baseline is kept alongside it so any swap is auditable after the fact.
+    recentStrengthPreference: formation.preference
+      ? {
+        policyId: input.allocationSelectionMode && input.allocationSelectionMode !== "BREADTH"
+          ? "cross-allocation-qualified-ranking-v1" : "cross-preference-shared-admission-v2",
+        selectionMode: formation.preference.selection,
+        reason: formation.preference.reason,
+        baselineLongs: formation.preference.baselineLongs.map((row) => row.symbol),
+        baselineShorts: formation.preference.baselineShorts.map((row) => row.symbol),
+        baselineSelection: selectionEvidence(formation.preference.baselineLongs, formation.preference.baselineShorts),
+        preferredSelection: formation.preference.selection === "PREFERRED"
+          ? selectionEvidence(formation.preference.longs, formation.preference.shorts) : null,
+        actualSelection: selectionEvidence(formation.selection.selectedLongs, formation.selection.selectedShorts),
+        dataSource: "COMPLETED_HOURLY_FEATURES",
+        weightingModel: "EQUAL_NOTIONAL",
+        baselineCandidateAudit: formation.selection.candidateAudit,
+        preferredLongs: formation.preference.longs.map((row) => row.symbol),
+        preferredShorts: formation.preference.shorts.map((row) => row.symbol),
+        actualLongs: formation.selection.selectedLongs.map((row) => row.symbol),
+        actualShorts: formation.selection.selectedShorts.map((row) => row.symbol),
+        basketReturn1h: formation.preference.basketReturn1h,
+        basketReturn4h: formation.preference.basketReturn4h,
+        s1h: formation.preference.s1h,
+        s4h: formation.preference.s4h,
+        baselineS1h: formation.preference.baselineS1h,
+        baselineS4h: formation.preference.baselineS4h,
+        consideredCombinations: formation.preference.consideredCombinations,
+        qualifyingCombinations: formation.preference.qualifyingCombinations,
+        searchExhausted: formation.preference.searchExhausted,
+        poolLongs: formation.preference.poolLongs,
+        poolShorts: formation.preference.poolShorts,
+        canonicalLongRanks: formation.preference.longs.map((row) => ({
+          symbol: row.symbol, rank: canonicalMom36Ranks(formation.activeUniverse, "LONG").get(row.symbol),
+          mom36: row.mom36, oneHourReturn: row.oneHourReturn ?? null, fastReturn: row.fastReturn ?? null,
+        })),
+        canonicalShortRanks: formation.preference.shorts.map((row) => ({
+          symbol: row.symbol, rank: canonicalMom36Ranks(formation.activeUniverse, "SHORT").get(row.symbol),
+          mom36: row.mom36, oneHourReturn: row.oneHourReturn ?? null, fastReturn: row.fastReturn ?? null,
+        })),
+        decisionInformationCutoff: new Date(input.decisionInformationCutoffMs).toISOString(),
+      }
+      : null,
+    selectedLongs: formation.selection.selectedLongs.map((row) => row.symbol),
+    selectedShorts: formation.selection.selectedShorts.map((row) => row.symbol),
+    blockedShortsSkipped: formation.selection.blockedShortsSkipped,
+    selectionCandidateAudit: formation.selection.candidateAudit,
+    selectionInsufficientReason: formation.selection.insufficientReason,
+    requiredLongs: formation.selection.requiredLongs,
+    requiredShorts: formation.selection.requiredShorts,
+    availableAlignedLongs: formation.selection.availableAlignedLongs,
+    availableAlignedShorts: formation.selection.availableAlignedShorts,
+    availableExecutionEligibleAlignedLongs: formation.selection.availableExecutionEligibleAlignedLongs,
+    availableExecutionEligibleAlignedShorts: formation.selection.availableExecutionEligibleAlignedShorts,
+    ...(admission.oneSidedDirectionalQuality ? { oneSidedDirectionalQuality: admission.oneSidedDirectionalQuality } : {}),
+    noEntryReason,
+    admission: {
+      scoreGap: admission.scoreGap,
+      scoreGapFloor: admission.scoreGapFloor,
+      clusterCap: input.maxPerCluster,
+      passed: admission.passed,
+      scoreGapApplicable: admission.scoreGapApplicable,
+      scoreGapReason: admission.scoreGapReason,
+      reason: admission.reason,
+      externalReason: admission.externalReason,
+      formationId: admission.formationId,
+      selectedCandidateHash: admission.selectedCandidateHash,
+      finalLongCount: admission.finalLongCount,
+      finalShortCount: admission.finalShortCount,
+      ...(admission.oneSidedDirectionalQuality ? { oneSidedDirectionalQuality: admission.oneSidedDirectionalQuality } : {}),
+    },
+  };
+}
+
+/** Defensive boundary for any caller of the pure evaluator: V4/V5 may never trust a future bar. */
+function markSlowFastSourcesAtDecision(
+  rows: readonly DynamicMom36RankedSymbol[],
+  decisionInformationCutoffMs: number,
+): DynamicMom36RankedSymbol[] {
+  const sourceAtDecision = (value: number | null | undefined): boolean =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 && value <= decisionInformationCutoffMs;
+  // Dynamic MOM36 requires a synchronous last fully-closed bar for every active symbol.  The
+  // SLOW/FAST source close must be that exact bar, rather than merely any old closed candle: an
+  // older source is stale market data and cannot be treated as current alignment.  Start bars may
+  // be older by their respective 36h/4h lookbacks but still must be closed at the decision cut.
+  const sourceIsCurrent = (value: number | null | undefined): boolean =>
+    sourceAtDecision(value) && value === decisionInformationCutoffMs;
+  return rows.map((row) => ({
+    ...row,
+    slowFastDataValid: row.slowFastDataValid !== false &&
+      sourceIsCurrent(row.slowSourceTimestampMs) &&
+      sourceAtDecision(row.slowStartTimestampMs) &&
+      sourceIsCurrent(row.fastSourceTimestampMs) &&
+      sourceAtDecision(row.fastStartTimestampMs),
+  }));
+}
+
+/**
+ * Pure formation evaluation used by both executable observation construction and the durable
+ * "would have traded" record.  It intentionally has no environment reads: all pool/guard and
+ * continuation outputs are frozen by the caller for this cycle.
+ */
+export function evaluateDynamicMom36Formation(input: DynamicMom36FormationInput): DynamicMom36FormationEvaluation {
+  if (!(input.featureTimestampMs <= input.decisionInformationCutoffMs)) {
+    return {
+      formation: null,
+      snapshot: null,
+      basket: null,
+      noEntryReason: "DYNAMIC_MOM36_FEATURE_TIMESTAMP_AFTER_DECISION_CUTOFF",
+    };
+  }
+  const strategyVersion = input.strategyVersion ?? DYNAMIC_MOM36_SHOCK_36H_V1;
+  const continuationStrategy = isDynamicMom36ContinuationVersion(strategyVersion);
+  const slowFastMode = dynamicMom36SlowFastMode(strategyVersion);
+  const slowFastStrategy = slowFastMode !== "OFF";
+  const baseline = buildDynamicMom36Formation({
+    activeUniverse: slowFastStrategy
+      ? markSlowFastSourcesAtDecision(input.activeUniverse, input.decisionInformationCutoffMs)
+      : input.activeUniverse,
+    maxPerCluster: input.maxPerCluster,
+    shock: continuationStrategy ? undefined : resolveFrozenRuntimeShockOverlay(),
+    continuationRuntime: continuationStrategy ? input.continuationRuntime ?? null : null,
+    continuationOnly: continuationStrategy,
+    slowFastMode,
+    allowedLongCounts: input.allowedLongCounts,
+  });
+  const admit = (candidate: typeof baseline) => {
+    const candidatePlan = buildDynamicMom36FinalFormationPlan(input, strategyVersion, candidate);
+    return isDynamicMom36FinalAllocationAdmissionVersion(strategyVersion)
+      ? evaluateDynamicMom36FinalAdmission(input, candidatePlan, candidate)
+      : evaluateLegacyDynamicMom36Admission(input, candidatePlan);
+  };
+  // Admit the complete baseline FIRST. Preference uses this exact admission implementation
+  // (including scoreGap/external/continuation guards) for every proposed replacement.
+  const baselineAdmission = admit(baseline);
+  const legacyFormation = noEntryReasonForDynamicFormation(baseline, baselineAdmission) === null
+    ? applyDynamicMom36Preference(baseline, {
+      maxPerCluster: input.maxPerCluster,
+      admit: (candidate) => noEntryReasonForDynamicFormation(candidate, admit(candidate)) === null,
+    })
+    : baseline;
+  const ranked = input.allocationSelectionMode && input.allocationSelectionMode !== "BREADTH"
+    && isDynamicMom36FinalAllocationAdmissionVersion(strategyVersion) && slowFastStrategy
+    ? rankDynamicMom36Allocations({
+      baseline, allowedLongCounts: input.allowedLongCounts ?? [2, 3, 4],
+      maxPerCluster: input.maxPerCluster, mode: input.allocationSelectionMode,
+      rejectionReason: candidate => noEntryReasonForDynamicFormation(candidate, admit(candidate)),
+    }) : null;
+  let formation = ranked?.audit.outcome === "QUALIFIED_WINNER" ? ranked.formation : legacyFormation;
+  const probe = input.threeLegContext?.enabled && threeLegStrategyAllowed(input.threeLegContext,strategyVersion)
+    && noEntryReasonForDynamicFormation(formation, admit(formation)) !== null
+    ? buildThreeLegFallback(baseline,input.threeLegContext,input.maxPerCluster,input.threeLegCandlesBySymbol,input.decisionInformationCutoffMs) : null;
+  if (probe?.audit.allowed) formation=probe.formation;
+  const plan = buildDynamicMom36FinalFormationPlan(input, strategyVersion, formation);
+  const admission = admit(formation);
+  const noEntryReason = probe && !probe.audit.allowed ? probe.audit.reason : noEntryReasonForDynamicFormation(formation, admission);
+  const snapshot = dynamicMom36Snapshot(input, strategyVersion, formation, plan, admission, noEntryReason);
+  if (probe) snapshot.threeLegFallback=probe.audit;
+  if (ranked) snapshot.allocationRanking = { ...ranked.audit, selectedAllocation: formation.finalAllocation };
+  if (noEntryReason) return { formation, snapshot, basket: null, noEntryReason };
+  const longCapitalWeight = formation.finalAllocation.longCount / dynamicExpectedLegCount(formation);
+  const shortCapitalWeight = formation.finalAllocation.shortCount / dynamicExpectedLegCount(formation);
+  const toLeg = (row: DynamicMom36RankedSymbol): CrossSectionalLeg => ({
+    symbol: row.symbol,
+    entryPrice: row.price,
+    exitPrice: null,
+    // Six equal $25 legs are represented as equal fractions of gross capital, including 6L0S/0L6S.
+    weight: 1 / dynamicExpectedLegCount(formation),
+    scoreAtOpen: row.mom36,
+    volatilityAtOpen: row.volatility,
+    fastReturnAtOpen: row.fastReturn,
+    extensionVolAtOpen: row.extensionVol,
+  });
+  const basket: CrossSectionalObservation = {
+    observationId: `xsec:${DYNAMIC_MOM36_SHOCK_SIGNAL}:${input.openedAtMs}`,
+    openedAt: input.now,
+    openedAtMs: input.openedAtMs,
+    horizonMs: input.horizonMs,
+    signal: DYNAMIC_MOM36_SHOCK_SIGNAL,
+    variant: DYNAMIC_MOM36_SHOCK_VARIANT,
+    strategyFamily: "MOMENTUM_DISPERSION",
+    k: 3,
+    longK: formation.finalAllocation.longCount,
+    shortK: formation.finalAllocation.shortCount,
+    longLeg: formation.selection.selectedLongs.map(toLeg),
+    shortLeg: formation.selection.selectedShorts.map(toLeg),
+    status: "OPEN",
+    scoreGap: admission.scoreGap,
+    regimeContext: null,
+    regimeClassAtOpen: null,
+    longCapitalWeight,
+    shortCapitalWeight,
+    weightingModel: "EQUAL_NOTIONAL",
+    takeProfitReturn: null,
+    stopLossReturn: null,
+    // Dynamic MOM36 has no numeric basket stop. Its MFE/MAE telemetry is recorded directly on
+    // deployed-capital returns, so do not carry a legacy R denominator that could be mistaken for
+    // a stop or silently feed an old exit path.
+    riskDistanceAtOpen: null,
+    regimeFlipExit: false,
+    formationMode: "PLAIN_MOM36",
+    smartFormation: null,
+    dynamicMom36: snapshot,
+    exitReason: null,
+    grossReturn: null,
+    costReturn: null,
+    netReturn: null,
+    longLegReturn: null,
+    shortLegReturn: null,
+    resolvedAt: null,
+  };
+  return { formation, snapshot, basket, noEntryReason: null };
+}
+
+/** Backwards-compatible observation-only facade retained for existing v1/v3 callers and tests. */
+export function buildDynamicMom36ShockBasket(input: DynamicMom36FormationInput): CrossSectionalObservation | null {
+  return evaluateDynamicMom36Formation(input).basket;
+}
+
 /** Rank scored symbols and build an equal-notional long-top-k / short-bottom-k basket. */
 export function buildCrossSectionalBasket(
   scored: ScoredSymbol[],
@@ -625,9 +2013,14 @@ export function buildCrossSectionalBasket(
   const mode = opts.selectionMode ?? "MOMENTUM";
   const longK = opts.longK ?? opts.k;
   const shortK = opts.shortK ?? opts.k;
-  const longPoolAll = valid.filter((s) => allowed(s.symbol, opts.longAllowlist, opts.longBlocklist));
+  const sideTrendAlignment = opts.sideTrendAlignment ?? "OFF";
+  const longPoolAll = valid.filter((s) =>
+    allowed(s.symbol, opts.longAllowlist, opts.longBlocklist) && sideTrendAligned(s, "LONG", sideTrendAlignment),
+  );
   const longSortedAll = [...longPoolAll].sort((a, b) => mode === "MEAN_REVERSION" ? a.score - b.score : b.score - a.score);
-  const shortPoolAll = valid.filter((s) => allowed(s.symbol, opts.shortAllowlist, opts.shortBlocklist));
+  const shortPoolAll = valid.filter((s) =>
+    allowed(s.symbol, opts.shortAllowlist, opts.shortBlocklist) && sideTrendAligned(s, "SHORT", sideTrendAlignment),
+  );
   const shortSortedAll = [...shortPoolAll].sort((a, b) => mode === "MEAN_REVERSION" ? b.score - a.score : a.score - b.score);
   // A symbol eligible for BOTH sides (e.g. via CROSS_SECTIONAL_REGIME_SKEW's own allowlists) can
   // only ever fill one leg. Whichever side selects first claims it. Previously long always went
@@ -639,20 +2032,79 @@ export function buildCrossSectionalBasket(
   // Ties (the common unskewed 3/3 case) keep the original long-first order unchanged.
   let selectedLongs: ScoredSymbol[];
   let selectedShorts: ScoredSymbol[];
+  const requestedFormationMode = opts.formationMode ?? (opts.smartFormation?.enabled === true ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36");
+  const smartEnabled = requestedFormationMode === "SMART_FORMATION_RERANK" && (opts.variant ?? "RAW") === "FILTERED" && mode === "MOMENTUM";
+  const formationMode: CrossSectionalFormationMode = smartEnabled ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36";
+  const smartCandidates: CrossSectionalSmartFormationCandidate[] = [];
+  let smartObjective = 0;
   if (shortK > longK) {
-    selectedShorts = selectWithClusterCap(shortSortedAll, shortK, opts.maxPerCluster);
+    if (smartEnabled) {
+      const shortSelection = selectSmartWithClusterCap(shortSortedAll, shortK, "SHORT", opts.maxPerCluster, opts.smartFormation?.axisScore);
+      selectedShorts = shortSelection.selected;
+      smartCandidates.push(...shortSelection.candidates);
+      smartObjective += shortSelection.objective;
+    } else {
+      selectedShorts = selectWithClusterCap(shortSortedAll, shortK, opts.maxPerCluster);
+    }
     const shortSymbols = new Set(selectedShorts.map((s) => s.symbol));
     const longRemaining = longSortedAll.filter((s) => !shortSymbols.has(s.symbol));
-    selectedLongs = selectWithClusterCap(longRemaining, longK, opts.maxPerCluster);
+    if (smartEnabled) {
+      const longSelection = selectSmartWithClusterCap(longRemaining, longK, "LONG", opts.maxPerCluster, opts.smartFormation?.axisScore);
+      selectedLongs = longSelection.selected;
+      smartCandidates.push(...longSelection.candidates);
+      smartObjective += longSelection.objective;
+    } else {
+      selectedLongs = selectWithClusterCap(longRemaining, longK, opts.maxPerCluster);
+    }
   } else {
-    selectedLongs = selectWithClusterCap(longSortedAll, longK, opts.maxPerCluster);
+    if (smartEnabled) {
+      const longSelection = selectSmartWithClusterCap(longSortedAll, longK, "LONG", opts.maxPerCluster, opts.smartFormation?.axisScore);
+      selectedLongs = longSelection.selected;
+      smartCandidates.push(...longSelection.candidates);
+      smartObjective += longSelection.objective;
+    } else {
+      selectedLongs = selectWithClusterCap(longSortedAll, longK, opts.maxPerCluster);
+    }
     const longSymbols = new Set(selectedLongs.map((s) => s.symbol));
     const shortRemaining = shortSortedAll.filter((s) => !longSymbols.has(s.symbol));
-    selectedShorts = selectWithClusterCap(shortRemaining, shortK, opts.maxPerCluster);
+    if (smartEnabled) {
+      const shortSelection = selectSmartWithClusterCap(shortRemaining, shortK, "SHORT", opts.maxPerCluster, opts.smartFormation?.axisScore);
+      selectedShorts = shortSelection.selected;
+      smartCandidates.push(...shortSelection.candidates);
+      smartObjective += shortSelection.objective;
+    } else {
+      selectedShorts = selectWithClusterCap(shortRemaining, shortK, opts.maxPerCluster);
+    }
   }
   if (selectedLongs.length < longK || selectedShorts.length < shortK) return null;
   const scoreGap = scoreGapFor(selectedLongs, selectedShorts);
-  if (opts.minScoreGap !== undefined && scoreGap < opts.minScoreGap) return null;
+  if (opts.minScoreGap !== undefined && scoreGap < opts.minScoreGap) {
+    // 2026-08-17: a rejected basket is never written anywhere, so "is this gate set correctly?" is
+    // unfalsifiable from the store no matter how long the lane runs — the data is not thin, it is
+    // never created. This hook records the composition it WOULD have opened. Deliberately a callback
+    // to a separate sink rather than an observation: adding one to the store would let
+    // `alreadyThisBucket` block a real basket later in the same hour (a behaviour change, not
+    // instrumentation), and `observationVariant` derives variant from the signal NAME, so any new
+    // variant silently reclassifies as RAW and contaminates the RAW report.
+    //
+    // Only the composition and timestamp are captured — the forward return is recomputed from
+    // klines at analysis time, so no resolution machinery is needed and nothing can go stale.
+    if (opts.onGapReject) {
+      try {
+        opts.onGapReject({
+          openedAtMs: opts.openedAtMs,
+          signal: opts.signal,
+          scoreGap,
+          minScoreGap: opts.minScoreGap,
+          longs: selectedLongs.map((s) => ({ symbol: s.symbol, score: s.score, price: s.price, volatility: finiteOrNull(s.volatility) })),
+          shorts: selectedShorts.map((s) => ({ symbol: s.symbol, score: s.score, price: s.price, volatility: finiteOrNull(s.volatility) })),
+        });
+      } catch {
+        // Instrumentation must never break basket formation.
+      }
+    }
+    return null;
+  }
   const longCapitalWeight = clampWeight(opts.longCapitalWeight ?? 0.5, 0.5);
   const shortCapitalWeight = clampWeight(opts.shortCapitalWeight ?? (1 - longCapitalWeight), 1 - longCapitalWeight);
   const totalCapital = longCapitalWeight + shortCapitalWeight;
@@ -670,8 +2122,8 @@ export function buildCrossSectionalBasket(
     k: opts.k,
     longK: selectedLongs.length,
     shortK: selectedShorts.length,
-    longLeg: weightedLegs(selectedLongs, normalizedLongCapital, { weightingModel, volBySymbol: opts.volBySymbol }),
-    shortLeg: weightedLegs(selectedShorts, normalizedShortCapital, { weightingModel, volBySymbol: opts.volBySymbol }),
+    longLeg: weightedLegs(selectedLongs, normalizedLongCapital, { weightingModel, volBySymbol: opts.volBySymbol, side: "LONG" }),
+    shortLeg: weightedLegs(selectedShorts, normalizedShortCapital, { weightingModel, volBySymbol: opts.volBySymbol, side: "SHORT" }),
     status: "OPEN",
     scoreGap,
     regimeContext: opts.regimeContext ?? null,
@@ -685,6 +2137,16 @@ export function buildCrossSectionalBasket(
     // process-frozen config stop-unit — the SAME quantity CORTEX's x-side uses, so netR is symmetric.
     riskDistanceAtOpen: opts.riskDistanceAtOpen ?? opts.stopLossReturn ?? CROSS_SECTIONAL_BASKET_STOP_LOSS_BPS / 10_000,
     regimeFlipExit: opts.regimeFlipExit ?? false,
+    formationMode,
+    smartFormation: smartEnabled
+      ? {
+          version: "SMART_BASKET_V1",
+          candidatePoolSize: CROSS_SECTIONAL_SMART_CANDIDATE_POOL,
+          axisScore: finiteOrNull(opts.smartFormation?.axisScore),
+          objectiveScore: smartObjective,
+          candidates: smartCandidates,
+        }
+      : null,
     exitReason: null,
     grossReturn: null,
     costReturn: null,
@@ -768,6 +2230,16 @@ export function crossSectionalLiquidityStarved(
   return longAllow.size === 0 || shortAllow.size === 0;
 }
 
+/**
+ * Momentum scoring can use spot candles for ratio continuity, but the auto-pool's C1 verdict is
+ * venue-correct USD-M liquidity. Once that durable pool is ACTIVE, do not reject a futures leg a
+ * second time on unrelated spot volume. Before the first successful refresh, retain the existing
+ * candle floor rather than silently relaxing admission.
+ */
+export function shouldApplyCandleLiquidityFloor(autoPool: CrossSectionalAutoPoolSnapshot | null): boolean {
+  return !(autoPool?.enabled === true && autoPool.state === "ACTIVE");
+}
+
 // ── Auto-updating symbol filters (operator: "ikutin filtered symbol, auto update
 // terus blacklist dan whitelist nya") ────────────────────────────────────────
 //
@@ -786,9 +2258,20 @@ export interface AdaptiveSymbolFilters {
   shortAllowlist: string[];
   longBlocklist: string[];
   shortBlocklist: string[];
+  /** In the soft phase, measured post-cutoff per-leg outcomes nudge the rank instead of silently
+   * deleting a symbol from the candidate pool. Values are signed momentum-score offsets. */
+  longScoreAdjustmentBySymbol: Record<string, number>;
+  shortScoreAdjustmentBySymbol: Record<string, number>;
   provenance: {
     closedBaskets: number;
     minLegSamples: number;
+    /** Evidence-era cutoff. Null means the legacy all-history behavior is intentionally in use. */
+    sinceMs: number | null;
+    mode: CrossSectionalAdaptiveMode;
+    /** True only when the policy has enough new-cohort data to apply hard demotions. */
+    hardDemotionsActive: boolean;
+    hardMinLegSamples: number;
+    hardMinClosedBaskets: number;
     promotedLong: string[];
     promotedShort: string[];
     demotedLong: string[];
@@ -824,11 +2307,54 @@ export function isCrossSectionalAdaptiveDemotionFrozen(env: NodeJS.ProcessEnv = 
   return env.CROSS_SECTIONAL_ADAPTIVE_DEMOTION_FROZEN === "1";
 }
 
+/**
+ * HARD preserves the historical behavior: a symbol with the normal sample floor can be removed
+ * from execution immediately.  SOFT only adjusts rank.  SOFT_THEN_HARD begins with rank nudges
+ * and graduates to hard removal only after the current evidence era has enough independent basket
+ * closes *and* the individual symbol has a deeper sample.  The testnet rollout uses the last mode.
+ */
+export type CrossSectionalAdaptiveMode = "HARD" | "SOFT" | "SOFT_THEN_HARD";
+
+function positiveWholeEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+export function getCrossSectionalAdaptiveMode(env: NodeJS.ProcessEnv = process.env): CrossSectionalAdaptiveMode {
+  const configured = (env.CROSS_SECTIONAL_ADAPTIVE_MODE ?? "HARD").trim().toUpperCase();
+  return configured === "SOFT" || configured === "SOFT_THEN_HARD" ? configured : "HARD";
+}
+
+/** Defaults to the report-era boundary so old configurations cannot curate a newly deployed
+ * testnet cohort. An explicit adaptive boundary exists for the rare case reports and curation
+ * genuinely need different eras. */
+export function getCrossSectionalAdaptiveSinceMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const explicit = env.CROSS_SECTIONAL_ADAPTIVE_START_AT ?? null;
+  const parsed = explicit ? Date.parse(explicit) : NaN;
+  return Number.isFinite(parsed) ? parsed : getCrossSectionalReportSinceMs(env);
+}
+
+function crossSectionalAdaptiveHardMinLegSamples(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveWholeEnv(env.CROSS_SECTIONAL_ADAPTIVE_HARD_MIN_LEG_SAMPLES, 6);
+}
+
+function crossSectionalAdaptiveHardMinClosedBaskets(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveWholeEnv(env.CROSS_SECTIONAL_ADAPTIVE_HARD_MIN_CLOSED_BASKETS, 8);
+}
+
+function crossSectionalAdaptiveSoftScoreWeight(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number.parseFloat(env.CROSS_SECTIONAL_ADAPTIVE_SOFT_SCORE_WEIGHT ?? "");
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.min(1, parsed) : 0.35;
+}
+
 export function deriveAdaptiveSymbolFilters(
   store: CrossSectionalStore,
   opts: {
     minLegSamples?: number;
     minEligiblePerSide?: number;
+    /** Override the evidence era for callers/tests. Undefined follows CROSS_SECTIONAL_ADAPTIVE_START_AT
+     * then CROSS_SECTIONAL_REPORT_START_AT, preserving legacy all-history behavior when neither is set. */
+    sinceMs?: number;
     /** Per-side overrides — thread the REGIME-SKEWED longK/shortK through here (not just the base
      *  CROSS_SECTIONAL_K) when regime skew is enabled. 2026-07-11: the floor below used to always
      *  check against the unskewed base K on both sides, so when skew raised e.g. shortK from 3 to
@@ -840,19 +2366,37 @@ export function deriveAdaptiveSymbolFilters(
      *  unaffected. */
     minEligiblePerSideLong?: number;
     minEligiblePerSideShort?: number;
+    /** Runtime C1/C2 ceiling. It can only narrow the fixed candidate universe. */
+    baseLongAllowlist?: readonly string[];
+    baseShortAllowlist?: readonly string[];
+    baseShortBlocklist?: readonly string[];
   } = {},
 ): AdaptiveSymbolFilters {
   const minLegSamples = opts.minLegSamples ?? 3;
   const minEligiblePerSide = opts.minEligiblePerSide ?? CROSS_SECTIONAL_K;
+  const mode = getCrossSectionalAdaptiveMode();
+  const sinceMs = opts.sinceMs ?? getCrossSectionalAdaptiveSinceMs();
+  const hardMinLegSamples = Math.max(minLegSamples, crossSectionalAdaptiveHardMinLegSamples());
+  const hardMinClosedBaskets = crossSectionalAdaptiveHardMinClosedBaskets();
+  const baseLongAllowlist = new Set(opts.baseLongAllowlist ?? CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST);
+  const baseShortAllowlist = new Set(opts.baseShortAllowlist ?? CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST);
+  const baseShortBlocklist = new Set(opts.baseShortBlocklist ?? CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST);
   if (isCrossSectionalAdaptiveDemotionFrozen()) {
     return {
-      longAllowlist: [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST].sort(),
-      shortAllowlist: [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST].sort(),
+      longAllowlist: [...baseLongAllowlist].sort(),
+      shortAllowlist: [...baseShortAllowlist].sort(),
       longBlocklist: [],
-      shortBlocklist: [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST].sort(),
+      shortBlocklist: [...baseShortBlocklist].sort(),
+      longScoreAdjustmentBySymbol: {},
+      shortScoreAdjustmentBySymbol: {},
       provenance: {
         closedBaskets: 0, minLegSamples, promotedLong: [], promotedShort: [],
         demotedLong: [], demotedShort: [],
+        sinceMs: sinceMs ?? null,
+        mode,
+        hardDemotionsActive: false,
+        hardMinLegSamples,
+        hardMinClosedBaskets,
         minEligiblePerSide,
         minEligiblePerSideLong: opts.minEligiblePerSideLong ?? minEligiblePerSide,
         minEligiblePerSideShort: opts.minEligiblePerSideShort ?? minEligiblePerSide,
@@ -876,8 +2420,9 @@ export function deriveAdaptiveSymbolFilters(
   };
 
   let closedBaskets = 0;
-  for (const obs of store.all) {
+  for (const obs of store.reportable) {
     if (obs.status !== "CLOSED") continue;
+    if (sinceMs !== undefined && obs.openedAtMs < sinceMs) continue;
     closedBaskets += 1;
     for (const leg of obs.longLeg) {
       if (leg.exitPrice !== null && leg.entryPrice > 0) bump(leg.symbol, "long", leg.exitPrice / leg.entryPrice - 1);
@@ -891,21 +2436,35 @@ export function deriveAdaptiveSymbolFilters(
   const promotedShort: string[] = [];
   const demotedLong: string[] = [];
   const demotedShort: string[] = [];
+  const hardDemotedLong: string[] = [];
+  const hardDemotedShort: string[] = [];
+  const longScoreAdjustmentBySymbol: Record<string, number> = {};
+  const shortScoreAdjustmentBySymbol: Record<string, number> = {};
+  const hardDemotionsActive = mode === "HARD" || (mode === "SOFT_THEN_HARD" && closedBaskets >= hardMinClosedBaskets);
+  const softWeight = crossSectionalAdaptiveSoftScoreWeight();
   for (const [symbol, row] of perf) {
     if (row.longN >= minLegSamples) {
-      if (row.longSum / row.longN > 0) promotedLong.push(symbol);
+      const avg = row.longSum / row.longN;
+      if (avg > 0) promotedLong.push(symbol);
       else demotedLong.push(symbol);
+      if (mode !== "HARD") longScoreAdjustmentBySymbol[symbol] = Math.max(-0.02, Math.min(0.02, avg * softWeight));
+      if (hardDemotionsActive && avg <= 0 && (mode === "HARD" || row.longN >= hardMinLegSamples)) hardDemotedLong.push(symbol);
     }
     if (row.shortN >= minLegSamples) {
-      if (row.shortSum / row.shortN > 0) promotedShort.push(symbol);
+      const avg = row.shortSum / row.shortN;
+      if (avg > 0) promotedShort.push(symbol);
       else demotedShort.push(symbol);
+      // A better short is a more negative momentum score; invert the measured short return so a
+      // positive outcome improves its rank and a loss only nudges it upward toward exclusion.
+      if (mode !== "HARD") shortScoreAdjustmentBySymbol[symbol] = Math.max(-0.02, Math.min(0.02, -avg * softWeight));
+      if (hardDemotionsActive && avg <= 0 && (mode === "HARD" || row.shortN >= hardMinLegSamples)) hardDemotedShort.push(symbol);
     }
   }
 
-  const longAllowRaw = new Set<string>([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST]);
-  for (const s of demotedLong) longAllowRaw.delete(s);
-  const shortAllowRaw = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST]);
-  for (const s of demotedShort) shortAllowRaw.delete(s);
+  const longAllowRaw = new Set<string>(baseLongAllowlist);
+  for (const s of hardDemotedLong) longAllowRaw.delete(s);
+  const shortAllowRaw = new Set<string>(baseShortAllowlist);
+  for (const s of hardDemotedShort) shortAllowRaw.delete(s);
 
   // Floor (2026-07-07 audit): demotion has no natural recovery path — a demoted symbol only
   // regains eligibility once NEW closed baskets remeasure it positive, but no new baskets can
@@ -918,22 +2477,29 @@ export function deriveAdaptiveSymbolFilters(
   // staying locked out forever with nothing left to remeasure it.
   const longFloorApplied = longAllowRaw.size < minEligiblePerSideLong;
   const shortFloorApplied = shortAllowRaw.size < minEligiblePerSideShort;
-  const longAllow = longFloorApplied ? new Set(CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST) : longAllowRaw;
-  const shortAllow = shortFloorApplied ? new Set(CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST) : shortAllowRaw;
+  const longAllow = longFloorApplied ? new Set(baseLongAllowlist) : longAllowRaw;
+  const shortAllow = shortFloorApplied ? new Set(baseShortAllowlist) : shortAllowRaw;
   const shortBlock = new Set<string>([
-    ...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
-    ...(shortFloorApplied ? [] : demotedShort),
+    ...baseShortBlocklist,
+    ...(shortFloorApplied ? [] : hardDemotedShort),
   ]);
-  const longBlock = new Set<string>(longFloorApplied ? [] : demotedLong);
+  const longBlock = new Set<string>(longFloorApplied ? [] : hardDemotedLong);
 
   return {
     longAllowlist: [...longAllow].sort(),
     shortAllowlist: [...shortAllow].sort(),
     longBlocklist: [...longBlock].sort(),
     shortBlocklist: [...shortBlock].sort(),
+    longScoreAdjustmentBySymbol,
+    shortScoreAdjustmentBySymbol,
     provenance: {
       closedBaskets,
       minLegSamples,
+      sinceMs: sinceMs ?? null,
+      mode,
+      hardDemotionsActive,
+      hardMinLegSamples,
+      hardMinClosedBaskets,
       promotedLong: promotedLong.sort(),
       promotedShort: promotedShort.sort(),
       demotedLong: demotedLong.sort(),
@@ -961,36 +2527,88 @@ export function getCrossSectionalFilteredExecutionFilters(
   opts: {
     minEligiblePerSideLong?: number;
     minEligiblePerSideShort?: number;
+    /** Empty must never flow through: an empty allowlist means allow-everything downstream. */
+    baseLongAllowlist?: readonly string[];
+    baseShortAllowlist?: readonly string[];
+    baseShortBlocklist?: readonly string[];
   } = {},
 ): {
   longAllowlist: string[];
   shortAllowlist: string[];
   shortBlocklist: string[];
+  longScoreAdjustmentBySymbol: Record<string, number>;
+  shortScoreAdjustmentBySymbol: Record<string, number>;
+  adaptiveMode: CrossSectionalAdaptiveMode;
   adaptiveDisabled: boolean;
 } {
   const adaptiveDisabled = isCrossSectionalAdaptiveDisabled();
+  const baseLongAllowlist = opts.baseLongAllowlist ?? [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST];
+  const baseShortAllowlist = opts.baseShortAllowlist ?? [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST];
+  const baseShortBlocklist = opts.baseShortBlocklist ?? [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST];
   if (adaptiveDisabled) {
     return {
-      longAllowlist: [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST],
-      shortAllowlist: [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST],
-      shortBlocklist: [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST],
+      longAllowlist: [...baseLongAllowlist],
+      shortAllowlist: [...baseShortAllowlist],
+      shortBlocklist: [...baseShortBlocklist],
+      longScoreAdjustmentBySymbol: {},
+      shortScoreAdjustmentBySymbol: {},
+      adaptiveMode: getCrossSectionalAdaptiveMode(),
       adaptiveDisabled: true,
     };
   }
-  const adaptive = deriveAdaptiveSymbolFilters(store, opts);
+  const adaptive = deriveAdaptiveSymbolFilters(store, {
+    ...opts,
+    baseLongAllowlist,
+    baseShortAllowlist,
+    baseShortBlocklist,
+  });
   return {
     longAllowlist: adaptive.longAllowlist,
     shortAllowlist: adaptive.shortAllowlist,
     shortBlocklist: adaptive.shortBlocklist,
+    longScoreAdjustmentBySymbol: adaptive.longScoreAdjustmentBySymbol,
+    shortScoreAdjustmentBySymbol: adaptive.shortScoreAdjustmentBySymbol,
+    adaptiveMode: adaptive.provenance.mode,
     adaptiveDisabled: false,
   };
 }
 
+/** Applies the early-stage adaptive policy without deleting candidates. FILTERED is momentum
+ * dispersion, so a long candidate benefits from a positive long-side outcome (raise score), while
+ * a short candidate benefits from a positive short-side outcome (make score more negative). */
+export function applyCrossSectionalAdaptiveRanking(
+  scored: ScoredSymbol[],
+  adaptive: Pick<ReturnType<typeof getCrossSectionalFilteredExecutionFilters>, "adaptiveMode" | "longScoreAdjustmentBySymbol" | "shortScoreAdjustmentBySymbol">,
+): ScoredSymbol[] {
+  if (adaptive.adaptiveMode === "HARD") return scored;
+  return scored.map((row) => {
+    const adjustment = row.score >= 0
+      ? adaptive.longScoreAdjustmentBySymbol[row.symbol] ?? 0
+      : adaptive.shortScoreAdjustmentBySymbol[row.symbol] ?? 0;
+    return adjustment === 0 ? row : { ...row, score: row.score + adjustment };
+  });
+}
+
+/**
+ * Which weighting the FILTERED lane sizes with. Env-selectable so the 2026-08-17 switch to
+ * CAPPED_SCORE_RANK is reversible without a code deploy, and so an unrecognised value falls back to
+ * the previous production model rather than silently equal-weighting.
+ */
+export function filteredWeightingModel(env: NodeJS.ProcessEnv = process.env): CrossSectionalWeightingModel {
+  const raw = (env.CROSS_SECTIONAL_FILTERED_WEIGHTING ?? "").trim().toUpperCase();
+  const allowed: CrossSectionalWeightingModel[] = ["EQUAL_NOTIONAL", "BETA_VOL_PROXY", "CAPPED_INVERSE_VOL", "CAPPED_SCORE_RANK"];
+  return (allowed as string[]).includes(raw) ? (raw as CrossSectionalWeightingModel) : "CAPPED_INVERSE_VOL";
+}
+
 export function buildFilteredCrossSectionalBasket(
   scored: ScoredSymbol[],
-  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
+  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap" | "sideTrendAlignment"> &
     Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap">>,
 ): CrossSectionalObservation | null {
+  const rerankEnabled = opts.smartFormation?.enabled === true || (
+    opts.smartFormation === undefined && isCrossSectionalSmartFormationRerankEnabled()
+  );
+  const formationMode = opts.formationMode ?? (rerankEnabled ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36");
   return buildCrossSectionalBasket(scored, {
     ...opts,
     signal: opts.signal ?? CROSS_SECTIONAL_FILTERED_SIGNAL,
@@ -1001,7 +2619,10 @@ export function buildFilteredCrossSectionalBasket(
     shortBlocklist: opts.shortBlocklist ?? CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
     minScoreGap: opts.minScoreGap ?? CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
     maxPerCluster: opts.maxPerCluster ?? CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER,
-    weightingModel: opts.weightingModel ?? "CAPPED_INVERSE_VOL",
+    weightingModel: opts.weightingModel ?? filteredWeightingModel(),
+    formationMode,
+    sideTrendAlignment: crossSectionalFilteredSideTrendAlignment(),
+    smartFormation: opts.smartFormation ?? { enabled: formationMode === "SMART_FORMATION_RERANK" },
   });
 }
 
@@ -1157,6 +2778,7 @@ export function resolveCrossSectional(
           : ageMs >= obs.horizonMs ? "HORIZON"
             : null;
   if (exitReason === null) return obs;
+  const scaleAnomalies = crossSectionalScaleAnomalies([...longLeg, ...shortLeg]);
   return {
     ...obs,
     longLeg,
@@ -1169,6 +2791,21 @@ export function resolveCrossSectional(
     longLegReturn,
     shortLegReturn,
     resolvedAt: now,
+    // Scale guard: a leg whose entry and exit came from different price scales produces a fake
+    // ~100% return. Still resolved (so nothing hangs OPEN forever) and the raw numbers are kept for
+    // audit, but voided from reports/learning the instant it is detected rather than three days
+    // later. Reuses the existing OPERATOR_VOID marker because that is the only kind the readers
+    // honour; the reason states plainly that this one was automatic, not an operator decision.
+    ...(scaleAnomalies.length > 0
+      ? {
+          reportingExclusion: {
+            kind: "OPERATOR_VOID" as const,
+            voidedAt: now,
+            reason: "AUTOMATIC SCALE GUARD (not an operator decision): entry/exit price scale mismatch on " +
+              scaleAnomalies.join("; "),
+          },
+        }
+      : {}),
   };
 }
 
@@ -1178,6 +2815,10 @@ interface CrossSectionalState {
   version: number;
   observations: CrossSectionalObservation[];
   lastCycleAt: string | null;
+  /** Latest Dynamic formation attempt, including a no-entry SLOW_AND_FAST audit. */
+  latestDynamicMom36Formation: DynamicMom36FormationSnapshot | null;
+  /** Durable canonical scan history used only as one-sided breadth context and read-only replay. */
+  dynamicMom36FormationHistory: DynamicMom36FormationSnapshot[];
 }
 
 export class CrossSectionalStore {
@@ -1200,25 +2841,69 @@ export class CrossSectionalStore {
         if (!existsSync(path)) continue;
         const parsed = JSON.parse(readFileSync(path, "utf-8")) as Partial<CrossSectionalState>;
         if (Array.isArray(parsed.observations)) {
-          return { version: parsed.version ?? 1, observations: parsed.observations, lastCycleAt: parsed.lastCycleAt ?? null };
+          return {
+            version: parsed.version ?? 1,
+            observations: parsed.observations,
+            lastCycleAt: parsed.lastCycleAt ?? null,
+            latestDynamicMom36Formation: parsed.latestDynamicMom36Formation ?? null,
+            dynamicMom36FormationHistory: Array.isArray(parsed.dynamicMom36FormationHistory)
+              ? parsed.dynamicMom36FormationHistory
+              : parsed.latestDynamicMom36Formation ? [parsed.latestDynamicMom36Formation] : [],
+          };
         }
       } catch {
         // fall through to the next candidate / empty
       }
     }
-    return { version: 1, observations: [], lastCycleAt: null };
+    return {
+      version: 1,
+      observations: [],
+      lastCycleAt: null,
+      latestDynamicMom36Formation: null,
+      dynamicMom36FormationHistory: [],
+    };
   }
 
   get all(): CrossSectionalObservation[] {
     return this.state.observations;
   }
 
+  /** Reporting/learning projection. Execution continues to read `all` so a reporting correction
+   * can never alter an already-admitted order lifecycle. */
+  get reportable(): CrossSectionalObservation[] {
+    return this.state.observations.filter((observation) => !isCrossSectionalObservationReportingExcluded(observation));
+  }
+
   get lastCycleAt(): string | null {
     return this.state.lastCycleAt;
   }
 
+  get latestDynamicMom36Formation(): DynamicMom36FormationSnapshot | null {
+    return this.state.latestDynamicMom36Formation;
+  }
+
+  /** Newest first; callers must treat these as read-only formation evidence. */
+  get recentDynamicMom36Formations(): readonly DynamicMom36FormationSnapshot[] {
+    return [...this.state.dynamicMom36FormationHistory]
+      .sort((a, b) => Date.parse(b.featureTimestamp) - Date.parse(a.featureTimestamp));
+  }
+
   markCycle(ts: string): void {
     this.state.lastCycleAt = ts;
+  }
+
+  /** Formation-only audit is intentionally durable even when no executable observation was made. */
+  recordDynamicMom36Formation(snapshot: DynamicMom36FormationSnapshot): void {
+    this.state.latestDynamicMom36Formation = snapshot;
+    // The scanner polls more frequently than a completed 1h bar. Replacing the same feature cut
+    // avoids pretending three retries of one candle are breadth persistence across three scans.
+    const featureTimestamp = snapshot.featureTimestamp;
+    const withoutSameFeature = this.state.dynamicMom36FormationHistory.filter(
+      (candidate) => candidate.featureTimestamp !== featureTimestamp,
+    );
+    this.state.dynamicMom36FormationHistory = [...withoutSameFeature, snapshot]
+      .sort((a, b) => Date.parse(a.featureTimestamp) - Date.parse(b.featureTimestamp))
+      .slice(-DYNAMIC_MOM36_FORMATION_HISTORY_MAX);
   }
 
   add(obs: CrossSectionalObservation): void {
@@ -1228,6 +2913,32 @@ export class CrossSectionalStore {
   replace(observationId: string, next: CrossSectionalObservation): void {
     const idx = this.state.observations.findIndex((o) => o.observationId === observationId);
     if (idx >= 0) this.state.observations[idx] = next;
+  }
+
+  /** Mark the exact measured source observation as excluded without deleting its raw audit record. */
+  voidObservationForReporting(
+    observationId: string,
+    opts: { reason: string; voidedAt?: string; sourceBasketId?: string },
+  ):
+    | { ok: true; alreadyVoided: boolean; observationId: string }
+    | { ok: false; reason: string } {
+    const normalizedObservationId = observationId.trim();
+    const reason = opts.reason.trim();
+    if (!normalizedObservationId) return { ok: false, reason: "observationId is required" };
+    if (!reason) return { ok: false, reason: "void reason is required" };
+    const observation = this.state.observations.find((candidate) => candidate.observationId === normalizedObservationId);
+    if (!observation) return { ok: false, reason: `observation ${normalizedObservationId} not found` };
+    if (isCrossSectionalObservationReportingExcluded(observation)) {
+      return { ok: true, alreadyVoided: true, observationId: observation.observationId };
+    }
+    observation.reportingExclusion = {
+      kind: "OPERATOR_VOID",
+      voidedAt: opts.voidedAt ?? new Date().toISOString(),
+      reason,
+      sourceBasketId: opts.sourceBasketId,
+    };
+    this.save();
+    return { ok: true, alreadyVoided: false, observationId: observation.observationId };
   }
 
   private prune(): void {
@@ -1271,13 +2982,35 @@ export function _resetCrossSectionalStoreForTests(): void {
 // ─── cycle ─────────────────────────────────────────────────────────────────
 
 export interface CrossSectionalCycleResult {
+  /** True when the 14d drawdown gate skipped basket formation this cycle. */
+  standDown?: boolean;
+  standDownMarketReturn?: number | null;
   opened: number;
   openedRaw?: number;
   openedFiltered?: number;
   openedTrend?: number;
   openedMixed?: number;
+  openedDynamicMom36Shock?: number;
+  /** Runtime C1/C2 pool state observed by this formation cycle. */
+  autoPoolState?: CrossSectionalAutoPoolSnapshot["state"];
   resolved: number;
   expired: number;
+}
+
+/**
+ * Current execution-owned eligibility blocks for a newly forming FILTERED basket.
+ *
+ * The symbol remains in the frozen inference/admission universe.  These blocks apply only when
+ * the already-fixed Dynamic MOM36 allocation walks its ranked candidates, so breadth and score-gap
+ * evidence cannot be changed by an open position in another lane.  Reasons are optional to retain
+ * compatibility with the existing loss-reentry getter while making a one-way-netting lease explicit
+ * in immutable formation provenance.
+ */
+export interface CrossSectionalFormationEntryBlocks {
+  longBlocklist: string[];
+  shortBlocklist: string[];
+  longBlockReasons?: Partial<Record<string, DynamicMom36ExecutionBlockReason>>;
+  shortBlockReasons?: Partial<Record<string, DynamicMom36ExecutionBlockReason>>;
 }
 
 /**
@@ -1294,11 +3027,57 @@ export async function runCrossSectionalCycle(opts: {
    *  CROSS_SECTIONAL_REGIME_SKEW_ENABLED=1 to tilt the FILTERED (executed) basket's leg counts
    *  toward the regime-favored side. Omit/null -> unskewed 3/3-style symmetry, same as before. */
   axisScore?: number | null;
-  /** Execution-owned blocks for losing same-symbol/same-side open exposure. */
-  filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
+  /** Execution-owned blocks for losing same-symbol/same-side exposure and isolated-lane leases. */
+  filteredEntryBlocks?: () => Promise<CrossSectionalFormationEntryBlocks>;
+  /** Actual-fill, independent-episode circuit-breaker state. Null/unavailable blocks new V1 formation. */
+  symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
+  /** Returns true only after a reliability decision is durable; otherwise a would-be basket is held. */
+  symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
+  /** Durable C1/C2 membership inside the fixed candidate universe. A failure preserves fallback lists. */
+  filteredExecutionPool?: () => Promise<CrossSectionalAutoPoolSnapshot | null>;
 }): Promise<CrossSectionalCycleResult> {
   const result: CrossSectionalCycleResult = { opened: 0, resolved: 0, expired: 0 };
   const nowIso = new Date(opts.now).toISOString();
+  const dynamicMom36Shock = isDynamicMom36ShockStrategy();
+  const dynamicStrategyVersion = crossSectionalStrategyVersion();
+  const dynamicAllocationPolicy = dynamicMom36AllocationPolicy(process.env.CROSS_SECTIONAL_DYNAMIC_ALLOWED_ALLOCATIONS);
+  const allocationSelectionMode = dynamicAllocationSelectionMode(process.env.CROSS_SECTIONAL_DYNAMIC_ALLOCATION_SELECTION_MODE);
+  const dynamicRequireSkewContinuationConfirmation = process.env.CROSS_SECTIONAL_DYNAMIC_SKEW_REQUIRE_CONTINUATION_CONFIRMATION === "1";
+  const dynamicFinalAllocationAdmission = dynamicMom36Shock &&
+    isDynamicMom36FinalAllocationAdmissionVersion(dynamicStrategyVersion);
+  const dynamicMom36Continuation = isDynamicMom36ContinuationStrategy();
+  const dynamicMom36SlowFastApplication = dynamicMom36SlowFastMode(dynamicStrategyVersion);
+  const dynamicMom36ConfigValid = !dynamicMom36Shock || (
+    CROSS_SECTIONAL_MOMENTUM_BARS === DYNAMIC_MOM36_LOOKBACK_BARS &&
+    CROSS_SECTIONAL_INTERVAL === "1h" &&
+    dynamicAllocationPolicy.valid && allocationSelectionMode !== null
+  );
+  if (!dynamicMom36ConfigValid) {
+    console.error(JSON.stringify({
+      event: "dynamic_mom36_formation",
+      strategyVersion: dynamicStrategyVersion,
+      admissionPass: false,
+      admissionReason: allocationSelectionMode === null
+        ? "CROSS_SECTIONAL_DYNAMIC_ALLOCATION_SELECTION_MODE is invalid"
+        : dynamicAllocationPolicy.valid
+        ? `CROSS_SECTIONAL_MOMENTUM_BARS=${CROSS_SECTIONAL_MOMENTUM_BARS}, CROSS_SECTIONAL_INTERVAL=${CROSS_SECTIONAL_INTERVAL}; strategy requires ${DYNAMIC_MOM36_LOOKBACK_BARS} x 1h fully closed candles`
+        : `CROSS_SECTIONAL_DYNAMIC_ALLOWED_ALLOCATIONS is ineffective: ${dynamicAllocationPolicy.reason ?? "invalid configuration"}`,
+      activeUniverseSize: 0,
+      positiveCount: 0,
+      negativeCount: 0,
+      zeroCount: 0,
+      baseAllocation: null,
+      shockAvailable: false,
+      shockModel: null,
+      shockState: "NO_EDGE",
+      shockReason: "core MOM36 configuration invalid",
+      finalAllocation: null,
+      selectedLongs: [],
+      selectedShorts: [],
+      blockedSymbolsSkipped: [],
+      entryDecision: "NO_TRADE",
+    }));
+  }
   const regimeContext = opts.regimeContext ? buildCrossSectionalRegimeContext(opts.regimeContext) : null;
 
   const candlesBySymbol: Record<string, Candle[]> = {};
@@ -1323,7 +3102,21 @@ export async function runCrossSectionalCycle(opts: {
     const vol = realizedVolatility(candles);
     if (vol !== null && vol > 0) volBySymbol[symbol] = vol;
     const sc = crossSectionalMomentumScore(candles, CROSS_SECTIONAL_MOMENTUM_BARS);
-    if (sc) scored.push({ symbol, score: sc.score, price: sc.price });
+    if (sc) {
+      const fastStart = candles[candles.length - 1 - CROSS_SECTIONAL_SMART_FAST_BARS];
+      const fastReturn = fastStart && fastStart.close > 0 ? (sc.price - fastStart.close) / fastStart.close : null;
+      const extensionCloses = candles.slice(-CROSS_SECTIONAL_SMART_EXTENSION_BARS).map((candle) => candle.close).filter((close) => close > 0);
+      const extensionMean = extensionCloses.length ? mean(extensionCloses) : 0;
+      const extensionVol = extensionMean > 0 && vol !== null && vol > 0 ? (sc.price - extensionMean) / extensionMean / vol : null;
+      scored.push({
+        symbol,
+        score: sc.score,
+        price: sc.price,
+        fastReturn,
+        volatility: vol,
+        extensionVol,
+      });
+    }
   }
 
   // 1. resolve matured open baskets against the latest closes
@@ -1341,7 +3134,7 @@ export async function runCrossSectionalCycle(opts: {
   const bucket = Math.floor(opts.now / BAR_MS);
   const alreadyThisBucket = (signal: string) => opts.store.all.some((o) => o.signal === signal && Math.floor(o.openedAtMs / BAR_MS) === bucket);
   const rawSignal = `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}`;
-  if (!alreadyThisBucket(rawSignal)) {
+  if (!dynamicMom36Shock && !alreadyThisBucket(rawSignal)) {
     const basket = buildCrossSectionalBasket(scored, {
       k: CROSS_SECTIONAL_K,
       signal: rawSignal,
@@ -1357,7 +3150,8 @@ export async function runCrossSectionalCycle(opts: {
       result.openedRaw = (result.openedRaw ?? 0) + 1;
     }
   }
-  if (!isCrossSectionalFilteredDisabled() && !alreadyThisBucket(CROSS_SECTIONAL_FILTERED_SIGNAL)) {
+  const filteredSignalForCycle = dynamicMom36Shock ? DYNAMIC_MOM36_SHOCK_SIGNAL : CROSS_SECTIONAL_FILTERED_SIGNAL;
+  if (!isCrossSectionalFilteredDisabled() && !alreadyThisBucket(filteredSignalForCycle) && dynamicMom36ConfigValid) {
     // Auto-updating lists: derived from the store's own measured per-leg performance
     // (env lists as the prior) — recomputed every cycle, never a frozen env var.
     // 2026-07-11: skew must be computed BEFORE deriveAdaptiveSymbolFilters, and threaded into its
@@ -1365,15 +3159,39 @@ export async function runCrossSectionalCycle(opts: {
     // regime-skewed shortK (e.g. 3->4) could silently starve the short side one leg short of what
     // buildFilteredCrossSectionalBasket actually requires, with the floor never noticing (3
     // eligible symbols isn't "under 3", but it IS under a skewed requirement of 4).
-    const skew = isCrossSectionalRegimeSkewEnabled() ? regimeSkewedK(CROSS_SECTIONAL_K, opts.axisScore ?? null) : null;
+    // Dynamic MOM36 owns allocation from sign breadth. The legacy regime skew may still be used
+    // by legacy observations, but it must not modify this policy's base allocation.
+    const skew = !dynamicMom36Shock && isCrossSectionalRegimeSkewEnabled()
+      ? regimeSkewedK(CROSS_SECTIONAL_K, opts.axisScore ?? null)
+      : null;
+    let managedPool: CrossSectionalAutoPoolSnapshot | null = null;
+    try {
+      managedPool = await opts.filteredExecutionPool?.() ?? null;
+    } catch {
+      // Never pass [] to allowed(): it means "allow everything". The proven fallback lists remain
+      // the only safe source if public pool resolution itself is unavailable.
+      managedPool = null;
+    }
+    const activePool = managedPool && managedPool.activeSymbols.length > 0
+      ? managedPool.activeSymbols.filter((symbol) => opts.universe.includes(symbol))
+      : [];
+    if (managedPool) result.autoPoolState = managedPool.state;
     const adaptive = getCrossSectionalFilteredExecutionFilters(opts.store, {
       minEligiblePerSideLong: skew?.longK,
       minEligiblePerSideShort: skew?.shortK,
+      ...(activePool.length > 0 ? {
+        baseLongAllowlist: activePool,
+        baseShortAllowlist: activePool,
+      } : {}),
     });
+    // In the new-cohort soft phase, evidence changes ranking but not eligibility. This preserves
+    // momentum opportunity while still steering a tie/near-tie away from a measured loser; only the
+    // graduated hard phase below is permitted to remove a symbol altogether.
+    const adaptiveRanked = applyCrossSectionalAdaptiveRanking(scored, adaptive);
     // Liquidity floor (default OFF — see CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR). Applied to
     // the ALLOWLISTS rather than to `scored`, so it narrows only the FILTERED basket: RAW stays the
     // unmodified OOS control, and TREND/MIXED keep reading their own env lists untouched.
-    const liquid = CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0
+    const liquid = CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0 && shouldApplyCandleLiquidityFloor(managedPool)
       ? liquidCrossSectionalSymbols(candlesBySymbol, CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR)
       : null;
     const longAllow = narrowAllowlistToLiquid(adaptive.longAllowlist, liquid);
@@ -1385,15 +3203,284 @@ export async function runCrossSectionalCycle(opts: {
     // side means "no eligible candidates this cycle": skip the basket, same fail-closed convention
     // buildCrossSectionalBasket already uses when a side cannot fill k legs.
     const liquidityStarved = crossSectionalLiquidityStarved(longAllow, shortAllow, liquid);
-    let dynamicBlocks: { longBlocklist: string[]; shortBlocklist: string[] } = { longBlocklist: [], shortBlocklist: [] };
+    let dynamicBlocks: CrossSectionalFormationEntryBlocks = { longBlocklist: [], shortBlocklist: [] };
+    let dynamicEntryGuardUnavailable = false;
     try {
       dynamicBlocks = await opts.filteredEntryBlocks?.() ?? dynamicBlocks;
     } catch {
       // If current marks cannot be read, fail closed for FILTERED rather than emitting a signal
       // which might duplicate a losing open leg before the executor gets a second chance to stop it.
+      dynamicEntryGuardUnavailable = true;
       dynamicBlocks = { longBlocklist: [...longAllow], shortBlocklist: [...shortAllow] };
     }
-    const basket = liquidityStarved ? null : buildFilteredCrossSectionalBasket(scored, {
+    // 2026-08-18: stand down while the universe sits in a deep multi-week drawdown. Measured over
+    // 2 years, the lane returns -0.71%/basket in the bottom decile of trailing 14d market return
+    // and +0.22% everywhere else, and that sign held in EVERY year — the only regime result in the
+    // whole sweep that did. Disabled unless CROSS_SECTIONAL_STAND_DOWN_14D_PCT is set negative, and
+    // it FAILS OPEN on a measurement problem: a short candle history must never look like a calm
+    // market's opposite and silently halt the lane.
+    const standDown = evaluateMarketStandDown(
+      Object.fromEntries(Object.entries(candlesBySymbol).map(([sym, cs]) => [sym, cs.map((c) => c.close)])),
+      standDownThresholdPct(),
+    );
+    if (standDown.standDown) {
+      // Logged, never silent: a gate that skips without a trace is the exact class of defect the
+      // rejected-basket recorder was added for on 2026-08-17.
+      console.error(`[cross-sectional] STAND-DOWN: ${standDown.reason} (${standDown.measuredSymbols} symbols measured)`);
+      result.standDown = true;
+      result.standDownMarketReturn = standDown.marketReturn;
+    }
+    const rerankEnabled = !dynamicMom36Shock && isCrossSectionalSmartFormationRerankEnabled();
+    const executionOwnedLongBlocks = new Set(dynamicBlocks.longBlocklist);
+    const executionOwnedShortBlocks = new Set(dynamicBlocks.shortBlocklist);
+    const adaptiveShortBlocks = new Set(adaptive.shortBlocklist);
+    const baseLongBlocks = new Set(executionOwnedLongBlocks);
+    const baseShortBlocks = new Set([...adaptiveShortBlocks, ...executionOwnedShortBlocks]);
+    // Dynamic MOM36 keeps its inference universe separate from execution eligibility. In
+    // particular, a current short-blocked symbol remains visible to breadth and rank audit; only
+    // the later short-leg selection skips it. Every symbol must share the last fully closed bar.
+    const dynamicDecisionInformationCutoffMs = Math.floor(opts.now / BAR_MS) * BAR_MS;
+    type DynamicBaseRow = Omit<DynamicMom36RankedSymbol, "longEligible" | "shortEligible" | "shortBlocked">;
+    const dynamicBaseRows: DynamicBaseRow[] = [];
+    const dynamicCompletedCandlesBySymbol: Record<string, Candle[]> = {};
+    let dynamicFeatureTimestampMs: number | null = null;
+    let dynamicFreshnessReason: string | null = null;
+    if (dynamicMom36Shock) {
+      const staleOrMissing: string[] = [];
+      for (const symbol of opts.universe) {
+        // Dynamic inference is defined over the CURRENT executable pool.  The broader
+        // cross-sectional universe intentionally retains retired/report-only symbols for
+        // legacy markout work; a stale one outside both execution pools must not make the
+        // active pool look asynchronous or block every new Dynamic formation.
+        //
+        // Short blocks deliberately do NOT apply here: they remain final-selection-only so
+        // breadth and admission continue to see the complete executable pool.
+        if (!allowed(symbol, longAllow, null) && !allowed(symbol, shortAllow, null)) continue;
+        const completed = completedCandlesForDynamicMom36(candlesBySymbol[symbol] ?? [], dynamicDecisionInformationCutoffMs);
+        // Synchronous inference: a stale symbol cannot be silently mixed with the latest bar.
+        if (!completed || completed.featureTimestampMs !== dynamicDecisionInformationCutoffMs) {
+          staleOrMissing.push(symbol);
+          continue;
+        }
+        const momentum = crossSectionalMomentumScore(completed.candles, CROSS_SECTIONAL_MOMENTUM_BARS);
+        if (!momentum) {
+          staleOrMissing.push(symbol);
+          continue;
+        }
+        const volatility = realizedVolatility(completed.candles);
+        // Dynamic v4 uses the recovered legacy FAST horizon directly.  It must not inherit the
+        // independently-configurable SMART formation horizon used by old strategies.
+        const slowStart = completed.candles[completed.candles.length - 1 - DYNAMIC_MOM36_LOOKBACK_BARS];
+        const slowSource = completed.candles.at(-1);
+        const fastStart = completed.candles[completed.candles.length - 1 - DYNAMIC_MOM36_SLOW_FAST_FAST_BARS];
+        const fastReturn = fastStart && fastStart.close > 0 ? (momentum.price - fastStart.close) / fastStart.close : null;
+        // Recent-strength preference needs a 1h horizon alongside the 4h fast window. Same numerator,
+        // same completed-candle cutoff, one bar back instead of four — so the two horizons are
+        // synchronous by construction and cost no additional market data.
+        const oneHourStart = completed.candles[completed.candles.length - 2];
+        const oneHourReturn = oneHourStart && oneHourStart.close > 0
+          ? (momentum.price - oneHourStart.close) / oneHourStart.close
+          : null;
+        const oneHourStartTimestampMs = oneHourStart ? oneHourStart.openTime + BAR_MS : null;
+        const slowSourceTimestampMs = slowSource ? slowSource.openTime + BAR_MS : null;
+        const slowStartTimestampMs = slowStart ? slowStart.openTime + BAR_MS : null;
+        const fastSourceTimestampMs = slowSourceTimestampMs;
+        const fastStartTimestampMs = fastStart ? fastStart.openTime + BAR_MS : null;
+        const slowFastDataValid = [
+          slowSourceTimestampMs,
+          slowStartTimestampMs,
+          fastSourceTimestampMs,
+          fastStartTimestampMs,
+        ].every((timestamp) => Number.isFinite(timestamp) && timestamp! > 0 && timestamp! <= dynamicDecisionInformationCutoffMs);
+        const extensionCloses = completed.candles
+          .slice(-CROSS_SECTIONAL_SMART_EXTENSION_BARS)
+          .map((candle) => candle.close)
+          .filter((close) => close > 0);
+        const extensionMean = extensionCloses.length ? mean(extensionCloses) : 0;
+        const extensionVol = extensionMean > 0 && volatility !== null && volatility > 0
+          ? (momentum.price - extensionMean) / extensionMean / volatility
+          : null;
+        dynamicBaseRows.push({
+          symbol,
+          mom36: momentum.score,
+          price: momentum.price,
+          volatility,
+          fastReturn,
+          oneHourReturn,
+          oneHourStartTimestampMs,
+          extensionVol,
+          slowSourceTimestampMs,
+          slowStartTimestampMs,
+          fastSourceTimestampMs,
+          fastStartTimestampMs,
+          slowFastDataValid,
+        });
+        // Preserve the exact fully-closed, synchronous candles that generated MOM36.  The v3
+        // continuation adapter receives this same snapshot; it never re-fetches, interpolates, or
+        // looks at an in-progress bar after the base allocation has been determined.
+        dynamicCompletedCandlesBySymbol[symbol] = completed.candles;
+        dynamicFeatureTimestampMs = completed.featureTimestampMs;
+      }
+      if (dynamicBaseRows.length < 6) {
+        dynamicFreshnessReason = staleOrMissing.length > 0
+          ? "active inference universe has fewer than six synchronous MOM36 rows; unavailable: " + staleOrMissing.join(",")
+          : "active inference universe has fewer than six valid MOM36 rows";
+        console.error("[cross-sectional] DYNAMIC_MOM36_SHOCK NO_TRADE: " + dynamicFreshnessReason);
+      } else if (staleOrMissing.length > 0) {
+        // A stale source is never allowed into a formation, but one rejected
+        // candidate must not freeze every otherwise-valid basket. The remaining
+        // rows are fully re-ranked and re-selected below using the usual
+        // cluster, score-gap, and side-eligibility constraints.
+        console.warn(
+          "[cross-sectional] DYNAMIC_MOM36_INPUT_EXCLUDED: source unavailable/not synchronous for: "
+          + staleOrMissing.join(",")
+          + `; continuing with ${dynamicBaseRows.length} synchronous executable rows`,
+        );
+      }
+    }
+    // V3/V4 continuation is formation-only and non-blocking.  It receives the completed MOM36
+    // snapshot plus BTC/ETH context when available; a short/missing external history is recorded
+    // as NO_EDGE by the frozen runtime rather than changing admission or base allocation.
+    let dynamicContinuationRuntime: DynamicMom36ContinuationRuntimeResult | null = null;
+    // Reuse the same fully-closed BTC/ETH series for the continuation adapter and V6.2's macro
+    // component. No second market-data fetch is introduced by one-sided quality.
+    let dynamicBtcCompletedCandles: Candle[] | null = null;
+    let dynamicEthCompletedCandles: Candle[] | null = null;
+    if (dynamicMom36Continuation) {
+      try {
+        const [btcRaw, ethRaw] = await Promise.all([
+          opts.fetchCandles("BTCUSDT"),
+          opts.fetchCandles("ETHUSDT"),
+        ]);
+        const btcCompleted = completedCandlesForDynamicMom36(btcRaw, dynamicDecisionInformationCutoffMs);
+        const ethCompleted = completedCandlesForDynamicMom36(ethRaw, dynamicDecisionInformationCutoffMs);
+        dynamicBtcCompletedCandles = btcCompleted?.featureTimestampMs === dynamicDecisionInformationCutoffMs ? btcCompleted.candles : null;
+        dynamicEthCompletedCandles = ethCompleted?.featureTimestampMs === dynamicDecisionInformationCutoffMs ? ethCompleted.candles : null;
+      } catch {
+        // The adapter below will retain the exact failure reason/fallback, and base MOM36 proceeds.
+      }
+      const continuationCandles: Record<string, readonly Candle[]> = {
+        ...dynamicCompletedCandlesBySymbol,
+        ...(dynamicBtcCompletedCandles ? { BTCUSDT: dynamicBtcCompletedCandles } : {}),
+        ...(dynamicEthCompletedCandles ? { ETHUSDT: dynamicEthCompletedCandles } : {}),
+      };
+      dynamicContinuationRuntime = evaluateDynamicMom36Continuation({
+        candlesBySymbol: continuationCandles,
+        btcCandles: dynamicBtcCompletedCandles,
+        nowMs: opts.now,
+      });
+      if (!dynamicContinuationRuntime.available) {
+        console.warn(JSON.stringify({
+          event: "dynamic_mom36_continuation_no_edge",
+          strategyVersion: dynamicStrategyVersion,
+          reason: dynamicContinuationRuntime.fallbackReason,
+          activeUniverseSize: dynamicBaseRows.length,
+          requiredBars: DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES,
+        }));
+      }
+    }
+    const dynamicRowsFor = (
+      longBlocks: ReadonlySet<string>,
+      shortBlocks: ReadonlySet<string>,
+    ): DynamicMom36RankedSymbol[] => dynamicBaseRows.map((row) => {
+      const longEligible = allowed(row.symbol, longAllow, longBlocks);
+      const shortEligible = allowed(row.symbol, shortAllow, shortBlocks);
+      const blockReason = (side: "LONG" | "SHORT", executionEligible: boolean) => {
+        if (executionEligible) return null;
+        if (dynamicEntryGuardUnavailable) return "EXECUTION_GUARD_UNAVAILABLE" as const;
+        const explicitReason = side === "LONG"
+          ? dynamicBlocks.longBlockReasons?.[row.symbol]
+          : dynamicBlocks.shortBlockReasons?.[row.symbol];
+        if (explicitReason) return explicitReason;
+        if ((side === "LONG" ? executionOwnedLongBlocks : executionOwnedShortBlocks).has(row.symbol)) {
+          return "LOSS_REENTRY_GUARD" as const;
+        }
+        if ((side === "LONG" ? quarantinedLong : quarantinedShort).has(row.symbol)) {
+          return "SYMBOL_RELIABILITY_GUARD" as const;
+        }
+        if (side === "SHORT" && adaptiveShortBlocks.has(row.symbol)) return "SHORT_BLOCKED" as const;
+        return "EXECUTION_INELIGIBLE" as const;
+      };
+      return {
+        ...row,
+        longEligible,
+        shortEligible,
+        shortBlocked: !shortEligible,
+        longExecutionBlockReason: blockReason("LONG", longEligible),
+        shortExecutionBlockReason: blockReason("SHORT", shortEligible),
+      };
+    });
+    // V6.1 keeps the existing score semantics (the adaptive MOM36 score map), but consumes that
+    // score only for the actual final selected legs. Pre-V6.1 identities retain their frozen
+    // generic-probe path below for compatibility; they are never silently upgraded in place.
+    const dynamicAdmissionRanked: ScoredSymbol[] = dynamicMom36Shock
+      ? applyCrossSectionalAdaptiveRanking(
+          dynamicBaseRows.map((row) => ({
+            symbol: row.symbol,
+            score: row.mom36,
+            price: row.price,
+            volatility: row.volatility,
+            fastReturn: row.fastReturn,
+            extensionVol: row.extensionVol,
+          })),
+          adaptive,
+        )
+      : adaptiveRanked;
+    const dynamicAdmissionScoreBySymbol: Readonly<Record<string, number>> | undefined = dynamicMom36Shock
+      ? Object.fromEntries(dynamicAdmissionRanked.map((row) => [row.symbol, row.score]))
+      : undefined;
+    let reliabilitySnapshot: SymbolReliabilitySnapshot | null = null;
+    let reliabilityReadError: string | null = null;
+    try {
+      reliabilitySnapshot = opts.symbolReliabilitySnapshotGetter?.() ?? null;
+    } catch (error) {
+      reliabilitySnapshot = null;
+      reliabilityReadError = error instanceof Error && error.message ? error.message : "snapshot getter threw";
+    }
+    const reliabilityEnabled = isCrossSectionalSymbolReliabilityEnabled();
+    const reliabilityPersistence: SymbolReliabilityPersistence = reliabilitySnapshot?.persistence ?? {
+      status: "UNAVAILABLE",
+      source: null,
+      reason: reliabilityReadError ?? "reliability snapshot was not supplied by the runtime",
+      recoveredAt: null,
+    };
+    // A missing/corrupt durability record is not equivalent to a lack of evidence.  The latter
+    // preserves baseline eligibility; the former must not release a previously quarantined side.
+    const reliabilityUnavailable = reliabilityEnabled && reliabilityPersistence.status === "UNAVAILABLE";
+    const quarantinedLong = new Set(
+      reliabilityEnabled
+        ? (reliabilitySnapshot?.quarantined ?? []).filter((row) => row.side === "LONG").map((row) => row.symbol)
+        : [],
+    );
+    const quarantinedShort = new Set(
+      reliabilityEnabled
+        ? (reliabilitySnapshot?.quarantined ?? []).filter((row) => row.side === "SHORT").map((row) => row.symbol)
+        : [],
+    );
+    const candidateList = (
+      side: SymbolReliabilitySide,
+      blocked: ReadonlySet<string>,
+    ): SymbolReliabilityFormationCandidate[] => {
+      const allowlist = side === "LONG" ? longAllow : shortAllow;
+      const sorted = adaptiveRanked
+        .filter((candidate) => allowed(candidate.symbol, allowlist, blocked))
+        .sort((a, b) => side === "LONG" ? b.score - a.score : a.score - b.score);
+      return sorted.map((candidate) => {
+        const status = reliabilityStatusFor(reliabilitySnapshot, candidate.symbol, side);
+        return {
+          symbol: candidate.symbol,
+          side,
+          score: candidate.score,
+          status: status?.status ?? "INSUFFICIENT_DATA",
+          diagnosticScore: status?.diagnosticScore ?? null,
+          eligible: !reliabilityUnavailable,
+          reason: reliabilityUnavailable
+            ? "reliability persistence unavailable: " + (reliabilityPersistence.reason ?? "unknown reason") + "; new formation held"
+            : status?.reason ?? "reliability snapshot unavailable; INSUFFICIENT_DATA, no intervention",
+        };
+      });
+    };
+    const buildOpts = {
       k: CROSS_SECTIONAL_K,
       longK: skew?.longK,
       shortK: skew?.shortK,
@@ -1402,16 +3489,319 @@ export async function runCrossSectionalCycle(opts: {
       horizonMs: CROSS_SECTIONAL_HORIZON_MS,
       regimeContext,
       longAllowlist: longAllow,
-      longBlocklist: new Set(dynamicBlocks.longBlocklist),
       shortAllowlist: shortAllow,
-      shortBlocklist: new Set([...adaptive.shortBlocklist, ...dynamicBlocks.shortBlocklist]),
       volBySymbol,
-    });
+      formationMode: (rerankEnabled ? "SMART_FORMATION_RERANK" : "PLAIN_MOM36") as CrossSectionalFormationMode,
+      smartFormation: {
+        enabled: rerankEnabled,
+        axisScore: opts.axisScore ?? null,
+      },
+    };
+    const admissionBuildOpts = buildOpts;
+    const baselineGap = { value: null as CrossSectionalGapRejection | null };
+    // V6.1 admission is final-plan aware and never invokes this generic 3L/3S builder. Older
+    // Dynamic identities keep their historical probe exactly so this targeted fix has no hidden
+    // policy drift outside the new V6.1 fingerprint.
+    const admissionBaseline = (!dynamicMom36Shock || !dynamicFinalAllocationAdmission) && !(liquidityStarved || standDown.standDown)
+      ? buildFilteredCrossSectionalBasket(dynamicAdmissionRanked, {
+      ...admissionBuildOpts,
+      longBlocklist: dynamicMom36Shock ? new Set<string>() : baseLongBlocks,
+      shortBlocklist: dynamicMom36Shock ? new Set<string>() : baseShortBlocks,
+      onGapReject: (info) => { baselineGap.value = info; },
+    })
+      : null;
+    const finalGap = { value: null as CrossSectionalGapRejection | null };
+    const finalLongBlocks = new Set([...baseLongBlocks, ...quarantinedLong]);
+    const finalShortBlocks = new Set([...baseShortBlocks, ...quarantinedShort]);
+    const admissionCandidate = dynamicMom36Shock
+      ? (dynamicFinalAllocationAdmission ? null : admissionBaseline)
+      : !(liquidityStarved || standDown.standDown)
+        ? buildFilteredCrossSectionalBasket(adaptiveRanked, {
+      ...admissionBuildOpts,
+      longBlocklist: finalLongBlocks,
+      shortBlocklist: finalShortBlocks,
+      onGapReject: (info) => {
+        finalGap.value = info;
+        recordRejectedBasket(info);
+      },
+    })
+        : null;
+    const dynamicAdmissionExternalReason = liquidityStarved
+      ? "CURRENT_LIQUIDITY_STARVED"
+      : standDown.standDown
+        ? (standDown.reason ?? "MARKET_STAND_DOWN")
+        : null;
+    // V6.2 context is assembled once from the exact completed candle snapshots already fetched
+    // for formation. It is passed downstream as evidence only after V6 has frozen its six legs.
+    const dynamicOneSidedQualityContext = dynamicMom36Shock &&
+      isDynamicMom36OneSidedDirectionalQualityVersion(dynamicStrategyVersion)
+      ? (() => {
+          const selectedOneHourReturnBySymbol: Record<string, number | null> = {};
+          const absMom36PercentileBySymbol: Record<string, number | null> = {};
+          const availableHours: number[] = [];
+          for (const [symbol, candles] of Object.entries(dynamicCompletedCandlesBySymbol)) {
+            selectedOneHourReturnBySymbol[symbol] = dynamicMom36OneHourReturn(candles);
+            const percentile = dynamicMom36AbsPercentile(candles);
+            absMom36PercentileBySymbol[symbol] = percentile.percentile;
+            availableHours.push(percentile.availableHours);
+          }
+          const breadthScans = opts.store.recentDynamicMom36Formations
+            .map(validDynamicMom36BreadthScan)
+            .filter((scan): scan is OneSidedBreadthScan => scan !== null)
+            .slice(0, 3);
+          const minimumAvailableHours = availableHours.length ? Math.min(...availableHours) : null;
+          return {
+            breadthScans,
+            btcFast4hReturn: dynamicBtcCompletedCandles ? dynamicMom36Fast4hReturn(dynamicBtcCompletedCandles) : null,
+            ethFast4hReturn: dynamicEthCompletedCandles ? dynamicMom36Fast4hReturn(dynamicEthCompletedCandles) : null,
+            selectedOneHourReturnBySymbol,
+            absMom36PercentileBySymbol,
+            percentileWindowHours: minimumAvailableHours,
+            percentileRequiredWindowHours: ONE_SIDED_MOM36_PERCENTILE_REQUIRED_HOURS,
+            percentileSource: minimumAvailableHours !== null
+              ? "completed_1h_candles"
+              : null,
+          };
+        })()
+      : undefined;
+    const dynamicBaselineEvaluation = dynamicMom36Shock && !dynamicFreshnessReason && dynamicFeatureTimestampMs !== null
+      ? evaluateDynamicMom36Formation({
+          activeUniverse: dynamicRowsFor(baseLongBlocks, baseShortBlocks),
+          now: nowIso,
+          openedAtMs: opts.now,
+          horizonMs: DYNAMIC_MOM36_HORIZON_MS,
+          featureTimestampMs: dynamicFeatureTimestampMs,
+          decisionInformationCutoffMs: dynamicDecisionInformationCutoffMs,
+          maxPerCluster: CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER,
+          allowedLongCounts: dynamicAllocationPolicy.allowedLongCounts,
+          allocationSelectionMode: allocationSelectionMode ?? "BREADTH",
+          threeLegContext: threeLegRuntimeContext(opts.now),
+          threeLegCandlesBySymbol: dynamicCompletedCandlesBySymbol,
+          requireSkewContinuationConfirmation: dynamicRequireSkewContinuationConfirmation,
+          admissionScoreGapFloor: CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
+          admissionScoreBySymbol: dynamicAdmissionScoreBySymbol,
+          admissionExternalReason: dynamicAdmissionExternalReason,
+          legacyAdmissionScoreGap: admissionBaseline?.scoreGap ?? baselineGap.value?.scoreGap ?? null,
+          legacyAdmissionPassed: admissionBaseline !== null,
+          strategyVersion: dynamicStrategyVersion as DynamicMom36StrategyVersion,
+          continuationRuntime: dynamicContinuationRuntime,
+          oneSidedQualityContext: dynamicOneSidedQualityContext,
+        })
+      : null;
+    const dynamicCandidateEvaluation = dynamicMom36Shock && !dynamicFreshnessReason && dynamicFeatureTimestampMs !== null
+      ? evaluateDynamicMom36Formation({
+          activeUniverse: dynamicRowsFor(finalLongBlocks, finalShortBlocks),
+          now: nowIso,
+          openedAtMs: opts.now,
+          horizonMs: DYNAMIC_MOM36_HORIZON_MS,
+          featureTimestampMs: dynamicFeatureTimestampMs,
+          decisionInformationCutoffMs: dynamicDecisionInformationCutoffMs,
+          maxPerCluster: CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER,
+          allowedLongCounts: dynamicAllocationPolicy.allowedLongCounts,
+          allocationSelectionMode: allocationSelectionMode ?? "BREADTH",
+          threeLegContext: threeLegRuntimeContext(opts.now),
+          threeLegCandlesBySymbol: dynamicCompletedCandlesBySymbol,
+          requireSkewContinuationConfirmation: dynamicRequireSkewContinuationConfirmation,
+          admissionScoreGapFloor: CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
+          admissionScoreBySymbol: dynamicAdmissionScoreBySymbol,
+          admissionExternalReason: dynamicAdmissionExternalReason,
+          legacyAdmissionScoreGap: admissionCandidate?.scoreGap ?? finalGap.value?.scoreGap ?? null,
+          legacyAdmissionPassed: admissionCandidate !== null,
+          strategyVersion: dynamicStrategyVersion as DynamicMom36StrategyVersion,
+          continuationRuntime: dynamicContinuationRuntime,
+          oneSidedQualityContext: dynamicOneSidedQualityContext,
+        })
+      : null;
+    const dynamicBaseline = dynamicBaselineEvaluation?.basket ?? null;
+    const dynamicCandidate = dynamicCandidateEvaluation?.basket ?? null;
+    const baseline = dynamicMom36Shock ? dynamicBaseline : admissionBaseline;
+    const candidateBasket = dynamicMom36Shock ? dynamicCandidate : admissionCandidate;
+    let basket = reliabilityUnavailable ? null : candidateBasket;
+    if (reliabilityEnabled) {
+      const selectedBefore = {
+        LONG: baseline?.longLeg.map((leg) => leg.symbol) ?? [],
+        SHORT: baseline?.shortLeg.map((leg) => leg.symbol) ?? [],
+      };
+      const selectedAfter = {
+        LONG: basket?.longLeg.map((leg) => leg.symbol) ?? [],
+        SHORT: basket?.shortLeg.map((leg) => leg.symbol) ?? [],
+      };
+      const replacements: SymbolReliabilityFormationDecision["replacements"] = [];
+      for (const side of ["LONG", "SHORT"] as const) {
+        const removed = selectedBefore[side].filter((symbol) => !selectedAfter[side].includes(symbol));
+        const added = selectedAfter[side].filter((symbol) => !selectedBefore[side].includes(symbol));
+        for (let index = 0; index < removed.length; index++) {
+          replacements.push({ side, removed: removed[index]!, replacement: added[index] ?? null });
+        }
+      }
+      const scoreGapAfter = dynamicMom36Shock
+        ? dynamicCandidateEvaluation?.snapshot?.admission.scoreGap ?? null
+        : candidateBasket?.scoreGap ?? finalGap.value?.scoreGap ?? null;
+      const dynamicAdmissionReason = dynamicCandidateEvaluation?.snapshot?.admission.reason ?? null;
+      let decision: SymbolReliabilityFormationDecision = {
+        version: "SYMBOL_RELIABILITY_V1",
+        evaluatedAt: reliabilitySnapshot?.evaluatedAt ?? nowIso,
+        evaluationId: reliabilitySnapshot?.evaluationId ?? "sr-v1-unavailable",
+        persistence: { ...reliabilityPersistence },
+        sourceObservationId: `xsec:${filteredSignalForCycle}:${opts.now}`,
+        decision: reliabilityUnavailable
+          ? "NO_TRADE_OTHER"
+          : basket
+          ? "PASS"
+          : dynamicMom36Shock && dynamicAdmissionReason === "ADMISSION_SCORE_GAP_FAIL"
+            ? "NO_TRADE_SCORE_GAP"
+          : finalGap.value
+            ? "NO_TRADE_SCORE_GAP"
+            : "NO_TRADE_INSUFFICIENT_ELIGIBLE",
+        candidateListBefore: {
+          LONG: candidateList("LONG", baseLongBlocks),
+          SHORT: candidateList("SHORT", baseShortBlocks),
+        },
+        candidateListAfter: {
+          LONG: candidateList("LONG", finalLongBlocks),
+          SHORT: candidateList("SHORT", finalShortBlocks),
+        },
+        quarantined: (reliabilitySnapshot?.quarantined ?? []).map((row) => ({ ...row })),
+        selectedBefore,
+        selectedAfter,
+        replacements,
+        scoreGapBefore: dynamicMom36Shock
+          ? dynamicBaselineEvaluation?.snapshot?.admission.scoreGap ?? null
+          : baseline?.scoreGap ?? baselineGap.value?.scoreGap ?? null,
+        scoreGapAfter,
+        scoreGapFloor: CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
+        diagnosticsBySymbolSide: (reliabilitySnapshot?.statuses ?? []).map((row) => ({
+          symbol: row.symbol,
+          side: row.side,
+          status: row.status,
+          diagnosticScore: row.diagnosticScore,
+          independentN: row.independentN,
+          meanContribution: row.meanContribution,
+          profitFactor: row.profitFactor,
+          cvar5: row.cvar5,
+          winnerToLoserDamageRate: row.winnerToLoserDamageRate,
+          reason: row.reason,
+        })),
+      };
+      let decisionPersisted = false;
+      try {
+        decisionPersisted = opts.symbolReliabilityDecisionRecorder?.(decision) === true;
+      } catch (error) {
+        console.error(
+          "[cross-sectional] RELIABILITY PERSISTENCE ERROR: formation decision could not be recorded; new basket held: " +
+          (error instanceof Error && error.message ? error.message : "unknown recorder failure"),
+        );
+      }
+      if (!decisionPersisted && basket) {
+        console.error(
+          "[cross-sectional] RELIABILITY PERSISTENCE UNAVAILABLE: formation decision is not durable; new basket held",
+        );
+        decision = {
+          ...decision,
+          decision: "NO_TRADE_OTHER",
+          selectedAfter: { LONG: [], SHORT: [] },
+          replacements: [],
+        };
+        basket = null;
+      }
+      if (basket) basket.symbolReliability = decision;
+    }
+    if (dynamicMom36Shock) {
+      const evaluatedSnapshot = dynamicCandidateEvaluation?.snapshot ?? dynamicBaselineEvaluation?.snapshot ?? null;
+      const admissionReason = dynamicFreshnessReason
+        ?? (reliabilityUnavailable ? `symbol reliability persistence unavailable: ${reliabilityPersistence.reason ?? "unknown"}` : null)
+        ?? evaluatedSnapshot?.noEntryReason
+        ?? (evaluatedSnapshot?.admission.passed ? null : "current production admission did not pass");
+      const snapshot = evaluatedSnapshot
+        ? {
+            ...evaluatedSnapshot,
+            noEntryReason: basket ? null : admissionReason ?? "DYNAMIC_MOM36_FORMATION_NOT_EXECUTED",
+          }
+        : null;
+      if (snapshot) opts.store.recordDynamicMom36Formation(snapshot);
+      console.info(JSON.stringify({
+        event: "dynamic_mom36_formation",
+        strategyVersion: dynamicStrategyVersion,
+        allowedAllocations: dynamicAllocationPolicy.allowedAllocations,
+        skewContinuationConfirmationRequired: dynamicRequireSkewContinuationConfirmation,
+        formationId: snapshot?.formationId ?? null,
+        admissionFormationId: snapshot?.admission.formationId ?? null,
+        selectedCandidateHash: snapshot?.selectedCandidateHash ?? null,
+        admissionSelectedCandidateHash: snapshot?.admission.selectedCandidateHash ?? null,
+        slowFastRequired: dynamicMom36SlowFastApplication === "STRICT" ||
+          dynamicMom36SlowFastApplication === "STRICT_DIRECTIONAL_FEASIBILITY",
+        slowFastMode: dynamicMom36SlowFastApplication,
+        admissionPass: snapshot?.admission.passed ?? false,
+        admissionReason,
+        activeUniverseSize: snapshot?.activeUniverse.length ?? dynamicBaseRows.length,
+        positiveCount: snapshot?.positiveCount ?? null,
+        negativeCount: snapshot?.negativeCount ?? null,
+        zeroCount: snapshot?.zeroCount ?? null,
+        baseAllocation: snapshot?.baseAllocation ?? null,
+        shockAvailable: snapshot?.shockRawOutput.artifactPresent === true,
+        shockModel: snapshot?.shockModelArtifact ?? null,
+        shockState: snapshot?.shockState ?? "NO_EDGE",
+        shockConfidence: snapshot?.shockRawOutput.probabilities ?? null,
+        shockReason: snapshot?.shockReason ?? null,
+        continuation: snapshot?.continuation ?? null,
+        slowFast: snapshot?.slowFast ?? null,
+        baseSelectedLongs: snapshot?.baseSelectedLongs ?? [],
+        baseSelectedShorts: snapshot?.baseSelectedShorts ?? [],
+        baseSelectionInsufficientReason: snapshot?.baseSelectionInsufficientReason ?? null,
+        rawV3SelectedLongs: snapshot?.rawV3SelectedLongs ?? [],
+        rawV3SelectedShorts: snapshot?.rawV3SelectedShorts ?? [],
+        rawV3SelectionInsufficientReason: snapshot?.rawV3SelectionInsufficientReason ?? null,
+        slowFastStrictSelectedLongs: snapshot?.slowFastStrictSelectedLongs ?? [],
+        slowFastStrictSelectedShorts: snapshot?.slowFastStrictSelectedShorts ?? [],
+        slowFastStrictSelectionInsufficientReason: snapshot?.slowFastStrictSelectionInsufficientReason ?? null,
+        selectionSource: snapshot?.selectionSource ?? null,
+        requestedAllocation: snapshot?.requestedAllocation ?? null,
+        directionalFeasibility: snapshot?.directionalFeasibility ?? null,
+        finalAllocation: snapshot?.finalAllocation ?? null,
+        finalLongCount: snapshot?.admission.finalLongCount ?? null,
+        finalShortCount: snapshot?.admission.finalShortCount ?? null,
+        scoreGapApplicable: snapshot?.admission.scoreGapApplicable ?? null,
+        scoreGap: snapshot?.admission.scoreGap ?? null,
+        scoreGapFloor: snapshot?.admission.scoreGapFloor ?? null,
+        scoreGapReason: snapshot?.admission.scoreGapReason ?? null,
+        admissionDecision: snapshot?.admission.reason ?? null,
+        oneSidedDirectionalQuality: snapshot?.admission.oneSidedDirectionalQuality ?? null,
+        oneSidedQualityScore: snapshot?.admission.oneSidedDirectionalQuality?.score ?? null,
+        oneSidedQualityMinScore: snapshot?.admission.oneSidedDirectionalQuality?.minScore ?? null,
+        oneSidedStrongReversal: snapshot?.admission.oneSidedDirectionalQuality?.strongReversal ?? null,
+        requiredLongs: snapshot?.requiredLongs ?? null,
+        requiredShorts: snapshot?.requiredShorts ?? null,
+        availableAlignedLongs: snapshot?.availableAlignedLongs ?? null,
+        availableAlignedShorts: snapshot?.availableAlignedShorts ?? null,
+        availableExecutionEligibleAlignedLongs: snapshot?.availableExecutionEligibleAlignedLongs ?? null,
+        availableExecutionEligibleAlignedShorts: snapshot?.availableExecutionEligibleAlignedShorts ?? null,
+        rawV3CandidateAudit: snapshot?.rawV3CandidateAudit ?? null,
+        selectionCandidateAudit: snapshot?.selectionCandidateAudit ?? null,
+        selectionInsufficientReason: snapshot?.selectionInsufficientReason ?? null,
+        noEntryReason: snapshot?.noEntryReason ?? admissionReason ?? null,
+        selectedLongs: snapshot?.selectedLongs ?? [],
+        selectedShorts: snapshot?.selectedShorts ?? [],
+        blockedSymbolsSkipped: snapshot?.blockedShortsSkipped ?? [],
+        entryDecision: basket ? "FORMED" : "NO_TRADE",
+      }));
+    }
     if (basket) {
       opts.store.add(basket);
       result.opened += 1;
-      result.openedFiltered = (result.openedFiltered ?? 0) + 1;
+      if (dynamicMom36Shock) result.openedDynamicMom36Shock = (result.openedDynamicMom36Shock ?? 0) + 1;
+      else result.openedFiltered = (result.openedFiltered ?? 0) + 1;
     }
+  }
+  // Dynamic MOM36 owns the only post-cutover cross-basket formation path. Existing observations
+  // were resolved above, but no legacy TREND/MIXED shadow candidate is allowed to appear alongside
+  // it and be mistaken for an executable alternate strategy.
+  if (dynamicMom36Shock) {
+    // Dynamic observations are executable signals. Persist both the newly formed observation and
+    // cycle watermark before returning so a restart cannot erase the signal or make the report
+    // falsely appear stale.
+    opts.store.markCycle(nowIso);
+    opts.store.save();
+    return result;
   }
   if (!isCrossSectionalAdaptiveDisabled() && regimeContext?.regimeClass && regimeContext.regimeClass !== "UNKNOWN") {
     if (
@@ -1463,7 +3853,10 @@ export async function runCrossSectionalCycleGuarded(opts: {
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   regimeContext?: CrossSectionalRegimeContext | null;
   axisScore?: number | null;
-  filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
+  filteredEntryBlocks?: () => Promise<CrossSectionalFormationEntryBlocks>;
+  symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
+  symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
+  filteredExecutionPool?: () => Promise<CrossSectionalAutoPoolSnapshot | null>;
 }): Promise<CrossSectionalCycleResult | null> {
   if (cycleRunning) return null;
   cycleRunning = true;
@@ -1496,6 +3889,15 @@ export interface CrossSectionalReport {
   nextResolveInMs: number | null;
   /** the net returns of recent closed baskets, for a distribution sparkline. */
   recentNetReturns: number[];
+  /** Closed observations that share NO holding period with each other — see
+   *  nonOverlappingClosedSample. These, not `closed`, are the independent trials. */
+  independentBlocks: number;
+  /** Mean/win-rate/t over the non-overlapping subsample. t is null below 2 blocks, because a
+   *  standard error over one sample is not a number, it is a hallucination. */
+  blockedNetAvgReturn: number | null;
+  blockedWinRate: number | null;
+  blockedTStat: number | null;
+  blockedNetReturns: number[];
   targetGrossReturn: number;
   edgeReady: boolean;
   byRegime: Array<{
@@ -1514,12 +3916,14 @@ export interface CrossSectionalReport {
 }
 
 function observationVariant(o: Pick<CrossSectionalObservation, "variant" | "signal">): CrossSectionalVariant {
+  if (o.variant === "DYNAMIC_MOM36_SHOCK" || o.signal === DYNAMIC_MOM36_SHOCK_SIGNAL) return "DYNAMIC_MOM36_SHOCK";
   if (o.variant === "MIXED_MEAN_REVERSION" || o.signal === CROSS_SECTIONAL_MIXED_SIGNAL) return "MIXED_MEAN_REVERSION";
   if (o.variant === "TREND_BETA_VOL" || o.signal === CROSS_SECTIONAL_TREND_SIGNAL) return "TREND_BETA_VOL";
   return o.variant === "FILTERED" || o.signal === CROSS_SECTIONAL_FILTERED_SIGNAL ? "FILTERED" : "RAW";
 }
 
 function reportSignalFor(variant: CrossSectionalVariant): string {
+  if (variant === "DYNAMIC_MOM36_SHOCK") return DYNAMIC_MOM36_SHOCK_SIGNAL;
   if (variant === "FILTERED") return CROSS_SECTIONAL_FILTERED_SIGNAL;
   if (variant === "TREND_BETA_VOL") return CROSS_SECTIONAL_TREND_SIGNAL;
   if (variant === "MIXED_MEAN_REVERSION") return CROSS_SECTIONAL_MIXED_SIGNAL;
@@ -1528,7 +3932,7 @@ function reportSignalFor(variant: CrossSectionalVariant): string {
 
 function targetGrossFor(variant: CrossSectionalVariant): number {
   if (variant === "RAW") return CROSS_SECTIONAL_ROUNDTRIP_BPS / 10_000;
-  if (variant === "FILTERED") return CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS / 10_000;
+  if (variant === "FILTERED" || variant === "DYNAMIC_MOM36_SHOCK") return CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS / 10_000;
   return CROSS_SECTIONAL_ADAPTIVE_MIN_GROSS_BPS / 10_000;
 }
 
@@ -1554,18 +3958,63 @@ function groupStats<T extends string>(
   });
 }
 
+/**
+ * Greedy non-overlapping subsample of closed observations.
+ *
+ * The lane opens a basket EVERY HOUR and holds each for `horizonMs` (48h), so consecutive
+ * observations share most of their life and most of their symbols — measured on the live store,
+ * ~18 ran concurrently with a peak of 36. Treating those rows as independent trials inflates any
+ * t-stat by roughly sqrt(overlap): a 4-day window read t=3.29 on 43 rows while containing under ONE
+ * non-overlapping 48h block.
+ *
+ * This walks the closed set in time order and keeps an observation only once the previously kept
+ * one has fully resolved. What comes back is a set of samples that genuinely do not share a holding
+ * period — the only set a standard error may be computed from. It is deliberately greedy-from-the-
+ * earliest rather than best-of: picking by return would select on the outcome being measured.
+ */
+export function nonOverlappingClosedSample<T extends { openedAtMs: number; horizonMs: number }>(
+  closed: readonly T[],
+): T[] {
+  const ordered = [...closed].sort((a, b) => a.openedAtMs - b.openedAtMs);
+  const kept: T[] = [];
+  let freeFromMs = Number.NEGATIVE_INFINITY;
+  for (const o of ordered) {
+    if (o.openedAtMs < freeFromMs) continue;
+    kept.push(o);
+    freeFromMs = o.openedAtMs + o.horizonMs;
+  }
+  return kept;
+}
+
 export function buildCrossSectionalReport(
   store: CrossSectionalStore,
   nowMs: number = Date.now(),
   opts: { variant?: CrossSectionalVariant; signal?: string; sinceMs?: number } = {},
 ): CrossSectionalReport {
-  const variant = opts.variant ?? (opts.signal === CROSS_SECTIONAL_FILTERED_SIGNAL ? "FILTERED" : "RAW");
-  const all = store.all.filter((o) =>
+  const variant = opts.variant ?? (
+    opts.signal === DYNAMIC_MOM36_SHOCK_SIGNAL
+      ? "DYNAMIC_MOM36_SHOCK"
+      : opts.signal === CROSS_SECTIONAL_FILTERED_SIGNAL
+        ? "FILTERED"
+        : "RAW"
+  );
+  const all = store.reportable.filter((o) =>
     (opts.signal ? o.signal === opts.signal : observationVariant(o) === variant) &&
     (opts.sinceMs === undefined || o.openedAtMs >= opts.sinceMs),
   );
   const closed = all.filter((o) => o.status === "CLOSED" && o.netReturn !== null);
   const nets = closed.map((o) => o.netReturn!);
+  // The independent-trial view. `closed` counts rows; this counts trials that share no holding
+  // period, which is what any mean/t-stat has to be built from on an hourly-open / 48h-hold lane.
+  const blocked = nonOverlappingClosedSample(closed);
+  const blockedNets = blocked.map((o) => o.netReturn!);
+  const blockedMean = blockedNets.length ? mean(blockedNets) : null;
+  const blockedSd = blockedNets.length > 1
+    ? Math.sqrt(blockedNets.reduce((sum, x) => sum + (x - blockedMean!) ** 2, 0) / (blockedNets.length - 1))
+    : null;
+  const blockedTStat = blockedMean !== null && blockedSd !== null && blockedSd > 0
+    ? blockedMean / (blockedSd / Math.sqrt(blockedNets.length))
+    : null;
   const gross = closed.map((o) => o.grossReturn ?? 0);
   const m = mean(nets);
   const sd = nets.length > 1 ? Math.sqrt(mean(nets.map((x) => (x - m) ** 2))) : 0;
@@ -1582,6 +4031,11 @@ export function buildCrossSectionalReport(
     lastCycleAt: store.lastCycleAt,
     nextResolveInMs: openRemaining.length ? Math.min(...openRemaining) : null,
     recentNetReturns: nets.slice(-30),
+    independentBlocks: blocked.length,
+    blockedNetAvgReturn: blockedMean,
+    blockedWinRate: blockedNets.length ? blockedNets.filter((x) => x > 0).length / blockedNets.length : null,
+    blockedTStat,
+    blockedNetReturns: blockedNets,
     signal: opts.signal ?? reportSignalFor(variant),
     variant,
     horizonBars: CROSS_SECTIONAL_HORIZON_BARS,

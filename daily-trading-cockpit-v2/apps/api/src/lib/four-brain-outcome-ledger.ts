@@ -59,6 +59,7 @@ import { existsSync, readFileSync } from "node:fs";
 export type FourBrainOutcomeHorizon = "SCALP" | "INTRADAY" | "SWING";
 export type FourBrainOutcomeDirectionAction = "LONG" | "SHORT" | "FLAT" | "BOTH";
 export type FourBrainOutcomeEntrySide = "LONG" | "SHORT";
+export type FourBrainOutcomeCanonicalRegimeFamily = "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN";
 export type FourBrainOutcomeEntryAction =
   | "ENTER_NOW"
   | "WAIT_PULLBACK"
@@ -74,6 +75,10 @@ export interface PendingDirectionRow {
   action: FourBrainOutcomeDirectionAction;
   /** R (net of cost), from proven edge-memory; null if unknown at decision time — never fabricated. */
   expectedDirectionalR: number | null;
+  /** Captured from the same Executive record, never inferred at resolve time. */
+  canonicalRegimeFamily?: FourBrainOutcomeCanonicalRegimeFamily | null;
+  scannerRegime?: string | null;
+  marketContextSnapshotId?: string | null;
 }
 
 /** Just enough of a journaled Entry Brain decision to resolve its counterfactual outcome later. */
@@ -90,6 +95,10 @@ export interface PendingEntryRow {
   initialStopPrice: number | null;
   /** R after est. fees + slippage; null if unknown at decision time — never fabricated. */
   expectedNetR: number | null;
+  /** Captured at decision time for exact testnet-fill reinforcement; legacy rows stay null/absent. */
+  canonicalRegimeFamily?: FourBrainOutcomeCanonicalRegimeFamily | null;
+  scannerRegime?: string | null;
+  marketContextSnapshotId?: string | null;
 }
 
 export interface FourBrainOutcomeLedgerOptions {
@@ -287,6 +296,33 @@ function stringOrNull(v: unknown): string | null {
   return typeof v === "string" ? v : null;
 }
 
+function canonicalRegimeOrNull(v: unknown): FourBrainOutcomeCanonicalRegimeFamily | null {
+  return v === "BULLISH" || v === "BEARISH" || v === "MIXED" || v === "UNKNOWN" ? v : null;
+}
+
+/**
+ * Pull only immutable, already-journaled market lineage from an executive
+ * record.  Do not fall back to a later/live regime: that would leak future
+ * state into the outcome label.
+ */
+function marketLineageFromExecutiveRecord(record: Record<string, unknown>): Partial<Pick<
+  PendingEntryRow,
+  "canonicalRegimeFamily" | "scannerRegime" | "marketContextSnapshotId"
+>> {
+  const brains = record.brains as Record<string, unknown> | null | undefined;
+  const marketState = brains?.marketState as Record<string, unknown> | null | undefined;
+  const authority = marketState?.authority as Record<string, unknown> | null | undefined;
+  const marketContext = record.marketContext as Record<string, unknown> | null | undefined;
+  const canonicalRegimeFamily = canonicalRegimeOrNull(authority?.canonicalRegimeFamily);
+  const scannerRegime = stringOrNull(authority?.scannerRegime);
+  const marketContextSnapshotId = stringOrNull(marketContext?.marketContextSnapshotId);
+  return {
+    ...(canonicalRegimeFamily !== null ? { canonicalRegimeFamily } : {}),
+    ...(scannerRegime !== null ? { scannerRegime } : {}),
+    ...(marketContextSnapshotId !== null ? { marketContextSnapshotId } : {}),
+  };
+}
+
 /** Extract a PendingDirectionRow from a raw EXECUTIVE_DECISION record's brains.direction slice (see
  *  buildExecutiveDecisionRecord in four-brain-journal.ts). Returns null when the slice is absent or any
  *  required field fails its runtime check — never a partially-fabricated row. */
@@ -298,12 +334,14 @@ export function extractPendingDirectionRow(record: Record<string, unknown>): Pen
   if (typeof decisionId !== "string" || decisionId.length === 0) return null;
   if (typeof asOfMs !== "number" || !Number.isFinite(asOfMs)) return null;
   if (!isHorizon(horizon) || !isDirectionAction(action)) return null;
+  const lineage = marketLineageFromExecutiveRecord(record);
   return {
     decisionId,
     asOfMs,
     horizon,
     action,
     expectedDirectionalR: finiteNumberOrNull(expectedDirectionalR),
+    ...lineage,
   };
 }
 
@@ -322,6 +360,7 @@ export function extractPendingEntryRow(record: Record<string, unknown>): Pending
   if (typeof decisionId !== "string" || decisionId.length === 0) return null;
   if (typeof asOfMs !== "number" || !Number.isFinite(asOfMs)) return null;
   if (!isEntrySide(side) || !isEntryAction(action)) return null;
+  const lineage = marketLineageFromExecutiveRecord(record);
   return {
     decisionId,
     asOfMs,
@@ -333,6 +372,7 @@ export function extractPendingEntryRow(record: Record<string, unknown>): Pending
     targetEntry: finiteNumberOrNull(targetEntry),
     initialStopPrice: finiteNumberOrNull(initialStopPrice),
     expectedNetR: finiteNumberOrNull(expectedNetR),
+    ...lineage,
   };
 }
 

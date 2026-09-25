@@ -10,7 +10,8 @@
  *  - testnet/mainnet is an explicit constructor choice (resolveLiveBinanceBaseUrl).
  *  - Server-time sync with a hard clock-skew guard: signed requests REFUSE to fire when
  *    |local+offset − server| was measured beyond MAX_CLOCK_SKEW_MS at last sync.
- *  - GET requests retry on timeout/429/network (idempotent). Order-mutating requests
+ *  - GET requests retry on timeout/429/network (idempotent), but never immediately retry an
+ *    HTTP 418 IP ban: repeating that request only extends the ban. Order-mutating requests
  *    (POST/DELETE) NEVER auto-retry — double-submit is worse than a missed attempt; the
  *    engine passes newClientOrderId so a retry-by-engine is exchange-side idempotent.
  *  - This module performs NO strategy logic and NO sizing. It is a transport.
@@ -38,13 +39,68 @@ export function resolveLiveBinanceBaseUrl(env: LiveBinanceEnv): string {
 
 // ─── constants ───────────────────────────────────────────────────────────────
 
-const REQUEST_TIMEOUT_MS = 6_000;
+/**
+ * 2026-08-18: raised from 6_000 after measuring Binance's own behaviour during a testnet backend
+ * outage. Every authenticated endpoint (positionRisk, account, balance, openOrders) failed at a
+ * consistent ~8.08s with HTTP 408 / -1007, while the gateway itself answered a deliberately bad key
+ * in <100ms — so 8.08s is Binance's server-side ceiling, not network noise.
+ *
+ * A 6s client timeout sits BELOW that ceiling. During a degraded-but-alive period Binance would
+ * answer at ~7-8s and we would abort first, turning a knowable outcome into an unknown one. That
+ * matters most on POST: this timeout covers GET, POST and DELETE alike, and -1007 says outright
+ * "Send status unknown; execution status unknown" — aborting early on an order placement is exactly
+ * how this codebase's recurring "invisible naked position" class of bug starts.
+ *
+ * 10s clears the ceiling with margin. Safe against tick overrun: tick() runs every 25s behind an
+ * `if (this.ticking) return` re-entrancy guard, so a slow tick skips the next one rather than
+ * overlapping. During a FULL outage this changes nothing — the request fails either way, only the
+ * error text differs ("timed out after 10000ms" vs the -1007 Binance returns at 8.08s).
+ */
+export const REQUEST_TIMEOUT_MS = 10_000;
+/**
+ * Ceiling on waiting for the previous transport slot to release.
+ *
+ * A slot legitimately holds the queue for `paceQueuedRead` (<=125 ms) plus one
+ * `dispatchRawRequest`, and that dispatch is itself bounded by
+ * REQUEST_TIMEOUT_MS with the abort armed through body consumption. GET
+ * retries take a fresh slot each, so ~11 s is the honest worst case and this
+ * is roughly three times that.
+ *
+ * It exists because the queue had no liveness guarantee at all: `await
+ * previous` on a head that never released froze EVERY later read forever, and
+ * because reads are what feed reconciliation, the engine then went blind while
+ * still reporting errorStreak:0 and a null lastTickError. Mainnet 3103 sat that
+ * way for 49+ minutes on 2026-09-04, armed and holding real positions, with no
+ * established connection and no error anywhere. A fetch implementation that
+ * ignores its abort signal (a stalled response body is the usual way) is enough
+ * to cause it. Passing this bound means the head has already broken its own
+ * timeout contract, so proceeding is strictly safer than waiting forever;
+ * paceQueuedRead still limits the resulting request rate.
+ */
+export const TRANSPORT_SLOT_MAX_WAIT_MS = 30_000;
 const RECV_WINDOW_MS = 5_000;
 // Guard stays below RECV_WINDOW_MS so offset-compensated timestamps still land inside Binance's window.
 export const MAX_CLOCK_SKEW_MS = 4_000;
 const GET_MAX_RETRIES = 2;
 // Sync every 60 s so the offset stays fresh even on hosts with fast clock drift.
 const TIME_SYNC_TTL_MS = 60_000;
+/**
+ * HTTP 418 is an IP-ban response, not a hint to retry shortly.  Binance does not always send a
+ * Retry-After header, so keep the transport quiet for a conservative two minutes when no explicit
+ * expiry is supplied.  This protects the account-wide client shared by the engine, basket
+ * executors, and dashboard from extending its own ban.
+ */
+const HTTP_418_FALLBACK_COOLDOWN_MS = 2 * 60_000;
+/** A plain 429 may be a short endpoint throttle; honour it too, but do not turn it into a ban. */
+const HTTP_429_FALLBACK_COOLDOWN_MS = 5_000;
+/**
+ * Requests were already serialized, but serial dispatch can still burst many public/signed USD-M
+ * reads in a few seconds. Pacing both environments keeps a dashboard refresh, executor
+ * reconciliation, and quote verification from recreating an IP-level spike. Risk-reducing
+ * POST/DELETE traffic remains unqueued (see rawRequest()).
+ */
+const TESTNET_GET_MIN_DISPATCH_GAP_MS = 125;
+const MAINNET_GET_MIN_DISPATCH_GAP_MS = process.env.NODE_ENV === "test" ? 0 : 125;
 // Re-fetch exchange filters (tickSize/stepSize/minQty/minNotional) periodically instead of caching
 // them for the process lifetime. Binance occasionally updates a symbol's LOT_SIZE/PRICE_FILTER/
 // MIN_NOTIONAL specs; without a TTL, a long-running process (days between restarts) would keep
@@ -69,17 +125,20 @@ export class BinanceFuturesPrivateError extends Error {
   readonly httpStatus: number | null;
   /** Binance error code (e.g. -2019 margin insufficient), when present. */
   readonly binanceCode: number | null;
+  /** ISO time at which the client may safely attempt the endpoint again, if rate-limited. */
+  readonly retryAt: string | null;
 
   constructor(
     failureType: LiveRequestFailureType,
     message: string,
-    opts: { httpStatus?: number | null; binanceCode?: number | null } = {},
+    opts: { httpStatus?: number | null; binanceCode?: number | null; retryAt?: string | null } = {},
   ) {
     super(message);
     this.name = "BinanceFuturesPrivateError";
     this.failureType = failureType;
     this.httpStatus = opts.httpStatus ?? null;
     this.binanceCode = opts.binanceCode ?? null;
+    this.retryAt = opts.retryAt ?? null;
   }
 }
 
@@ -88,6 +147,18 @@ const RETRYABLE_GET_FAILURES: ReadonlySet<LiveRequestFailureType> = new Set([
   "429",
   "network",
 ]);
+
+/**
+ * A Binance 418 is an explicit IP-ban signal, not an ordinary transient 429.  The old generic
+ * GET retry loop turned one rejected dashboard/account read into three immediate signed reads;
+ * that is exactly the wrong response while Binance asks this IP to stop.  Keep ordinary 429
+ * retries (they can be a short-lived per-endpoint throttle), but surface 418 to the caller so
+ * the dashboard-level cooldown can serve its last verified snapshot instead.
+ */
+function shouldRetryGet(error: unknown): boolean {
+  if (!(error instanceof BinanceFuturesPrivateError)) return true;
+  return RETRYABLE_GET_FAILURES.has(error.failureType) && error.httpStatus !== 418;
+}
 
 // ─── public shapes ───────────────────────────────────────────────────────────
 
@@ -99,6 +170,17 @@ export interface FuturesSymbolFilters {
   minNotional: number;
   pricePrecision: number;
   quantityPrecision: number;
+}
+
+/** A USD-M futures candle from the same selected venue as private execution. */
+export interface FuturesKline {
+  openTime: number;
+  closeTime: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
 }
 
 export interface FuturesBalance {
@@ -142,6 +224,10 @@ export interface FuturesOrder {
 export interface FillPriceResolution {
   price: number;
   confirmed: boolean;
+  /** Exact exchange update time for the confirmed fill, when Binance returned one.  This is
+   * deliberately null rather than a local fallback: chart/audit consumers must never present a
+   * submission timestamp as an exchange-confirmed fill timestamp. */
+  filledAtMs: number | null;
 }
 
 /**
@@ -167,17 +253,25 @@ export async function resolveConfirmedFillPrice(
   opts: {
     retries?: number;
     retryDelayMs?: number;
+    /** `placeOrder` can already carry a terminal fill and its exchange update time. */
+    initialUpdateTime?: number | null;
     onUnconfirmed?: (symbol: string, orderId: string, fallbackPrice: number) => void;
   } = {},
 ): Promise<FillPriceResolution> {
-  if (initialAvgPrice > 0) return { price: initialAvgPrice, confirmed: true };
+  const validExchangeTime = (value: number | null | undefined): number | null =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : null;
+  if (initialAvgPrice > 0) {
+    return { price: initialAvgPrice, confirmed: true, filledAtMs: validExchangeTime(opts.initialUpdateTime) };
+  }
   const retries = opts.retries ?? 4;
   const delayMs = opts.retryDelayMs ?? 400;
   for (let attempt = 0; attempt < retries; attempt++) {
     if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
     try {
       const queried = await client.queryOrder(symbol, orderId);
-      if (queried.avgPrice > 0) return { price: queried.avgPrice, confirmed: true };
+      if (queried.avgPrice > 0) {
+        return { price: queried.avgPrice, confirmed: true, filledAtMs: validExchangeTime(queried.updateTime) };
+      }
       if (queried.status !== "NEW" && queried.status !== "PARTIALLY_FILLED") break; // terminal, non-fillable
     } catch {
       // best-effort — fall through to the next attempt / final fallback
@@ -192,7 +286,7 @@ export async function resolveConfirmedFillPrice(
         `confirmed fill price.`,
     );
   }
-  return { price: fallbackPrice, confirmed: false };
+  return { price: fallbackPrice, confirmed: false, filledAtMs: null };
 }
 
 export interface FuturesAlgoOrder {
@@ -242,6 +336,11 @@ export interface FuturesUserTrade {
    * (only MARKET and STOP_MARKET are ever placed by single-symbol-lane-executor.ts and
    * cross-sectional-executor.ts, so the real cost is 5.0 bps/side taker commission) is VERIFIED per
    * fill instead of assumed.
+   *
+   * THAT ASSUMPTION IS NO LONGER UNIVERSAL (2026-08-16): cross-sectional-executor.ts can now place
+   * post-only GTX entry legs when CROSS_SECTIONAL_MAKER_ENTRY_ENABLED=1, so this flag stopped being
+   * a redundant confirmation and became the measurement — it is how the maker share and the real
+   * blended cost are read back. Measured rates on this account: maker 2.00, taker 4.00 bps/side.
    *
    * OPTIONAL, and `undefined` means UNKNOWN — the exchange did not report a boolean for this row.
    * It is deliberately NOT defaulted to `false`: `false` is exactly the value we expect, so
@@ -293,7 +392,10 @@ export interface PlaceOrderParams {
   price?: number; // LIMIT
   stopPrice?: number; // STOP_MARKET / TAKE_PROFIT_MARKET
   reduceOnly?: boolean;
-  timeInForce?: "GTC" | "IOC" | "FOK";
+  /** GTX is Binance's post-only: the order is REJECTED outright if it would cross and take
+   *  liquidity, so it can only ever fill as maker. Added 2026-08-16 — this account's measured
+   *  rates are maker 2.00 bps vs taker 4.00 bps per side, i.e. exactly half. */
+  timeInForce?: "GTC" | "IOC" | "FOK" | "GTX";
   /** Engine-supplied idempotency key (derived from the paper order id). REQUIRED (2026-07-12 fix):
    *  this file's own top-of-file safety design ("POST/DELETE NEVER auto-retry... the engine passes
    *  newClientOrderId so a retry-by-engine is exchange-side idempotent") depended entirely on every
@@ -303,6 +405,15 @@ export interface PlaceOrderParams {
    *  non-idempotent retry risk. */
   newClientOrderId: string;
   workingType?: "CONTRACT_PRICE" | "MARK_PRICE";
+  /**
+   * Executor-owned abort boundary for a fresh basket entry. This is never sent
+   * to Binance: it prevents a queued filter lookup or an in-flight POST from
+   * turning into a new leg after the basket's hard entry deadline has elapsed.
+   * Reduce-only exits intentionally omit it and remain able to flatten.
+   */
+  signal?: AbortSignal;
+  /** Recording-only callback immediately before HTTP dispatch; never serialized to Binance. */
+  onDispatch?: (atMs: number) => void;
 }
 
 export interface PlaceAlgoOrderParams {
@@ -432,6 +543,42 @@ export interface FuturesExecutionBookTicker {
   time: number | null;
 }
 
+/** Current local circuit state. Purely diagnostic; it never invents exchange health. */
+export interface BinanceFuturesRateLimitStatus {
+  coolingDown: boolean;
+  retryAt: string | null;
+  lastHttpStatus: 418 | 429 | null;
+  lastFailure: string | null;
+}
+
+function parseRetryAfterMs(raw: string | null, nowMs: number): number | null {
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1_000);
+  const atMs = Date.parse(raw);
+  return Number.isFinite(atMs) ? Math.max(0, atMs - nowMs) : null;
+}
+
+/** Binance -1003 bodies commonly say "IP banned until <unix-ms>". Parse that if present. */
+function parseBanUntilMs(bodyText: string): number | null {
+  let message = bodyText;
+  try {
+    const parsed = JSON.parse(bodyText) as { msg?: unknown; retryAfter?: unknown; retryAfterMs?: unknown };
+    const explicit = Number(parsed.retryAfterMs ?? parsed.retryAfter);
+    if (Number.isFinite(explicit) && explicit > 0) {
+      return explicit < 100_000_000_000 ? Math.round(explicit * 1_000) : Math.round(explicit);
+    }
+    if (typeof parsed.msg === "string") message = parsed.msg;
+  } catch {
+    // Keep the raw body as the best available message to inspect for a ban-until timestamp.
+  }
+  const match = message.match(/\b(?:ban(?:ned)?\s+until|until)\D*(\d{10,13})\b/i);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed < 100_000_000_000 ? Math.round(parsed * 1_000) : Math.round(parsed);
+}
+
 export class BinanceFuturesPrivateClient {
   private readonly apiKey: string;
   private readonly apiSecret: string;
@@ -445,6 +592,21 @@ export class BinanceFuturesPrivateClient {
   private lastMeasuredSkewMs = 0;
   private exchangeFiltersCache: Map<string, FuturesSymbolFilters> | null = null;
   private exchangeFiltersCacheAtMs = 0;
+  /**
+   * Coalesce a cold exchangeInfo fetch. A multi-leg basket submits its maker
+   * legs concurrently; without this, every leg observes the empty cache and
+   * queues the same GET behind the shared transport limiter.
+   */
+  private exchangeFiltersInFlight: Promise<Map<string, FuturesSymbolFilters>> | null = null;
+  /** Coalesces a cold-start time sync shared by concurrent signed reads. */
+  private timeSyncInFlight: Promise<void> | null = null;
+  /** Serialises actual HTTP dispatch, so a Promise.all cannot race several requests past a new 418. */
+  private transportTail: Promise<void> = Promise.resolve();
+  /** Next permitted queued GET dispatch in the selected Binance environment. */
+  private nextReadDispatchAtMs = 0;
+  private rateLimitCooldownUntilMs = 0;
+  private lastRateLimitHttpStatus: 418 | 429 | null = null;
+  private lastRateLimitFailure: string | null = null;
 
   constructor(options: BinanceFuturesPrivateClientOptions) {
     this.apiKey = options.apiKey;
@@ -457,29 +619,160 @@ export class BinanceFuturesPrivateClient {
 
   // ── raw transport ──────────────────────────────────────────────────────────
 
-  private async rawRequest(method: "GET" | "POST" | "DELETE", url: string, signed: boolean): Promise<unknown> {
+  private async rawRequest(
+    method: "GET" | "POST" | "DELETE",
+    url: string,
+    signed: boolean,
+    signal?: AbortSignal,
+    onDispatch?: (atMs: number) => void,
+  ): Promise<unknown> {
+    // Reads are the burst source (dashboard/account/reconcile snapshots) and are safe to queue.
+    // Never queue a risk-reducing POST/DELETE behind a slow read: it still respects an already-open
+    // 418 circuit, but an operator/engine close keeps its normal immediate dispatch priority.
+    if (method === "GET") {
+      return this.withTransportSlot(() => this.dispatchRawRequest(method, url, signed, signal, onDispatch));
+    }
+    this.assertRateLimitCircuitClosed();
+    return this.dispatchRawRequest(method, url, signed, signal, onDispatch);
+  }
+
+  /**
+   * Queue read dispatches, rather than merely retrying callers independently: a concurrent
+   * balance/positions/orders snapshot must not send a second request while the first one is
+   * learning that Binance has banned this IP. POST/DELETE intentionally bypass this queue so an
+   * exit never waits behind a slow observability read.
+   */
+  private async withTransportSlot<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.transportTail;
+    let release = (): void => {};
+    this.transportTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await this.awaitTransportQueueHead(previous);
+    try {
+      this.assertRateLimitCircuitClosed();
+      await this.paceQueuedRead();
+      // A priority exit may have learnt of an exchange cooldown while this queued read waited.
+      this.assertRateLimitCircuitClosed();
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Wait for the queue head, then stop waiting. `transportTail` promises are
+   * only ever settled by their own `release()`, so a slot whose operation never
+   * settles never releases and every later read inherits that wait forever.
+   * Breaking the chain is loud on purpose: this exact freeze was completely
+   * silent, which is what let it run for the better part of an hour.
+   */
+  private async awaitTransportQueueHead(previous: Promise<void>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const abandoned = new Promise<"ABANDONED">((resolve) => {
+      timer = setTimeout(() => resolve("ABANDONED"), TRANSPORT_SLOT_MAX_WAIT_MS);
+      timer.unref?.();
+    });
+    try {
+      const outcome = await Promise.race([previous.then(() => "RELEASED" as const), abandoned]);
+      if (outcome === "ABANDONED") {
+        console.warn(
+          `[binance-transport] queue head did not release within ${TRANSPORT_SLOT_MAX_WAIT_MS}ms `
+          + `(request timeout is ${REQUEST_TIMEOUT_MS}ms) — proceeding without it so exchange reads `
+          + "cannot stall indefinitely. A stuck slot means a dispatch ignored its own abort.",
+        );
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Pace queued GETs only; mutation paths retain immediate risk-reducing priority. */
+  private async paceQueuedRead(): Promise<void> {
+    const gapMs = this.env === "testnet" ? TESTNET_GET_MIN_DISPATCH_GAP_MS : MAINNET_GET_MIN_DISPATCH_GAP_MS;
+    if (gapMs <= 0) return;
+    const now = this.nowMs();
+    const dispatchAt = Math.max(now, this.nextReadDispatchAtMs);
+    this.nextReadDispatchAtMs = dispatchAt + gapMs;
+    const waitMs = dispatchAt - now;
+    if (waitMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+  }
+
+  private assertRateLimitCircuitClosed(): void {
+    const now = this.nowMs();
+    if (this.rateLimitCooldownUntilMs <= now) return;
+    const retryAt = new Date(this.rateLimitCooldownUntilMs).toISOString();
+    throw new BinanceFuturesPrivateError(
+      "429",
+      `rate limited (HTTP ${this.lastRateLimitHttpStatus ?? 418}); transport cooldown until ${retryAt}`,
+      { httpStatus: this.lastRateLimitHttpStatus ?? 418, retryAt },
+    );
+  }
+
+  private registerRateLimit(response: Response, bodyText: string): BinanceFuturesPrivateError {
+    const now = this.nowMs();
+    const status = response.status === 418 ? 418 : 429;
+    const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"), now);
+    const banUntilMs = parseBanUntilMs(bodyText);
+    const fallbackMs = status === 418 ? HTTP_418_FALLBACK_COOLDOWN_MS : HTTP_429_FALLBACK_COOLDOWN_MS;
+    const retryUntilMs = Math.max(
+      now + fallbackMs,
+      retryAfterMs === null ? 0 : now + retryAfterMs,
+      banUntilMs ?? 0,
+    );
+    this.rateLimitCooldownUntilMs = Math.max(this.rateLimitCooldownUntilMs, retryUntilMs);
+    this.lastRateLimitHttpStatus = status;
+    this.lastRateLimitFailure = `rate limited (HTTP ${status})`;
+    const retryAt = new Date(this.rateLimitCooldownUntilMs).toISOString();
+    return new BinanceFuturesPrivateError(
+      "429",
+      `rate limited (HTTP ${status}); transport cooldown until ${retryAt}`,
+      { httpStatus: status, retryAt },
+    );
+  }
+
+  private async dispatchRawRequest(
+    method: "GET" | "POST" | "DELETE",
+    url: string,
+    signed: boolean,
+    externalSignal?: AbortSignal,
+    onDispatch?: (atMs: number) => void,
+  ): Promise<unknown> {
     const controller = new AbortController();
+    const abortFromExternalSignal = () => controller.abort();
+    if (externalSignal?.aborted) abortFromExternalSignal();
+    else externalSignal?.addEventListener("abort", abortFromExternalSignal, { once: true });
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let response: Response;
+    let bodyText: string;
     try {
+      try { onDispatch?.(this.nowMs()); } catch { /* Observability must not suppress an order. */ }
       response = await this.fetchImpl(url, {
         method,
         headers: signed ? { "X-MBX-APIKEY": this.apiKey } : undefined,
         signal: controller.signal,
       });
+      // `fetch()` resolves on headers. Keep the abort armed through body
+      // consumption so a stalled Binance stream cannot pin transportTail (and
+      // the time-sync / entry paths queued behind it) forever.
+      bodyText = await response.text();
     } catch (error) {
-      const aborted = error instanceof Error && error.name === "AbortError";
+      const aborted = controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
       throw new BinanceFuturesPrivateError(
         aborted ? "timeout" : "network",
-        aborted ? `request timed out after ${REQUEST_TIMEOUT_MS}ms` : `network failure: ${(error as Error)?.message ?? "unknown"}`,
+        aborted
+          ? externalSignal?.aborted
+            ? "request aborted by executor entry-deadline watchdog"
+            : `request timed out after ${REQUEST_TIMEOUT_MS}ms`
+          : `network failure: ${(error as Error)?.message ?? "unknown"}`,
       );
     } finally {
       clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", abortFromExternalSignal);
     }
 
-    const bodyText = await response.text().catch(() => "");
     if (response.status === 429 || response.status === 418) {
-      throw new BinanceFuturesPrivateError("429", `rate limited (HTTP ${response.status})`, { httpStatus: response.status });
+      throw this.registerRateLimit(response, bodyText);
     }
     let parsed: unknown = null;
     try {
@@ -517,8 +810,7 @@ export class BinanceFuturesPrivateClient {
         return await this.rawRequest("GET", url, false);
       } catch (error) {
         lastError = error;
-        const type = error instanceof BinanceFuturesPrivateError ? error.failureType : "network";
-        if (!RETRYABLE_GET_FAILURES.has(type) || attempt === GET_MAX_RETRIES) throw error;
+        if (!shouldRetryGet(error) || attempt === GET_MAX_RETRIES) throw error;
         await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
       }
     }
@@ -529,9 +821,29 @@ export class BinanceFuturesPrivateClient {
     method: "GET" | "POST" | "DELETE",
     path: string,
     params: Record<string, string | number | boolean | undefined> = {},
+    options: { allowUnsyncedRiskReduction?: boolean; signal?: AbortSignal; onDispatch?: (atMs: number) => void } = {},
   ): Promise<unknown> {
-    await this.ensureTimeSync();
-    this.assertClockSkewOk();
+    if (options.signal?.aborted) {
+      throw new BinanceFuturesPrivateError("timeout", "request aborted by executor entry-deadline watchdog");
+    }
+    // A cold worker normally proves its server-time offset before it sends any
+    // signed request.  The sole exception is an operation Binance itself
+    // guarantees cannot increase exposure: cancelling an order or a
+    // reduce-only order.  During a Testnet GET backlog, waiting for /time here
+    // used to leave an already-confirmed partial basket unprotected even
+    // though the host clock is ordinarily NTP-synchronised.  Send the
+    // risk-reducing request with the local clock instead; an inaccurate clock
+    // is safely rejected by Binance (-1021), never turned into an entry.
+    // This exemption applies even when an earlier background signed GET has
+    // already started a *stale* /time refresh. Waiting on that in-flight GET
+    // was enough to keep a newly discovered partial fill exposed.
+    if (!options.allowUnsyncedRiskReduction) {
+      await this.ensureTimeSync();
+      this.assertClockSkewOk();
+    }
+    if (options.signal?.aborted) {
+      throw new BinanceFuturesPrivateError("timeout", "request aborted by executor entry-deadline watchdog");
+    }
     const buildSignedUrl = (): string => {
       const qs = buildQueryString({
         ...params,
@@ -548,7 +860,6 @@ export class BinanceFuturesPrivateClient {
           return await this.rawRequest("GET", buildSignedUrl(), true);
         } catch (error) {
           lastError = error;
-          const type = error instanceof BinanceFuturesPrivateError ? error.failureType : "network";
           if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021 && attempt < GET_MAX_RETRIES) {
             // 2026-07-12 fix: forceTimeSync() itself hits the network (/fapi/v1/time) and can throw —
             // previously that throw escaped this catch block uncaught, aborting the ENTIRE retry loop
@@ -564,7 +875,7 @@ export class BinanceFuturesPrivateClient {
             await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
             continue;
           }
-          if (!RETRYABLE_GET_FAILURES.has(type) || attempt === GET_MAX_RETRIES) throw error;
+          if (!shouldRetryGet(error) || attempt === GET_MAX_RETRIES) throw error;
           await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
         }
       }
@@ -572,15 +883,23 @@ export class BinanceFuturesPrivateClient {
     }
     // POST/DELETE: exactly one attempt — the engine owns retries via idempotent client ids.
     try {
-      return await this.rawRequest(method, buildSignedUrl(), true);
+      return await this.rawRequest(method, buildSignedUrl(), true, options.signal, options.onDispatch);
     } catch (error) {
       if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021) {
         // Best-effort resync for the NEXT signed call — this call is failing with -1021 regardless,
         // so a resync failure here must not replace the original error being rethrown below.
-        try {
-          await this.forceTimeSync();
-        } catch {
-          /* best-effort — see GET branch above */
+        if (options.allowUnsyncedRiskReduction) {
+          // Do not turn a rejected *risk-reducing* request into an unbounded
+          // wait behind a cold GET queue. The next attempt can use this
+          // background resync once it finishes; this attempt stays a clean,
+          // visible failure with no order submitted.
+          void this.forceTimeSync().catch(() => { /* best-effort */ });
+        } else {
+          try {
+            await this.forceTimeSync();
+          } catch {
+            /* best-effort — see GET branch above */
+          }
         }
       }
       throw error;
@@ -591,19 +910,40 @@ export class BinanceFuturesPrivateClient {
 
   async ensureTimeSync(): Promise<void> {
     if (this.nowMs() - this.lastTimeSyncAtMs < TIME_SYNC_TTL_MS) return;
+    if (this.timeSyncInFlight) return this.timeSyncInFlight;
+    const task = (async (): Promise<void> => {
+      try {
+        await this.forceTimeSync();
+      } catch (error) {
+        // 2026-07-12 fix: this ran unconditionally before EVERY signed request, uncaught — a single
+        // transient hiccup hitting the public /fapi/v1/time endpoint aborted the request outright with
+        // ZERO retry, even for the GET path which otherwise retries several times. Binance's own
+        // recvWindow/signature check (and assertClockSkewOk below, using the LAST successfully measured
+        // skew) are the actual safety net against a truly-drifted clock, so a periodic-refresh miss is
+        // safe to ride out on the stale-but-recent offset. Only fail closed when there has NEVER been a
+        // successful sync (lastTimeSyncAtMs still 0): lastMeasuredSkewMs's 0 default would otherwise
+        // silently pass assertClockSkewOk() as if skew were known-good when it is actually unknown.
+        if (this.lastTimeSyncAtMs === 0) throw error;
+      }
+    })();
+    this.timeSyncInFlight = task;
     try {
-      await this.forceTimeSync();
-    } catch (error) {
-      // 2026-07-12 fix: this ran unconditionally before EVERY signed request, uncaught — a single
-      // transient hiccup hitting the public /fapi/v1/time endpoint aborted the request outright with
-      // ZERO retry, even for the GET path which otherwise retries several times. Binance's own
-      // recvWindow/signature check (and assertClockSkewOk below, using the LAST successfully measured
-      // skew) are the actual safety net against a truly-drifted clock, so a periodic-refresh miss is
-      // safe to ride out on the stale-but-recent offset. Only fail closed when there has NEVER been a
-      // successful sync (lastTimeSyncAtMs still 0): lastMeasuredSkewMs's 0 default would otherwise
-      // silently pass assertClockSkewOk() as if skew were known-good when it is actually unknown.
-      if (this.lastTimeSyncAtMs === 0) throw error;
+      await task;
+    } finally {
+      if (this.timeSyncInFlight === task) {
+        this.timeSyncInFlight = null;
+      }
     }
+  }
+
+  getRateLimitStatus(): BinanceFuturesRateLimitStatus {
+    const now = this.nowMs();
+    return {
+      coolingDown: this.rateLimitCooldownUntilMs > now,
+      retryAt: this.rateLimitCooldownUntilMs > now ? new Date(this.rateLimitCooldownUntilMs).toISOString() : null,
+      lastHttpStatus: this.lastRateLimitHttpStatus,
+      lastFailure: this.lastRateLimitFailure,
+    };
   }
 
   private async forceTimeSync(): Promise<void> {
@@ -655,42 +995,163 @@ export class BinanceFuturesPrivateClient {
     };
   }
 
-  async getExchangeFilters(): Promise<Map<string, FuturesSymbolFilters>> {
+  /**
+   * Fetches the selected USD-M venue's complete top-of-book snapshot once, then
+   * returns only the requested contracts.  Cross-sectional entry uses this
+   * instead of six individually queued GETs: every leg is priced from the
+   * same exchange response, and a slow request remains fail-closed upstream
+   * rather than silently pricing only the early legs in the transport queue.
+   */
+  async getExecutionBookTickers(symbols: readonly string[]): Promise<Map<string, FuturesExecutionBookTicker>> {
+    const requested = new Set(
+      symbols
+        .map((symbol) => symbol.trim().toUpperCase())
+        .filter((symbol) => symbol.length > 0),
+    );
+    const books = new Map<string, FuturesExecutionBookTicker>();
+    if (requested.size === 0) return books;
+
+    // Binance USD-M returns an array when `symbol` is omitted.  One request is
+    // both lower-weight than per-leg fan-out and immune to this client's GET
+    // serialization making later basket legs miss the old 750ms app deadline.
+    const parsed = await this.requestPublic("/fapi/v1/ticker/bookTicker");
+    if (!Array.isArray(parsed)) {
+      throw new BinanceFuturesPrivateError("invalid_response", "execution book-ticker batch response is not an array");
+    }
+    const positiveOrNull = (value: unknown): number | null => {
+      const parsedValue = toNum(value);
+      return parsedValue > 0 ? parsedValue : null;
+    };
+    for (const raw of parsed) {
+      if (!raw || typeof raw !== "object") continue;
+      const row = raw as Record<string, unknown>;
+      const symbol = typeof row.symbol === "string" ? row.symbol.trim().toUpperCase() : "";
+      if (!requested.has(symbol)) continue;
+      books.set(symbol, {
+        bid: positiveOrNull(row.bidPrice),
+        ask: positiveOrNull(row.askPrice),
+        bidQty: positiveOrNull(row.bidQty),
+        askQty: positiveOrNull(row.askQty),
+        time: toNum(row.time) > 0 ? toNum(row.time) : null,
+      });
+    }
+    return books;
+  }
+
+  /**
+   * Public USD-M mark from the SAME selected execution environment.  This must
+   * not be substituted with Binance spot's PEPEUSDT price for multiplier perps.
+   */
+  async getMarkPrice(symbol: string): Promise<number | null> {
+    const parsed = await this.requestPublic("/fapi/v1/premiumIndex", { symbol });
+    const row = parsed as Record<string, unknown> | null;
+    if (!row || typeof row !== "object") {
+      throw new BinanceFuturesPrivateError("invalid_response", `premium index missing for ${symbol}`);
+    }
+    const markPrice = toNum(row.markPrice);
+    return markPrice > 0 ? markPrice : null;
+  }
+
+  /**
+   * Read USD-M candles from the selected execution environment.  It never falls
+   * back to spot data: range levels must be executable on the venue we trade.
+   */
+  async getKlines(
+    symbol: string,
+    interval: "1m" | "5m" | "1h" | "4h" | "1d",
+    opts: { startTime?: number; endTime?: number; limit?: number } = {},
+  ): Promise<FuturesKline[]> {
+    const parsed = await this.requestPublic("/fapi/v1/klines", {
+      symbol,
+      interval,
+      startTime: opts.startTime,
+      endTime: opts.endTime,
+      limit: opts.limit,
+    });
+    if (!Array.isArray(parsed)) {
+      throw new BinanceFuturesPrivateError("invalid_response", `klines response missing for ${symbol}/${interval}`);
+    }
+    const candles: FuturesKline[] = [];
+    for (const row of parsed) {
+      if (!Array.isArray(row) || row.length < 7) continue;
+      const openTime = toNum(row[0]);
+      const open = toNum(row[1]);
+      const high = toNum(row[2]);
+      const low = toNum(row[3]);
+      const close = toNum(row[4]);
+      const volume = toNum(row[5]);
+      const closeTime = toNum(row[6]);
+      if (!Number.isFinite(openTime) || !Number.isFinite(closeTime) || !(open > 0) || !(high > 0) || !(low > 0) || !(close > 0)) {
+        continue;
+      }
+      candles.push({ openTime, closeTime, open, high, low, close, volume });
+    }
+    return candles;
+  }
+
+  async getExchangeFilters(
+    _priority: "EXECUTION" | "BACKGROUND" = "BACKGROUND",
+  ): Promise<Map<string, FuturesSymbolFilters>> {
     if (this.exchangeFiltersCache && this.nowMs() - this.exchangeFiltersCacheAtMs < EXCHANGE_FILTERS_TTL_MS) {
       return new Map(this.exchangeFiltersCache);
     }
-    const parsed = await this.requestPublic("/fapi/v1/exchangeInfo");
-    const symbols = (parsed as { symbols?: unknown })?.symbols;
-    const out = new Map<string, FuturesSymbolFilters>();
-    if (!Array.isArray(symbols)) return out;
-    for (const s of symbols) {
-      const sym = s as {
-        symbol?: string;
-        pricePrecision?: number;
-        quantityPrecision?: number;
-        filters?: Array<{ filterType?: string; tickSize?: string; stepSize?: string; minQty?: string; notional?: string }>;
-      };
-      if (!sym.symbol || !Array.isArray(sym.filters)) continue;
-      const price = sym.filters.find((f) => f.filterType === "PRICE_FILTER");
-      const lot = sym.filters.find((f) => f.filterType === "LOT_SIZE");
-      const notional = sym.filters.find((f) => f.filterType === "MIN_NOTIONAL");
-      out.set(sym.symbol, {
-        symbol: sym.symbol,
-        tickSize: toNum(price?.tickSize),
-        stepSize: toNum(lot?.stepSize),
-        minQty: toNum(lot?.minQty),
-        minNotional: toNum(notional?.notional),
-        pricePrecision: sym.pricePrecision ?? 8,
-        quantityPrecision: sym.quantityPrecision ?? 8,
-      });
+    if (this.exchangeFiltersInFlight) return new Map(await this.exchangeFiltersInFlight);
+
+    const task = (async (): Promise<Map<string, FuturesSymbolFilters>> => {
+      const parsed = await this.requestPublic("/fapi/v1/exchangeInfo");
+      const symbols = (parsed as { symbols?: unknown })?.symbols;
+      const out = new Map<string, FuturesSymbolFilters>();
+      if (!Array.isArray(symbols)) return out;
+      for (const s of symbols) {
+        const sym = s as {
+          symbol?: string;
+          status?: string;
+          contractType?: string;
+          quoteAsset?: string;
+          pricePrecision?: number;
+          quantityPrecision?: number;
+          filters?: Array<{ filterType?: string; tickSize?: string; stepSize?: string; minQty?: string; notional?: string }>;
+        };
+        // This cache gates executable USD-M symbols.  A symbol merely present in
+        // exchangeInfo is not enough: delivery, settling, inactive, and non-USDT
+        // contracts must be absent so every caller fails closed before sizing.
+        if (
+          !sym.symbol ||
+          sym.status !== "TRADING" ||
+          sym.contractType !== "PERPETUAL" ||
+          sym.quoteAsset !== "USDT" ||
+          !Array.isArray(sym.filters)
+        ) continue;
+        const price = sym.filters.find((f) => f.filterType === "PRICE_FILTER");
+        const lot = sym.filters.find((f) => f.filterType === "LOT_SIZE");
+        const notional = sym.filters.find((f) => f.filterType === "MIN_NOTIONAL");
+        out.set(sym.symbol, {
+          symbol: sym.symbol,
+          tickSize: toNum(price?.tickSize),
+          stepSize: toNum(lot?.stepSize),
+          minQty: toNum(lot?.minQty),
+          minNotional: toNum(notional?.notional),
+          pricePrecision: sym.pricePrecision ?? 8,
+          quantityPrecision: sym.quantityPrecision ?? 8,
+        });
+      }
+      this.exchangeFiltersCache = out;
+      this.exchangeFiltersCacheAtMs = this.nowMs();
+      return out;
+    })();
+    this.exchangeFiltersInFlight = task;
+    try {
+      return new Map(await task);
+    } finally {
+      if (this.exchangeFiltersInFlight === task) this.exchangeFiltersInFlight = null;
     }
-    this.exchangeFiltersCache = out;
-    this.exchangeFiltersCacheAtMs = this.nowMs();
-    return new Map(out);
   }
 
-  private async getSymbolFilters(symbol: string): Promise<FuturesSymbolFilters | null> {
-    const filters = await this.getExchangeFilters();
+  private async getSymbolFilters(
+    symbol: string,
+    priority: "EXECUTION" | "BACKGROUND" = "BACKGROUND",
+  ): Promise<FuturesSymbolFilters | null> {
+    const filters = await this.getExchangeFilters(priority);
     return filters.get(symbol) ?? null;
   }
 
@@ -761,8 +1222,43 @@ export class BinanceFuturesPrivateClient {
     return this.mapOrder(parsed);
   }
 
+  /**
+   * Same endpoint as queryOrder, looked up by the client-supplied idempotency key instead of the
+   * exchange-assigned orderId — Binance's /fapi/v1/order accepts EITHER as an alternative lookup key.
+   * Added for account-exposure-coordinator.ts's restart/staleness reconciliation: a reservation
+   * persisted before an order-placement attempt knows its own clientOrderId (it must, by
+   * construction — see ExposureReservation.clientOrderId) but has no orderId to query by if the
+   * process died before placeOrder()'s response (containing the exchange-assigned orderId) was ever
+   * recorded. Reuses the exact same signed GET path queryOrder does (requestSigned, GET retries on
+   * timeout/429/network, the clock-skew guard) — this file's own header comment states it is "the
+   * ONLY module that talks to Binance private endpoints" for a reason; a second, hand-rolled request
+   * path here would be a real regression risk, not just style.
+   */
+  async queryOrderByClientId(symbol: string, origClientOrderId: string): Promise<FuturesOrder> {
+    const parsed = await this.requestSigned("GET", "/fapi/v1/order", { symbol, origClientOrderId });
+    return this.mapOrder(parsed);
+  }
+
   async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
-    const filters = await this.getSymbolFilters(params.symbol);
+    const throwIfEntryDeadlineAborted = () => {
+      if (params.signal?.aborted) {
+        throw new BinanceFuturesPrivateError("timeout", "order suppressed by executor entry-deadline watchdog");
+      }
+    };
+    throwIfEntryDeadlineAborted();
+    // Order placement is execution-critical on both venues.  The Testnet
+    // transport honours this priority; Mainnet keeps the same public contract.
+    // A reduce-only MARKET quantity is an exchange-confirmed quantity from the
+    // leg being flattened.  On a cold worker it is therefore safer to submit
+    // that exact quantity than to block a rollback behind exchangeInfo.  Every
+    // entry and every priced/conditional reduce-only order still refreshes the
+    // normal exchange filter cache before it is sent.
+    const canUseKnownReduceOnlyQty = params.reduceOnly === true && params.type === "MARKET";
+    const cachedFilters = this.exchangeFiltersCache && this.nowMs() - this.exchangeFiltersCacheAtMs < EXCHANGE_FILTERS_TTL_MS
+      ? this.exchangeFiltersCache.get(params.symbol) ?? null
+      : null;
+    const filters = canUseKnownReduceOnlyQty ? cachedFilters : await this.getSymbolFilters(params.symbol, "EXECUTION");
+    throwIfEntryDeadlineAborted();
     const quantity = filters
       ? formatToStep(params.quantity, filters.stepSize, "down", filters.quantityPrecision)
       : params.quantity;
@@ -784,6 +1280,10 @@ export class BinanceFuturesPrivateClient {
       newClientOrderId: params.newClientOrderId,
       workingType: params.workingType,
       newOrderRespType: "RESULT",
+    }, {
+      allowUnsyncedRiskReduction: canUseKnownReduceOnlyQty,
+      onDispatch: params.onDispatch,
+      ...(params.signal ? { signal: params.signal } : {}),
     });
     return this.mapOrder(parsed);
   }
@@ -811,7 +1311,36 @@ export class BinanceFuturesPrivateClient {
   }
 
   async cancelOrder(symbol: string, orderId: string): Promise<void> {
-    await this.requestSigned("DELETE", "/fapi/v1/order", { symbol, orderId });
+    await this.requestSigned("DELETE", "/fapi/v1/order", { symbol, orderId }, { allowUnsyncedRiskReduction: true });
+  }
+
+  /**
+   * Returns Binance's terminal cancellation response so maker-entry recovery
+   * can use its actual filled quantity without issuing a separate status GET.
+   */
+  async cancelOrderAndRead(symbol: string, orderId: string): Promise<FuturesOrder> {
+    const parsed = await this.requestSigned(
+      "DELETE",
+      "/fapi/v1/order",
+      { symbol, orderId },
+      { allowUnsyncedRiskReduction: true },
+    );
+    return this.mapOrder(parsed);
+  }
+
+  /**
+   * Cancels one order by its durable client-supplied id. This is the safe
+   * recovery path when Binance accepted a POST but its response (and therefore
+   * exchange orderId) was lost before the executor could persist it.
+   */
+  async cancelOrderByClientIdAndRead(symbol: string, origClientOrderId: string): Promise<FuturesOrder> {
+    const parsed = await this.requestSigned(
+      "DELETE",
+      "/fapi/v1/order",
+      { symbol, origClientOrderId },
+      { allowUnsyncedRiskReduction: true },
+    );
+    return this.mapOrder(parsed);
   }
 
   async cancelAlgoOrder(algoId: string): Promise<void> {

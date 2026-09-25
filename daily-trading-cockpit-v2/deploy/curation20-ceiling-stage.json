@@ -1,0 +1,11 @@
+{
+  "name": "live",
+  "old": "/root/kronos-live-releases/live-cross-curation20-v1-20260906-r1/daily-trading-cockpit-v2",
+  "new": "/root/kronos-live-releases/live-cross-curation20-v1-20260906-r2/daily-trading-cockpit-v2",
+  "sourceChanged": [
+    "apps/api/src/lib/cross-sectional-curated-universe.ts",
+    "apps/api/src/routes/shadow.ts"
+  ],
+  "envIdentical": true,
+  "stateTarget": "/root/kronos-live/daily-trading-cockpit-v2/apps/api/data"
+}

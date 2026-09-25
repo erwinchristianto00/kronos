@@ -249,6 +249,13 @@ function scoreLane(
   candidate: LaneSelectorV2Candidate,
   regime: string | null,
 ): LaneSelectorV2ScoreBreakdown {
+  // `state.freshValid` is the variant matrix's FULL fresh-valid close count for this lane × context
+  // (P_all), and it grows for as long as the lane trades. It is deliberately NOT a proof-stage
+  // development slice: this term scales how much weight the scorer puts on `globalEdge`, so a
+  // count bounded by a frozen window would pin the confidence at that window's size forever —
+  // log10(41)/log10(250) ~ 0.67 for a lane with a thousand closes. See
+  // current-guard-variant-matrix.ts's `freshValid` doc; stage separation is enforced at the STABLE/
+  // PROMOTION gate, never by starving the live scorer.
   const fresh = Math.max(0, numeric(state.freshValid));
   const confidence = clamp(Math.log10(fresh + 1) / Math.log10(250), 0, 1);
   const globalNet = numeric(state.netAvgR);
@@ -486,18 +493,27 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
     const shortlistAllowed = isLaneSelectorV2SupportedVariantId(state.variantId) &&
       rotationShortlistAllowsState(inputs, state, estimated);
     const forcedMaturityEligible = state.operatorForceEligible === true && state.exactContextResolved === true;
-    const statusAllowed =
-      shortlistGateActive
-        ? shortlistAllowed
-        : forcedMaturityEligible ||
-          state.status === "STABLE_CANDIDATE" ||
-          (!state.contextRows && isLaneSelectorV2LongWideStopOverride({
-            variantId: state.variantId,
-            direction: candidate.direction,
-            estimatedRegime: estimated,
-          }));
+    // The rotation shortlist is a symbol-level REFINEMENT, never a substitute for exact-context
+    // maturity proof. Previously, when the shortlist gate was active, `statusAllowed` was set to
+    // `shortlistAllowed` ALONE — a COLLECTING/WATCHABLE/REJECT lane (or one with missing proof, or
+    // a null-PF axis row) could be selected purely because the shortlist happened to ALLOW that
+    // symbol. `maturityEligible` is now computed identically regardless of `shortlistGateActive`,
+    // and the shortlist is ANDed in only as an additional narrowing when its gate is active. The
+    // operator-force override (`forcedMaturityEligible`) is preserved exactly as one of the ORed
+    // maturity conditions — it can still skip the STABLE_CANDIDATE bar through its own explicit,
+    // visible path, but it can never rewrite `state.status` itself, and it still requires real
+    // `exactContextResolved === true` proof, so it cannot invent context that was never resolved.
+    const maturityEligible =
+      forcedMaturityEligible ||
+      state.status === "STABLE_CANDIDATE" ||
+      (!state.contextRows && isLaneSelectorV2LongWideStopOverride({
+        variantId: state.variantId,
+        direction: candidate.direction,
+        estimatedRegime: estimated,
+      }));
+    const statusAllowed = maturityEligible && (!shortlistGateActive || shortlistAllowed);
     if (!statusAllowed) {
-      rejected.push(shortlistGateActive
+      rejected.push(maturityEligible
         ? `${state.variantId}:rotation_shortlist_blocked`
         : `${state.variantId}:status_${state.status ?? "unknown"}`);
       continue;

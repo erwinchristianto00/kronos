@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   ExecutiveReviewStore,
   eligibleTier1ExecutiveReview,
   executiveReviewTier1Aggregates,
+  readExecutiveReviewStoreStrict,
   type ExecutiveReviewOutcome,
   type ExecutiveReviewOutcomeLink,
   type ExecutiveReviewPositionLink,
@@ -14,6 +15,10 @@ import {
 import { markTerminalExecutiveReviewsTier2Only, resolveExecutiveReviewPositions } from "../src/lib/executive-review-runtime.js";
 import type { LiveIntent } from "../src/lib/live-execution-engine.js";
 import type { PaperOrder } from "../src/lib/paper-execution-router.js";
+import {
+  _resetCortexProductionChainDiagnosticsForTests,
+  cortexProductionChainDiagnostics,
+} from "../src/lib/cortex-production-chain-diagnostics.js";
 
 const review = (overrides: Partial<ExecutiveReviewRecord> = {}): ExecutiveReviewRecord => ({
   executiveReviewId: "review-1",
@@ -21,7 +26,8 @@ const review = (overrides: Partial<ExecutiveReviewRecord> = {}): ExecutiveReview
   opportunityId: "opportunity-1",
   laneId: "LANE",
   marketContextSnapshotId: "market-1",
-  allocationSnapshotId: null,
+  allocationSnapshotId: "cortex-allocation-1",
+  canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
   strategyAction: "ENTER",
   direction: "LONG",
   marketState: "BULLISH_TACTICAL",
@@ -38,6 +44,8 @@ const review = (overrides: Partial<ExecutiveReviewRecord> = {}): ExecutiveReview
   reasonCode: null,
   positionId: null,
   outcomeId: null,
+  executionIntentId: null,
+  paperOrderId: "paper-1",
   ...overrides,
 });
 
@@ -50,6 +58,8 @@ const position = (overrides: Partial<ExecutiveReviewPositionLink> = {}): Executi
   positionId: "position-1",
   laneId: "LANE",
   marketContextSnapshotId: "market-1",
+  allocationSnapshotId: "cortex-allocation-1",
+  canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
   entryAtMs: 110,
   originalRisk: 10,
   ambiguousOwnership: false,
@@ -64,6 +74,8 @@ const outcome = (overrides: Partial<ExecutiveReviewOutcomeLink> = {}): Executive
   executiveReviewId: "review-1",
   opportunityId: "opportunity-1",
   positionId: "position-1",
+  allocationSnapshotId: "cortex-allocation-1",
+  canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
   outcomeId: "outcome-1",
   resolvedAtMs: 200,
   grossR: 0.25,
@@ -75,6 +87,7 @@ const outcome = (overrides: Partial<ExecutiveReviewOutcomeLink> = {}): Executive
   matchedRequiredOrderIds: ["order-1", "exit-1"],
   missingRequiredOrderIds: [],
   netR: 0.2,
+  paperOrderId: "paper-1",
   decisionPipelinePolicyVersion: "decision/1",
   executionPolicyVersion: "execution/1",
   evidencePolicyVersion: "evidence/1",
@@ -95,7 +108,8 @@ const tier1 = (): ExecutiveReviewOutcome => ({
   positionId: "position-1",
   outcomeId: "outcome-1",
   marketContextSnapshotId: "market-1",
-  allocationSnapshotId: null,
+  allocationSnapshotId: "cortex-allocation-1",
+  canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
   laneId: "LANE",
   direction: "LONG",
   marketState: "BULLISH_TACTICAL",
@@ -104,6 +118,7 @@ const tier1 = (): ExecutiveReviewOutcome => ({
   advisoryVerdict: "VALID",
   incumbentAction: "ENTERED",
   advisoryOnly: true,
+  paperOrderId: "paper-1",
   entryAtMs: 110,
   resolvedAtMs: 200,
   originalRisk: 10,
@@ -124,7 +139,44 @@ const tier1 = (): ExecutiveReviewOutcome => ({
 });
 
 describe("Executive Review Store", () => {
+  it("strictly rejects duplicate Tier-1 rows even when they reuse the same review owner", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-duplicate-"));
+    try {
+      const file = join(dir, "reviews.json");
+      const resolved = review({
+        state: "TIER1_ELIGIBLE", executionIntentId: "intent-1", positionId: "position-1", outcomeId: "outcome-1",
+      });
+      const row = tier1();
+      writeFileSync(file, JSON.stringify({ version: 1, reviews: [resolved], tier1: [row, { ...row }], tier2: [], processedIds: [row.executiveReviewOutcomeId], rejected: [] }));
+      expect(readExecutiveReviewStoreStrict(file)).toMatchObject({ status: "EXECUTIVE_REVIEW_STORE_CORRUPTED" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("gives the operator a strict corruption signal instead of silently dropping malformed Tier 1 evidence", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-strict-"));
+    try {
+      const file = join(dir, "reviews.json");
+      const store = new ExecutiveReviewStore(file);
+      expect(store.addReview(review())).toBe(true);
+      expect(store.resolve("review-1", position(), outcome())).toBeNull();
+      store.save();
+      expect(readExecutiveReviewStoreStrict(file)).toMatchObject({
+        status: "VALID", counts: { reviews: 1, tier1: 1, malformed: 0, duplicates: 0 },
+      });
+
+      writeFileSync(file, JSON.stringify({ ...store.get(), tier1: [{ ...tier1(), executiveReviewId: "missing-parent" }] }));
+      expect(readExecutiveReviewStoreStrict(file)).toMatchObject({
+        status: "EXECUTIVE_REVIEW_STORE_CORRUPTED", counts: { malformed: 1, duplicates: 0 },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("requires an exact persisted lineage and resolves each review outcome once", () => {
+    _resetCortexProductionChainDiagnosticsForTests();
     const dir = mkdtempSync(join(tmpdir(), "executive-review-"));
     try {
       const store = new ExecutiveReviewStore(join(dir, "reviews.json"));
@@ -134,8 +186,13 @@ describe("Executive Review Store", () => {
       expect(store.resolve("review-1", position(), outcome())).toBeNull();
       expect(store.get().reviews[0]?.state).toBe("TIER1_ELIGIBLE");
       expect(store.get().tier1).toHaveLength(1);
+      // Point 11: report-only — recorded exactly once, on the real Tier-1 transition, never on the
+      // earlier POSITION_NOT_RESOLVED attempt.
+      expect(cortexProductionChainDiagnostics().CORTEX_TIER1_RESOLVED).toBe(1);
       expect(store.resolve("review-1", position(), outcome())).toBe("EXECUTIVE_REVIEW_ALREADY_RESOLVED");
       expect(store.get().tier1).toHaveLength(1);
+      // A second, already-resolved call must never double-count the diagnostic.
+      expect(cortexProductionChainDiagnostics().CORTEX_TIER1_RESOLVED).toBe(1);
       expect(executiveReviewTier1Aggregates(store.get())).toContainEqual({
         dimension: "direction", key: "LONG", resolvedCount: 1, averageNetR: 0.2, positiveCount: 1, negativeCount: 0,
       });
@@ -228,6 +285,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -276,6 +334,7 @@ describe("Executive Review Store", () => {
         laneId: first.laneId,
         marketContextSnapshotId: first.marketContextSnapshotId,
         allocationSnapshotId: first.allocationSnapshotId,
+        canonicalCortexLaneId: first.canonicalCortexLaneId,
         direction: first.direction,
         marketState: first.marketState,
         evidenceEra: first.evidenceEra,
@@ -322,6 +381,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -376,6 +436,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -429,6 +490,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -480,6 +542,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -529,6 +592,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -586,6 +650,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -649,6 +714,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -700,7 +766,7 @@ describe("Executive Review Store", () => {
         settlementFetchComplete: false, requiredOrderIds: ["order-1", "exit-1"], matchedRequiredOrderIds: ["exit-1"], missingRequiredOrderIds: ["order-1"],
         executiveReviewLink: {
           executiveReviewId: "review-1", candidateId: "candidate-1", opportunityId: "opportunity-1", laneId: "LANE",
-          marketContextSnapshotId: "market-1", allocationSnapshotId: null, direction: "LONG", marketState: "BULLISH_TACTICAL", evidenceEra: "post-fix/1",
+          marketContextSnapshotId: "market-1", allocationSnapshotId: "cortex-allocation-1", canonicalCortexLaneId: "CG_WIDE_FAST_LONG", direction: "LONG", marketState: "BULLISH_TACTICAL", evidenceEra: "post-fix/1",
           decisionPipelinePolicyVersion: "decision/1", executionPolicyVersion: "execution/1", evidencePolicyVersion: "evidence/1", fourBrainPolicyVersion: "four-brain/1",
         },
       } as LiveIntent;

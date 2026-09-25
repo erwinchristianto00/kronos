@@ -1,4 +1,6 @@
-import { useEffect, useState } from 'react';
+import BasketSelectionBadge from './BasketSelectionBadge';
+import { useEffect, useState, type ReactNode } from 'react';
+import OpenBasketReviewChart, { type OpenBasketReviewLeg } from './OpenBasketReviewChart';
 
 const C = {
   card: '#14222a',
@@ -11,6 +13,8 @@ const C = {
   measure: '#6fb3d6',
   accent: '#f0b54b',
 };
+
+const CLOSED_REPORT_PAGE_SIZE = 10;
 
 type XSecReport = {
   signal: string;
@@ -30,6 +34,11 @@ type XSecReport = {
   lastCycleAt: string | null;
   nextResolveInMs: number | null;
   recentNetReturns: number[];
+  independentBlocks: number;
+  blockedNetAvgReturn: number | null;
+  blockedWinRate: number | null;
+  blockedTStat: number | null;
+  blockedNetReturns: number[];
 };
 type XSecBasket = {
   openedAt: string;
@@ -86,9 +95,48 @@ type ClosedLeg = {
   feeAllocatedUsd: number;
   netPnlUsd: number;
   priceConfirmed: boolean;
+  entryLiquidity?: { makerQty: number; takerQty: number; reason: string } | null;
   unrealizedExtrema?: LegUnrealizedExtrema | null;
 };
+type ExecutionReleaseStamp = {
+  releaseId: string | null;
+  label: string;
+  activatedAt: string | null;
+  capturedAt: string;
+  source: 'RUNTIME_MANIFEST' | 'RUNTIME_UNVERIFIED' | 'LEGACY_UNVERIFIED';
+};
+type ExecutionReleaseLifecycle = {
+  openedWith: ExecutionReleaseStamp;
+  closedWith: ExecutionReleaseStamp | null;
+};
+type BasketProtectionSummary = {
+  policyId: string | null; policyFingerprint: string | null; strategyFingerprint: string | null;
+  source: string; priceBasis: string; effectiveArmUsd: number | null; armFraction: number | null;
+  trailArmed: boolean | null; floorUsd: number | null; lastEvaluatedAt: string | null; lastEvaluationIntervalMs: number | null;
+};
+function BasketProtectionBlock({ protection, exitAudit, closed = false }: { protection?: BasketProtectionSummary | null; exitAudit?: unknown; closed?: boolean }) {
+  const stale = protection?.lastEvaluatedAt ? Date.now() - Date.parse(protection.lastEvaluatedAt) > 15000 : true;
+  return <div style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, fontSize: 12, display: 'grid', gap: 6 }}>
+    <strong style={{ color: C.text }}>Proteksi basket</strong>
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14 }}>
+      <span>Arm efektif: <strong>{money(protection?.effectiveArmUsd)}</strong>{protection?.armFraction != null ? ` (${(protection.armFraction * 100).toFixed(2)}% notional)` : ''}</span>
+      <span>Trail armed: <strong style={{ color: protection?.trailArmed ? C.good : C.accent }}>{protection?.trailArmed === true ? 'YES' : protection?.trailArmed === false ? 'NO' : 'UNKNOWN'}</strong></span>
+      <span>Floor saat ini: <strong>{protection?.floorUsd != null ? money(protection.floorUsd) : protection?.trailArmed === false ? 'Belum terbentuk' : '—'}</strong></span>
+      <span>Interval evaluasi terakhir: <strong>{protection?.lastEvaluationIntervalMs != null ? `${(protection.lastEvaluationIntervalMs / 1000).toFixed(3)} detik` : 'Belum terukur'}</strong></span>
+    </div>
+    <div style={{ color: C.dim, overflowWrap: 'anywhere' }}>Policy: {protection?.policyId ?? 'UNKNOWN'} · basis {protection?.priceBasis ?? 'UNKNOWN'}</div>
+    <div style={{ color: stale ? C.accent : C.dim }}>Evaluasi terakhir: {protection?.lastEvaluatedAt ? formatDate(protection.lastEvaluatedAt) : '—'}{stale && !closed ? ' · belum ada evaluasi fresh' : ''}</div>
+    <details style={{ color: C.dim, overflowWrap: 'anywhere' }}><summary>Fingerprint basket</summary>
+      <div>Exit: {protection?.policyFingerprint ?? 'UNKNOWN'}</div><div>Strategi: {protection?.strategyFingerprint ?? 'UNKNOWN'}</div>
+      <small>Aturan dari snapshot basket. Watcher lebih cepat tidak mengubah arm atau pilihan formation.</small>
+    </details>
+    {exitAudit != null && <a download="basket-exit-evidence.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(exitAudit, null, 2))}`} style={{ color: C.measure }}>Unduh bukti exit (quote, keputusan, submit, fill, rekonsiliasi; kelengkapan biaya/funding tercatat)</a>}
+  </div>;
+}
 type ClosedBasket = {
+  protectionSummary?: BasketProtectionSummary | null;
+  exitAudit?: unknown;
+  recentStrengthPreference?: unknown;
   basketId: string;
   variant: string;
   signal: string;
@@ -101,10 +149,34 @@ type ClosedBasket = {
   feeSource: string | null;
   netPnlUsd: number | null;
   allPricesConfirmed: boolean;
+  releaseProvenance?: ExecutionReleaseLifecycle | null;
+  /** First persisted Net Ladder arm; null means this row never armed or predates the policy. */
+  netLadderArm?: { at: string; armNetPnlUsd: number } | null;
+  closedChartSnapshot?: {
+    version: string;
+    status: 'CAPTURED' | 'PENDING' | 'UNAVAILABLE';
+    requestedAt: string;
+    capturedAt: string | null;
+    source: 'BINANCE_USDM_COMPLETED_CANDLES';
+    entryAt: string | null;
+    exitAt: string | null;
+    assetFile: string | null;
+    mimeType: 'image/svg+xml' | null;
+    dailyCandleCount: number;
+    legCount: number;
+    reason: string | null;
+  } | null;
   unrealizedExtrema?: UnrealizedExtrema | null;
   legs: ClosedLeg[];
 };
 type ClosedLane = { lane: string; laneId: string; closedBaskets: number; baskets: ClosedBasket[] };
+type ClosedAuditHistory = {
+  excludedFromActiveCohort: boolean;
+  reason: string;
+  totalClosed: number;
+  totalNetPnlUsd: number;
+  lanes: ClosedLane[];
+};
 type UnrealizedExtrema = {
   grossHighUsd: number;
   grossLowUsd: number;
@@ -125,24 +197,56 @@ type LegUnrealizedExtrema = {
   closedAt?: string;
 };
 type OpenBasketUnrealized = {
+  protectionSummary?: BasketProtectionSummary | null;
+  exitAudit?: unknown;
+  recentStrengthPreference?: unknown;
   basketId: string;
   signal: string;
   variant: string;
   openedAt: string;
+  /** Canonical executor deadline; never the later research measurement horizon when a cap exists. */
+  scheduledCloseAtMs?: number | null;
+  executionCapHours?: number | null;
+  deadlineSource?: 'BASKET_POLICY_FINGERPRINT' | 'LEGACY_BASKET_CONTRACT' | 'MEASUREMENT_HORIZON';
+  /** TP/SL/adaptive policy can close a basket before its scheduled HORIZON deadline. */
+  mayExitEarlier?: boolean;
   legs: Array<{
     symbol: string;
     side: 'LONG' | 'SHORT';
     qty: number;
     entryPrice: number;
+    /** Exact exchange fill timestamp for chart placement; absent on legacy basket legs. */
+    entryAt?: string | null;
     markPrice: number | null;
     grossUnrealizedUsd: number | null;
     afterEstimatedCloseCostUsd: number | null;
+    entryLiquidity?: { makerQty: number; takerQty: number; reason: string } | null;
     unrealizedExtrema?: LegUnrealizedExtrema | null;
   }>;
   grossUnrealizedUsd: number | null;
   unrealizedAfterEstimatedCloseCostUsd: number | null;
   unrealizedExtrema: UnrealizedExtrema | null;
+  /** First persisted Net Ladder arm; do not infer one from the current mark. */
+  netLadderArm?: { at: string; armNetPnlUsd: number } | null;
 };
+
+function openBasketReviewLeg(basket: OpenBasketUnrealized, leg: OpenBasketUnrealized['legs'][number]): OpenBasketReviewLeg {
+  return {
+    key: `${basket.basketId}:${leg.side}:${leg.symbol}`,
+    basketId: basket.basketId,
+    signal: basket.signal,
+    variant: basket.variant,
+    symbol: leg.symbol,
+    side: leg.side,
+    openedAt: basket.openedAt,
+    entryAt: leg.entryAt ?? null,
+    armAt: basket.netLadderArm?.at ?? null,
+    armLabel: basket.netLadderArm ? `ARM +$${basket.netLadderArm.armNetPnlUsd.toFixed(2)}` : null,
+    entryPrice: leg.entryPrice,
+    markPrice: leg.markPrice,
+    grossUnrealizedUsd: leg.grossUnrealizedUsd,
+  };
+}
 type CrossSectionalPnl = {
   openBasketCount: number;
   openLegCount: number;
@@ -164,6 +268,79 @@ type ClosedResponse = {
   crossSectionalPnl?: CrossSectionalPnl;
   openBaskets?: OpenBasketUnrealized[];
   lanes: ClosedLane[];
+  auditHistory?: ClosedAuditHistory | null;
+};
+type XSecExecStatus = {
+  allowed: boolean;
+  enabled: boolean;
+  signalAgeMs: number | null;
+  signalMaxAgeMs: number | null;
+  signalStale: boolean;
+  signalObservability?: {
+    executableSignal?: {
+      featureSource?: string | null;
+      featureTimestamp?: string | null;
+      featureAgeMs?: number | null;
+      featureMaxAgeMs?: number | null;
+      featureFresh?: boolean | null;
+      featureReason?: string | null;
+    } | null;
+  } | null;
+  openHalted?: string | null;
+  entryAdmission?: { tier?: string; allowed?: boolean; reason?: string; maxLearningOpen?: number } | null;
+  entryAttemptAudit?: {
+    latest?: {
+      at: string;
+      stage: string;
+      outcome: string;
+      reason: string | null;
+      longSymbols?: string[];
+      shortSymbols?: string[];
+      basket?: {
+        basketId: string;
+        status: 'RESERVED' | 'PLACING' | 'PARTIALLY_FILLED' | 'COMPLETE' | 'CLOSED' | 'ABORTED';
+        terminal: boolean;
+        closedAt: string | null;
+        closeReason: string | null;
+      } | null;
+    } | null;
+  } | null;
+  /** Runtime-owned only: the dashboard can observe, never drive, formation timing. */
+  formationScheduler?: {
+    enabled: boolean;
+    interval: '1h';
+    nextDueAt: string | null;
+    inFlight: boolean;
+    lastOutcome: string;
+    lastError: string | null;
+    lastFeatureCutoffAt: string | null;
+  } | null;
+  /** Current policy stays visible even while no Dynamic basket is open. */
+  dynamicMom36Status?: {
+    netLadderPolicy?: {
+      policyId: string;
+      hardSLNetReturn: number;
+      armNetPnlUsd: number;
+      armStepNetPnlUsd: number;
+      fullTakeProfitCapitalFraction: number;
+      givebackFraction: number;
+      volatilitySampleIntervalMs: number;
+      horizonHours: number;
+    } | null;
+    netLadderExit?: {
+      trailArmed?: boolean;
+      highestArmLevel?: number;
+      peakNetPnlUsd?: number | null;
+      trailingFloorNetUsd?: number | null;
+    } | null;
+  } | null;
+};
+type RegimeBreadth = {
+  advancersPct: number | null;
+  altAdvancersPct?: number | null;
+  percentAboveEma20: number | null;
+  btcReturn24h: number | null;
+  unavailableReason?: string | null;
 };
 type DirectionalPick = { symbol: string; sideScore: number; relativeEdge: number; confidence: number };
 type DirectionalExecutor = { openPositions?: unknown[]; dailyMaxLossUsd?: number; lastError?: string | null };
@@ -184,6 +361,21 @@ type DirectionalRegimeResponse = {
 
 const pct = (x: number | null | undefined, d = 3) => x == null ? '—' : `${(x * 100).toFixed(d)}%`;
 const pctRaw = (x: number | null | undefined, d = 2) => x == null ? '—' : `${x.toFixed(d)}%`;
+/** Two-sided 95% critical |t| for df = n-1. A t-stat is meaningless without its degrees of
+ *  freedom: at 2 blocks (df=1) the bar is 12.71, not 2.0 — colouring t=2.37 green there would
+ *  repeat exactly the overlap mistake this row exists to correct. Falls back to 2.0 for large n. */
+const T_CRIT_95: Record<number, number> = {
+  1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31,
+  9: 2.26, 10: 2.23, 12: 2.18, 15: 2.13, 20: 2.09, 25: 2.06, 30: 2.04, 40: 2.02,
+};
+function tCritical95(blocks: number): number | null {
+  const df = blocks - 1;
+  if (df < 1) return null;
+  const keys = Object.keys(T_CRIT_95).map(Number).sort((a, b) => a - b);
+  for (const k of keys) if (df <= k) return T_CRIT_95[k]!;
+  return 2.0;
+}
+
 const tone = (x: number | null | undefined) => x == null ? C.measure : x > 0 ? C.good : x < 0 ? C.bad : C.dim;
 const ago = (ts: string) => {
   const seconds = Math.max(0, Math.round((Date.now() - new Date(ts).getTime()) / 1000));
@@ -196,6 +388,109 @@ const duration = (ms: number | null) => {
   const minutes = Math.round((ms % 3_600_000) / 60_000);
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 };
+
+type EntryLiquidity = { makerQty: number; takerQty: number; reason: string } | null | undefined;
+
+/**
+ * How a leg's ENTRY was filled, split by liquidity.
+ *
+ * EXACT, not an estimate. Binance rejects a GTX order outright if it would cross, so it can only
+ * ever fill as maker; a MARKET order can only ever fill as taker. Which order filled which quantity
+ * therefore IS the split — no per-fill lookup needed to make it true.
+ *
+ * An ABSENT field is not unknown: legs opened before 2026-08-16 could only be placed as MARKET, so
+ * absence means taker and is rendered as taker. Rendering it as "—" would turn a code-level
+ * certainty into a mystery. Exits are still MARKET on every path, so there is no exit badge —
+ * that fact is stated once per panel instead of repeated on every row.
+ */
+/** Modal yang benar-benar dipakai basket: jumlah notional entry seluruh kakinya.
+ *
+ *  Returns null unless EVERY leg is priced. A partial sum would understate the denominator and
+ *  quietly inflate every percentage built on it — better to show no percentage than a flattering
+ *  one. Margin is notional/leverage, so this is exposure, not cash locked; the label says so. */
+function basketNotionalUsd(legs: ReadonlyArray<{ qty: number; entryPrice: number }>): number | null {
+  let total = 0;
+  for (const l of legs) {
+    if (!(l.qty > 0) || !(l.entryPrice > 0)) return null;
+    total += l.qty * l.entryPrice;
+  }
+  return total > 0 ? total : null;
+}
+
+/** The six gross/after-cost figures as ONE horizontal strip, each with its share of basket capital.
+ *
+ *  Was two separate copies — six wide tiles in the closed panel, six wrapping cells in the open one
+ *  — which pushed everything else below the fold and gave the numbers no scale: "+0.72 USDT" says
+ *  nothing until you know it sits on $105. Same component both places now, so the two can no longer
+ *  drift apart, and the percentage is always against the same denominator. */
+function ExtremaStrip({ rows, capitalUsd }: {
+  rows: ReadonlyArray<readonly [string, number | null | undefined]>;
+  capitalUsd: number | null;
+}) {
+  const pct = (v: number | null | undefined) =>
+    capitalUsd && capitalUsd > 0 && v != null && Number.isFinite(v)
+      ? `${v >= 0 ? '+' : ''}${(v / capitalUsd * 100).toFixed(3)}%`
+      : null;
+  return <div style={{
+    display: 'grid', gridTemplateColumns: `repeat(${rows.length}, minmax(84px, 1fr))`,
+    borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`, overflowX: 'auto',
+  }}>
+    {rows.map(([label, value], i) => (
+      <div key={label} style={{ padding: '5px 8px', borderLeft: i ? `1px solid ${C.border}` : undefined }}>
+        <small style={{ display: 'block', color: C.dim, fontSize: 9.5, lineHeight: 1.3, whiteSpace: 'nowrap' }}>{label}</small>
+        <strong style={{ color: tone(value), fontSize: 12.5, fontVariantNumeric: 'tabular-nums' }}>{money(value)}</strong>
+        {pct(value) && <small style={{ display: 'block', color: C.dim, fontSize: 9.5, fontVariantNumeric: 'tabular-nums' }}>{pct(value)}</small>}
+      </div>
+    ))}
+  </div>;
+}
+
+/** Modal line for a basket header. */
+function CapitalNote({ legs }: { legs: ReadonlyArray<{ qty: number; entryPrice: number }> }) {
+  const n = basketNotionalUsd(legs);
+  if (n === null) return <span style={{ color: C.dim, fontSize: 11 }}>modal — (ada kaki tanpa harga)</span>;
+  return <span style={{ color: C.dim, fontSize: 11 }}>
+    modal <strong style={{ color: C.text }}>${n.toFixed(2)}</strong> · {legs.length} kaki · ~${(n / legs.length).toFixed(2)}/kaki
+  </span>;
+}
+
+function LiquidityBadge({ liq, compact = false }: { liq: EntryLiquidity; compact?: boolean }) {
+  const label = (text: string, color: string, title: string) => (
+    <span title={title} style={{
+      color, border: `1px solid ${color}`, borderRadius: 3, padding: '0 4px',
+      fontSize: compact ? 9.5 : 10, letterSpacing: 0.3, whiteSpace: 'nowrap',
+    }}>{text}</span>
+  );
+  if (!liq) return label('TAKER', C.dim, 'Leg dibuka sebelum mode maker — saat itu kode hanya bisa memasang MARKET, jadi pasti taker');
+  const total = liq.makerQty + liq.takerQty;
+  if (total <= 0) return label('TAKER', C.dim, liq.reason);
+  const makerPct = (liq.makerQty / total) * 100;
+  if (makerPct >= 99.9) return label('MAKER', C.good, `Terisi penuh sebagai maker (GTX post-only). ${liq.reason}`);
+  if (makerPct <= 0.1) return label('TAKER', C.accent, `Post-only tidak terisi, disilang ke MARKET. ${liq.reason}`);
+  return label(`${makerPct.toFixed(0)}% MAKER`, C.measure, `Sebagian maker, sisanya disilang ke MARKET. ${liq.reason}`);
+}
+
+/** Basket-level roll-up: what share of the ENTRY notional was added rather than taken. */
+function BasketLiquiditySummary({ legs }: { legs: ReadonlyArray<{ qty: number; entryPrice: number; entryLiquidity?: EntryLiquidity }> }) {
+  let makerNotional = 0;
+  let total = 0;
+  for (const l of legs) {
+    const px = l.entryPrice;
+    if (!(px > 0) || !(l.qty > 0)) continue;
+    total += px * l.qty;
+    const liq = l.entryLiquidity;
+    if (liq && liq.makerQty + liq.takerQty > 0) makerNotional += px * liq.makerQty;
+  }
+  if (total <= 0) return null;
+  const pctMaker = (makerNotional / total) * 100;
+  // Commission is the only part that is certain: 2.00 bps maker vs 4.00 taker, measured on this
+  // account. The spread saved and the adverse selection paid are NOT included and never claimed.
+  const entryBps = 2 * (pctMaker / 100) + 4 * (1 - pctMaker / 100);
+  return <span style={{ color: C.dim, fontSize: 10.5 }}>
+    entry <strong style={{ color: pctMaker >= 99.9 ? C.good : pctMaker > 0 ? C.measure : C.dim }}>{pctMaker.toFixed(0)}% maker</strong>
+    {' · komisi masuk ~'}{entryBps.toFixed(2)} bps{' · exit MARKET = taker 4,00 bps'}
+  </span>;
+}
 
 function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
   return <div style={{ padding: '8px 14px', borderRight: `1px solid ${C.border}` }}>
@@ -231,6 +526,165 @@ function InlineSymbolList({ symbols, color = C.dim, empty = 'Tidak ada' }: { sym
   return <div style={{ color, paddingLeft: 12, marginTop: 3, lineHeight: 1.5 }}>{symbols.length ? symbols.join(', ') : empty}</div>;
 }
 
+/* ── Pool panel ───────────────────────────────────────────────────────────────────────────────
+   This used to read "POOL LONG OPERATOR" / "POOL SHORT OPERATOR", which stopped being true the
+   moment the list became criteria-derived, and it named exclusions without ever saying why. A pool
+   view that cannot answer "why is this symbol in, and that one out" is how a hand-picked list
+   survives for months without anyone being able to question it.
+
+   Every number below is MEASURED and comes from /api/live/cross-sectional-pool, not typed in here.
+   The one list that genuinely has no criterion — the short blocklist — is labelled as exactly that
+   rather than sharing a heading with the criteria-derived pools. */
+type PoolReport = {
+  measured: boolean;
+  leg: { baseUsd: number; multiplier: number; effectiveUsd: number | null; oneLotCeilingUsd: number | null };
+  thresholds: { minLiquidityUsdPerHour: number; maxLotFractionOfLeg: number; minListedDays: number; maxFundingCarryBps: number; maxCorrelation: number };
+  counts: { universe: number; passesEvaluated: number; poolLong: number; poolShort: number; shortBlocked: number; shortEligible: number };
+  rows: Array<{ symbol: string; passesEvaluated: boolean; inPool: boolean; shortBlocked: boolean; agreesWithCriteria: boolean; failures: Array<{ code: string; detail: string }> }>;
+  mismatch: string[];
+  /** The actionable verdict, hysteresis-aware. `mismatch` above is the RAW threshold comparison —
+   *  true per symbol, but not a reason to change anything on its own. */
+  reconciliation?: { changed: boolean; adds: string[]; drops: string[]; held: Array<{ symbol: string; action: string; reason: string }>; unmeasured: boolean };
+  /** Same durable C1/C2 membership consumed by the backend for new Dynamic baskets. */
+  autoPool?: {
+    enabled: boolean;
+    state: 'DISABLED' | 'ACTIVE' | 'STALE_FALLBACK';
+    source: 'BINANCE_USDM_MAINNET_PUBLIC' | null;
+    activeSymbols: string[];
+    updatedAt: string | null;
+    lastError: string | null;
+    refreshEveryMs: number;
+  } | null;
+  blockedInPool: string[];
+  btc: { oneLotUsd: number | null; legNeededUsd: number | null };
+  unevaluatedCriteria: Array<{ code: string; why: string }>;
+};
+
+const usd = (v: number | null | undefined, dp = 2) => (v == null ? '—' : `$${v.toFixed(dp)}`);
+
+function Banner({ tone, children }: { tone: 'warn' | 'ok'; children: ReactNode }) {
+  return <div style={{
+    color: tone === 'warn' ? C.accent : C.good, background: tone === 'warn' ? '#2a2110' : 'transparent',
+    border: `1px solid ${tone === 'warn' ? C.accent : 'transparent'}`, borderRadius: 4,
+    padding: tone === 'warn' ? '6px 9px' : '2px 0', fontSize: 11.5, lineHeight: 1.5,
+  }}>{children}</div>;
+}
+
+function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlocked, executionExcluded }: {
+  apiPrefix: string;
+  executionLong: string[]; executionShort: string[]; executionShortBlocked: string[]; executionExcluded: string[];
+}) {
+  const [pool, setPool] = useState<PoolReport | null>(null);
+  const [poolError, setPoolError] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    async function loadPool() {
+      try {
+        const response = await fetch(`${apiPrefix}/live/cross-sectional-pool`, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const parsed = await response.json() as PoolReport;
+        if (alive) { setPool(parsed); setPoolError(false); }
+      } catch {
+        if (alive) setPoolError(true);
+      }
+    }
+    void loadPool();
+    // The report is cached 15 min on the API; polling faster only burns requests for the same bytes.
+    const timer = window.setInterval(() => void loadPool(), 5 * 60_000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [apiPrefix]);
+
+  const activeShort = executionShort.filter((symbol) => !executionShortBlocked.includes(symbol));
+  const poolsIdentical = executionLong.length === executionShort.length
+    && executionLong.every((symbol) => executionShort.includes(symbol));
+  // Both endpoints read one durable runtime pool. If the two disagree, the dashboard is describing
+  // a membership source the formation path is not using, which must never pass silently.
+  const countDrift = pool && (pool.counts.poolLong !== executionLong.length || pool.counts.poolShort !== executionShort.length);
+  const refreshMinutes = pool?.autoPool?.refreshEveryMs ? Math.round(pool.autoPool.refreshEveryMs / 60_000) : null;
+
+  const label = (text: string, n: number, color: string) => <strong style={{ color }}>{text} ({n})</strong>;
+
+  return <div style={{ display: 'grid', gap: 8, marginTop: 2, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
+    <div>
+      <strong style={{ color: C.text }}>Pool FILTERED yang dipakai sekarang</strong>
+      <div style={{ color: C.dim, fontSize: 11.5, marginTop: 2, lineHeight: 1.5 }}>
+        Daftar long dan short <b style={{ color: C.text }}>diturunkan dari C1/C2 USD-M</b>, bukan dipilih tangan.
+        {pool?.measured && <> Leg efektif <b style={{ color: C.text }}>{usd(pool.leg.effectiveUsd)}</b> ({usd(pool.leg.baseUsd, 0)} × {pool.leg.multiplier}) ·
+        C1 likuiditas ≥ ${Math.round(pool.thresholds.minLiquidityUsdPerHour / 1000)}k/jam ·
+        C2 satu lot ≤ {usd(pool.leg.oneLotCeilingUsd)} ({(pool.thresholds.maxLotFractionOfLeg * 100).toFixed(0)}% leg)</>}
+      </div>
+    </div>
+
+    {poolError && <Banner tone="warn">Kriteria tidak bisa dibaca (endpoint pool gagal). Daftar di bawah tetap yang dipakai executor, tapi belum diuji terhadap kriteria apa pun.</Banner>}
+    {pool && !pool.measured && <Banner tone="warn">⚠ Kriteria tidak bisa diukur sekarang — pembacaan exchange gagal. Ini <b>bukan</b> berarti simbol-simbolnya gagal kriteria; belum ada yang diuji.</Banner>}
+    {pool?.autoPool?.state === 'ACTIVE' && <Banner tone="ok">
+      ✓ Auto-pool aktif · refresh C1/C2 tiap {refreshMinutes ?? 15} menit dari USD-M mainnet · berlaku untuk basket baru saja.
+    </Banner>}
+    {pool?.autoPool?.state === 'STALE_FALLBACK' && <Banner tone="warn">
+      ⚠ Auto-pool belum punya snapshot valid; sementara memakai fallback terakhir tanpa memperlebar universe. Refresh otomatis akan mencoba lagi. Basket terbuka tidak disentuh.
+    </Banner>}
+    {/* Reads the hysteresis-aware reconciliation, never the raw mismatch. The action is executed
+        automatically by the shared runtime pool; this panel is only reporting the next refresh. */}
+    {pool?.measured && pool.reconciliation?.changed && <Banner tone="warn">
+      ⚠ Pool auto akan memperbarui: {[
+        ...pool.reconciliation.adds.map((s) => `tambah ${s.replace('USDT', '')}`),
+        ...pool.reconciliation.drops.map((s) => `keluarkan ${s.replace('USDT', '')}`),
+      ].join(' · ')}. Berlaku pada refresh berikutnya untuk basket baru; basket terbuka tidak disentuh.
+    </Banner>}
+    {pool?.measured && pool.reconciliation && !pool.reconciliation.changed && pool.reconciliation.held.length > 0 && <Banner tone="ok">
+      ● Tidak ada yang perlu diubah. {pool.reconciliation.held.map((d) => d.symbol.replace('USDT', '')).join(', ')} di bawah ambang mentah tetapi <strong style={{ color: C.text }}>di dalam pita histeresis ±10%</strong>, jadi keanggotaannya sengaja dipertahankan — tanpa pita, simbol di garis batas keluar-masuk tiap beberapa jam dan menulis ulang pool yang dibandingkan overlap guard.
+    </Banner>}
+    {pool?.measured && pool.reconciliation && !pool.reconciliation.changed && pool.reconciliation.held.length === 0 && pool.autoPool?.state !== 'ACTIVE' && <Banner tone="ok">✓ Ke-{pool.counts.poolLong} simbol pool sama persis dengan hasil kriteria C1 &amp; C2.</Banner>}
+    {countDrift && <Banner tone="warn">⚠ Pool runtime menghitung {pool.counts.poolLong} long / {pool.counts.poolShort} short, laporan formation menampilkan {executionLong.length} / {executionShort.length}. Data sedang tidak sinkron; tidak ada membership baru yang diasumsikan dari panel ini.</Banner>}
+
+    <div>{label('POOL LONG — hasil kriteria C1 & C2', executionLong.length, C.good)}<InlineSymbolList symbols={executionLong} color={C.good} /></div>
+    <div>
+      {label('POOL SHORT — hasil kriteria C1 & C2', executionShort.length, C.good)}
+      {poolsIdentical
+        ? <div style={{ color: C.dim, paddingLeft: 12, marginTop: 3, fontSize: 11.5 }}>Sama persis dengan pool long — satu-satunya beda sisi short adalah blocklist di bawah.</div>
+        : <InlineSymbolList symbols={executionShort} color={C.good} />}
+    </div>
+
+    <div>
+      {label('BLOCKED SHORT — daftar tangan, TANPA kriteria', executionShortBlocked.length, C.bad)}
+      <InlineSymbolList symbols={executionShortBlocked} color={C.bad} />
+      <div style={{ color: C.dim, paddingLeft: 12, marginTop: 3, fontSize: 11.5, lineHeight: 1.5 }}>
+        Satu-satunya daftar yang masih dipilih manual. Tidak ada alasan tercatat kenapa simbol ini tidak boleh di-short,
+        dan tidak ada aturan untuk menambah atau mengeluarkan anggotanya. Diukur 2026-08-16 pada pool 20 simbol,
+        biayanya <b style={{ color: C.text }}>−0,8 bps median</b> — jadi pertanyaannya konsistensi, bukan biaya.
+        {!!pool?.blockedInPool.length && <> Saat ini {pool.blockedInPool.length} di antaranya ada di pool aktif, jadi hanya bisa dipakai di sisi long.</>}
+      </div>
+    </div>
+
+    <div>{label('SHORT ELIGIBLE SEKARANG', activeShort.length, C.measure)}<InlineSymbolList symbols={activeShort} color={C.measure} /></div>
+
+    {!!executionExcluded.length && <div>
+      {label('DIKELUARKAN DARI EXECUTOR', executionExcluded.length, C.accent)}
+      <InlineSymbolList symbols={executionExcluded} color={C.accent} />
+    </div>}
+
+    {pool?.measured && <div style={{ color: C.dim, fontSize: 11.5, lineHeight: 1.5, borderTop: `1px solid ${C.border}`, paddingTop: 6 }}>
+      {pool.btc.oneLotUsd !== null && <>
+        <b style={{ color: C.text }}>BTC di luar pool secara permanen pada leg ini</b>, bukan &ldquo;sementara&rdquo;: satu lot minimumnya {usd(pool.btc.oneLotUsd)} vs plafon {usd(pool.leg.oneLotCeilingUsd)}.
+        Baru bisa masuk kalau leg dinaikkan ke sekitar {usd(pool.btc.legNeededUsd, 0)} — itu keputusan ukuran posisi, bukan sesuatu yang hilang sendiri.<br />
+      </>}
+      <b style={{ color: C.text }}>C3 umur listing, C4 carry funding, C5 korelasi tidak diukur</b> di panel ini ({pool.unevaluatedCriteria.map((c) => c.code.split('_')[0]).join(', ')}),
+      jadi ketiganya tidak ikut menentukan status di atas — dinyatakan, bukan disembunyikan. Pada universe {pool.counts.universe} simbol saat ini hanya C1 dan C2 yang menyaring.
+      {' '}<a href={`${apiPrefix}/live/cross-sectional-pool/view`} target="_blank" rel="noreferrer" style={{ color: C.measure }}>Rincian per simbol →</a>
+    </div>}
+    {/* 2026-08-17: both recorders installed today answer questions that were previously
+        unanswerable because the data was never created — the basket the gate refuses was written
+        nowhere, and OI/depth have no usable history. Linked, not inlined: both are still
+        ACCUMULATING and putting them in a results panel would invite reading them as findings. */}
+    <div style={{ marginTop: 10, paddingTop: 9, borderTop: `1px solid ${C.border}`, fontSize: 11.5, color: C.dim }}>
+      Pencatatan baru (masih mengumpul, belum bisa disimpulkan): basket yang <b style={{ color: C.text }}>ditolak gerbang</b> dan
+      {' '}<b style={{ color: C.text }}>open interest + kedalaman orderbook</b>.
+      {' '}<a href={`${apiPrefix}/live/instrumentation/view`} target="_blank" rel="noreferrer" style={{ color: C.measure }}>Lihat pencatatan →</a>
+    </div>
+  </div>;
+}
+
 function BasketRows({ baskets, open }: { baskets: XSecBasket[]; open?: boolean }) {
   if (!baskets.length) return <div style={{ color: C.dim, fontSize: 12 }}>No {open ? 'open' : 'closed'} baskets yet.</div>;
   return <>{baskets.slice(-6).reverse().map((basket, index) => <div key={`${basket.openedAt}-${index}`} style={{ display: 'flex', gap: 12, fontSize: 12, padding: '4px 0', borderTop: index ? `1px solid ${C.border}` : undefined, flexWrap: 'wrap' }}>
@@ -241,12 +695,26 @@ function BasketRows({ baskets, open }: { baskets: XSecBasket[]; open?: boolean }
   </div>)}</>;
 }
 
-function formatDate(ts: string | null | undefined) {
+function formatDate(ts: string | number | null | undefined) {
   return ts ? new Intl.DateTimeFormat('id-ID', {
     dateStyle: 'medium',
     timeStyle: 'medium',
     timeZone: 'Asia/Taipei',
   }).format(new Date(ts)) : '—';
+}
+
+function releaseVersionLabel(stamp: ExecutionReleaseStamp | null | undefined): string {
+  if (!stamp || stamp.source === 'LEGACY_UNVERIFIED') return 'LEGACY';
+  if (stamp.source === 'RUNTIME_MANIFEST') return stamp.label;
+  return 'UNVERIFIED';
+}
+
+function releaseStampLabel(stamp: ExecutionReleaseStamp | null | undefined): string {
+  if (!stamp || stamp.source === 'LEGACY_UNVERIFIED') return 'LEGACY · release tidak terekam';
+  if (stamp.source === 'RUNTIME_MANIFEST' && stamp.activatedAt) {
+    return stamp.label + ' (' + formatDate(stamp.activatedAt) + ')';
+  }
+  return 'UNVERIFIED · manifest release tidak tersedia';
 }
 
 function sideReturn(basket: ClosedBasket, side: 'LONG' | 'SHORT') {
@@ -291,89 +759,220 @@ function LegUnrealizedExtremaLine({ extrema }: { extrema: LegUnrealizedExtrema |
   </div>;
 }
 
-function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: string }) {
+function ClosedBasketBlock({
+  basket,
+  lane,
+  snapshotSelected,
+  onToggleSnapshot,
+}: {
+  basket: ClosedBasket;
+  lane: string;
+  snapshotSelected: boolean;
+  onToggleSnapshot: () => void;
+}) {
   const longReturn = sideReturn(basket, 'LONG');
   const shortReturn = sideReturn(basket, 'SHORT');
-  return <div style={{ border: `1px solid ${C.border}`, borderRadius: 6, marginTop: 10, overflow: 'hidden' }}>
-    <div style={{ padding: '9px 12px', background: C.sub, display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'baseline' }}>
+  const long = basket.legs.filter((leg) => leg.side === 'LONG').map((leg) => leg.symbol);
+  const short = basket.legs.filter((leg) => leg.side === 'SHORT').map((leg) => leg.symbol);
+  const extrema = basket.unrealizedExtrema;
+  return <details style={{ border: `1px solid ${C.border}`, borderRadius: 6, marginTop: 10, overflow: 'hidden' }}>
+    <summary style={{ padding: '9px 12px', background: C.sub, display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'baseline', cursor: 'pointer' }}>
       <strong style={{ color: C.text }}>{basket.basketId}</strong>
+      <BasketSelectionBadge preference={basket.recentStrengthPreference} />
       <span style={{ color: C.dim }}>{lane} · {basket.variant} · {basket.signal}</span>
-      <span style={{ color: C.dim }}>hold {basket.holdHours.toFixed(2)}h</span>
+      <span style={{ color: tone(basket.netPnlUsd), fontWeight: 700 }}>net {money(basket.netPnlUsd)}</span>
+      <span style={{ color: C.dim }}>close {formatDate(basket.closedAt)}</span>
+      <span
+        style={{ color: C.measure }}
+        title="Release pembuka dan penutup dicatat secara terpisah. Waktu lengkap ada di detail."
+      >release {releaseVersionLabel(basket.releaseProvenance?.openedWith)} → {releaseVersionLabel(basket.releaseProvenance?.closedWith)}</span>
+      <span style={{ color: C.accent }}>buka detail</span>
+    </summary>
+    <div style={{ padding: '8px 12px', display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'baseline', fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
+      <span style={{ color: C.dim }}>open {formatDate(basket.openedAt)} · close {formatDate(basket.closedAt)}</span>
+      <span
+        style={{ color: C.measure }}
+        title="Waktu dalam tanda kurung adalah cutover/deploy release di Taipei, bukan waktu fill."
+      >release open {releaseStampLabel(basket.releaseProvenance?.openedWith)} · close {releaseStampLabel(basket.releaseProvenance?.closedWith)}</span>
       <span style={{ color: basket.allPricesConfirmed ? C.good : C.accent }}>{basket.allPricesConfirmed ? 'fills confirmed' : 'unconfirmed fill price'}</span>
+      {basket.netLadderArm && <span style={{ color: C.text }}>MFE arm {formatDate(basket.netLadderArm.at)} · +${basket.netLadderArm.armNetPnlUsd.toFixed(2)}</span>}
+      {basket.closedChartSnapshot?.status === 'CAPTURED'
+        ? <button
+            type="button"
+            onClick={onToggleSnapshot}
+            aria-pressed={snapshotSelected}
+            title="Buka chart 1D semua leg yang dibekukan saat basket close"
+            style={{ color: C.measure, background: 'transparent', border: `1px solid ${C.measure}`, borderRadius: 4, padding: '3px 7px', cursor: 'pointer', font: 'inherit' }}
+          >{snapshotSelected ? 'tutup final chart' : 'final chart'}</button>
+        : basket.closedChartSnapshot?.status === 'PENDING'
+          ? <small style={{ color: C.dim }} title={basket.closedChartSnapshot.reason ?? 'Menunggu arsip candle selesai.'}>menyimpan chart…</small>
+          : basket.closedChartSnapshot?.status === 'UNAVAILABLE'
+            ? <small style={{ color: C.accent }} title={basket.closedChartSnapshot.reason ?? 'Arsip candle tidak tersedia.'}>chart tidak tersedia</small>
+            : <small style={{ color: C.dim }}>pra-snapshot</small>}
     </div>
+    <BasketProtectionBlock protection={basket.protectionSummary} exitAudit={basket.exitAudit} closed />
     <div style={{ padding: '8px 12px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
-      <span>Open: <strong>{formatDate(basket.openedAt)}</strong></span>
-      <span>Close: <strong>{formatDate(basket.closedAt)}</strong></span>
-      <span>Gross: <strong style={{ color: tone(basket.grossPnlUsd) }}>{money(basket.grossPnlUsd)}</strong></span>
-      <span>Fee/cost: <strong style={{ color: C.accent }}>{money(basket.feeEstimateUsd)}</strong> <small style={{ color: C.dim }}>({basket.feeSource ?? 'unknown'})</small></span>
-      <span>Realized net: <strong style={{ color: tone(basket.netPnlUsd) }}>{money(basket.netPnlUsd)}</strong></span>
-      <span>Long return: <strong style={{ color: tone(longReturn) }}>{pct(longReturn)}</strong></span>
-      <span>Short return: <strong style={{ color: tone(shortReturn) }}>{pct(shortReturn)}</strong></span>
+      <span style={{ color: C.good }}>Long: {long.join(', ')}</span>
+      <span style={{ color: C.bad }}>Short: {short.join(', ')}</span>
+      <span style={{ color: C.dim }}>hold {basket.holdHours.toFixed(2)}h · reason {basket.closeReason ?? '—'}</span>
+      <CapitalNote legs={basket.legs} />
+      <BasketLiquiditySummary legs={basket.legs} />
     </div>
-    <UnrealizedExtremaBlock extrema={basket.unrealizedExtrema} />
+    <ExtremaStrip capitalUsd={basketNotionalUsd(basket.legs)} rows={[
+      ['Gross realized', basket.grossPnlUsd],
+      ['Setelah biaya', basket.netPnlUsd],
+      ['ATH gross', extrema?.grossHighUsd],
+      ['ATH stlh biaya', extrema?.afterEstimatedCloseCostHighUsd],
+      ['ATL gross', extrema?.grossLowUsd],
+      ['ATL stlh biaya', extrema?.afterEstimatedCloseCostLowUsd],
+    ]} />
     <div style={{ overflowX: 'auto' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
         <thead><tr style={{ color: C.dim, textAlign: 'left' }}>
-          <th style={{ padding: 7 }}>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Close</th><th>Return</th><th>Gross</th><th>Fee allocated</th><th>Realized</th>
+          <th style={{ padding: 7 }}>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Close</th><th>Return</th><th>Gross realized</th><th>Setelah biaya</th><th>ATH gross</th><th>ATH setelah biaya</th><th>ATL gross</th><th>ATL setelah biaya</th><th>Fee allocated</th>
         </tr></thead>
         <tbody>{basket.legs.map((leg) => {
           const ret = leg.entryPrice > 0 ? (leg.side === 'LONG' ? leg.exitPrice - leg.entryPrice : leg.entryPrice - leg.exitPrice) / leg.entryPrice : null;
-          return <>
-            <tr key={`${basket.basketId}-${leg.symbol}`} style={{ borderTop: `1px solid ${C.border}` }}>
-              <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>{leg.symbol}</td>
+          const path = leg.unrealizedExtrema;
+          return <tr key={`${basket.basketId}-${leg.symbol}`} style={{ borderTop: `1px solid ${C.border}` }}>
+              <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>
+                {leg.symbol}{' '}<LiquidityBadge liq={leg.entryLiquidity} compact />
+              </td>
               <td style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</td>
               <td>{leg.qty}</td><td>{leg.entryPrice}</td><td>{leg.exitPrice}</td>
               <td style={{ color: tone(ret) }}>{pct(ret)}</td>
               <td style={{ color: tone(leg.grossPnlUsd) }}>{money(leg.grossPnlUsd)}</td>
-              <td style={{ color: C.accent }}>{money(leg.feeAllocatedUsd)}</td>
               <td style={{ color: tone(leg.netPnlUsd) }}>{money(leg.netPnlUsd)} {!leg.priceConfirmed && <span title="Entry or close fill price was not exchange-confirmed">⚠</span>}</td>
+              <td style={{ color: tone(path?.grossHighUsd) }}>{money(path?.grossHighUsd)}</td>
+              <td style={{ color: tone(path?.afterEstimatedCloseCostHighUsd) }}>{money(path?.afterEstimatedCloseCostHighUsd)}</td>
+              <td style={{ color: tone(path?.grossLowUsd) }}>{money(path?.grossLowUsd)}</td>
+              <td style={{ color: tone(path?.afterEstimatedCloseCostLowUsd) }}>{money(path?.afterEstimatedCloseCostLowUsd)}</td>
+              <td style={{ color: C.accent }}>{money(leg.feeAllocatedUsd)}</td>
             </tr>
-            <tr key={`${basket.basketId}-${leg.symbol}-extrema`}><td colSpan={9}><LegUnrealizedExtremaLine extrema={leg.unrealizedExtrema} /></td></tr>
-          </>;
         })}</tbody>
       </table>
     </div>
-    <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>Close reason: {basket.closeReason ?? '—'}</div>
-  </div>;
+    <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>Fee/cost: {money(basket.feeEstimateUsd)} ({basket.feeSource ?? 'unknown'}) · long return {pct(longReturn)} · short return {pct(shortReturn)}</div>
+  </details>;
 }
 
-function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized }) {
+function OpenBasketUnrealizedBlock({
+  basket,
+  selectedLegKey,
+  onSelectLeg,
+  isLive,
+  closeBusy,
+  onCloseNow,
+}: {
+  basket: OpenBasketUnrealized;
+  selectedLegKey: string | null;
+  onSelectLeg: (leg: OpenBasketReviewLeg) => void;
+  isLive: boolean;
+  closeBusy: boolean;
+  onCloseNow: () => void;
+}) {
   const long = basket.legs.filter((leg) => leg.side === 'LONG').map((leg) => leg.symbol);
   const short = basket.legs.filter((leg) => leg.side === 'SHORT').map((leg) => leg.symbol);
+  const scheduledCloseAtMs = typeof basket.scheduledCloseAtMs === 'number' && Number.isFinite(basket.scheduledCloseAtMs)
+    ? basket.scheduledCloseAtMs
+    : null;
+  const closeInHours = scheduledCloseAtMs == null ? null : Math.max(0, (scheduledCloseAtMs - Date.now()) / 3_600_000);
+  const deadlineLabel = basket.mayExitEarlier ? 'batas close' : 'tutup';
+  const extrema = basket.unrealizedExtrema;
+  const summary = [
+    ['Gross sekarang', basket.grossUnrealizedUsd],
+    ['Setelah biaya', basket.unrealizedAfterEstimatedCloseCostUsd],
+    ['ATH gross', extrema?.grossHighUsd],
+    ['ATH stlh biaya', extrema?.afterEstimatedCloseCostHighUsd],
+    ['ATL gross', extrema?.grossLowUsd],
+    ['ATL stlh biaya', extrema?.afterEstimatedCloseCostLowUsd],
+  ] as const;
   return <div style={{ border: `1px solid ${C.border}`, borderRadius: 6, marginTop: 10, overflow: 'hidden' }}>
-    <div style={{ padding: '9px 12px', background: C.sub, display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'baseline' }}>
-      <strong style={{ color: C.text }}>{basket.basketId}</strong>
-      <span style={{ color: C.dim }}>{basket.variant} · {basket.signal}</span>
-      <span style={{ color: C.dim }}>open {formatDate(basket.openedAt)}</span>
+    <div style={{ padding: '9px 12px', background: C.sub, display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'baseline', minWidth: 0, flex: '1 1 620px' }}>
+        <strong style={{ color: C.text }}>{basket.basketId}</strong>
+      <BasketSelectionBadge preference={basket.recentStrengthPreference} />
+        <span style={{ color: C.dim }}>{basket.variant} · {basket.signal}</span>
+        <span style={{ color: C.dim }}>open {formatDate(basket.openedAt)} Taipei</span>
+        {basket.netLadderArm && <span style={{ color: C.text }}>MFE arm {formatDate(basket.netLadderArm.at)} · +${basket.netLadderArm.armNetPnlUsd.toFixed(2)}</span>}
+        <span
+          style={{ color: scheduledCloseAtMs == null ? C.bad : C.measure }}
+          title={scheduledCloseAtMs == null
+            ? 'Executor tidak memberikan deadline close; UI tidak menebak dari mark atau horizon riset.'
+            : `${basket.deadlineSource ?? 'unknown source'}${basket.mayExitEarlier ? ' · TP/SL/adaptive exit dapat menutup lebih awal' : ''}`}
+        >
+          {scheduledCloseAtMs == null
+            ? 'jadwal close tidak tersedia'
+            : `${deadlineLabel} ${formatDate(scheduledCloseAtMs)} Taipei · ${closeInHours?.toFixed(1)}h lagi${basket.executionCapHours != null ? ` (cap ${basket.executionCapHours}h)` : ''}`}
+        </span>
+        <CapitalNote legs={basket.legs} />
+        <BasketLiquiditySummary legs={basket.legs} />
+      </div>
+      {isLive ? <button
+        type="button"
+        disabled={closeBusy}
+        onClick={onCloseNow}
+        style={{
+          flex: '0 0 auto',
+          minWidth: 144,
+          padding: '7px 10px',
+          border: `1px solid ${C.bad}`,
+          borderRadius: 4,
+          background: closeBusy ? C.sub : '#32191f',
+          color: closeBusy ? C.dim : '#ffd9dd',
+          cursor: closeBusy ? 'wait' : 'pointer',
+          fontWeight: 700,
+        }}
+        title="Menutup seluruh leg basket ini saja dengan market reduce-only. Basket lain dan lane lain tidak disentuh."
+      >{closeBusy ? 'Closing basket…' : 'Close basket now'}</button> : null}
     </div>
-    <div style={{ padding: '8px 12px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
+    <BasketProtectionBlock protection={basket.protectionSummary} exitAudit={basket.exitAudit} />
+    <div style={{ padding: '8px 12px 4px', display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12 }}>
       <span style={{ color: C.good }}>Long: {long.join(', ')}</span>
       <span style={{ color: C.bad }}>Short: {short.join(', ')}</span>
-      <span>Gross sekarang: <strong style={{ color: tone(basket.grossUnrealizedUsd) }}>{money(basket.grossUnrealizedUsd)}</strong></span>
-      <span>Setelah biaya close: <strong style={{ color: tone(basket.unrealizedAfterEstimatedCloseCostUsd) }}>{money(basket.unrealizedAfterEstimatedCloseCostUsd)}</strong></span>
+      <span style={{ color: C.measure }}>Klik simbol di tabel untuk melihat candle</span>
     </div>
-    <div style={{ fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(105px, 1.2fr) minmax(72px, .7fr) repeat(3, minmax(92px, 1fr))', gap: 8, padding: '7px 12px', color: C.dim, fontSize: 11 }}>
-        <span>Symbol</span><span>Arah</span><span>Entry</span><span>Mark sekarang</span><span>Unrealized P&amp;L</span>
-      </div>
-      {basket.legs.map((leg) => <div key={`${basket.basketId}-${leg.symbol}-${leg.side}`} style={{ borderTop: `1px solid ${C.border}` }}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(105px, 1.2fr) minmax(72px, .7fr) repeat(3, minmax(92px, 1fr))', gap: 8, padding: '7px 12px' }}>
-          <strong style={{ color: C.text }}>{leg.symbol}</strong>
-          <span style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</span>
-          <span>{price(leg.entryPrice)}</span>
-          <span>{price(leg.markPrice)}</span>
-          <strong style={{ color: tone(leg.grossUnrealizedUsd) }}>{money(leg.grossUnrealizedUsd)}</strong>
-        </div>
-        <LegUnrealizedExtremaLine extrema={leg.unrealizedExtrema} />
-      </div>)}
+    <ExtremaStrip capitalUsd={basketNotionalUsd(basket.legs)} rows={summary} />
+    {!extrema && <small style={{ display: 'block', padding: '6px 10px', color: C.dim }}>ATH/ATL mulai direkam sejak report ini aktif.</small>}
+    <div style={{ overflowX: 'auto' }}>
+      <table className="cross-open-basket-table" style={{ width: '100%', minWidth: 1180, borderCollapse: 'collapse', fontSize: 11 }}>
+        <thead><tr style={{ color: C.dim, textAlign: 'left' }}>
+          <th style={{ padding: 7 }}>Symbol</th><th>Side</th><th>Entry</th><th>Mark</th><th>Gross sekarang</th><th>Setelah biaya</th><th>ATH gross</th><th>ATH setelah biaya</th><th>ATL gross</th><th>ATL setelah biaya</th>
+        </tr></thead>
+        <tbody>{basket.legs.map((leg) => {
+          const path = leg.unrealizedExtrema;
+          const reviewLeg = openBasketReviewLeg(basket, leg);
+          const selected = reviewLeg.key === selectedLegKey;
+          return <tr key={`${basket.basketId}-${leg.symbol}-${leg.side}`} style={{ borderTop: `1px solid ${C.border}`, background: selected ? '#19313a' : undefined }}>
+            <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>
+              <button
+                type="button"
+                onClick={() => onSelectLeg(reviewLeg)}
+                style={{ color: selected ? C.accent : C.text, background: 'transparent', border: 0, padding: 0, font: 'inherit', fontWeight: 700, cursor: 'pointer', textDecoration: 'underline', textUnderlineOffset: 3 }}
+                title={`Buka candle ${leg.symbol}`}
+              >
+                {leg.symbol}
+              </button>{' '}<LiquidityBadge liq={leg.entryLiquidity} compact />
+            </td>
+            <td style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</td>
+            <td>{price(leg.entryPrice)}</td>
+            <td>{price(leg.markPrice)}</td>
+            <td style={{ color: tone(leg.grossUnrealizedUsd) }}>{money(leg.grossUnrealizedUsd)}</td>
+            <td style={{ color: tone(leg.afterEstimatedCloseCostUsd) }}>{money(leg.afterEstimatedCloseCostUsd)}</td>
+            <td style={{ color: tone(path?.grossHighUsd) }}>{money(path?.grossHighUsd)}</td>
+            <td style={{ color: tone(path?.afterEstimatedCloseCostHighUsd) }}>{money(path?.afterEstimatedCloseCostHighUsd)}</td>
+            <td style={{ color: tone(path?.grossLowUsd) }}>{money(path?.grossLowUsd)}</td>
+            <td style={{ color: tone(path?.afterEstimatedCloseCostLowUsd) }}>{money(path?.afterEstimatedCloseCostLowUsd)}</td>
+          </tr>;
+        })}</tbody>
+      </table>
     </div>
-    <UnrealizedExtremaBlock extrema={basket.unrealizedExtrema} />
   </div>;
 }
 
-function directionalModeLabel(mode: DirectionalRegimeResponse['mode']): string {
-  if (mode === 'BEAR_SHORT_3') return 'BEARISH KUAT → SHORT 3';
-  if (mode === 'BULL_LONG_3') return 'BULLISH KUAT → LONG 3';
+function directionalModeLabel(mode: DirectionalRegimeResponse['mode'], directionalPickCount = 3): string {
+  if (mode === 'BEAR_SHORT_3') return `BEARISH KUAT → SHORT ${directionalPickCount}`;
+  if (mode === 'BULL_LONG_3') return `BULLISH KUAT → LONG ${directionalPickCount}`;
   if (mode === 'BALANCED_3X3') return 'SEIMBANG → BASKET 3 LONG × 3 SHORT';
   return 'NO TRADE';
 }
@@ -385,7 +984,55 @@ function directionalModeColor(mode: DirectionalRegimeResponse['mode']): string {
 }
 
 /** Keputusan executor yang aktual, terpisah dari histori basket FILTERED di bawahnya. */
+/**
+ * The ACTUAL breadth numbers.
+ *
+ * The tile beside this used to be labelled "Scanner breadth" while displaying `marketRegime` — a
+ * discrete PATTERN name ("Mixed rotation"), not breadth at all. Sitting next to "Canonical regime:
+ * BEARISH" it read like the two disagreed, when they were answering different questions and the one
+ * number that reconciles them was not on the page: breadth itself, which is what the canonical
+ * engine reads. At 21% advancers, BEARISH is exactly what breadth says.
+ *
+ * Fetched separately rather than threaded through the directional-regime route, so no API shape
+ * changes and a failure here can never take the regime panel down with it.
+ */
+function BreadthRow({ apiPrefix }: { apiPrefix: string }) {
+  const [b, setB] = useState<RegimeBreadth | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    async function load() {
+      try {
+        const r = await fetch(`${apiPrefix}/shadow/regime-engine-report`, { cache: 'no-store' });
+        if (!r.ok) throw new Error(String(r.status));
+        const j = await r.json() as { latest?: { breadth?: RegimeBreadth } };
+        if (alive) { setB(j.latest?.breadth ?? null); setFailed(false); }
+      } catch { if (alive) setFailed(true); }
+    }
+    void load();
+    const t = window.setInterval(() => void load(), 30_000);
+    return () => { alive = false; window.clearInterval(t); };
+  }, [apiPrefix]);
+
+  const pct = (v: number | null | undefined, d = 0) => (v == null ? '—' : `${(v * 100).toFixed(d)}%`);
+  const tint = (v: number | null | undefined) => (v == null ? C.dim : v >= 0.5 ? C.good : v <= 0.35 ? C.bad : C.measure);
+
+  if (failed) return <div style={{ padding: '7px 12px', color: C.bad, fontSize: 11, borderBottom: `1px solid ${C.border}` }}>Breadth tidak terbaca.</div>;
+  if (!b) return <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11, borderBottom: `1px solid ${C.border}` }}>Memuat breadth…</div>;
+  if (b.unavailableReason) return <div style={{ padding: '7px 12px', color: C.accent, fontSize: 11, borderBottom: `1px solid ${C.border}` }}>Breadth tidak tersedia: {b.unavailableReason}</div>;
+
+  return <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11.5, lineHeight: 1.6, borderBottom: `1px solid ${C.border}` }}>
+    <strong style={{ color: C.text }}>Breadth</strong>{' — angka yang dibaca canonical: '}
+    <strong style={{ color: tint(b.advancersPct) }}>{pct(b.advancersPct)}</strong> advancers
+    {b.altAdvancersPct != null && <> · <strong style={{ color: tint(b.altAdvancersPct) }}>{pct(b.altAdvancersPct)}</strong> advancers alt</>}
+    {' · '}<strong style={{ color: tint(b.percentAboveEma20) }}>{pct(b.percentAboveEma20)}</strong> di atas EMA20
+    {' · BTC 24j '}<strong style={{ color: tone(b.btcReturn24h) }}>{b.btcReturn24h == null ? '—' : `${(b.btcReturn24h * 100).toFixed(2)}%`}</strong>
+  </div>;
+}
+
 function DirectionalRegimeStatus({ apiPrefix }: { apiPrefix: string }) {
+  // sama seperti CrossSectionalReportCard: apiPrefix sudah membedakan halaman, jangan hardcode 'testnet'.
+  const isLiveDR = apiPrefix.startsWith('/live');
   const [data, setData] = useState<DirectionalRegimeResponse | null>(null);
   const [error, setError] = useState(false);
   const [lastGoodAt, setLastGoodAt] = useState<string | null>(null);
@@ -401,28 +1048,32 @@ function DirectionalRegimeStatus({ apiPrefix }: { apiPrefix: string }) {
   useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 10_000); return () => window.clearInterval(timer); }, [apiPrefix]);
   const picks = data?.mode === 'BEAR_SHORT_3' ? data.shortPicks : data?.mode === 'BULL_LONG_3' ? data.longPicks : [];
   const isStale = error && data !== null;
-  return <section className="testnet-panel testnet-wide-panel" id="cross-sectional-directional-decision">
-    <header><div><span>Keputusan arah cross-sectional</span><strong>{data ? directionalModeLabel(data.mode) : 'Memuat keputusan…'}</strong></div><span className="tone-measure">khusus testnet · executor source of truth</span></header>
+  return <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-directional-decision">
+    <header><div><span>Keputusan arah cross-sectional</span><strong>{data ? directionalModeLabel(data.mode, picks.length) : 'Memuat keputusan…'}</strong></div><span className="tone-measure">khusus {isLiveDR ? 'mainnet' : 'testnet'} · executor source of truth</span></header>
     {error && <div style={{ padding: '9px 12px', color: C.bad, borderBottom: `1px solid ${C.border}`, fontSize: 12 }}>
       <strong>{isStale ? 'DATA TERAKHIR — BUKAN DATA LIVE. ' : 'DATA TIDAK TERSEDIA. '}</strong>
       Fetch keputusan executor gagal; jangan gunakan card ini untuk menilai arah atau membuka entry.{lastGoodAt ? ` Terakhir berhasil dimuat ${ago(lastGoodAt)} lalu.` : ''}
     </div>}
     {data && <>
       <div style={{ padding: '10px 12px', display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'baseline', borderBottom: `1px solid ${C.border}` }}>
-        <strong style={{ color: directionalModeColor(data.mode), fontSize: 16 }}>{directionalModeLabel(data.mode)}</strong>
+        <strong style={{ color: directionalModeColor(data.mode), fontSize: 16 }}>{directionalModeLabel(data.mode, picks.length)}</strong>
         <span style={{ color: C.dim }}>scan selesai {data.scanFinishedAt ? formatDate(data.scanFinishedAt) : 'belum ada'}</span>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(180px, 1fr))', borderBottom: `1px solid ${C.border}` }}>
-        <Stat label="Scanner breadth" value={data.marketRegime ?? '—'} color={data.marketRegime?.includes('Bearish') ? C.bad : data.marketRegime?.includes('Bullish') ? C.good : C.measure} />
+        {/* Was labelled "Scanner breadth" and showed a PATTERN name, which is not breadth. The
+            dashboard's own tooltip calls these patterns "BUKAN penilaian arah" — so the label now
+            says what the value is, and the real breadth appears in BreadthRow below. */}
+        <Stat label="Pola scanner (bukan arah)" value={data.marketRegime ?? '—'} color={C.measure} />
         <Stat label="Canonical regime" value={data.canonicalRegimeFamily} color={data.canonicalRegimeFamily === 'BEARISH' ? C.bad : data.canonicalRegimeFamily === 'BULLISH' ? C.good : C.measure} />
         <Stat label="Canonical gate" value={data.canonicalAllowed ? 'VALID' : data.canonicalAllowed === false ? 'BLOCKED' : 'MENUNGGU'} color={data.canonicalAllowed ? C.good : data.canonicalAllowed === false ? C.bad : C.measure} />
       </div>
+      <BreadthRow apiPrefix={apiPrefix} />
       <div style={{ padding: '10px 12px', fontSize: 12, lineHeight: 1.55 }}>
         <strong style={{ color: C.text }}>Mengapa:</strong> <span style={{ color: C.dim }}>{data.reason}</span>
         {data.canonicalReason && <div style={{ color: C.dim, marginTop: 4 }}>Canonical detail: {data.canonicalReason}</div>}
       </div>
       {picks.length > 0 && <div style={{ padding: '0 12px 12px', overflowX: 'auto' }}>
-        <div style={{ color: C.dim, fontSize: 12, margin: '4px 0 6px' }}>Tiga simbol yang akan dieksekusi bila mode ini tetap valid</div>
+        <div style={{ color: C.dim, fontSize: 12, margin: '4px 0 6px' }}>{picks.length} simbol yang akan dieksekusi bila mode ini tetap valid</div>
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}><thead><tr style={{ color: C.dim, textAlign: 'left' }}><th style={{ padding: 7 }}>Simbol</th><th>Skor sisi</th><th>Keunggulan relatif</th><th>Confidence</th></tr></thead>
           <tbody>{picks.map((pick) => <tr key={pick.symbol} style={{ borderTop: `1px solid ${C.border}` }}><td style={{ padding: 7, color: C.text, fontWeight: 600 }}>{pick.symbol}</td><td>{pick.sideScore.toFixed(1)}</td><td>{pick.relativeEdge.toFixed(1)}</td><td>{pick.confidence.toFixed(1)}</td></tr>)}</tbody>
         </table>
@@ -434,9 +1085,224 @@ function DirectionalRegimeStatus({ apiPrefix }: { apiPrefix: string }) {
   </section>;
 }
 
+/**
+ * Kapan basket baru bisa dibuka.
+ *
+ * DELIBERATELY NOT A COUNTDOWN TO A NEW BASKET. Only ONE part of this is on a clock: the current
+ * signal's expiry (or Dynamic MOM36's stricter frozen feature cutoff). Whether the next signal actually OPENS anything
+ * is decided by the overlap guard against the basket that came before it, which depends on how the
+ * ranking moved and cannot be predicted from a timestamp — measured, consecutive baskets share
+ * 4.94 of 6 symbols and the guard skips ~55% of attempts, so the lane averages one new basket every
+ * 2-3 days. Printing "next basket at HH:MM" would be a number the system cannot honour.
+ *
+ * So it shows the three things that ARE knowable: when the signal goes stale, what the last attempt
+ * actually did and why it stopped, and whether admission would even allow an open right now.
+ */
+function NextSignalNote({ apiPrefix }: { apiPrefix: string }) {
+  const [st, setSt] = useState<XSecExecStatus | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    async function load() {
+      try {
+        const r = await fetch(`${apiPrefix}/live/cross-sectional-executor`, { cache: 'no-store' });
+        if (!r.ok) throw new Error(String(r.status));
+        const j = await r.json() as XSecExecStatus;
+        if (alive) { setSt(j); setFailed(false); }
+      } catch { if (alive) setFailed(true); }
+    }
+    void load();
+    const t = window.setInterval(() => void load(), 15_000);
+    return () => { alive = false; window.clearInterval(t); };
+  }, [apiPrefix]);
+
+  if (failed) return <div style={{ padding: '8px 12px', color: C.bad, fontSize: 11 }}>Status executor tidak terbaca — jadwal sinyal tidak diketahui.</div>;
+  if (!st) return <div style={{ padding: '8px 12px', color: C.dim, fontSize: 11 }}>Memuat jadwal sinyal…</div>;
+
+  const dynamicFeature = st.signalObservability?.executableSignal ?? null;
+  const dynamicFeatureFreshness = dynamicFeature && dynamicFeature.featureMaxAgeMs != null && dynamicFeature.featureAgeMs != null
+    ? dynamicFeature
+    : null;
+  const usesFeatureFreshness = dynamicFeatureFreshness !== null;
+  const freshnessAgeMs = dynamicFeatureFreshness?.featureAgeMs ?? st.signalAgeMs;
+  const freshnessMaxAgeMs = dynamicFeatureFreshness?.featureMaxAgeMs ?? st.signalMaxAgeMs;
+  const freshnessStale = dynamicFeatureFreshness ? dynamicFeatureFreshness.featureFresh !== true : st.signalStale;
+  const remainMs = freshnessMaxAgeMs != null && freshnessAgeMs != null ? freshnessMaxAgeMs - freshnessAgeMs : null;
+  const expiresAt = remainMs != null ? new Date(Date.now() + remainMs) : null;
+  const last = st.entryAttemptAudit?.latest ?? null;
+  const admission = st.entryAdmission ?? null;
+  const formation = st.formationScheduler ?? null;
+  const formationDue = formation?.nextDueAt ? new Date(formation.nextDueAt) : null;
+  const netLadderPolicy = st.dynamicMom36Status?.netLadderPolicy ?? null;
+  const netLadderState = st.dynamicMom36Status?.netLadderExit ?? null;
+  const admissionTerminalBasket = last?.basket?.terminal ? last.basket : null;
+
+  return <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, background: C.sub, color: C.dim, fontSize: 11, lineHeight: 1.6 }}>
+    <div>
+      <strong style={{ color: C.text }}>Sinyal berikutnya</strong>
+      {' · '}
+      {freshnessStale
+        ? <span style={{ color: C.accent }}>{usesFeatureFreshness ? 'feature MOM36 sekarang SUDAH kedaluwarsa — menunggu formation berikutnya' : 'sinyal sekarang SUDAH kedaluwarsa — menunggu siklus berikutnya'}</span>
+        : expiresAt
+          ? <>{usesFeatureFreshness ? 'feature MOM36 ini berlaku' : 'sinyal ini berlaku'} {duration(remainMs)} lagi, sampai <strong style={{ color: C.text }}>{expiresAt.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}</strong></>
+          : <span>umur sinyal tidak dilaporkan</span>}
+      {admission ? <>{' · admission '}<span style={{ color: admission.allowed ? C.good : C.bad }}>{admission.tier ?? (admission.allowed ? 'OK' : 'BLOK')}</span></> : null}
+      {st.openHalted ? <> · <span style={{ color: C.bad }}>open dihentikan: {st.openHalted}</span></> : null}
+    </div>
+    {dynamicFeatureFreshness && <div style={{ opacity: 0.75 }}>
+      Freshness Dynamic: {dynamicFeatureFreshness.featureSource === 'DECISION_INFORMATION_CUTOFF' ? 'decision cutoff' : 'feature timestamp'}{' '}
+      {dynamicFeatureFreshness.featureAgeMs == null ? 'tidak terbaca' : `${duration(dynamicFeatureFreshness.featureAgeMs)} / ${duration(dynamicFeatureFreshness.featureMaxAgeMs!)}`}
+      {dynamicFeatureFreshness.featureReason ? ` — ${dynamicFeatureFreshness.featureReason}` : ''}
+    </div>}
+    {formation && <div style={{ opacity: 0.85 }}>
+      Formation 1h: <strong style={{ color: formation.enabled ? C.text : C.bad }}>{formation.enabled ? 'AKTIF' : 'NONAKTIF'}</strong>
+      {formationDue ? <> · berikutnya <strong style={{ color: C.text }}>{formatDate(formationDue.toISOString())}</strong></> : null}
+      {formation.inFlight ? <> · <span style={{ color: C.accent }}>sedang membaca candle</span></> : null}
+      {!formation.inFlight && formation.lastOutcome ? <> · terakhir {formation.lastOutcome}</> : null}
+      {formation.lastError ? <> · <span style={{ color: C.bad }}>{formation.lastError}</span></> : null}
+    </div>}
+    {netLadderPolicy && <div style={{ opacity: 0.9 }}>
+      <strong style={{ color: C.text }}>Exit Cross baru: Net Ladder aktif</strong>
+      {' · '}hard cut {(netLadderPolicy.hardSLNetReturn * 100).toFixed(2)}%
+      {' · '}arm +${netLadderPolicy.armNetPnlUsd.toFixed(2)} lalu +${netLadderPolicy.armStepNetPnlUsd.toFixed(2)}/level
+      {' · '}full TP {(netLadderPolicy.fullTakeProfitCapitalFraction * 100).toFixed(0)}% modal
+      {' · '}trail {(netLadderPolicy.givebackFraction * 100).toFixed(0)}% peak dengan floor σ5m
+      {' · '}cap {netLadderPolicy.horizonHours}h.
+      {netLadderState
+        ? <> Basket aktif: {netLadderState.trailArmed ? `ARM L${netLadderState.highestArmLevel ?? 1}` : 'belum arm'} · peak {money(netLadderState.peakNetPnlUsd)} · floor {money(netLadderState.trailingFloorNetUsd)}.</>
+        : <> Tidak ada basket Net Ladder yang sedang open; ini bukan status OFF.</>}
+    </div>}
+    {last && <div>
+      {admissionTerminalBasket ? (
+        <>
+          Percobaan terakhir <strong style={{ color: C.text }}>{formatDate(last.at)}</strong>{' '}
+          lolos sampai <strong style={{ color: C.text }}>{last.stage}</strong>{' → '}
+          <span style={{ color: C.good }}>{last.outcome}</span>, tetapi basket{' '}
+          <strong style={{ color: C.text }}>{admissionTerminalBasket.basketId}</strong> kemudian{' '}
+          <span style={{ color: admissionTerminalBasket.status === 'ABORTED' ? C.bad : C.accent }}>{admissionTerminalBasket.status}</span>
+          {admissionTerminalBasket.closeReason ? ': ' + admissionTerminalBasket.closeReason : ''}.
+        </>
+      ) : <>
+      {/* "berhenti di" was wrong for a PASSING attempt: BASKET_RESERVED/ADMITTED means it went all
+          the way through and a basket was created, but the wording read as a failure and was
+          reported as one. The verb now follows the outcome. */}
+      Percobaan terakhir <strong style={{ color: C.text }}>{formatDate(last.at)}</strong>{' '}
+      {last.outcome === 'ADMITTED' || last.outcome === 'OPENED' ? (
+        <>lolos sampai <strong style={{ color: C.text }}>{last.stage}</strong>{' → '}
+          <span style={{ color: C.good }}>{last.outcome}</span> — basket dibuat{last.reason ? `: ${last.reason}` : ''}</>
+      ) : (
+        <>berhenti di <strong style={{ color: C.text }}>{last.stage}</strong>{' → '}
+          <span style={{ color: C.accent }}>{last.outcome}</span>{last.reason ? `: ${last.reason}` : ''}</>
+      )}
+      </>}
+    </div>}
+    {admission?.reason && <div style={{ opacity: 0.85 }}>{admission.reason}</div>}
+    <div style={{ opacity: 0.7 }}>
+      Waktu formation 1h bisa dijadwalkan; apakah hasilnya benar-benar MEMBUKA basket tetap ditentukan
+      overlap guard terhadap basket sebelumnya — terukur, basket berurutan berbagi 4,94 dari 6 simbol dan guard menolak
+      ~55% percobaan, jadi rata-ratanya <strong style={{ color: C.text }}>1 basket baru per 2-3 hari</strong>. Jam pasti tidak bisa dijanjikan.
+    </div>
+  </div>;
+}
+
+function OpenCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
+  const [data, setData] = useState<ClosedResponse | null>(null);
+  const [error, setError] = useState(false);
+  const [selectedLegKey, setSelectedLegKey] = useState<string | null>(null);
+  const [closeBusyBasketId, setCloseBusyBasketId] = useState<string | null>(null);
+  const [closeResult, setCloseResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const isLive = apiPrefix.startsWith('/live');
+  async function load() {
+    try {
+      const response = await fetch(`${apiPrefix}/live/cross-sectional-closed-baskets`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setData(await response.json() as ClosedResponse);
+      setError(false);
+    } catch { setError(true); }
+  }
+  useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 15_000); return () => window.clearInterval(timer); }, [apiPrefix]);
+  const openBaskets = data?.openBaskets ?? [];
+  const reviewLegs = openBaskets.flatMap((basket) => basket.legs.map((leg) => openBasketReviewLeg(basket, leg)));
+  const reviewLegKeys = reviewLegs.map((leg) => leg.key).join('|');
+  const selectedLeg = reviewLegs.find((leg) => leg.key === selectedLegKey) ?? reviewLegs[0] ?? null;
+  useEffect(() => {
+    if (selectedLegKey !== selectedLeg?.key) setSelectedLegKey(selectedLeg?.key ?? null);
+  }, [reviewLegKeys, selectedLegKey, selectedLeg?.key]);
+  async function closeBasketNow(basket: OpenBasketUnrealized) {
+    if (!isLive || closeBusyBasketId !== null) return;
+    const accepted = window.confirm(
+      `Close ${basket.basketId} now?\n\nOnly this cross-basket will be market-closed with reduce-only exits. Other baskets and lanes are not touched. New admissions pause only until this basket is proven closed with no orphaned leg.`,
+    );
+    if (!accepted) return;
+    setCloseBusyBasketId(basket.basketId);
+    setCloseResult(null);
+    try {
+      const response = await fetch(`${apiPrefix}/live/cross-sectional-close`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm: 'CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET', basketId: basket.basketId }),
+      });
+      const body = await response.json().catch(() => null) as {
+        ok?: boolean;
+        reason?: string;
+        result?: { outcome?: string };
+        newEntryDrain?: { active?: { drainActive?: boolean } };
+      } | null;
+      if (!response.ok || body?.ok !== true) {
+        setCloseResult({
+          ok: false,
+          message: `${basket.basketId}: close belum clean — ${body?.reason ?? `HTTP ${response.status}`}. New entry tetap diblok sampai rekonsiliasi bersih.`,
+        });
+        return;
+      }
+      const accountingNote = body.result?.outcome === 'ABORTED'
+        ? ' Exchange sudah terbukti flat; accounting basket ditandai incomplete untuk audit.'
+        : ' Semua leg target sudah closed dan tidak ada orphan.';
+      const admissionNote = body.newEntryDrain?.active?.drainActive
+        ? ' New entry masih diblok oleh drain sistem yang sudah aktif sebelumnya.'
+        : ' Temporary admission drain sudah dilepas; entry berikutnya dapat dievaluasi normal.';
+      setCloseResult({ ok: true, message: `${basket.basketId} closed.${accountingNote}${admissionNote}` });
+    } catch (closeError) {
+      setCloseResult({
+        ok: false,
+        message: `${basket.basketId}: close request gagal — ${closeError instanceof Error ? closeError.message : 'network error'}. New entry tetap diblok sampai statusnya jelas.`,
+      });
+    } finally {
+      setCloseBusyBasketId(null);
+      await load();
+    }
+  }
+  return <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-open-report">
+    <header><div><span>Open cross-basket · unrealized P&amp;L path</span><strong>{openBaskets.length} open basket{openBaskets.length === 1 ? '' : 's'}</strong></div><span className="tone-measure">grouped per basket · live marks</span></header>
+    <NextSignalNote apiPrefix={apiPrefix} />
+    {error ? <div style={{ padding: 12, color: C.bad }}>Open-basket report fetch failed.</div> : data?.crossSectionalPnl ? <>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(150px, 1fr))', borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
+        <Stat label="Gross unrealized" value={money(data.crossSectionalPnl.grossUnrealizedUsd)} color={tone(data.crossSectionalPnl.grossUnrealizedUsd)} />
+        <Stat label="Unrealized setelah slippage" value={money(data.crossSectionalPnl.unrealizedAfterSlippageUsd)} color={tone(data.crossSectionalPnl.unrealizedAfterSlippageUsd)} />
+      </div>
+      <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>{data.crossSectionalPnl.openLegCount} leg aktif · {data.crossSectionalPnl.slippageCaveat}</div>
+      {closeResult ? <div style={{ padding: '8px 12px', borderTop: `1px solid ${C.border}`, color: closeResult.ok ? C.good : C.bad, fontSize: 12, lineHeight: 1.45 }}>{closeResult.message}</div> : null}
+      {openBaskets.length ? <div style={{ padding: '0 12px 12px' }}>
+        {openBaskets.map((basket) => <OpenBasketUnrealizedBlock
+          key={basket.basketId}
+          basket={basket}
+          selectedLegKey={selectedLeg?.key ?? null}
+          onSelectLeg={(leg) => setSelectedLegKey(leg.key)}
+          isLive={isLive}
+          closeBusy={closeBusyBasketId === basket.basketId}
+          onCloseNow={() => void closeBasketNow(basket)}
+        />)}
+      </div> : <div style={{ padding: 12, color: C.dim }}>Tidak ada basket aktif.</div>}
+    </> : <div style={{ padding: 12, color: C.dim }}>Loading open basket…</div>}
+    <OpenBasketReviewChart apiPrefix={apiPrefix} leg={selectedLeg} />
+  </section>;
+}
+
 function ClosedCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
   const [data, setData] = useState<ClosedResponse | null>(null);
   const [error, setError] = useState(false);
+  const [selectedSnapshotBasketId, setSelectedSnapshotBasketId] = useState<string | null>(null);
+  const [pageIndex, setPageIndex] = useState(0);
   async function load() {
     try {
       const response = await fetch(`${apiPrefix}/live/cross-sectional-closed-baskets`, { cache: 'no-store' });
@@ -448,29 +1314,92 @@ function ClosedCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
   useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 15_000); return () => window.clearInterval(timer); }, [apiPrefix]);
   const lanes = (data?.lanes ?? []).filter((lane) => lane.laneId.startsWith('CROSS_SECTIONAL_'));
   const baskets = lanes.flatMap((lane) => lane.baskets.map((basket) => ({ lane: lane.lane, basket }))).sort((a, b) => new Date(b.basket.closedAt).getTime() - new Date(a.basket.closedAt).getTime());
-  return <section className="testnet-panel testnet-wide-panel" id="cross-sectional-closed-report">
-    <header><div><span>Closed cross-basket realized report</span><strong>{baskets.length} closed basket{baskets.length === 1 ? '' : 's'}</strong></div><span className="tone-measure">grouped per basket · real fills</span></header>
+  const auditLanes = (data?.auditHistory?.lanes ?? []).filter((lane) => lane.laneId.startsWith('CROSS_SECTIONAL_'));
+  const auditBaskets = auditLanes
+    .flatMap((lane) => lane.baskets.map((basket) => ({ lane: lane.lane, basket })))
+    .sort((a, b) => new Date(b.basket.closedAt).getTime() - new Date(a.basket.closedAt).getTime());
+  // 2026-08-16: ONE chronological history. The audit rows used to sit in a collapsed section below
+  // the cohort, so the same lane's baskets appeared in two places ordered by a cutoff rather than
+  // by time, and the operator had to open a details pane to see half their own fills. Provenance is
+  // not lost — every pre-cutoff row still carries its `audit` marker inline, and the totals below
+  // still separate what the cohort counts from what the exchange actually did.
+  const allBaskets = [
+    ...baskets.map((b) => ({ ...b, audit: false })),
+    ...auditBaskets.map((b) => ({ ...b, audit: true })),
+  ].sort((a, b) => new Date(b.basket.closedAt).getTime() - new Date(a.basket.closedAt).getTime());
+  const pageCount = Math.max(1, Math.ceil(allBaskets.length / CLOSED_REPORT_PAGE_SIZE));
+  const visiblePageIndex = Math.min(pageIndex, pageCount - 1);
+  const pageStart = visiblePageIndex * CLOSED_REPORT_PAGE_SIZE;
+  const visibleBaskets = allBaskets.slice(pageStart, pageStart + CLOSED_REPORT_PAGE_SIZE);
+  const pageEnd = Math.min(pageStart + visibleBaskets.length, allBaskets.length);
+  const selectedSnapshotRow = allBaskets.find((row) => row.basket.basketId === selectedSnapshotBasketId) ?? null;
+  const selectedSnapshot = selectedSnapshotRow?.basket.closedChartSnapshot ?? null;
+  const selectedSnapshotUrl = selectedSnapshotRow && selectedSnapshot?.status === 'CAPTURED'
+    ? `${apiPrefix}/live/cross-sectional-closed-basket-snapshot?basketId=${encodeURIComponent(selectedSnapshotRow.basket.basketId)}`
+    : null;
+  const cohortNet = data?.crossSectionalPnl?.netRealizedProfitUsd;
+  const auditNet = data?.auditHistory?.totalNetPnlUsd;
+  const allTimeNet = cohortNet != null || auditNet != null ? (cohortNet ?? 0) + (auditNet ?? 0) : undefined;
+  return <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-closed-report">
+    <header><div><span>Closed cross-basket realized report</span><strong>{allBaskets.length} basket{allBaskets.length === 1 ? '' : 's'}{auditBaskets.length ? ` · ${auditBaskets.length} pra-cohort` : ''}</strong></div><span className="tone-measure">grouped per basket · real fills</span></header>
     <div style={{ padding: '8px 12px', color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
-      Scope: {data?.reportStartAt ? `baskets opened from ${formatDate(data.reportStartAt)} onward` : 'all stored history'}. Gross profit, fee/cost, long/short return, realized net per symbol, and open/close timestamps. Fee/cost comes from the basket ledger; separate slippage is not currently stored independently. Per-symbol fee is allocated by notional touched.
+      Scope: {data?.reportStartAt ? `baskets opened from ${formatDate(data.reportStartAt)} onward` : 'all stored history'}. Gross profit, fee/cost, long/short return, realized net per symbol, and open/close timestamps. Fee/cost comes from the basket ledger; separate slippage is not currently stored independently. Per-symbol fee is allocated by notional touched. Final chart baru ada untuk basket yang settled setelah snapshot diaktifkan; histori lama tetap jujur sebagai pra-snapshot.
     </div>
-    {data?.crossSectionalPnl && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(150px, 1fr))', borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
-      <Stat label="Gross unrealized" value={money(data.crossSectionalPnl.grossUnrealizedUsd)} color={tone(data.crossSectionalPnl.grossUnrealizedUsd)} />
-      <Stat label="Unrealized setelah slippage" value={money(data.crossSectionalPnl.unrealizedAfterSlippageUsd)} color={tone(data.crossSectionalPnl.unrealizedAfterSlippageUsd)} />
-      <Stat label="Realized sebelum slippage" value={money(data.crossSectionalPnl.realizedBeforeSlippageUsd)} color={tone(data.crossSectionalPnl.realizedBeforeSlippageUsd)} />
-      <Stat label="Net realized profit" value={money(data.crossSectionalPnl.netRealizedProfitUsd)} color={tone(data.crossSectionalPnl.netRealizedProfitUsd)} />
+    {data?.crossSectionalPnl && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(150px, 1fr))', borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
+      <Stat label="Net cohort aktif" value={money(cohortNet)} color={tone(cohortNet)} />
+      <Stat label="Net pra-cohort (audit)" value={money(auditNet)} color={tone(auditNet)} />
+      <Stat label="Net semua histori" value={money(allTimeNet)} color={tone(allTimeNet)} />
     </div>}
-    {data?.crossSectionalPnl && <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>{data.crossSectionalPnl.openBasketCount} basket aktif · {data.crossSectionalPnl.openLegCount} leg aktif · {data.crossSectionalPnl.slippageCaveat}</div>}
-    {(data?.openBaskets?.length ?? 0) > 0 && <div style={{ padding: '0 12px 12px' }}>
-      <div style={{ color: C.dim, fontSize: 12, marginTop: 10 }}>Open basket · unrealized P&amp;L path</div>
-      {data!.openBaskets!.map((basket) => <OpenBasketUnrealizedBlock key={basket.basketId} basket={basket} />)}
-    </div>}
-    {error ? <div style={{ padding: 12, color: C.bad }}>Closed-basket report fetch failed.</div> : baskets.length ? <div style={{ padding: '0 12px 12px' }}>
-      {baskets.map(({ lane, basket }) => <ClosedBasketBlock key={basket.basketId} lane={lane} basket={basket} />)}
-    </div> : <div style={{ padding: 12, color: C.dim }}>{data?.reason ? 'Belum ada cross-sectional basket yang sudah open dan close di exchange.' : 'Loading closed basket history…'}</div>}
+    <div style={{ padding: '6px 12px', color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
+      Daftar di bawah satu urutan waktu, cohort dan pra-cohort digabung. Baris bertanda <span style={{ color: C.accent }}>audit</span> adalah
+      fill exchange nyata dari sebelum batas cohort: tetap bisa diaudit, tapi <strong style={{ color: C.text }}>tidak</strong> masuk edge aktif,
+      pembelajaran Four-Brain, atau P&amp;L hari ini — itulah kenapa ketiga angka di atas dipisah.
+      {data?.auditHistory?.reason ? ` ${data.auditHistory.reason}` : ''}
+    </div>
+    {error ? <div style={{ padding: 12, color: C.bad }}>Closed-basket report fetch failed.</div> : <>
+      {allBaskets.length ? <div style={{ padding: '0 12px 12px' }}>
+        {visibleBaskets.map(({ lane, basket, audit }) => (
+          <ClosedBasketBlock
+            key={`${audit ? 'audit-' : ''}${basket.basketId}`}
+            lane={audit ? `${lane} · audit` : lane}
+            basket={basket}
+            snapshotSelected={selectedSnapshotBasketId === basket.basketId}
+            onToggleSnapshot={() => setSelectedSnapshotBasketId((current) => current === basket.basketId ? null : basket.basketId)}
+          />
+        ))}
+        <div className="closed-report-pagination" aria-label="Closed cross-basket report pagination">
+          <span>Menampilkan {pageStart + 1}–{pageEnd} dari {allBaskets.length} basket terbaru</span>
+          <div className="closed-report-pagination-controls">
+            <button type="button" disabled={visiblePageIndex === 0} onClick={() => { setSelectedSnapshotBasketId(null); setPageIndex(visiblePageIndex - 1); }}>Previous page</button>
+            <span>Page {visiblePageIndex + 1} / {pageCount}</span>
+            <button type="button" disabled={visiblePageIndex + 1 >= pageCount} onClick={() => { setSelectedSnapshotBasketId(null); setPageIndex(visiblePageIndex + 1); }}>Next page</button>
+          </div>
+        </div>
+      </div> : <div style={{ padding: 12, color: C.dim }}>{data?.reason ? 'Belum ada basket closed.' : 'Loading closed basket history…'}</div>}
+
+      {selectedSnapshotRow && selectedSnapshot && selectedSnapshotUrl ? <section
+        id="cross-sectional-closed-chart-snapshot"
+        style={{ margin: '14px 12px 12px', border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden', background: C.sub }}
+      >
+        <div style={{ padding: '10px 12px', borderBottom: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'baseline' }}>
+          <div><strong style={{ color: C.text }}>{selectedSnapshotRow.basket.basketId} · final charts at close</strong><small style={{ display: 'block', color: C.dim, marginTop: 3 }}>Satu chart 1D vertikal per leg · entry sampai confirmed basket close · completed USD-M candle saja · disimpan {formatDate(selectedSnapshot.capturedAt)}</small></div>
+          <button type="button" onClick={() => setSelectedSnapshotBasketId(null)} style={{ color: C.measure, background: 'transparent', border: `1px solid ${C.measure}`, borderRadius: 4, padding: '3px 7px', cursor: 'pointer', font: 'inherit' }}>tutup</button>
+        </div>
+        <img
+          src={selectedSnapshotUrl}
+          alt={`${selectedSnapshotRow.basket.basketId} immutable Cross-Sectional 1D charts from entry to close`}
+          style={{ display: 'block', width: '100%', height: 'auto', background: '#071016' }}
+        />
+      </section> : null}
+
+    </>}
   </section>;
 }
 
 export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }: { apiPrefix?: string }) {
+  // 2026-08-18: apiPrefix IS the page discriminator ('/live/api' vs '/testnet/api'), so the card
+  // can label itself correctly instead of hardcoding "testnet" on whichever page renders it.
+  const isLive = apiPrefix.startsWith('/live');
   const [data, setData] = useState<XSecResponse | null>(null);
   const [variant, setVariant] = useState<'RAW' | 'FILTERED'>('FILTERED');
   const [error, setError] = useState(false);
@@ -499,25 +1428,31 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
 
   return <>
   <DirectionalRegimeStatus apiPrefix={apiPrefix} />
-  <section className="testnet-panel testnet-wide-panel" id="cross-sectional-definitions">
-    <header><div><span>Istilah cross-basket</span><strong>Cara membaca report ini</strong></div><span className="tone-measure">khusus testnet</span></header>
+  <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-definitions">
+    <header><div><span>Istilah cross-basket</span><strong>Cara membaca report ini</strong></div><span className="tone-measure">khusus {isLive ? 'mainnet' : 'testnet'}</span></header>
     <div style={{ padding: '10px 12px', display: 'grid', gap: 8, color: C.dim, fontSize: 12, lineHeight: 1.5 }}>
       <div><strong style={{ color: C.text }}>RAW</strong> = universe sinyal dasar. Sistem merangking seluruh pool basket yang eligible tanpa aturan allow/block FILTERED per simbol yang sudah diukur. Ini adalah baseline pembanding, bukan otomatis pilihan eksekusi live.</div>
       <div><strong style={{ color: C.text }}>FILTERED</strong> = ide momentum cross-sectional yang sama setelah melewati filter likuiditas, selisih skor, serta allow/block operator. Executor market-neutral testnet saat ini memakai varian ini.</div>
-      <div style={{ display: 'grid', gap: 8, marginTop: 2, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
-        <strong style={{ color: C.text }}>Pool FILTERED yang dipakai sekarang</strong>
-        {config ? <>
-          <div><strong style={{ color: C.good }}>POOL LONG OPERATOR ({executionLong.length})</strong><InlineSymbolList symbols={executionLong} color={C.good} /></div>
-          <div><strong style={{ color: C.good }}>POOL SHORT OPERATOR ({executionShort.length})</strong><InlineSymbolList symbols={executionShort} color={C.good} /></div>
-          <div><strong style={{ color: C.bad }}>BLOCKED SHORT EKSPLISIT ({executionShortBlocked.length})</strong><InlineSymbolList symbols={executionShortBlocked} color={C.bad} /></div>
-          <div><strong style={{ color: C.measure }}>SHORT ELIGIBLE SEKARANG ({activeShort.length})</strong><InlineSymbolList symbols={activeShort} color={C.measure} /></div>
-          {!!config.executionExcludedSymbols?.length && <div><strong style={{ color: C.accent }}>DIKELUARKAN SEMENTARA DARI EXECUTOR ({config.executionExcludedSymbols.length})</strong><InlineSymbolList symbols={config.executionExcludedSymbols} color={C.accent} /></div>}
-        </> : <div>Memuat konfigurasi FILTERED…</div>}
-      </div>
+      {config
+        ? <PoolPanel
+            apiPrefix={apiPrefix}
+            executionLong={executionLong}
+            executionShort={executionShort}
+            executionShortBlocked={executionShortBlocked}
+            executionExcluded={config.executionExcludedSymbols ?? []}
+          />
+        : <div style={{ display: 'grid', gap: 8, marginTop: 2, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
+            <strong style={{ color: C.text }}>Pool FILTERED yang dipakai sekarang</strong>
+            <div>Memuat konfigurasi FILTERED…</div>
+          </div>}
       <div><strong style={{ color: C.text }}>MOM36_FILTERED</strong> = sinyal FILTERED dengan momentum dari 36 candle 1 jam yang sudah selesai. Angka <strong style={{ color: C.accent }}>36</strong> adalah lookback, bukan durasi holding; horizon basket saat ini ditampilkan terpisah di sebelah judul report dan dikonfigurasi secara terpisah.</div>
     </div>
   </section>
-  <section className="testnet-panel testnet-wide-panel" id="cross-sectional-report">
+  {/* 2026-08-18 (operator: "ga usah di live"): this card is the SHADOW measurement surface —
+      report-only RAW/FILTERED observations, not executed baskets. On mainnet it reads all zeros
+      and is labelled as a measurement, so it is testnet-only. The EXECUTED books stay on both
+      pages: OpenCrossBasketReport / ClosedCrossBasketReport below. */}
+  {!isLive && <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-report">
     <header>
       <div>
         <span>Cross-sectional horizon report</span>
@@ -538,7 +1473,48 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
         <Stat label="Open" value={`${report.open}`} />
         <Stat label="Net avg" value={pct(report.netAvgReturn)} color={tone(report.netAvgReturn)} />
         <Stat label="Win rate" value={report.closed ? `${Math.round(report.winRate * 100)}%` : '—'} />
-        <Stat label="Total net" value={pct(report.totalNetReturn, 2)} color={tone(report.totalNetReturn)} />
+        {/* 2026-08-18: was `label="Total net"` tinted green/red by tone(). It reads as profit and is
+            not: baskets open HOURLY and are held horizonBars hours, so these observations overlap
+            heavily — measured on the live store, ~18 ran concurrently with a peak of 36, against a
+            live cap of 2 open baskets. Summing them prices a portfolio nobody can hold. Renamed to
+            what it is and deliberately left uncoloured so it stops reading as a P&L figure. */}
+        <Stat label="Σ observasi (tumpang tindih)" value={pct(report.totalNetReturn, 2)} />
+      </div>
+      {/* 2026-08-18: the row above counts ROWS. The lane opens hourly and holds horizonBars hours,
+          so those rows share holding periods and symbols — they are not independent trials, and a
+          t-stat computed from them is inflated by roughly sqrt(overlap). The row below is the same
+          book resampled so no two entries share a holding period (nonOverlappingClosedSample), which
+          is the only set a mean and a standard error may honestly be built from. */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}`, background: 'rgba(255,255,255,0.02)' }}>
+        <Stat label="Blok independen" value={`${report.independentBlocks}`} />
+        <Stat
+          label="Net avg / blok"
+          value={report.blockedNetAvgReturn === null ? '—' : pct(report.blockedNetAvgReturn)}
+          color={report.blockedNetAvgReturn === null ? undefined : tone(report.blockedNetAvgReturn)}
+        />
+        <Stat
+          label="Win rate / blok"
+          value={report.blockedWinRate === null ? '—' : `${Math.round(report.blockedWinRate * 100)}%`}
+        />
+        {(() => {
+          const crit = tCritical95(report.independentBlocks);
+          const t = report.blockedTStat;
+          const passes = t !== null && crit !== null && Math.abs(t) >= crit;
+          return <Stat
+            label={crit === null ? 't-stat' : `t-stat (butuh ${crit.toFixed(2)})`}
+            value={t === null ? '— (butuh ≥2 blok)' : t.toFixed(2)}
+            color={passes ? C.good : C.dim}
+          />;
+        })()}
+      </div>
+      <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
+        Basket dibuka tiap jam dan ditahan {report.horizonBars} jam, jadi baris <em>Closed</em> di atas{' '}
+        <strong>saling tumpang tindih</strong> — mereka berbagi periode tahan dan sebagian besar simbol, jadi{' '}
+        <strong>bukan {report.closed} percobaan bebas</strong>. Baris kedua memakai ulang buku yang sama tetapi hanya
+        mengambil observasi yang <strong>tidak berbagi periode tahan</strong> sama sekali: itulah percobaan yang sebenarnya.
+        Pakai <strong>Net avg / blok</strong> dan <strong>t-stat</strong> untuk menilai — dan bandingkan t dengan
+        ambang yang tertera, bukan dengan 2,0: ambang itu bergantung pada jumlah blok (pada 2 blok ambangnya 12,71).
+        {report.independentBlocks < 2 && ' Saat ini blok independennya < 2, jadi belum ada kesimpulan statistik yang bisa ditarik dari jendela ini.'}
       </div>
       <LegBars report={report} />
       <div style={{ padding: '10px 12px' }}>
@@ -550,7 +1526,8 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
         Pool yang dipakai executor: long {executionLong.length} · short {executionShort.length} · short eligible {activeShort.length}. Auto-demotion historis {config.adaptiveDemotionActive ? 'aktif' : 'nonaktif'}.
       </div>}
     </> : <div style={{ padding: 16, color: C.dim }}>{error ? 'No report data available.' : 'Loading…'}</div>}
-  </section>
+  </section>}
+  <OpenCrossBasketReport apiPrefix={apiPrefix} />
   <ClosedCrossBasketReport apiPrefix={apiPrefix} />
   </>;
 }

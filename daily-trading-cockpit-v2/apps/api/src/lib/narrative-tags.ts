@@ -145,7 +145,16 @@ export function buildNarrativeTiltReport(opts: {
     for (const l of o.shortLeg) measuredSamples.push(...sampleLeg(l.symbol, "SHORT", l.entryPrice, l.exitPrice));
   }
 
-  const executedReal = opts.executedBaskets.filter((b) => b.status !== "ABORTED");
+  // 2026-08-05 (second-audit finding): defensive accountingStatus check alongside the pre-existing
+  // status filter, mirroring every other ExecutorBasket consumer's exclusion (see
+  // cross-sectional-executor.ts:910/943/961/985/994/1322, routes/live.ts's
+  // mergeCrossSectionalIntoLaneSeries). Today accountingStatus is only ever set together with
+  // status:"ABORTED" (see closeBasket's staleBookReconciled branch), so this is currently a no-op
+  // in practice -- but this report-only narrative feed should not silently start including an
+  // out-of-band-flattened basket's real prices if that coupling is ever loosened.
+  const executedReal = opts.executedBaskets.filter(
+    (b) => b.status !== "ABORTED" && b.accountingStatus !== "ACCOUNTING_INCOMPLETE",
+  );
   const executedSamples: LegSample[] = [];
   for (const b of executedReal) {
     for (const l of b.legs) executedSamples.push(...sampleLeg(l.symbol, l.side, l.entryPrice, l.exitPrice));

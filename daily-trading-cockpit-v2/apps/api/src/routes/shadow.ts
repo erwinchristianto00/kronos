@@ -1,3 +1,4 @@
+import { crossSectionalCuratedUniverse } from "../lib/cross-sectional-curated-universe.js";
 import type { FastifyInstance } from "fastify";
 import {
   buildStrategyExperienceRecords,
@@ -236,6 +237,7 @@ import {
   getExitBrainShadowStore,
   resolvedTradesFromShadowPositions,
   runExitBrainShadowCycleGuarded,
+  type ExitBrainShadowReport,
 } from "../lib/exit-brain-shadow.js";
 import { getPositionPathRecorder, resolvedTradesFromRecordedPaths } from "../lib/position-path-recorder.js";
 import {
@@ -366,6 +368,7 @@ import {
   type CurrentGuardVariantMatrixReport,
   type KlineTuple as VariantMatrixKlineTuple,
 } from "../lib/current-guard-variant-matrix.js";
+import { standDownThresholdPct, STAND_DOWN_LOOKBACK_BARS } from "../lib/market-drawdown-standdown.js";
 import {
   getCrossSectionalStore,
   getCrossSectionalReportSinceMs,
@@ -384,11 +387,18 @@ import {
   getCrossSectionalFilteredExecutionFilters,
   CROSS_SECTIONAL_TREND_SIGNAL,
   CROSS_SECTIONAL_MIXED_SIGNAL,
+  type CrossSectionalCycleResult,
+  type CrossSectionalFormationEntryBlocks,
 } from "../lib/cross-sectional-edge.js";
+import { DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES } from "../lib/dynamic-mom36-continuation-runtime.js";
+import { isDynamicMom36ContinuationStrategy } from "../lib/dynamic-mom36-shock-strategy.js";
+import type { CrossSectionalAutoPool } from "../lib/cross-sectional-auto-pool.js";
+import { startCrossSectionalAutoPoolHeartbeat } from "../lib/cross-sectional-auto-pool-heartbeat.js";
 import { spotSymbolForCandles, buildWinnersCounterfactualReport } from "../lib/cross-sectional-winners-counterfactual.js";
 import { buildRegimeAxisTimeline } from "../lib/regime-axis-timeline.js";
 import { buildTpSweepReport } from "../lib/cross-sectional-tp-sweep.js";
 import { CrossSectionalExecutorStore } from "../lib/cross-sectional-executor.js";
+import type { SymbolReliabilityFormationDecision, SymbolReliabilitySnapshot } from "../lib/cross-sectional-symbol-reliability.js";
 import { buildNarrativeTiltReport } from "../lib/narrative-tags.js";
 import {
   isNewCoinRadarEnabled,
@@ -423,15 +433,28 @@ import {
   buildPriceImpactEfficiencyReport,
 } from "../lib/price-impact-efficiency.js";
 import type { FourBrainMetricsSummary } from "../lib/four-brain-metrics.js";
+import type { FourBrainActualFillBindingStoreStatus } from "../lib/four-brain-actual-fill-binding.js";
+import type { FourBrainExecutionReinforcementStatus } from "../lib/four-brain-execution-reinforcement.js";
 import type { DirectionEntryOutcomeReport } from "../lib/direction-entry-outcome-store.js";
 import { judgeFourBrainReadiness, rollUpFourBrainReadiness, exitBrainReadinessFromReport } from "../lib/four-brain-readiness.js";
+import { buildFourBrainLearningPipelineHealth } from "../lib/four-brain-learning-pipeline-health.js";
+
+/**
+ * Formation is constructed here because it owns the complete read-only market
+ * context, but its schedule is owned by app.ts after the executor exists.
+ * Report routes must never decide when executable Cross signals are formed.
+ */
+export type CrossSectionalFormationCycleController = {
+  run: () => Promise<CrossSectionalCycleResult | null>;
+};
 
 // Fail-open shape for /api/shadow/four-brain's `health` field on any instance where the four-brain
 // metrics aggregator was never constructed (mode off, test harness, etc.) — every count is honestly 0,
 // never fabricated, and the shape always matches FourBrainMetricsSummary so the frontend never has to
 // special-case a missing field.
 const EMPTY_FOUR_BRAIN_HEALTH: FourBrainMetricsSummary = {
-  ticks: { attempted: 0, completed: 0, skippedSingleFlight: 0, gatherErrors: 0, exceptions: 0, journalErrors: 0, brainErrors: 0, invariantFailures: 0 },
+  ticks: { attempted: 0, completed: 0, skippedSingleFlight: 0, gatherErrors: 0, exceptions: 0, wiringErrors: 0, journalErrors: 0, brainErrors: 0, invariantFailures: 0 },
+  heartbeat: { lastAttemptAtMs: null, lastCompletedAtMs: null, lastFailureAtMs: null, lastCycleReason: null, lastFailureReason: null },
   decisions: { total: 0, duplicateDecisionIds: 0, unknownLanes: 0, duplicateIdentities: 0 },
   coverage: { lastLaneCoverage: 0, maxLaneCoverage: 0, lastPositionCoverage: 0, maxPositionCoverage: 0 },
   sourceQuality: {},
@@ -483,8 +506,14 @@ export async function registerShadowRoutes(
     /** Lazy getter for the live-execution engine (created after this registration). Used READ-ONLY
      *  (sync getStatus, no I/O) to compute the order-reconciliation readiness gate. */
     liveEngineGetter?: () => { getStatus: () => unknown } | null;
-    /** Dynamic testnet-only blocks from open losing Cross-sectional legs. */
-    crossSectionalReentryBlocksGetter?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
+    /** Testnet only: prevents a new FILTERED basket from reusing a guarded leg or isolated-lane lease. */
+    crossSectionalReentryBlocksGetter?: () => Promise<CrossSectionalFormationEntryBlocks>;
+    /** Actual-fill Reliability V1 snapshot; this is the only path allowed to quarantine a symbol-side. */
+    symbolReliabilitySnapshotGetter?: () => SymbolReliabilitySnapshot | null;
+    /** Returns true only after formation provenance is durable; false holds a new V1 basket. */
+    symbolReliabilityDecisionRecorder?: (decision: SymbolReliabilityFormationDecision) => boolean;
+    /** Durable C1/C2 membership source shared with the executed Dynamic formation path. */
+    crossSectionalAutoPool?: CrossSectionalAutoPool;
     /** Lazy getter for the four-brain shadow tick's metrics aggregator (created after this
      *  registration, inside app.ts's `if (!isTest)` block, on instances that even construct it).
      *  null on any instance where four-brain shadow mode has never enabled (fail-open — see the
@@ -499,9 +528,46 @@ export async function registerShadowRoutes(
      *  reconciler's own 3-layer gate (directionEntryReconcilerActive) is not active — fail-open, exactly
      *  like fourBrainMetricsGetter above; never a 500. */
     directionEntryOutcomeReportGetter?: () => DirectionEntryOutcomeReport | null;
+    /** Testnet pilot audit only. No route consumer can mutate the bridge or execution state. */
+    fourBrainBridgeGetter?: () => unknown;
+    /** Exact Four-Brain decision -> executor fill lifecycle counts for the focused testnet cohort. */
+    fourBrainActualFillBindingStatusGetter?: () => FourBrainActualFillBindingStoreStatus | null;
+    /** Read-only proof that persisted exact-fill outcomes are visible to shadow ranking. */
+    fourBrainExecutionReinforcementStatusGetter?: () => FourBrainExecutionReinforcementStatus | null;
   } = {},
-): Promise<void> {
+): Promise<CrossSectionalFormationCycleController> {
   const overlayStore = new JsonExternalRotationOverlayStore(opts.externalOverlayDataDir ?? "data");
+  /**
+   * Automatic membership deliberately needs a symmetric Dynamic long/short candidate set. If a
+   * future operator creates asymmetric static sides, do not silently redefine that policy: retain
+   * its static list until an explicit side-aware auto-pool contract is introduced.
+   */
+  const autoPoolInput = () => {
+    const configured = getCrossSectionalFilteredConfig();
+    const long = configured.longAllowlist;
+    const short = configured.shortAllowlist;
+    if (long.length !== short.length || long.some((symbol) => !short.includes(symbol))) return null;
+    const baseLeg = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "");
+    const multiplier = Number.parseFloat(process.env.CROSS_SECTIONAL_TESTNET_LEARNING_LEG_MULTIPLIER ?? "");
+    return {
+      candidateUniverse: crossSectionalCuratedUniverse(CROSS_SECTIONAL_UNIVERSE, long, short),
+      fallbackSymbols: long,
+      baseLegUsd: Number.isFinite(baseLeg) && baseLeg > 0 ? baseLeg : 25,
+      sizeMultiplier: Number.isFinite(multiplier) && multiplier > 0 ? multiplier : 1,
+    };
+  };
+  // Public metadata only: it cannot create, change, or close a basket.  This must not depend on
+  // a dashboard/brief request: a quiet UI must not freeze the C1/C2 pool past its own cadence.
+  if (opts.crossSectionalAutoPool && autoPoolInput()) {
+    const stopAutoPoolHeartbeat = startCrossSectionalAutoPoolHeartbeat(
+      opts.crossSectionalAutoPool,
+      autoPoolInput,
+      { onError: (error) => console.error("[cross-sectional-auto-pool] REFRESH_FAILED", error) },
+    );
+    app.addHook("onClose", () => {
+      stopAutoPoolHeartbeat();
+    });
+  }
   if (opts.notificationService) {
     opts.notificationService.setSnapshotProvider(() => {
       const scanStatus = opts.coreScanAutoRefreshController?.getStatus() ?? null;
@@ -909,8 +975,8 @@ export async function registerShadowRoutes(
     return {
       ok: true,
       ...buildNarrativeTiltReport({
-        measuredObservations: getCrossSectionalStore().all,
-        executedBaskets: executorStore.getState().baskets,
+        measuredObservations: getCrossSectionalStore().reportable,
+        executedBaskets: executorStore.getReportableBaskets(),
         variant: q.variant ?? "FILTERED",
         nowIso: new Date().toISOString(),
       }),
@@ -919,6 +985,12 @@ export async function registerShadowRoutes(
 
   // Cross-sectional market-neutral measurement lane — report + open/closed baskets (report-only).
   app.get("/api/shadow/cross-sectional-report", async () => {
+    // The dashboard must show the same current membership that a new formation will use. This is
+    // cadence-gated by the pool itself (15m), so a page refresh never turns into exchange polling.
+    const reportAutoPoolInput = autoPoolInput();
+    if (reportAutoPoolInput && opts.crossSectionalAutoPool) {
+      await opts.crossSectionalAutoPool.refreshIfDue(reportAutoPoolInput).catch(() => undefined);
+    }
     const store = getCrossSectionalStore();
     // Testnet can deliberately start a fresh evidence era without deleting the older store. The
     // cutoff is configured per deployment via CROSS_SECTIONAL_REPORT_START_AT; absent/invalid means
@@ -970,10 +1042,10 @@ export async function registerShadowRoutes(
     // but they must not inflate the current RAW/FILTERED horizon counts or basket lists.
     const rawSignal = `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}`;
     const filteredSignal = getCrossSectionalFilteredConfig().signal;
-    const raw = store.all.filter((o) => o.signal === rawSignal);
-    const filtered = store.all.filter((o) => o.signal === filteredSignal);
-    const trend = store.all.filter((o) => o.signal === CROSS_SECTIONAL_TREND_SIGNAL);
-    const mixed = store.all.filter((o) => o.signal === CROSS_SECTIONAL_MIXED_SIGNAL);
+    const raw = store.reportable.filter((o) => o.signal === rawSignal);
+    const filtered = store.reportable.filter((o) => o.signal === filteredSignal);
+    const trend = store.reportable.filter((o) => o.signal === CROSS_SECTIONAL_TREND_SIGNAL);
+    const mixed = store.reportable.filter((o) => o.signal === CROSS_SECTIONAL_MIXED_SIGNAL);
     return {
       reportStartAt,
       report: buildCrossSectionalReport(store, Date.now(), { signal: rawSignal, sinceMs: reportSinceMs }),
@@ -985,13 +1057,26 @@ export async function registerShadowRoutes(
       // necessarily the filter that this testnet executor is using today.
       filteredConfig: (() => {
         const configured = getCrossSectionalFilteredConfig();
-        const execution = getCrossSectionalFilteredExecutionFilters(store);
+        const input = autoPoolInput();
+        const autoPool = input ? opts.crossSectionalAutoPool?.getSnapshot(input) ?? null : null;
+        // The durable C1/C2 pool is a strict ceiling on the old configured candidate list.  Never
+        // pass an empty list here: downstream `allowed()` treats that as allow-everything.
+        const activePool = autoPool?.enabled && autoPool.activeSymbols.length > 0
+          ? autoPool.activeSymbols
+          : null;
+        const execution = getCrossSectionalFilteredExecutionFilters(store, activePool ? {
+          baseLongAllowlist: activePool,
+          baseShortAllowlist: activePool,
+        } : {});
         const executionUniverse = new Set(CROSS_SECTIONAL_UNIVERSE);
         // The testnet deployment can narrow CROSS_SECTIONAL_UNIVERSE for an exchange constraint
         // (for example BTC's minimum notional). Reflect that same universe in the report so an
         // allowlist entry is never presented as executable when the runner cannot select it.
         const executable = (symbols: readonly string[]) => symbols.filter((symbol) => executionUniverse.has(symbol));
-        const configuredSymbols = new Set([...configured.longAllowlist, ...configured.shortAllowlist]);
+        const configuredSymbols = new Set([
+          ...(activePool ?? configured.longAllowlist),
+          ...(activePool ?? configured.shortAllowlist),
+        ]);
         return {
           ...configured,
           executionUniverse: [...CROSS_SECTIONAL_UNIVERSE],
@@ -1000,16 +1085,28 @@ export async function registerShadowRoutes(
           executionShortAllowlist: executable(execution.shortAllowlist),
           executionShortBlocklist: execution.shortBlocklist,
           adaptiveDemotionActive: !execution.adaptiveDisabled,
+          autoPool,
         };
       })(),
       adaptiveConfig: getCrossSectionalAdaptiveConfig(),
       // Retained for audit only.  Do not label this the active FILTERED pool without checking
       // filteredConfig.adaptiveDemotionActive above.
       adaptiveSymbolFilters: (() => {
-        const adaptive = deriveAdaptiveSymbolFilters(store);
+        const input = autoPoolInput();
+        const autoPool = input ? opts.crossSectionalAutoPool?.getSnapshot(input) ?? null : null;
+        const activePool = autoPool?.enabled && autoPool.activeSymbols.length > 0
+          ? autoPool.activeSymbols
+          : null;
+        const adaptive = deriveAdaptiveSymbolFilters(store, activePool ? {
+          baseLongAllowlist: activePool,
+          baseShortAllowlist: activePool,
+        } : {});
         return {
           ...adaptive,
-          executionUsesThis: !getCrossSectionalFilteredExecutionFilters(store).adaptiveDisabled,
+          executionUsesThis: !getCrossSectionalFilteredExecutionFilters(store, activePool ? {
+            baseLongAllowlist: activePool,
+            baseShortAllowlist: activePool,
+          } : {}).adaptiveDisabled,
         };
       })(),
       openBaskets: raw.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
@@ -1752,7 +1849,44 @@ export async function registerShadowRoutes(
       enabled: health !== null,
       health: health ?? EMPTY_FOUR_BRAIN_HEALTH,
       recentDecisions,
+      bridge: opts.fourBrainBridgeGetter?.() ?? null,
+      actualFillBindings: opts.fourBrainActualFillBindingStatusGetter?.() ?? null,
     };
+  });
+
+  // End-to-end observer health: a single "0 errors" counter cannot prove collection → decision →
+  // attribution → outcome → feedback actually advances.  This route combines only existing,
+  // report-only stores and exposes BLOCKED vs normal WAITING explicitly.  Getter failures become a
+  // visible unavailable stage, never a 500 or a fabricated green check.
+  app.get("/api/shadow/learning-pipeline-health", async () => {
+    const safe = <T>(getter: (() => T | null | undefined) | undefined): T | null => {
+      try {
+        return getter?.() ?? null;
+      } catch {
+        return null;
+      }
+    };
+    const health = safe(opts.fourBrainMetricsGetter);
+    const recent = safe(opts.fourBrainRecentDecisionsGetter) ?? [];
+    const outcomeReport = safe(opts.directionEntryOutcomeReportGetter);
+    const actualFillBindings = safe(opts.fourBrainActualFillBindingStatusGetter);
+    const reinforcement = safe(opts.fourBrainExecutionReinforcementStatusGetter);
+    let exitReport: ExitBrainShadowReport | null = null;
+    try {
+      exitReport = getExitBrainShadowStore().buildReport();
+    } catch {
+      exitReport = null;
+    }
+    return buildFourBrainLearningPipelineHealth({
+      nowMs: Date.now(),
+      enabled: health !== null,
+      health,
+      recentDecisions: recent,
+      outcomeReport,
+      actualFillBindings,
+      exitReport,
+      reinforcement,
+    });
   });
 
   // Direction + Entry Brain counterfactual outcome report (2026-07-23) — report-only, two independent
@@ -1769,9 +1903,10 @@ export async function registerShadowRoutes(
     // Every input was already computed here; only the judgement was missing. Purely additive.
     //
     // measuredBasis is the load-bearing field. DIRECTION is REAL: its outcome is whether the price
-    // actually moved the way it called, and that move happened. ENTRY Tier 2 is SIMULATED: a forward
-    // candle walk of a trade that was never placed — it can never qualify the brain, which is why
-    // Tier 1 (real fills, currently 0) is read separately and Tier 2 is judged on its own line.
+    // actually moved the way it called, and that move happened. ENTRY readiness is stricter: only a
+    // DIRECT, valid ENTER_NOW decision with its exact confirmed exchange fill can qualify. The older
+    // reconciler's Tier 1 rows are real matched outcomes, but may be WAIT/SKIP observations of an
+    // executor-owned fill; they remain audit-only and must never inflate Entry readiness.
     const readiness = (() => {
       if (!report) return null;
       try {
@@ -1789,15 +1924,19 @@ export async function registerShadowRoutes(
               }),
             ),
         );
-        const cov = (report.entry?.coverage ?? {}) as Record<string, unknown>;
-        const tier1N = typeof cov.resolvedRealMatch === "number" ? cov.resolvedRealMatch : 0;
+        const directBindings = opts.fourBrainActualFillBindingStatusGetter?.() ?? null;
+        const directTier1N = typeof directBindings?.measured === "number" && Number.isFinite(directBindings.measured)
+          ? directBindings.measured
+          : 0;
         const entry = [
           judgeFourBrainReadiness("ENTRY", {
-            scope: "TIER1/ENTER_NOW (real fills)",
-            effectiveN: tier1N,
+            scope: "DIRECT/ENTER_NOW exact-fill",
+            effectiveN: directTier1N,
             meanNetR: null,
             meanCalibrationGapR: null,
-            measuredBasis: tier1N > 0 ? "REAL" : "NONE",
+            // This is a real-fill cohort even while it has zero closes. Passing NONE would make
+            // the generic helper label an empty direct cohort as "simulated only", which is false.
+            measuredBasis: "REAL",
           }),
         ];
         return {
@@ -2205,6 +2344,57 @@ export async function registerShadowRoutes(
 
     return { ok: true, mode, closed, skipped, skippedNonProfit, raced, realizedPnl, realizedR, lane: laneFilter ?? "ALL" };
   });
+
+  /**
+   * Cross formation is an operational input for the executor, not a by-product
+   * of the heavyweight operator-brief resolver. Its caller is the dedicated
+   * hourly scheduler registered by app.ts; this controller itself has no timer
+   * and no order side effect.
+   */
+  const triggerCrossSectionalMeasurementCycle = () => {
+    if (isCrossSectionalEdgeDisabled() || !opts.binanceClient) return Promise.resolve(null);
+    const xsecClient = opts.binanceClient;
+    const latestRegimeSnapshot = getRegimeDirectionControllerSnapshotStore().readLatest();
+    const crossSectionalRegimeContext = latestRegimeSnapshot
+      ? buildCrossSectionalRegimeContext({
+          currentRegime: latestRegimeSnapshot.currentRegime,
+          controllerMode: latestRegimeSnapshot.controllerMode,
+          directionalBias: latestRegimeSnapshot.directionalBias,
+          confidence: latestRegimeSnapshot.confidence,
+          capturedAt: latestRegimeSnapshot.capturedAt,
+        })
+      : null;
+    const axisScore = buildRegimeAxisTimeline(getRegimeEngineStore().snapshots).current?.score ?? null;
+    return runCrossSectionalCycleGuarded({
+      store: getCrossSectionalStore(),
+      universe: [...CROSS_SECTIONAL_UNIVERSE],
+      now: Date.now(),
+      regimeContext: crossSectionalRegimeContext,
+      axisScore,
+      filteredEntryBlocks: opts.crossSectionalReentryBlocksGetter,
+      symbolReliabilitySnapshotGetter: opts.symbolReliabilitySnapshotGetter,
+      symbolReliabilityDecisionRecorder: opts.symbolReliabilityDecisionRecorder,
+      filteredExecutionPool: async () => {
+        const input = autoPoolInput();
+        return input && opts.crossSectionalAutoPool
+          ? opts.crossSectionalAutoPool.refreshIfDue(input)
+          : null;
+      },
+      // 1000x-multiplier futures contracts use their bare spot symbol only for
+      // public candles. The measured/executed futures symbol remains unchanged.
+      fetchCandles: async (symbol: string) =>
+        xsecClient.getCandles(
+          spotSymbolForCandles(symbol),
+          CROSS_SECTIONAL_INTERVAL,
+          Math.max(
+            CROSS_SECTIONAL_MOMENTUM_BARS + 5,
+            isDynamicMom36ContinuationStrategy() ? DYNAMIC_MOM36_CONTINUATION_MIN_CANDLES + 30 : 0,
+            CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0 ? CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS : 0,
+            standDownThresholdPct() < 0 ? STAND_DOWN_LOOKBACK_BARS + 1 : 0,
+          ),
+        ),
+    });
+  };
 
   // ── Compact operator brief (report-only read, no writes, no behavior changes) ──
   app.get<{ Querystring: { era?: string; resolve?: string; paper?: string; headless?: string } }>("/api/shadow/operator-brief", async (request, reply) => {
@@ -2853,53 +3043,6 @@ export async function registerShadowRoutes(
             // (that would read as "market calm"); a growing "last cycle Xh ago" is the honest signal.
             console.warn(`[moonshot] meme universe resolve failed: ${(err as Error).message}`);
           });
-        }
-        // Cross-sectional market-neutral measurement lane: rank the universe by N-bar momentum, go
-        // (hypothetically) long-top-k / short-bottom-k at equal notional, measure the forward basket
-        // return. Beta cancels → the P&L is dispersion, which can be positive in BOTH bull and bear.
-        // Report-only, fire-and-forget, env-gated. NOT regime-gated — it's market-neutral by design.
-        if (!isCrossSectionalEdgeDisabled()) {
-          const _xsc = opts.binanceClient;
-          const latestRegimeSnapshot = getRegimeDirectionControllerSnapshotStore().readLatest();
-          const crossSectionalRegimeContext = latestRegimeSnapshot
-            ? buildCrossSectionalRegimeContext({
-                currentRegime: latestRegimeSnapshot.currentRegime,
-                controllerMode: latestRegimeSnapshot.controllerMode,
-                directionalBias: latestRegimeSnapshot.directionalBias,
-                confidence: latestRegimeSnapshot.confidence,
-                capturedAt: latestRegimeSnapshot.capturedAt,
-              })
-            : null;
-          // Regime-axis score for the FILTERED basket's leg-count skew (regimeSkewedK) — same
-          // score/boundary already proven out by the directional lane-switch guidance. A missing/
-          // unparseable score just falls back to unskewed 3/3 (regimeSkewedK's own null handling).
-          const axisScore = buildRegimeAxisTimeline(getRegimeEngineStore().snapshots).current?.score ?? null;
-          void runCrossSectionalCycleGuarded({
-            store: getCrossSectionalStore(),
-            universe: [...CROSS_SECTIONAL_UNIVERSE],
-            now: Date.now(),
-            regimeContext: crossSectionalRegimeContext,
-            axisScore,
-            filteredEntryBlocks: opts.crossSectionalReentryBlocksGetter,
-            // spotSymbolForCandles: 1000x-multiplier futures contracts (1000PEPEUSDT, …) have no
-            // spot pair under that name — fetch the bare spot symbol instead. Returns are price
-            // RATIOS, so the 1000x scaling cancels; the rest of the pipeline (scoring, allowlist
-            // matching, executor order symbol) keeps using the real futures name throughout.
-            // Depth is MAX(momentum lookback, liquidity lookback): the liquidity floor takes a
-            // MEDIAN over its own window, and a window deeper than what is fetched here silently
-            // starves it (2026-08-12 testnet incident — see liquidCrossSectionalSymbols). Only
-            // deepened when the floor is actually enabled, so the un-floored default fetches
-            // exactly what it always did.
-            fetchCandles: async (symbol: string) =>
-              _xsc.getCandles(
-                spotSymbolForCandles(symbol),
-                CROSS_SECTIONAL_INTERVAL,
-                Math.max(
-                  CROSS_SECTIONAL_MOMENTUM_BARS + 5,
-                  CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0 ? CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS : 0,
-                ),
-              ),
-          }).catch(() => undefined);
         }
       }
       let postCutoverReport: PostCutoverReport | undefined;
@@ -4375,4 +4518,6 @@ export async function registerShadowRoutes(
     // until those signals are surfaced. Warnings are advisory only.
     return buildLiveReadinessReport({ positions: shadowEngine.getAllPositions() });
   });
+
+  return { run: triggerCrossSectionalMeasurementCycle };
 }

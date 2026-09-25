@@ -1,8 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   BinanceFuturesPrivateClient,
   BinanceFuturesPrivateError,
+  REQUEST_TIMEOUT_MS,
+  TRANSPORT_SLOT_MAX_WAIT_MS,
   buildQueryString,
   resolveLiveBinanceBaseUrl,
   resolveLiveBinanceEnv,
@@ -11,6 +13,97 @@ import {
 import { fillFromUserTrade } from "../src/lib/execution-fill-recorder.js";
 
 describe("binance-futures-private signing", () => {
+  it("keeps the transport timeout armed until a response body is consumed", async () => {
+    vi.useFakeTimers();
+    try {
+      const nowMs = 1_700_000_000_000;
+      let bodyAbortObserved = false;
+      const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+        if (String(url).includes("/fapi/v1/time")) {
+          return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+        }
+        const signal = init?.signal;
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          text: () => new Promise<string>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => {
+              bodyAbortObserved = true;
+              reject(Object.assign(new Error("response body aborted"), { name: "AbortError" }));
+            }, { once: true });
+          }),
+        } as Response;
+      }) as typeof fetch;
+      const client = new BinanceFuturesPrivateClient({
+        apiKey: "k",
+        apiSecret: "s",
+        env: "testnet",
+        nowMs: () => nowMs,
+        fetchImpl,
+      });
+
+      const placing = client.setLeverage("BTCUSDT", 3);
+      const rejected = expect(placing).rejects.toMatchObject({ failureType: "timeout" });
+      await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS + 1);
+
+      await rejected;
+      expect(bodyAbortObserved).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cannot be frozen forever by a transport slot whose dispatch ignores its abort", async () => {
+    // 2026-09-04: mainnet 3103 went 49+ minutes without a single exchange read.
+    // The queue head never released, so `await previous` in withTransportSlot
+    // froze every later read — public and signed alike — and the engine traded
+    // blind while still reporting errorStreak:0, lastTickError:null and no
+    // rate-limit cooldown. The process held no established connection at all.
+    // The test above proves the abort is armed through body consumption; this
+    // one covers the case where the dispatch ignores that abort anyway, which
+    // is the only way the head can outlive its own timeout.
+    vi.useFakeTimers();
+    try {
+      const nowMs = 1_700_000_000_000;
+      vi.setSystemTime(nowMs);
+      const urls: string[] = [];
+      let pinned = false;
+      const fetchImpl = (async (url: RequestInfo | URL) => {
+        urls.push(String(url));
+        if (!pinned) {
+          pinned = true;
+          // Never settles, and never honours the abort signal.
+          return new Promise<Response>(() => {});
+        }
+        return new Response(JSON.stringify([[
+          1_700_000_000_000, "100", "103", "99", "102", "12.5", 1_700_000_299_999,
+        ]]), { status: 200 });
+      }) as typeof fetch;
+      const client = new BinanceFuturesPrivateClient({
+        apiKey: "k",
+        apiSecret: "s",
+        env: "testnet",
+        fetchImpl,
+        nowMs: () => Date.now(),
+      });
+
+      const stuck = client.getKlines("SOLUSDT", "1m", { limit: 1 });
+      stuck.catch(() => { /* intentionally never settles */ });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(urls).toHaveLength(1);
+
+      // A second read arrives behind the pinned head. It must still get out.
+      const rescued = client.getKlines("ETHUSDT", "1m", { limit: 1 });
+      await vi.advanceTimersByTimeAsync(TRANSPORT_SLOT_MAX_WAIT_MS + 1_000);
+      await expect(rescued).resolves.toHaveLength(1);
+      expect(urls).toHaveLength(2);
+      expect(urls[1]).toContain("symbol=ETHUSDT");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("signs the official Binance documentation HMAC vector", () => {
     // Vector from Binance API docs (signed endpoint example).
     const secret = "NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j";
@@ -58,6 +151,196 @@ describe("binance-futures-private signing", () => {
     expect(book.bid).toBe(64100.5);
     expect(book.ask).toBe(64101);
     expect(urls[0]).toContain("testnet.binancefuture.com/fapi/v1/ticker/bookTicker");
+  });
+
+  it("reads requested execution books from one same-venue batch response", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify([
+        { symbol: "SOLUSDT", bidPrice: "99.9", askPrice: "100.1", bidQty: "12", askQty: "13" },
+        { symbol: "DOGEUSDT", bidPrice: "0.099", askPrice: "0.101", bidQty: "1200", askQty: "1300" },
+        { symbol: "UNRELATEDUSDT", bidPrice: "1", askPrice: "1.1", bidQty: "1", askQty: "1" },
+      ]), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "testnet",
+      fetchImpl,
+    });
+
+    const books = await client.getExecutionBookTickers(["solusdt", "DOGEUSDT", "MISSINGUSDT"]);
+
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("testnet.binancefuture.com/fapi/v1/ticker/bookTicker");
+    expect(urls[0]).not.toContain("symbol=");
+    expect([...books.keys()]).toEqual(["SOLUSDT", "DOGEUSDT"]);
+    expect(books.get("SOLUSDT")).toMatchObject({ bid: 99.9, ask: 100.1, bidQty: 12, askQty: 13 });
+  });
+
+  it("reads the public premium-index mark from the same selected execution base", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({ symbol: "1000PEPEUSDT", markPrice: "0.00319802" }), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "testnet",
+      fetchImpl,
+    });
+
+    await expect(client.getMarkPrice("1000PEPEUSDT")).resolves.toBeCloseTo(0.00319802, 10);
+    expect(urls[0]).toContain("testnet.binancefuture.com/fapi/v1/premiumIndex?symbol=1000PEPEUSDT");
+  });
+
+  it("reads completed USD-M klines from the selected execution base without a spot fallback", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify([[
+        1_700_000_000_000, "100", "103", "99", "102", "12.5", 1_700_000_299_999,
+      ]]), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    const rows = await client.getKlines("SOLUSDT", "5m", { startTime: 1_700_000_000_000, limit: 1 });
+    expect(rows).toEqual([{
+      openTime: 1_700_000_000_000, closeTime: 1_700_000_299_999,
+      open: 100, high: 103, low: 99, close: 102, volume: 12.5,
+    }]);
+    expect(urls[0]).toContain("testnet.binancefuture.com/fapi/v1/klines?symbol=SOLUSDT&interval=5m");
+  });
+
+  it("does not amplify an HTTP 418 IP ban with immediate signed GET retries", async () => {
+    const urls: string[] = [];
+    const nowMs = 1_700_000_000_000;
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      urls.push(value);
+      if (value.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ code: -1003, msg: "Too many requests" }), { status: 418 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "mainnet",
+      fetchImpl,
+      nowMs: () => nowMs,
+    });
+
+    await expect(client.getBalances()).rejects.toMatchObject({ failureType: "429", httpStatus: 418 });
+    expect(urls.filter((url) => url.includes("/fapi/v2/balance"))).toHaveLength(1);
+  });
+
+  it("opens one client-wide 418 circuit, coalesces cold-start time sync, and resumes only after its expiry", async () => {
+    const urls: string[] = [];
+    let nowMs = 1_700_000_000_000;
+    const bannedUntilMs = nowMs + 5 * 60_000;
+    let balanceAttempts = 0;
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      urls.push(value);
+      if (value.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+      }
+      if (value.includes("/fapi/v2/balance")) {
+        balanceAttempts += 1;
+        return new Response(JSON.stringify({ code: -1003, msg: `Way too much request weight used; IP banned until ${bannedUntilMs}.` }), { status: 418 });
+      }
+      if (value.includes("/fapi/v2/positionRisk")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (value.includes("/fapi/v1/openOrders")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      throw new Error(`unexpected URL ${value}`);
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "mainnet",
+      fetchImpl,
+      nowMs: () => nowMs,
+    });
+
+    // All three signed reads start from a cold clock. They share one /time request and the
+    // transport queues the remaining physical dispatches behind the balance response.
+    const [balance, positions, openOrders] = await Promise.allSettled([
+      client.getBalances(),
+      client.getPositions(),
+      client.getOpenOrders(),
+    ]);
+    expect(balance.status).toBe("rejected");
+    expect(positions.status).toBe("rejected");
+    expect(openOrders.status).toBe("rejected");
+    expect(balanceAttempts).toBe(1);
+    expect(urls.filter((url) => url.includes("/fapi/v1/time"))).toHaveLength(1);
+    expect(urls.filter((url) => url.includes("/fapi/v2/positionRisk"))).toHaveLength(0);
+    expect(urls.filter((url) => url.includes("/fapi/v1/openOrders"))).toHaveLength(0);
+    expect(client.getRateLimitStatus()).toMatchObject({
+      coolingDown: true,
+      lastHttpStatus: 418,
+      retryAt: new Date(bannedUntilMs).toISOString(),
+    });
+
+    // The client must not probe Binance during the ban, even for a different endpoint.
+    await expect(client.getPositions()).rejects.toMatchObject({ failureType: "429", httpStatus: 418 });
+    expect(urls.filter((url) => url.includes("/fapi/v2/positionRisk"))).toHaveLength(0);
+
+    nowMs = bannedUntilMs;
+    await expect(client.getPositions()).resolves.toEqual([]);
+    expect(urls.filter((url) => url.includes("/fapi/v2/positionRisk"))).toHaveLength(1);
+    expect(client.getRateLimitStatus().coolingDown).toBe(false);
+  });
+
+  it("accepts only actively trading USD-M perpetual filters", async () => {
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      expect(String(url)).toContain("/fapi/v1/exchangeInfo");
+      return new Response(JSON.stringify({
+        symbols: [
+          {
+            symbol: "1000PEPEUSDT", status: "TRADING", contractType: "PERPETUAL", quoteAsset: "USDT",
+            pricePrecision: 7, quantityPrecision: 0,
+            filters: [
+              { filterType: "PRICE_FILTER", tickSize: "0.0000001" },
+              { filterType: "LOT_SIZE", stepSize: "1", minQty: "1" },
+              { filterType: "MIN_NOTIONAL", notional: "5" },
+            ],
+          },
+          {
+            symbol: "SOLUSDT", status: "TRADING", contractType: "PERPETUAL", quoteAsset: "USDT",
+            pricePrecision: 2, quantityPrecision: 2,
+            filters: [
+              { filterType: "PRICE_FILTER", tickSize: "0.01" },
+              { filterType: "LOT_SIZE", stepSize: "0.01", minQty: "0.01" },
+              { filterType: "MIN_NOTIONAL", notional: "5" },
+            ],
+          },
+          {
+            symbol: "SPOTONLYUSDT", status: "TRADING", contractType: "PERPETUAL", quoteAsset: "BUSD",
+            filters: [],
+          },
+          {
+            symbol: "DELISTEDUSDT", status: "SETTLING", contractType: "PERPETUAL", quoteAsset: "USDT",
+            filters: [],
+          },
+          {
+            symbol: "DELIVERYUSDT", status: "TRADING", contractType: "CURRENT_MONTH", quoteAsset: "USDT",
+            filters: [],
+          },
+        ],
+      }), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "mainnet", fetchImpl });
+
+    const filters = await client.getExchangeFilters();
+
+    expect([...filters.keys()]).toEqual(["1000PEPEUSDT", "SOLUSDT"]);
+    expect(filters.get("1000PEPEUSDT")).toMatchObject({ stepSize: 1, minQty: 1, minNotional: 5 });
   });
 
   it("refuses signed requests when measured clock skew exceeds the guard", async () => {
@@ -239,6 +522,9 @@ describe("binance-futures-private signing", () => {
         return new Response(JSON.stringify({
           symbols: [{
             symbol: "DOGEUSDT",
+            status: "TRADING",
+            contractType: "PERPETUAL",
+            quoteAsset: "USDT",
             pricePrecision: 5,
             quantityPrecision: 0,
             filters: [
@@ -307,6 +593,44 @@ describe("binance-futures-private signing", () => {
     expect(urls.filter((u) => u.includes("/fapi/v1/exchangeInfo"))).toHaveLength(1);
   });
 
+  it("suppresses a fresh entry when the basket watchdog aborts during a cold filter lookup", async () => {
+    const urls: string[] = [];
+    let releaseExchangeInfo: (() => void) | null = null;
+    const exchangeInfo = new Promise<Response>((resolve) => {
+      releaseExchangeInfo = () => resolve(new Response(JSON.stringify({
+        symbols: [{
+          symbol: "DOGEUSDT", status: "TRADING", contractType: "PERPETUAL", quoteAsset: "USDT",
+          pricePrecision: 5, quantityPrecision: 0,
+          filters: [
+            { filterType: "PRICE_FILTER", tickSize: "0.00001" },
+            { filterType: "LOT_SIZE", stepSize: "1", minQty: "1" },
+          ],
+        }],
+      }), { status: 200 }));
+    });
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const value = String(url);
+      urls.push(value);
+      if (value.includes("/fapi/v1/exchangeInfo")) return exchangeInfo;
+      throw new Error(`a stale entry must not dispatch ${value}`);
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl,
+    });
+    const controller = new AbortController();
+    const placing = client.placeOrder({
+      symbol: "DOGEUSDT", side: "BUY", type: "MARKET", quantity: 5,
+      newClientOrderId: "stale-entry-must-not-dispatch", signal: controller.signal,
+    });
+
+    await Promise.resolve();
+    controller.abort();
+    releaseExchangeInfo?.();
+
+    await expect(placing).rejects.toMatchObject({ failureType: "timeout" });
+    expect(urls.filter((url) => url.includes("/fapi/v1/order"))).toHaveLength(0);
+  });
+
   it("re-fetches exchange filters after the TTL instead of caching them for the process lifetime", async () => {
     let exchangeInfoCalls = 0;
     let simulatedNowMs = 1_000_000_000_000;
@@ -320,6 +644,9 @@ describe("binance-futures-private signing", () => {
         return new Response(JSON.stringify({
           symbols: [{
             symbol: "DOGEUSDT",
+            status: "TRADING",
+            contractType: "PERPETUAL",
+            quoteAsset: "USDT",
             pricePrecision: 5,
             quantityPrecision: 0,
             filters: [
@@ -350,6 +677,50 @@ describe("binance-futures-private signing", () => {
     simulatedNowMs += 6 * 60 * 60 * 1000; // +6h more (total +7h)
     await client.getExchangeFilters();
     expect(exchangeInfoCalls).toBe(2);
+  });
+
+  it("coalesces concurrent cold exchange-filter reads into one request", async () => {
+    let exchangeInfoCalls = 0;
+    let releaseExchangeInfo: (() => void) | null = null;
+    const exchangeInfo = new Promise<Response>((resolve) => {
+      releaseExchangeInfo = () => resolve(new Response(JSON.stringify({
+        symbols: [{
+          symbol: "DOGEUSDT", status: "TRADING", contractType: "PERPETUAL", quoteAsset: "USDT",
+          pricePrecision: 5, quantityPrecision: 0,
+          filters: [
+            { filterType: "PRICE_FILTER", tickSize: "0.0000100" },
+            { filterType: "LOT_SIZE", stepSize: "1", minQty: "1" },
+            { filterType: "MIN_NOTIONAL", notional: "5" },
+          ],
+        }],
+      }), { status: 200 }));
+    });
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      if (String(url).includes("/fapi/v1/exchangeInfo")) {
+        exchangeInfoCalls += 1;
+        return exchangeInfo;
+      }
+      throw new Error(`unexpected URL ${String(url)}`);
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl,
+    });
+
+    const reads = Array.from({ length: 6 }, () => client.getExchangeFilters("EXECUTION"));
+    // Drain the microtask queue with one real macrotask turn rather than
+    // counting `await Promise.resolve()` hops. The count is an artifact of how
+    // many awaits the transport happens to have between here and the fetch —
+    // adding the queue-head deadlock guard changed it and broke this test even
+    // though coalescing itself was untouched. What matters is that six
+    // concurrent cold reads produce exactly one request, asserted here and
+    // again after they all resolve.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(exchangeInfoCalls).toBe(1);
+    releaseExchangeInfo?.();
+
+    const results = await Promise.all(reads);
+    expect(results.every((filters) => filters.get("DOGEUSDT")?.stepSize === 1)).toBe(true);
+    expect(exchangeInfoCalls).toBe(1);
   });
 
   it("getIncomeHistory signs a GET to /fapi/v1/income and maps a realistic multi-type response", async () => {
@@ -453,6 +824,63 @@ describe("binance-futures-private signing", () => {
     nowMs += 120_000;
     await expect(client.getBalances()).resolves.toEqual([]);
     expect(timeCalls).toBeGreaterThan(1);
+  });
+
+  it("queryOrderByClientId signs a GET to /fapi/v1/order keyed by origClientOrderId, not orderId", async () => {
+    // Same 19-digit precision fixture as the queryOrder(orderId) test above — this method must go
+    // through the exact same mapOrder() precision-preserving path, not a hand-rolled parse.
+    const bigOrderId = "8389766229891298477";
+    const rawOrderBody = `{"symbol":"BTCUSDT","orderId":${bigOrderId},"clientOrderId":"my-client-id","status":"FILLED","type":"MARKET","side":"BUY","reduceOnly":false,"price":"0","stopPrice":"0","origQty":"1","executedQty":"1","avgPrice":"61800.5","updateTime":1}`;
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: Date.now() }), { status: 200 });
+      }
+      return new Response(rawOrderBody, { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    const order = await client.queryOrderByClientId("BTCUSDT", "my-client-id");
+
+    const orderUrl = urls.find((u) => u.includes("/fapi/v1/order?"));
+    expect(orderUrl).toBeDefined();
+    expect(orderUrl).toContain("origClientOrderId=my-client-id");
+    // Must NOT also (accidentally) send a bare `orderId=` param — this is a lookup BY client id, the
+    // whole point being that no exchange-assigned orderId is known yet.
+    expect(orderUrl).not.toMatch(/[?&]orderId=/);
+    expect(order.orderId).toBe(bigOrderId);
+    expect(typeof order.orderId).toBe("string");
+    expect(order.status).toBe("FILLED");
+    expect(order.executedQty).toBe(1);
+    expect(order.avgPrice).toBeCloseTo(61800.5, 6);
+  });
+
+  it("cancels one order by origClientOrderId and returns Binance's terminal response", async () => {
+    const bigOrderId = "8389766229891298477";
+    const rawOrderBody = `{"symbol":"BTCUSDT","orderId":${bigOrderId},"clientOrderId":"lost-placement-response","status":"CANCELED","type":"LIMIT","side":"BUY","reduceOnly":false,"price":"61800.5","stopPrice":"0","origQty":"1","executedQty":"0","avgPrice":"0","updateTime":1}`;
+    const requests: Array<{ url: string; method: string }> = [];
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      const request = { url: String(url), method: init?.method ?? "GET" };
+      requests.push(request);
+      if (request.url.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: Date.now() }), { status: 200 });
+      }
+      return new Response(rawOrderBody, { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    const order = await client.cancelOrderByClientIdAndRead("BTCUSDT", "lost-placement-response");
+
+    const cancelRequest = requests.find((request) => request.url.includes("/fapi/v1/order?"));
+    expect(cancelRequest).toBeDefined();
+    expect(cancelRequest?.method).toBe("DELETE");
+    expect(cancelRequest?.url).toContain("origClientOrderId=lost-placement-response");
+    expect(cancelRequest?.url).not.toMatch(/[?&]orderId=/);
+    expect(order.orderId).toBe(bigOrderId);
+    expect(order.clientOrderId).toBe("lost-placement-response");
+    expect(order.status).toBe("CANCELED");
   });
 
   it("still fails closed when the very first time-sync attempt never succeeds", async () => {

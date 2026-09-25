@@ -95,9 +95,25 @@ describe("Four-Brain shadow tick — gate + single-flight + fail-open", () => {
   });
 
   it("a journal exception does NOT fail the tick (report-only, fail-open)", () => {
-    const r = runFourBrainShadowTick({ mode: "shadow", nowMs: NOW, gather: gatherFrom(fakeDeps()), journalAppend: () => { throw new Error("disk full"); }, tickId: "t" });
+    const attached: string[] = [];
+    const r = runFourBrainShadowTick({ mode: "shadow", nowMs: NOW, gather: gatherFrom(fakeDeps()), journalAppend: () => { throw new Error("disk full"); }, onExecutiveDecision: (d) => attached.push(d.decisionId), tickId: "t" });
     expect(r.ran).toBe(true);
     expect(r.metrics.journalErrors).toBeGreaterThan(0);
+    expect(attached).toEqual(r.executiveDecisions.map((d) => d.decisionId));
+  });
+
+  it("evaluates each horizon independently rather than cloning the first result", () => {
+    const gathered = assembleFourBrainTick(buildFourBrainGatherInput(fakeDeps()));
+    const scalp = gathered.directionInputs.find((d) => d.horizon === "SCALP")!.input;
+    const swing = gathered.directionInputs.find((d) => d.horizon === "SWING")!.input;
+    scalp.longEdge = { value: null, asOfMs: NOW };
+    scalp.shortEdge = { value: 0.15, asOfMs: NOW };
+    scalp.shortEdgeN = 100;
+    swing.longEdge = { value: 0.15, asOfMs: NOW };
+    swing.longEdgeN = 100;
+    const r = runFourBrainShadowTick({ mode: "shadow", nowMs: NOW, gather: () => gathered, journalAppend: () => {}, tickId: "horizons" });
+    expect(r.directions.find((d) => d.horizon === "SCALP")?.action).toBe("SHORT");
+    expect(r.directions.find((d) => d.horizon === "SWING")?.action).toBe("LONG");
   });
 
   it("single-flight: a re-entrant tick while one is running is SKIPPED (never overlaps)", () => {
@@ -130,6 +146,21 @@ describe("Four-Brain shadow tick — decisions + journal + determinism", () => {
       expect(rec.reportOnly).toBe(true);
       expect(rec.instanceId).toBe("3102");
     }
+  });
+
+  it("testnet canonical regime overrides the technical directional bias", () => {
+    const dep = fakeDeps({
+      marketStateAuthority: {
+        source: "TESTNET_EXECUTOR",
+        canonicalRegimeFamily: "MIXED",
+        scannerRegime: "Mixed rotation",
+        capturedAtMs: NOW - MIN,
+      },
+    });
+    const r = runFourBrainShadowTick({ mode: "shadow", nowMs: NOW, gather: gatherFrom(dep), journalAppend: () => {}, tickId: "canonical-authority" });
+    expect(r.ran).toBe(true);
+    expect(r.marketState?.bias).toBe("MIXED");
+    expect(r.marketState?.authority).toMatchObject({ canonicalRegimeFamily: "MIXED", scannerRegime: "Mixed rotation" });
   });
 
   it("[REGRESSION 2026-07-22] one candidate's decideEntry throwing does NOT abort the whole tick — the market snapshot + the exit candidate's decision still journal, and it's counted (not silently lost)", () => {
@@ -324,6 +355,23 @@ describe("Four-Brain incumbent parity", () => {
     expect(fourBrainInstanceAllowed({ PORT: "3103", FOUR_BRAIN_INSTANCE_ALLOWLIST: "3101,3102,3103" } as NodeJS.ProcessEnv)).toBe(false);
     // an unknown instance not in the allowlist is excluded
     expect(fourBrainInstanceAllowed({ PORT: "9999" } as NodeJS.ProcessEnv)).toBe(false);
+  });
+
+  // 2026-08-05 (identity-spoofing fix): an isolated staging mirror physically running on 3111/3112 is
+  // authorized via an explicit FOUR_BRAIN_LOGICAL_ROLE grant, never by relabeling its own instanceId.
+  it("[role-based staging authorization] an explicit FOUR_BRAIN_LOGICAL_ROLE grant authorizes an instance whose own PORT is honestly outside the allowlist, without needing FOUR_BRAIN_INSTANCE_ID at all", () => {
+    expect(fourBrainInstanceAllowed({ PORT: "3111" } as NodeJS.ProcessEnv)).toBe(false); // no grant: fails closed
+    expect(fourBrainInstanceAllowed({ PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv)).toBe(true);
+    expect(fourBrainInstanceAllowed({ PORT: "3112", FOUR_BRAIN_LOGICAL_ROLE: "TESTNET" } as NodeJS.ProcessEnv)).toBe(true);
+    // instanceId reported by the resolver itself is unaffected — the role grants authorization, it
+    // never relabels identity.
+    expect(resolveFourBrainInstanceId({ PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv)).toBe("3111");
+    expect(resolveFourBrainInstanceId({ PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv)).not.toBe("3101");
+  });
+
+  it("[fail-closed] a role grant can never reach the live instance — 3103 stays hard-blocked even with FOUR_BRAIN_LOGICAL_ROLE set", () => {
+    expect(fourBrainInstanceAllowed({ PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv)).toBe(false);
+    expect(fourBrainInstanceAllowed({ PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "TESTNET" } as NodeJS.ProcessEnv)).toBe(false);
   });
 
   // Regression (2026-07-23): app.ts used to expose fourBrainMetricsRef/fourBrainRecentDecisionsRef to the

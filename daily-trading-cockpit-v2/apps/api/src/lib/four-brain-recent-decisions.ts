@@ -14,6 +14,7 @@
  * Pure + independently unit-testable: push/evict/order have no dependency on the journal file, the shadow
  * tick, or any live state.
  */
+import { closeSync, existsSync, fstatSync, openSync, readSync } from "node:fs";
 
 export interface FourBrainRecentDecisionsBufferOptions {
   /** Max records retained. Oldest is evicted (FIFO) once exceeded. Defaults to 100. */
@@ -53,6 +54,51 @@ export class FourBrainRecentDecisionsBuffer {
  *  aggregate journaled separately by four-brain-live-wiring.ts) and any future kind are deliberately left
  *  out of this buffer so the recent-decisions table stays exactly what its name says. */
 const RELEVANT_KINDS = new Set(["MARKET_SNAPSHOT", "EXECUTIVE_DECISION"]);
+
+/**
+ * Rehydrates the dashboard ring once at process boot. HTTP reads remain strictly
+ * memory-only; this bounded tail read prevents a routine API restart from
+ * turning a healthy Four-Brain card into a misleading empty state until the
+ * next five-minute shadow cycle completes.
+ */
+export function hydrateFourBrainRecentDecisionsBuffer(
+  buffer: FourBrainRecentDecisionsBuffer,
+  journalPath: string,
+  maxRecords = 100,
+): number {
+  if (!existsSync(journalPath)) return 0;
+  const fd = openSync(journalPath, "r");
+  try {
+    const size = fstatSync(fd).size;
+    // 2 MB is ample for the last 100 verbose journal records while avoiding a
+    // full 8 MB rotated journal read on every boot.
+    const bytes = Math.min(size, 2 * 1024 * 1024);
+    const start = Math.max(0, size - bytes);
+    const chunk = Buffer.alloc(bytes);
+    readSync(fd, chunk, 0, bytes, start);
+    const lines = chunk.toString("utf8").split("\n");
+    if (start > 0) lines.shift(); // first fragment began before this tail window
+    const records: Record<string, unknown>[] = [];
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const parsed: unknown = JSON.parse(line);
+        if (parsed && typeof parsed === "object" && RELEVANT_KINDS.has((parsed as { kind?: unknown }).kind as string)) {
+          records.push(parsed as Record<string, unknown>);
+        }
+      } catch {
+        // A partial final line or a malformed historical record must never
+        // prevent the live shadow layer from starting.
+      }
+    }
+    for (const record of records.slice(-Math.max(1, maxRecords))) buffer.push(record);
+    return Math.min(records.length, Math.max(1, maxRecords));
+  } catch {
+    return 0;
+  } finally {
+    closeSync(fd);
+  }
+}
 
 /**
  * Wrap an existing journalAppend so it ALSO mirrors relevant records into the ring buffer, in addition to

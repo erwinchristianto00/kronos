@@ -80,6 +80,16 @@ function snapshot(positions: ReturnType<typeof position>[]) {
   } as never;
 }
 
+function exchangeBySymbol(entries: Array<[string, number | null]>) {
+  return new Map(entries.map(([symbol, markPrice]) => [symbol, {
+    direction: "SHORT" as const,
+    quantity: 10,
+    markPrice,
+    leverage: 3,
+    estimatedCloseCostUsd: 0.22,
+  }]));
+}
+
 describe("annotateSingleSymbolAccount", () => {
   it("tags a matching exchange position with the executor's laneId and fills basketQty/basketUnrealizedPnl", () => {
     const executor = makeExecutorWithPositions([positionOf()]);
@@ -198,7 +208,7 @@ describe("flattenSingleSymbolPositions (2026-07-10: per-lane close-now button)",
       [positionOf({ positionId: "b1", symbol: "BTCUSDT", direction: "LONG", entryPrice: 63000, stopPrice: 62000 })],
       "REGIME_COMPOSITE_CONFIRMATION_LONG",
     );
-    const rows = flattenSingleSymbolPositions([a, b], new Map([["BTCUSDT", 63500]]));
+    const rows = flattenSingleSymbolPositions([a, b], exchangeBySymbol([["BTCUSDT", 63500]]));
     expect(rows).toHaveLength(2);
     expect(rows.map((r) => r.laneId).sort()).toEqual(["REGIME_COMPOSITE_CONFIRMATION_LONG", "SHORT_FADE_EXHAUSTION_CROWDED"]);
     expect(rows.find((r) => r.positionId === "a1")!.laneId).toBe("SHORT_FADE_EXHAUSTION_CROWDED");
@@ -218,7 +228,7 @@ describe("flattenSingleSymbolPositions (2026-07-10: per-lane close-now button)",
       [positionOf({ positionId: "regime1", symbol: "SOLUSDT", direction: "LONG", qty: 0.76, entryPrice: 78.3, stopPrice: 77.08 })],
       "REGIME_COMPOSITE_CONFIRMATION_LONG",
     );
-    const rows = flattenSingleSymbolPositions([wide, regime], new Map([["SOLUSDT", 79]]));
+    const rows = flattenSingleSymbolPositions([wide, regime], exchangeBySymbol([["SOLUSDT", 79]]));
     expect(rows).toHaveLength(2);
     const wideRow = rows.find((r) => r.positionId === "wide1")!;
     const regimeRow = rows.find((r) => r.positionId === "regime1")!;
@@ -230,21 +240,58 @@ describe("flattenSingleSymbolPositions (2026-07-10: per-lane close-now button)",
 
   it("computes SHORT unrealizedPnl direction-aware", () => {
     const executor = makeExecutorWithPositions([positionOf({ direction: "SHORT", qty: 0.01, entryPrice: 60000, stopPrice: 61800 })]);
-    const rows = flattenSingleSymbolPositions([executor], new Map([["BTCUSDT", 59000]]));
+    const rows = flattenSingleSymbolPositions([executor], exchangeBySymbol([["BTCUSDT", 59000]]));
     expect(rows[0]!.unrealizedPnl).toBeCloseTo((60000 - 59000) * 0.01, 6);
   });
 
   it("returns markPrice/unrealizedPnl null when no mark is available for the symbol", () => {
     const executor = makeExecutorWithPositions([positionOf()]);
-    const rows = flattenSingleSymbolPositions([executor], new Map());
+    const rows = flattenSingleSymbolPositions([executor], exchangeBySymbol([]));
     expect(rows[0]!.markPrice).toBeNull();
     expect(rows[0]!.unrealizedPnl).toBeNull();
   });
 
   it("returns an empty list with no executors and with executors that have no open positions", () => {
-    expect(flattenSingleSymbolPositions([], new Map())).toEqual([]);
+    expect(flattenSingleSymbolPositions([], exchangeBySymbol([]))).toEqual([]);
     const empty = makeExecutorWithPositions([]);
-    expect(flattenSingleSymbolPositions([empty], new Map())).toEqual([]);
+    expect(flattenSingleSymbolPositions([empty], exchangeBySymbol([]))).toEqual([]);
+  });
+
+  it("reports fixed TP, gap, leverage, and allocated after-cost P&L from the bound exchange position", () => {
+    const executor = makeExecutorWithPositions([
+      positionOf({
+        direction: "SHORT",
+        qty: 2,
+        entryPrice: 100,
+        stopPrice: 110,
+        targetPrice: 90,
+      }),
+    ]);
+    const rows = flattenSingleSymbolPositions([executor], new Map([["BTCUSDT", {
+      direction: "SHORT" as const,
+      quantity: 4,
+      markPrice: 95,
+      leverage: 5,
+      estimatedCloseCostUsd: 0.4,
+    }]]));
+    expect(rows[0]!.targetPrice).toBe(90);
+    expect(rows[0]!.targetTpGapPct).toBeCloseTo((95 - 90) / 95 * 100, 6);
+    expect(rows[0]!.leverage).toBe(5);
+    expect(rows[0]!.estimatedCloseCostUsd).toBeCloseTo(0.2, 9);
+    expect(rows[0]!.unrealizedAfterEstimatedCloseCostUsd).toBeCloseTo(9.8, 9);
+  });
+
+  it("does not invent fee attribution when tracked lane quantities exceed the exchange position", () => {
+    const a = makeExecutorWithPositions([positionOf({ positionId: "a", qty: 3 })]);
+    const b = makeExecutorWithPositions([positionOf({ positionId: "b", qty: 3 })], "SECOND_SHORT");
+    const rows = flattenSingleSymbolPositions([a, b], new Map([["BTCUSDT", {
+      direction: "SHORT" as const,
+      quantity: 4,
+      markPrice: 59000,
+      leverage: 3,
+      estimatedCloseCostUsd: 0.4,
+    }]]));
+    expect(rows.every((row) => row.estimatedCloseCostUsd === null && row.unrealizedAfterEstimatedCloseCostUsd === null)).toBe(true);
   });
 });
 
