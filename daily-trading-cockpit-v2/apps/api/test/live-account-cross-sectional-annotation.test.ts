@@ -245,6 +245,31 @@ describe("mergeCrossSectionalIntoLaneSeries — baskets appear on the lane-perfo
     expect(merged.lanes.find((l) => l.laneId === "CROSS_SECTIONAL_MARKET_NEUTRAL")).toBeUndefined();
   });
 
+  // 2026-08-05 (panic-flatten accounting gap fix): a basket closed out-of-band and reconciled with
+  // no real exit price is flagged accountingStatus="ACCOUNTING_INCOMPLETE" (see
+  // ExecutorBasket.accountingStatus's own doc comment) — its P&L is UNKNOWN, not zero, and must
+  // never enter the lane-performance timeline the way a real $0 close would.
+  //
+  // mergeCrossSectionalIntoLaneSeries reads baskets ONLY via executor.getClosedBaskets(), which
+  // ALREADY excludes ACCOUNTING_INCOMPLETE baskets (see cross-sectional-executor.test.ts's own
+  // dedicated coverage) — so under normal conditions this function's OWN guard is fully masked by
+  // that upstream filter and can never independently fire. This test stubs getClosedBaskets() to
+  // simulate that upstream filter ever regressing, to prove this function's guard is real,
+  // deliberate defense-in-depth (per the design's own risk #1) and not dead code.
+  it("[ACCOUNTING-INCOMPLETE] excludes a basket flagged ACCOUNTING_INCOMPLETE via its OWN guard, even if getClosedBaskets() ever regressed and returned one", () => {
+    const flagged = { ...closedBasket("xb-flagged", "2026-07-07T10:20:00.000Z", 1000, "RNDRUSDT"), accountingStatus: "ACCOUNTING_INCOMPLETE" as const };
+    const normal = closedBasket("xb-normal", "2026-07-07T10:30:00.000Z", 1.5);
+    const executor = makeExecutorWithBaskets([flagged, normal]);
+    executor.getClosedBaskets = () => [flagged, normal]; // simulate the upstream filter regressing
+    const merged = mergeCrossSectionalIntoLaneSeries(seriesReport(["2026-07-07T10:00:00.000Z"]), executor) as {
+      lanes: Array<{ laneId: string; realizedPnlUsd: number; closedCount: number; symbols: string[] }>;
+    };
+    const lane = merged.lanes.find((l) => l.laneId === "CROSS_SECTIONAL_MARKET_NEUTRAL")!;
+    expect(lane.closedCount).toBe(1); // NOT 2 — the flagged basket's $1000 must never leak in
+    expect(lane.realizedPnlUsd).toBeCloseTo(1.5, 9);
+    expect(lane.symbols).toEqual(["SOLUSDT"]); // NOT RNDRUSDT
+  });
+
   it("is a no-op with no closed baskets in the window / no executor", () => {
     const executor = makeExecutorWithBaskets([]);
     const report = seriesReport(["2026-07-07T10:00:00.000Z"]);

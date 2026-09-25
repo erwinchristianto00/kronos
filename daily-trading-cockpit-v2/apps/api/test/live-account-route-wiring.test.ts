@@ -3,8 +3,11 @@ import Fastify, { type FastifyInstance } from "fastify";
 
 import { registerLiveRoutes } from "../src/routes/live.js";
 import type { LiveExecutionEngine } from "../src/lib/live-execution-engine.js";
+import { BinanceFuturesPrivateError } from "../src/lib/binance-futures-private.js";
 import type { CrossSectionalExecutor, ExecutorBasket } from "../src/lib/cross-sectional-executor.js";
+import type { DailyRangeAcceptanceLane, DailyRangeOpenPositionClaim } from "../src/lib/daily-4h-range-acceptance-lane.js";
 import type { SingleSymbolLaneExecutor, SingleSymbolPosition } from "../src/lib/single-symbol-lane-executor.js";
+import type { SymbolReliabilitySnapshot } from "../src/lib/cross-sectional-symbol-reliability.js";
 
 /**
  * 2026-07-09 audit finding: routes/live.ts's registerLiveRoutes() builds allCrossSectionalExecutors()/
@@ -23,6 +26,9 @@ function fakeAccountSnapshot(): Awaited<ReturnType<LiveExecutionEngine["getAccou
     accountEquity: 1000,
     openPositionCount: 2,
     openOrderCount: 0,
+    openAlgoOrdersObserved: false,
+    openOrderCountCoverage: "EXCHANGE_OPEN_ORDERS",
+    dailyRangeReconciledProtectiveOrderCount: null,
     positions: [
       {
         symbol: "AUSDT", direction: "LONG", quantity: 10, entryPrice: 1, markPrice: 1,
@@ -30,7 +36,10 @@ function fakeAccountSnapshot(): Awaited<ReturnType<LiveExecutionEngine["getAccou
         estimatedCloseCostUsd: 0, unrealizedAfterEstimatedCloseCostUsd: 0, leverage: 3,
         sourceOrderCount: 0, laneIds: [] as string[], intentDirection: null, intentQty: null,
         intentEntryPrice: null, intentUnrealizedPnl: null, basketQty: null, basketUnrealizedPnl: null,
-        singleSymbolStopPrice: null,
+        singleSymbolStopPrice: null, dailyRangeTradeId: null, dailyRangeQty: null,
+        dailyRangeEntryPrice: null, dailyRangeUnrealizedPnl: null, dailyRangeStopPrice: null,
+        dailyRangeTakeProfitPrice: null, dailyRangeOpenedAt: null, dailyRangeStatus: null,
+        dailyRangeLastReconcileError: null,
       },
       {
         symbol: "BUSDT", direction: "SHORT", quantity: 5, entryPrice: 1, markPrice: 1,
@@ -38,7 +47,10 @@ function fakeAccountSnapshot(): Awaited<ReturnType<LiveExecutionEngine["getAccou
         estimatedCloseCostUsd: 0, unrealizedAfterEstimatedCloseCostUsd: 0, leverage: 3,
         sourceOrderCount: 0, laneIds: [] as string[], intentDirection: null, intentQty: null,
         intentEntryPrice: null, intentUnrealizedPnl: null, basketQty: null, basketUnrealizedPnl: null,
-        singleSymbolStopPrice: null,
+        singleSymbolStopPrice: null, dailyRangeTradeId: null, dailyRangeQty: null,
+        dailyRangeEntryPrice: null, dailyRangeUnrealizedPnl: null, dailyRangeStopPrice: null,
+        dailyRangeTakeProfitPrice: null, dailyRangeOpenedAt: null, dailyRangeStatus: null,
+        dailyRangeLastReconcileError: null,
       },
     ],
     lanes: [],
@@ -66,6 +78,7 @@ function fakeXsecExecutor(laneId: string, symbol: string): CrossSectionalExecuto
   };
   return {
     getStatus: () => ({ laneId, openBaskets: [basket] }),
+    getRegimeSkewCounterfactual: () => null,
     getClosedSummary: () => ({ closedCount: 0, wins: 0, losses: 0, realizedPnlUsd: 0, feesUsd: 0, symbols: [], lastClosedAt: null }),
     getClosedBaskets: () => [],
   } as unknown as CrossSectionalExecutor;
@@ -84,6 +97,34 @@ function fakeSingleSymbolExecutor(laneId: string, symbol: string): SingleSymbolL
     getClosedSummary: () => ({ closedCount: 0, wins: 0, losses: 0, realizedPnlUsd: 0, feesUsd: 0, symbols: [], lastClosedAt: null }),
     getClosedPositions: () => [],
   } as unknown as SingleSymbolLaneExecutor;
+}
+
+function fakeDailyRangeLane(
+  claims: DailyRangeOpenPositionClaim[],
+  reconciledProtectiveOrderCount: number | null = 0,
+): DailyRangeAcceptanceLane {
+  return {
+    getOpenPositionClaims: () => claims,
+    getReconciledOpenProtectiveOrderCount: () => reconciledProtectiveOrderCount,
+  } as unknown as DailyRangeAcceptanceLane;
+}
+
+function fakeDailyRangeAccountSnapshot(): Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>> {
+  const snapshot = fakeAccountSnapshot();
+  snapshot.openPositionCount = 2;
+  snapshot.positions = [
+    {
+      ...snapshot.positions[0]!,
+      symbol: "OPUSDT", direction: "SHORT", quantity: 242.2,
+      entryPrice: 0.1032, markPrice: 0.103, unrealizedPnl: 0.04844,
+    },
+    {
+      ...snapshot.positions[1]!,
+      symbol: "ADAUSDT", direction: "SHORT", quantity: 116,
+      entryPrice: 0.2154, markPrice: 0.21194, unrealizedPnl: 0.40136,
+    },
+  ];
+  return snapshot;
 }
 
 let app: FastifyInstance | null = null;
@@ -109,6 +150,16 @@ async function buildApp(): Promise<FastifyInstance> {
   return app;
 }
 
+async function buildSnapshotApp(
+  engine: LiveExecutionEngine,
+  dashboardAccountSnapshot?: { nowMs?: () => number; cacheTtlMs?: number; rateLimitBackoffMs?: number; snapshotTimeoutMs?: number },
+): Promise<FastifyInstance> {
+  app = Fastify();
+  await registerLiveRoutes(app, engine, { dashboardAccountSnapshot });
+  await app.ready();
+  return app;
+}
+
 describe("registerLiveRoutes — /api/live/account wires ALL 5 executor instances, not just the first", () => {
   it("annotates the AUSDT position with all 3 cross-sectional laneIds (FILTERED + TREND + MIXED)", async () => {
     const a = await buildApp();
@@ -117,6 +168,12 @@ describe("registerLiveRoutes — /api/live/account wires ALL 5 executor instance
     const body = res.json();
     const row = body.positions.find((p: { symbol: string }) => p.symbol === "AUSDT");
     expect(row.laneIds.sort()).toEqual(["CROSS_SECTIONAL_MARKET_NEUTRAL", "CROSS_SECTIONAL_MIXED", "CROSS_SECTIONAL_TREND"]);
+
+    // The second response is served from the short dashboard cache. Attribution remains exactly
+    // once per executor; cache reuse must not retain /api/live/account's mutable annotations.
+    const again = await a.inject({ method: "GET", url: "/api/live/account" });
+    const againRow = again.json().positions.find((p: { symbol: string }) => p.symbol === "AUSDT");
+    expect(againRow.sourceOrderCount).toBe(row.sourceOrderCount);
   });
 
   it("annotates the BUSDT position with both single-symbol-executor laneIds (SHORT_FADE + INTRADAY_MOMENTUM)", async () => {
@@ -143,6 +200,370 @@ describe("registerLiveRoutes — /api/live/account wires ALL 5 executor instance
     expect(res.statusCode).toBe(200);
     const row = res.json().positions.find((p: { symbol: string }) => p.symbol === "AUSDT");
     expect(row.laneIds).toEqual(["CROSS_SECTIONAL_MARKET_NEUTRAL"]);
+  });
+
+  it("attributes only an exact, durable daily-range position claim and leaves a quantity mismatch visible as unclaimed", async () => {
+    const claims: DailyRangeOpenPositionClaim[] = [
+      {
+        laneId: "DAILY_4H_RANGE_ACCEPTANCE", tradeId: "drra-op", symbol: "OPUSDT", direction: "SHORT",
+        qty: 242.2, entryPrice: 0.1032, openedAt: "2026-08-25T16:45:49.991Z", status: "OPEN",
+        stopPrice: 0.1072, takeProfitPrice: 0.0952, lastReconcileError: null,
+      },
+      {
+        // Same symbol and side are insufficient. A partial/foreign net quantity
+        // must remain an alarm rather than being silently claimed by this lane.
+        laneId: "DAILY_4H_RANGE_ACCEPTANCE", tradeId: "drra-ada-mismatch", symbol: "ADAUSDT", direction: "SHORT",
+        qty: 115.9, entryPrice: 0.2154, openedAt: "2026-08-25T16:45:49.043Z", status: "OPEN",
+        stopPrice: 0.221, takeProfitPrice: 0.2042, lastReconcileError: null,
+      },
+    ];
+    const fakeEngine = {
+      getAccountSnapshot: async () => fakeDailyRangeAccountSnapshot(),
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+    } as unknown as LiveExecutionEngine;
+    app = Fastify();
+    await registerLiveRoutes(app, fakeEngine, { dailyRangeLane: () => fakeDailyRangeLane(claims, 2) });
+    await app.ready();
+
+    const response = await app.inject({ method: "GET", url: "/api/live/account" });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    const op = body.positions.find((row: { symbol: string }) => row.symbol === "OPUSDT");
+    const ada = body.positions.find((row: { symbol: string }) => row.symbol === "ADAUSDT");
+    expect(op).toMatchObject({
+      laneIds: ["DAILY_4H_RANGE_ACCEPTANCE"],
+      sourceOrderCount: 1,
+      dailyRangeTradeId: "drra-op",
+      dailyRangeQty: -242.2,
+      dailyRangeEntryPrice: 0.1032,
+      dailyRangeStopPrice: 0.1072,
+      dailyRangeTakeProfitPrice: 0.0952,
+    });
+    expect(op.dailyRangeUnrealizedPnl).toBeCloseTo(0.04844, 8);
+    expect(ada.laneIds).toEqual([]);
+    expect(ada.dailyRangeTradeId).toBeNull();
+    expect(body.lanes).toContainEqual(expect.objectContaining({
+      laneId: "DAILY_4H_RANGE_ACCEPTANCE", sourceOrderCount: 1, symbols: ["OPUSDT"],
+    }));
+    expect(body).toMatchObject({
+      openOrderCount: 2,
+      openOrderCountCoverage: "EXCHANGE_OPEN_ORDERS_PLUS_RECONCILED_DAILY_RANGE_BRACKETS",
+      dailyRangeReconciledProtectiveOrderCount: 2,
+    });
+  });
+
+  it("does not double count reconciled Daily Range brackets after a full exchange algo snapshot", async () => {
+    const claims: DailyRangeOpenPositionClaim[] = [{
+      laneId: "DAILY_4H_RANGE_ACCEPTANCE", tradeId: "drra-op", symbol: "OPUSDT", direction: "SHORT",
+      qty: 242.2, entryPrice: 0.1032, openedAt: "2026-08-25T16:45:49.991Z", status: "OPEN",
+      stopPrice: 0.1072, takeProfitPrice: 0.0952, lastReconcileError: null,
+    }];
+    const snapshot = fakeDailyRangeAccountSnapshot();
+    snapshot.openOrderCount = 4;
+    snapshot.openAlgoOrdersObserved = true;
+    snapshot.openOrderCountCoverage = "EXCHANGE_OPEN_AND_ALGO_ORDERS";
+    const fakeEngine = {
+      getAccountSnapshot: async () => snapshot,
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+    } as unknown as LiveExecutionEngine;
+    app = Fastify();
+    await registerLiveRoutes(app, fakeEngine, { dailyRangeLane: () => fakeDailyRangeLane(claims, 2) });
+    await app.ready();
+
+    const response = await app.inject({ method: "GET", url: "/api/live/account" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      openOrderCount: 4,
+      openOrderCountCoverage: "EXCHANGE_OPEN_AND_ALGO_ORDERS",
+      dailyRangeReconciledProtectiveOrderCount: 2,
+    });
+  });
+});
+
+describe("registerLiveRoutes — Symbol Reliability V1 runtime contract", () => {
+  it("returns the API-owned snapshot beside the executor status rather than requiring dashboard inference", async () => {
+    const snapshot: SymbolReliabilitySnapshot = {
+      version: "SYMBOL_RELIABILITY_V1",
+      enabled: true,
+      persistence: { status: "HEALTHY", source: "PRIMARY", reason: null, recoveredAt: null },
+      evidenceContract: "ACTUAL_NO_TP_HOLD_36H_INDEPENDENT_EPISODES_V1",
+      evaluatedAt: "2026-08-21T00:00:00.000Z",
+      evaluationId: "sr-v1-route-test",
+      evaluationCycle: 1,
+      evidenceChanged: false,
+      independentEpisodes: 0,
+      eligibleBaskets: 0,
+      excludedBaskets: {},
+      minimumIndependentEpisodes: 8,
+      statuses: [],
+      quarantined: [],
+      lastFormationDecision: null,
+    };
+    const fakeEngine = {
+      getAccountSnapshot: async () => fakeAccountSnapshot(),
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+    } as unknown as LiveExecutionEngine;
+    app = Fastify();
+    await registerLiveRoutes(app, fakeEngine, {
+      crossSectionalExecutor: () => fakeXsecExecutor("CROSS_SECTIONAL_MARKET_NEUTRAL", "AUSDT"),
+      symbolReliabilitySnapshotGetter: () => snapshot,
+    });
+    await app.ready();
+
+    const response = await app.inject({ method: "GET", url: "/api/live/cross-sectional-executor" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().symbolReliability).toEqual(snapshot);
+  });
+
+  it("surfaces the runtime-owned hourly formation scheduler without letting the route control it", async () => {
+    const fakeEngine = {
+      getAccountSnapshot: async () => fakeAccountSnapshot(),
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+    } as unknown as LiveExecutionEngine;
+    app = Fastify();
+    await registerLiveRoutes(app, fakeEngine, {
+      crossSectionalExecutor: () => fakeXsecExecutor("CROSS_SECTIONAL_MARKET_NEUTRAL", "AUSDT"),
+      crossSectionalFormationScheduler: () => ({
+        enabled: true,
+        interval: "1h",
+        postCloseGraceMs: 20_000,
+        retryIntervalMs: 60_000,
+        featureMaxAgeMs: 300_000,
+        latestAttemptStartOffsetMs: 240_000,
+        startedAt: "2026-09-01T00:00:00.000Z",
+        nextDueAt: "2026-09-01T01:00:20.000Z",
+        inFlight: false,
+        activeFeatureCutoffAt: null,
+        attemptsForActiveFeature: 0,
+        lastAttemptAt: null,
+        lastCompletedAt: null,
+        lastFeatureCutoffAt: null,
+        lastOutcome: "WAITING_FOR_CLOSE" as const,
+        lastError: null,
+        lastExecutorHandoffAt: null,
+        lastExecutorHandoffError: null,
+      }),
+    });
+    await app.ready();
+
+    const response = await app.inject({ method: "GET", url: "/api/live/cross-sectional-executor" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().formationScheduler).toMatchObject({
+      enabled: true,
+      interval: "1h",
+      nextDueAt: "2026-09-01T01:00:20.000Z",
+      lastOutcome: "WAITING_FOR_CLOSE",
+    });
+  });
+});
+
+describe("registerLiveRoutes — continuation lifecycle observability", () => {
+  it("serves lifecycle status without requiring a trading engine or mutating an executor", async () => {
+    app = Fastify();
+    await registerLiveRoutes(app, null);
+    await app.ready();
+
+    const response = await app.inject({ method: "GET", url: "/api/live/cross-sectional/continuation-lifecycle/status" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      configured: false,
+      mode: "AUTO_PROMOTION_STRICT_GATE",
+      pendingCommands: [],
+      runtimeArtifact: { source: "BOOTSTRAP_PINNED" },
+    });
+  });
+});
+
+describe("registerLiveRoutes — dashboard account snapshot pressure guard", () => {
+  it("coalesces concurrent dashboard routes onto one USD-M account read", async () => {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const engine = {
+      getAccountSnapshot: async () => {
+        calls += 1;
+        await gate;
+        return fakeAccountSnapshot();
+      },
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+      laneSelectionWeightPctForLane: () => 0,
+    } as unknown as LiveExecutionEngine;
+    const a = await buildSnapshotApp(engine);
+
+    const account = a.inject({ method: "GET", url: "/api/live/account" });
+    const positions = a.inject({ method: "GET", url: "/api/live/single-symbol/positions" });
+    const evaluation = a.inject({ method: "GET", url: "/api/live/lane-evaluation" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toBe(1);
+
+    release();
+    const [accountResponse, positionsResponse, evaluationResponse] = await Promise.all([account, positions, evaluation]);
+    expect(accountResponse.statusCode).toBe(200);
+    expect(positionsResponse.statusCode).toBe(200);
+    expect(evaluationResponse.statusCode).toBe(200);
+    expect(calls).toBe(1);
+  });
+
+  it("returns an explicitly stale last-good snapshot during a 418 cooldown without another exchange read", async () => {
+    let nowMs = 1_000;
+    let calls = 0;
+    const engine = {
+      getAccountSnapshot: async () => {
+        calls += 1;
+        if (calls === 1) return fakeAccountSnapshot();
+        throw new BinanceFuturesPrivateError("429", "rate limited (HTTP 418)", { httpStatus: 418 });
+      },
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+      laneSelectionWeightPctForLane: () => 0,
+    } as unknown as LiveExecutionEngine;
+    const a = await buildSnapshotApp(engine, {
+      nowMs: () => nowMs,
+      cacheTtlMs: 10,
+      rateLimitBackoffMs: 1_000,
+    });
+
+    const first = await a.inject({ method: "GET", url: "/api/live/account" });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().accountSnapshot).toMatchObject({ source: "USD_M_PRIVATE_ACCOUNT", stale: false });
+
+    nowMs += 11;
+    const stale = await a.inject({ method: "GET", url: "/api/live/account" });
+    expect(stale.statusCode).toBe(200);
+    expect(stale.json().accountSnapshot).toMatchObject({
+      source: "LAST_GOOD_USD_M_PRIVATE_CACHE",
+      stale: true,
+      lastFailure: "rate limited (HTTP 418)",
+    });
+    expect(calls).toBe(2);
+
+    nowMs += 1;
+    const positions = await a.inject({ method: "GET", url: "/api/live/single-symbol/positions" });
+    expect(positions.statusCode).toBe(200);
+    expect(calls).toBe(2);
+  });
+
+  it("fails closed on the first 418, then enforces the cooldown without retrying Binance", async () => {
+    let calls = 0;
+    const engine = {
+      getAccountSnapshot: async () => {
+        calls += 1;
+        throw new BinanceFuturesPrivateError("429", "rate limited (HTTP 418)", { httpStatus: 418 });
+      },
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+      laneSelectionWeightPctForLane: () => 0,
+    } as unknown as LiveExecutionEngine;
+    const a = await buildSnapshotApp(engine, { rateLimitBackoffMs: 1_000 });
+
+    const first = await a.inject({ method: "GET", url: "/api/live/account" });
+    expect(first.statusCode).toBe(503);
+    expect(first.json()).toMatchObject({ ok: false, reason: "rate limited (HTTP 418)" });
+
+    const second = await a.inject({ method: "GET", url: "/api/live/lane-evaluation" });
+    expect(second.statusCode).toBe(503);
+    expect(calls).toBe(1);
+  });
+});
+
+describe("[operator close] /api/live/cross-sectional-close stays scoped to one market-neutral basket", () => {
+  const operatorDrainEngine = {
+    setNewEntriesPaused: () => ({ enabled: true, effective: true, pausedAt: "2026-07-08T00:00:00.000Z", reason: "test" }),
+    getStatus: () => ({
+      newEntries: { allowed: true, persistedDrain: false },
+    }),
+  } as unknown as LiveExecutionEngine;
+
+  const basket = (basketId: string): ExecutorBasket => ({
+    basketId, sourceObservationId: "o1", signal: "MOM24", variant: "FILTERED",
+    openedAt: "2026-07-08T00:00:00.000Z", closesAtMs: 0,
+    legs: [{ symbol: "AUSDT", side: "LONG", qty: 5, entryPrice: 1, entryOrderId: 1, entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null }],
+    status: "COMPLETE", closedAt: null, closeReason: null, grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
+  });
+
+  it("uses only the market-neutral executor, and only when its exact target is the sole open basket", async () => {
+    const previousEnv = process.env.LIVE_BINANCE_ENV;
+    process.env.LIVE_BINANCE_ENV = "testnet";
+    try {
+      const target = basket("only-core-basket");
+      let targetOpen = true;
+      let closeCalls = 0;
+      let closeReason = "";
+      let directionalGetterCalls = 0;
+      const coreExecutor = {
+        getStatus: () => ({
+          laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL",
+          openBaskets: targetOpen ? [target] : [],
+          orphanedLegs: [],
+        }),
+        closeBasketOrderly: async (_basketId: string, reason: string) => {
+          closeCalls += 1;
+          closeReason = reason;
+          targetOpen = false;
+          return { basketId: target.basketId, outcome: "CLOSED", reason: null };
+        },
+      } as unknown as CrossSectionalExecutor;
+
+      app = Fastify();
+      await registerLiveRoutes(app, operatorDrainEngine, {
+        crossSectionalExecutor: () => coreExecutor,
+        crossSectionalDirectionalShortExecutor: () => {
+          directionalGetterCalls += 1;
+          return fakeSingleSymbolExecutor("CROSS_SECTIONAL_DIRECTIONAL_SHORT", "SUSDT");
+        },
+      });
+      await app.ready();
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/live/cross-sectional-close",
+        remoteAddress: "127.0.0.1",
+        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", basketId: target.basketId },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({ ok: true, basketId: target.basketId, openBasketIds: [] });
+      expect(closeCalls).toBe(1);
+      expect(closeReason).toBe(`OPERATOR_SCOPED_CLOSE:${target.basketId}`);
+      expect(directionalGetterCalls).toBe(0);
+    } finally {
+      if (previousEnv === undefined) delete process.env.LIVE_BINANCE_ENV;
+      else process.env.LIVE_BINANCE_ENV = previousEnv;
+    }
+  });
+
+  it("closes only the requested basket when more than one market-neutral basket is open", async () => {
+    const previousEnv = process.env.LIVE_BINANCE_ENV;
+    process.env.LIVE_BINANCE_ENV = "testnet";
+    try {
+      const target = basket("target-basket");
+      const other = basket("another-basket");
+      let openBaskets = [target, other];
+      let closeCalls = 0;
+      let closedBasketId = "";
+      const coreExecutor = {
+        getStatus: () => ({ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", openBaskets, orphanedLegs: [] }),
+        closeBasketOrderly: async (basketId: string) => {
+          closeCalls += 1;
+          closedBasketId = basketId;
+          openBaskets = openBaskets.filter((basket) => basket.basketId !== basketId);
+          return { basketId, outcome: "CLOSED", reason: null };
+        },
+      } as unknown as CrossSectionalExecutor;
+
+      app = Fastify();
+      await registerLiveRoutes(app, operatorDrainEngine, { crossSectionalExecutor: () => coreExecutor });
+      await app.ready();
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/live/cross-sectional-close",
+        remoteAddress: "127.0.0.1",
+        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", basketId: target.basketId },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({ ok: true, basketId: target.basketId, openBasketIds: ["another-basket"] });
+      expect(closeCalls).toBe(1);
+      expect(closedBasketId).toBe(target.basketId);
+    } finally {
+      if (previousEnv === undefined) delete process.env.LIVE_BINANCE_ENV;
+      else process.env.LIVE_BINANCE_ENV = previousEnv;
+    }
   });
 });
 
@@ -235,6 +656,63 @@ describe("[2026-07-22] /api/live/cortex-promoted-weights — direct visibility i
       ok: true,
       active: true,
       weights: { CG_MFE_GIVEBACK_SHORT: 23.71776, INTRADAY_MOMENTUM_BREAKOUT_LONG: 7.808 },
+    });
+  });
+});
+
+describe("registerLiveRoutes — dashboard account snapshot never hangs the route", () => {
+  it("answers within the bound when the account read never settles, then serves its late result", async () => {
+    // 2026-09-18: one refresh stayed pending for three days and every /api/live/account request
+    // coalesced onto it, so the Exchange P&L panel sat on "Loading…" indefinitely.
+    let calls = 0;
+    let settle!: (value: ReturnType<typeof fakeAccountSnapshot>) => void;
+    const engine = {
+      getAccountSnapshot: () => {
+        calls += 1;
+        return new Promise((resolve) => { settle = resolve; });
+      },
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+      laneSelectionWeightPctForLane: () => 0,
+    } as unknown as LiveExecutionEngine;
+    const a = await buildSnapshotApp(engine, { snapshotTimeoutMs: 30 });
+
+    const first = await a.inject({ method: "GET", url: "/api/live/account" });
+    expect(first.statusCode).toBe(502);
+    expect(first.json().reason).toMatch(/did not complete within 30ms/);
+
+    // A second request re-joins the outstanding read instead of stacking another exchange read.
+    const second = await a.inject({ method: "GET", url: "/api/live/account" });
+    expect(second.statusCode).toBe(502);
+    expect(calls).toBe(1);
+
+    settle(fakeAccountSnapshot());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const third = await a.inject({ method: "GET", url: "/api/live/account" });
+    expect(third.statusCode).toBe(200);
+    expect(calls).toBe(1);
+  });
+
+  it("falls back to the explicitly stale last-good snapshot when a refresh overruns the bound", async () => {
+    let nowMs = 1_000;
+    let calls = 0;
+    const engine = {
+      getAccountSnapshot: () => {
+        calls += 1;
+        return calls === 1 ? Promise.resolve(fakeAccountSnapshot()) : new Promise(() => {});
+      },
+      getLanePerformanceSeries: () => fakeLaneSeries(),
+      laneSelectionWeightPctForLane: () => 0,
+    } as unknown as LiveExecutionEngine;
+    const a = await buildSnapshotApp(engine, { nowMs: () => nowMs, cacheTtlMs: 10, snapshotTimeoutMs: 30 });
+
+    expect((await a.inject({ method: "GET", url: "/api/live/account" })).statusCode).toBe(200);
+    nowMs += 11;
+    const stale = await a.inject({ method: "GET", url: "/api/live/account" });
+    expect(stale.statusCode).toBe(200);
+    expect(stale.json().accountSnapshot).toMatchObject({
+      source: "LAST_GOOD_USD_M_PRIVATE_CACHE",
+      stale: true,
+      lastFailure: "account snapshot did not complete within 30ms",
     });
   });
 });

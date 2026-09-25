@@ -19,6 +19,9 @@ import { buildPostCutoverReport } from "../src/lib/frozen-current-guard-post-cut
 import {
   buildCurrentGuardVariantMatrixReport,
   CurrentGuardVariantMatrixStore,
+  type CurrentGuardVariantMatrixReport,
+  type ExactLaneContext,
+  type VariantContextEvidenceRow,
 } from "../src/lib/current-guard-variant-matrix.js";
 import { buildRegimeDirectionControllerReport } from "../src/lib/regime-direction-controller.js";
 
@@ -600,5 +603,251 @@ describe("adaptive-lane-router", () => {
     expect(directionCompatibleWithMode("LONG", "SHORT_ONLY")).toBe(false);
     expect(directionCompatibleWithMode("SHORT", "LONG_ONLY")).toBe(false);
     expect(directionCompatibleWithMode("LONG", "BOTH_ALLOWED")).toBe(true);
+  });
+});
+
+// ── maturityCeiling ────────────────────────────────────────────────────────────
+//
+// TWO LADDERS, ONE VOCABULARY. `classifyLaneMaturity` runs the router's own COARSE ladder: raw
+// `freshValid` against WATCHABLE_MIN_FRESH / STABLE_MIN_FRESH / PROMOTION_MIN_FRESH plus the
+// economics gates. The variant matrix runs the AUTHORITATIVE one: immutable, episode-aligned stage
+// proof windows with independent-episode floors and a holdout. They emit the same five status
+// names, so without a cap the router can print `maturity=STABLE_CANDIDATE` for a lane the
+// authoritative ladder has not granted — an operator-visible falsehood in the brief and in
+// `currentPermission`. `CandidateLane.maturityCeiling` is that cap.
+//
+// WHY THIS BLOCK EXISTS. The mechanism shipped with ZERO tests: `grep -rn maturityCeiling
+// apps/api/test` returned nothing, and deleting the cap from `classifyLaneMaturity` left the entire
+// suite green and byte-identical. It is live-adjacent — `classifyLaneMaturity` drives rejection, the
+// mature-lane pick (maturityRank >= 2) and the PAPER_ELIGIBLE gate (>= 3), and this module is
+// imported by paper-execution-router.ts and paper-opportunity-allocator.ts.
+//
+// Every case below goes through the real exported `classifyLaneMaturity`, or through the real
+// `lanesFromVariantMatrix` wiring via `buildAdaptiveLaneRouterReport`. Nothing here re-implements
+// the ladder or the cap.
+describe("maturityCeiling — the authoritative ladder caps the router's raw-row ladder", () => {
+  /** freshValid=220 with every economics gate passing: PROMOTION_CANDIDATE when infraReady. */
+  const promotionGrade = () =>
+    makeLane({
+      laneId: "MC_PROMOTION_GRADE",
+      freshValid: 220,
+      netAvgR: 0.3,
+      pf: 2.5,
+      payoffRatio: 1.5,
+      oosAllPositive: true,
+      plus10bpsPositive: true,
+      maxDrawdownR: 1,
+      topSymbolShare: 0.2,
+      status: "STABLE_CANDIDATE",
+    });
+
+  it("[MC-PASSTHROUGH] with no ceiling every rung of the router's own ladder is returned unchanged", () => {
+    // Absent AND explicitly-undefined both have to pass through: the guard is `ceiling === undefined`.
+    const rungs: Array<[string, CandidateLane, boolean, string]> = [
+      ["INSUFFICIENT", makeLane({ freshValid: 0 }), false, "INSUFFICIENT"],
+      ["COLLECTING", makeLane({ freshValid: 10 }), false, "COLLECTING"],
+      // fv in [WATCHABLE_MIN_FRESH, STABLE_MIN_FRESH): economics pass, stable floor not reached.
+      ["WATCHABLE", makeLane({ freshValid: 60 }), false, "WATCHABLE"],
+      ["STABLE_CANDIDATE", promotionGrade(), false, "STABLE_CANDIDATE"],
+      ["PROMOTION_CANDIDATE", promotionGrade(), true, "PROMOTION_CANDIDATE"],
+      ["REJECT", makeLane({ freshValid: 120, netAvgR: -0.2, pf: 0.7 }), false, "REJECT"],
+    ];
+    for (const [name, lane, infraReady, expected] of rungs) {
+      expect(`${name}:${classifyLaneMaturity(lane, infraReady)}`).toBe(`${name}:${expected}`);
+      expect(`${name}:${classifyLaneMaturity({ ...lane, maturityCeiling: undefined }, infraReady)}`).toBe(
+        `${name}:${expected}`,
+      );
+    }
+  });
+
+  it("[MC-CAP-EXACT] a promotion-grade lane lands exactly on its ceiling, never one rung above it", () => {
+    // infraReady=true so the UNCAPPED verdict is PROMOTION_CANDIDATE for every row below — each
+    // assertion is then purely about where the ceiling puts it.
+    const ceilings = ["INSUFFICIENT", "COLLECTING", "WATCHABLE", "STABLE_CANDIDATE", "PROMOTION_CANDIDATE"] as const;
+    for (const ceiling of ceilings) {
+      const lane = { ...promotionGrade(), maturityCeiling: ceiling };
+      // Encoding the input in the assertion makes a failure name the offending ceiling directly.
+      expect(`${ceiling}=>${classifyLaneMaturity(lane, true)}`).toBe(`${ceiling}=>${ceiling}`);
+    }
+    // The top ceiling is the control: it must NOT downgrade anything (cap, not clamp-to-lower).
+    expect(classifyLaneMaturity({ ...promotionGrade(), maturityCeiling: "PROMOTION_CANDIDATE" }, true)).toBe(
+      "PROMOTION_CANDIDATE",
+    );
+    // INSUFFICIENT is reachable through the FIELD's type but is not produced by
+    // maturityCeilingForContextStatus today; it is pinned so a future mapping cannot land on it
+    // silently with undefined behaviour.
+  });
+
+  it("[MC-CEILING-REJECT] a REJECT ceiling rejects a lane the router itself would promote", () => {
+    expect(classifyLaneMaturity({ ...promotionGrade(), maturityCeiling: "REJECT" }, true)).toBe("REJECT");
+    expect(classifyLaneMaturity({ ...promotionGrade(), maturityCeiling: "REJECT" }, false)).toBe("REJECT");
+  });
+
+  it("[MC-REJECT-ABSORBING] REJECT survives capping in BOTH directions", () => {
+    // Router says REJECT, matrix says promotable → REJECT. The cap must never launder a rejection.
+    const routerReject = makeLane({
+      laneId: "MC_ROUTER_REJECT",
+      freshValid: 220,
+      netAvgR: -0.4,
+      pf: 0.5,
+      maturityCeiling: "PROMOTION_CANDIDATE",
+    });
+    expect(classifyLaneMaturity(routerReject, true)).toBe("REJECT");
+    // Same, via the status string branch rather than the economics branch.
+    const statusReject = { ...promotionGrade(), status: "REJECT", maturityCeiling: "PROMOTION_CANDIDATE" as const };
+    expect(classifyLaneMaturity(statusReject, true)).toBe("REJECT");
+    // A legacy-negative lane cannot be rescued by a ceiling either.
+    const legacy = { ...promotionGrade(), isLegacyNegative: true, maturityCeiling: "PROMOTION_CANDIDATE" as const };
+    expect(classifyLaneMaturity(legacy, true)).toBe("REJECT");
+    // Matrix says REJECT, router says promotable → REJECT (the other direction).
+    expect(classifyLaneMaturity({ ...promotionGrade(), maturityCeiling: "REJECT" }, true)).toBe("REJECT");
+  });
+
+  it("[MC-NEVER-UPGRADES] the ceiling only ever downgrades — a weak lane is never lifted to it", () => {
+    const promotionCeiling = { maturityCeiling: "PROMOTION_CANDIDATE" } as const;
+    expect(classifyLaneMaturity({ ...makeLane({ freshValid: 0 }), ...promotionCeiling }, true)).toBe("INSUFFICIENT");
+    expect(classifyLaneMaturity({ ...makeLane({ freshValid: 10 }), ...promotionCeiling }, true)).toBe("COLLECTING");
+    expect(classifyLaneMaturity({ ...makeLane({ freshValid: 60 }), ...promotionCeiling }, true)).toBe("WATCHABLE");
+    // infraReady=false keeps the router at STABLE_CANDIDATE; a PROMOTION ceiling must not fill that gap.
+    expect(classifyLaneMaturity({ ...promotionGrade(), ...promotionCeiling }, false)).toBe("STABLE_CANDIDATE");
+    // A WATCHABLE lane under a STABLE ceiling stays WATCHABLE.
+    expect(classifyLaneMaturity({ ...makeLane({ freshValid: 60 }), maturityCeiling: "STABLE_CANDIDATE" }, true)).toBe(
+      "WATCHABLE",
+    );
+  });
+
+  // ── the real lanesFromVariantMatrix wiring ───────────────────────────────────
+  //
+  // These build a REAL report (`buildCurrentGuardVariantMatrixReport` over an empty store) and
+  // replace ONE exact-context evidence row, then push it through the real
+  // `buildAdaptiveLaneRouterReport`. The candidate's `maturityCeiling` is not on `RankedCandidate`,
+  // so the ceiling is observed the only way an operator ever sees it: through the published
+  // `maturity`.
+  function vmWithContextRow(
+    variantId: string,
+    context: ExactLaneContext,
+    patch: Partial<VariantContextEvidenceRow> & { status: VariantContextEvidenceRow["status"] },
+  ): CurrentGuardVariantMatrixReport {
+    const vm = emptyVm();
+    const rows = vm.rows.map((row) => {
+      if (row.variantId !== variantId) return row;
+      const existing = row.contextRows?.[context];
+      if (!existing) throw new Error(`fixture error: ${variantId} has no ${context} context row`);
+      return { ...row, contextRows: { ...row.contextRows, [context]: { ...existing, ...patch } } };
+    });
+    return { ...vm, rows };
+  }
+
+  /** Evidence that makes the router's OWN ladder say STABLE_CANDIDATE (fv >= STABLE_MIN_FRESH=100,
+   *  every economics gate passing). Whatever comes back is then the ceiling's doing, not the data's. */
+  const stableGradeEvidence = {
+    freshValid: 220,
+    effectiveN: 40,
+    netAvgR: 0.3,
+    pf: 2.5,
+    wr: 0.6,
+    payoffRatio: 1.5,
+    allThreeOosPositive: true,
+    plus10bpsStillPositive: true,
+    approxMaxDrawdownR: 1,
+    topSymbolPnlShare: 0.2,
+    blockers: [],
+  } as const;
+
+  function maturityOfCandidate(report: ReturnType<typeof buildAdaptiveLaneRouterReport>, laneId: string) {
+    const all = [
+      ...report.rankedCandidates,
+      ...report.experimentalUpsideCandidates,
+      ...report.collectingWatchlist,
+      ...report.rejectedOrDeprioritizedLanes,
+    ];
+    const found = all.find((candidate) => candidate.laneId === laneId);
+    if (!found) throw new Error(`candidate ${laneId} not present in any bucket`);
+    return found.maturity;
+  }
+
+  it("[MC-WIRING] a matrix-sourced candidate is capped at its own exact-context evidence status", () => {
+    const laneId = "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE:SHORT_BEARISH";
+    // Each row: the matrix's authoritative verdict → the maturity the router is allowed to print.
+    // The evidence numbers are identical in all three; only `status` moves.
+    const cases = [
+      ["COLLECTING", "COLLECTING"],
+      ["WATCHABLE", "WATCHABLE"],
+      // Ceiling equal to the router's own verdict: must not downgrade.
+      ["STABLE_CANDIDATE", "STABLE_CANDIDATE"],
+      // PROMOTION ceiling above the router's verdict (infraReady=false): must not upgrade.
+      ["PROMOTION_CANDIDATE", "STABLE_CANDIDATE"],
+    ] as const;
+    for (const [status, expected] of cases) {
+      const report = buildAdaptiveLaneRouterReport({
+        ...routerInputs("Bearish pressure"),
+        variantMatrixReport: vmWithContextRow("CG_WIDE_STOP_TP_WIDE", "SHORT_BEARISH", {
+          ...stableGradeEvidence,
+          status,
+        }),
+      });
+      expect(`${status}=>${maturityOfCandidate(report, laneId)}`).toBe(`${status}=>${expected}`);
+    }
+    // NOT included above on purpose: status "REJECT". The router's own ladder already returns REJECT
+    // for it via the `status` string branch of classifyLaneMaturityUncapped, so that row would pass
+    // with the ceiling deleted and would prove nothing. [MC-CEILING-REJECT] covers the REJECT
+    // ceiling against a lane whose own status is not REJECT.
+  });
+
+  it("[MC-WIRING-NOT-APPLICABLE] a NOT_APPLICABLE evidence status caps at COLLECTING, not REJECT and not uncapped", () => {
+    // NOT_APPLICABLE is a value of ContextLaneStatus. `buildContextEvidenceRow` does not emit it
+    // today — it is produced by `laneStatusForContext` when a context is outside a lane's
+    // applicability map, and `lanesFromVariantMatrix` only walks `definition.applicableContexts` —
+    // so this branch is defensive. The test therefore hands the router a report carrying that
+    // status directly, which is exactly what a future producer would do. Pinning it matters in two
+    // directions: mapping it to REJECT would silently kill candidates the matrix never judged, and
+    // leaving it uncapped would let an out-of-scope context advertise STABLE_CANDIDATE.
+    const report = buildAdaptiveLaneRouterReport({
+      ...routerInputs("Bearish pressure"),
+      variantMatrixReport: vmWithContextRow("CG_WIDE_STOP_TP_WIDE", "SHORT_BEARISH", {
+        ...stableGradeEvidence,
+        status: "NOT_APPLICABLE",
+      }),
+    });
+    const maturity = maturityOfCandidate(report, "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE:SHORT_BEARISH");
+    expect(maturity).toBe("COLLECTING");
+    expect(maturity).not.toBe("REJECT");
+    expect(maturity).not.toBe("STABLE_CANDIDATE");
+  });
+
+  it("[MC-PAPER-NO-CEILING] paper-derived candidates carry NO ceiling, while their matrix-derived sibling in the same report still does", () => {
+    // LG_R12_STOP250_FULL is longOnly, so `lanesFromVariantMatrix` looks for paper evidence per
+    // context. LONG_BULLISH gets 120 closed paper orders (numbers come from the paper book, so the
+    // matrix status is not the authority and no ceiling applies). LONG_MIXED gets none, so it falls
+    // back to matrix evidence and IS capped. Same lane, same report, one ceiling each way — so a
+    // green LONG_BULLISH cannot be explained by "ceilings never fire in this fixture".
+    const laneBase = "CG_LONG_VARIANT_MATRIX:LG_R12_STOP250_FULL";
+    const base = Date.parse("2026-06-01T00:00:00.000Z");
+    // i%4 !== 3 wins +1.0, else loses -0.5 → net 0.625R, PF 6, payoff 2, drawdown 0.5R, all three
+    // OOS thirds positive, top-symbol share 0.2 across 5 symbols. 120 rows clears STABLE_MIN_FRESH
+    // (100) and stays under PROMOTION_MIN_FRESH (200).
+    const paperOrders = Array.from({ length: 120 }, (_, index) => ({
+      selectedLaneId: laneBase,
+      paperStatus: index % 4 === 3 ? "PAPER_CLOSED_LOSS" : "PAPER_CLOSED_WIN",
+      netR: index % 4 === 3 ? -0.5 : 1.0,
+      plannedStopDistanceBps: 200,
+      symbol: `MC${index % 5}USDT`,
+      direction: "LONG",
+      regime: "Bullish expansion",
+      updatedAt: new Date(base + index * 60_000).toISOString(),
+    }));
+    const report = buildAdaptiveLaneRouterReport({
+      ...routerInputs("Bullish expansion"),
+      // The matrix's own verdict for BOTH contexts is COLLECTING; only LONG_MIXED should feel it.
+      variantMatrixReport: vmWithContextRow("LG_R12_STOP250_FULL", "LONG_MIXED", {
+        ...stableGradeEvidence,
+        status: "COLLECTING",
+      }),
+      paperOrders: paperOrders as never,
+    });
+    // Paper-derived: reaches the router's own STABLE_CANDIDATE despite a COLLECTING matrix row.
+    expect(maturityOfCandidate(report, `${laneBase}:LONG_BULLISH`)).toBe("STABLE_CANDIDATE");
+    // Matrix-derived sibling with identical-strength numbers: capped at COLLECTING.
+    expect(maturityOfCandidate(report, `${laneBase}:LONG_MIXED`)).toBe("COLLECTING");
   });
 });

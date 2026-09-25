@@ -54,6 +54,11 @@ function resetStore(
 
   writeJsonAtomic(file, {
     observations: [],
+    // Written EXPLICITLY, not merely omitted, so this reset's blast radius is visible in the diff:
+    // it also destroys every frozen stage proof window (the immutable STABLE/PROMOTION
+    // development/holdout boundaries in current-guard-variant-matrix.ts). Those windows take weeks
+    // of episode accumulation to re-earn. The backup above is the only copy afterwards.
+    stageCuts: {},
     resolverMeta: {
       lastRunAt: now,
       resolvedCount: 0,

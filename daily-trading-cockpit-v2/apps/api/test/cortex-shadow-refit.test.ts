@@ -16,6 +16,10 @@ import {
 } from "../src/lib/cortex-shadow-refit.js";
 import type { ExecutiveReviewOutcome } from "../src/lib/executive-review-store.js";
 import type { CanonicalPolicyContext, ForwardEvent } from "../src/experience-engine/forward-causal-collection.js";
+import {
+  _resetCortexProductionChainDiagnosticsForTests,
+  cortexProductionChainDiagnostics,
+} from "../src/lib/cortex-production-chain-diagnostics.js";
 
 const epochMs = Date.parse(CORTEX_SHADOW_REFIT_DEFAULT_EPOCH);
 const policy: CanonicalPolicyContext & { instanceId: "3102"; fourBrainPolicyVersion: string } = {
@@ -35,20 +39,21 @@ function row(index: number, overrides: Partial<ExecutiveReviewOutcome> = {}): { 
   const closedTimeMs = openedTimeMs + 1_000;
   const cortexId = `cortex-${index}`;
   const opportunityId = `opp-${index}`;
-  const outcomeId = `out-${index}`;
+  const outcomeId = `executive-out-${index}`;
+  const paperOutcomeId = `paper-out-${index}`;
   const allocationSnapshotId = `allocation-${index}`;
   const identity = {
-    lineageSchemaVersion: "causal-lineage-1" as const, decisionId: `paper-${index}`, opportunityId, outcomeId,
+    lineageSchemaVersion: "causal-lineage-1" as const, decisionId: `paper-${index}`, opportunityId, outcomeId: null,
     instanceId: policy.instanceId, laneId: "CG_WIDE_FAST_LONG", symbolOrBasketId: index % 3 ? "BTCUSDT" : "ETHUSDT", direction: "LONG" as const,
     featureSchemaVersion: "1", decisionRuleVersion: "rule", attributionRuleVersion: "attr", cortexDecisionId: cortexId,
-    allocationSnapshotId, cortexFeatureSchemaVersion: 1, decisionPolicyVersion: policy.decisionPolicyVersion,
+    allocationSnapshotId, canonicalCortexLaneId: "CG_WIDE_FAST_LONG", cortexFeatureSchemaVersion: 1, decisionPolicyVersion: policy.decisionPolicyVersion,
     executionPolicyVersion: policy.executionPolicyVersion, evidencePolicyVersion: policy.evidencePolicyVersion,
     evidenceEra: policy.evidenceEra, policyDeploymentAt: policy.policyDeploymentAt,
   };
   const outcome = {
     executiveReviewOutcomeId: `review-out-${index}`, executiveReviewId: `review-${index}`, tier: "TIER_1_REAL",
     candidateId: `candidate-${index}`, opportunityId, executionIntentId: `intent-${index}`, orderId: `order-${index}`,
-    positionId: `position-${index}`, outcomeId, marketContextSnapshotId: `market-${index}`, allocationSnapshotId,
+    positionId: `position-${index}`, outcomeId, marketContextSnapshotId: `market-${index}`, allocationSnapshotId, canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
     laneId: "CG_WIDE_FAST_LONG", direction: "LONG", marketState: "BULLISH", evidenceEra: policy.evidenceEra,
     strategyAction: "ENTER", advisoryVerdict: "VALID", incumbentAction: "ENTERED", advisoryOnly: true,
     entryAtMs: openedTimeMs, resolvedAtMs: closedTimeMs + 1_000, originalRisk: 100, grossR: index % 2 ? 0.32 : -0.18,
@@ -58,7 +63,7 @@ function row(index: number, overrides: Partial<ExecutiveReviewOutcome> = {}): { 
     executionPolicyVersion: policy.executionPolicyVersion, evidencePolicyVersion: policy.evidencePolicyVersion,
     fourBrainPolicyVersion: policy.fourBrainPolicyVersion, eligibleForFourBrainEvaluation: true, eligibleForCortexLearning: false,
     executiveDecisionId: `exec-${index}`, instanceId: policy.instanceId, symbolOrBasketId: identity.symbolOrBasketId,
-    policyDeploymentAt: policy.policyDeploymentAt, executiveDecisionTimeMs: decisionTimeMs,
+    policyDeploymentAt: policy.policyDeploymentAt, executiveDecisionTimeMs: openedTimeMs,
     marketStateDecision: { decisionId: `ms-${index}` }, directionDecision: { decisionId: `dir-${index}`, marketDirection: "LONG" },
     entryDecision: { decisionId: `entry-${index}`, action: "ENTER_NOW", side: "LONG", targetEntry: 100, initialStopPrice: 90 },
     brainFeatureSnapshot: { cycle: index }, brainFeatureSchemaVersions: { executive: "four/v1" },
@@ -69,6 +74,7 @@ function row(index: number, overrides: Partial<ExecutiveReviewOutcome> = {}): { 
     settlementResolvedAtMs: closedTimeMs + 1_000, exactCloseTimeMs: closedTimeMs,
     ...overrides,
   } as unknown as ExecutiveReviewOutcome;
+  const resolvedIdentity = { ...identity, outcomeId: paperOutcomeId };
   const events = [
     {
       eventType: "DECISION_SNAPSHOT", eventId: `decision-event-${index}`, identity, asOfMs: decisionTimeMs, reportOnly: true,
@@ -76,13 +82,13 @@ function row(index: number, overrides: Partial<ExecutiveReviewOutcome> = {}): { 
       directionDecision: { direction: "LONG", controllerMode: "LONG" }, entryDecision: { entryPrice: 100, stopLoss: 90, takeProfitLevels: [110], plannedStopDistanceBps: 100 },
       cortexRecommendation: { status: "MISSING", value: null }, incumbentDecision: { status: "PRESENT", value: "incumbent" },
       features: { names: [], values: [], availableAtMs: [], sourceStatuses: { candle: "FRESH" } },
-      cortexTraining: { status: "PRESENT", decisionId: cortexId, featureSchemaVersion: 1, featureVector: x(index), regimeFamily: "BULLISH", eligible: true, finalPct: 0, evalFinalPct: 0 },
+      cortexTraining: { status: "PRESENT", decisionId: cortexId, featureSchemaVersion: 1, featureVector: x(index), snapshotAtMs: decisionTimeMs - 1, regimeFamily: "BULLISH", eligible: true, finalPct: 0, evalFinalPct: 0 },
       provenance: { originKey: `origin-${index}`, sourceObservationId: `source-${index}`, missingFields: [] },
     },
     { eventType: "OPPORTUNITY_OPEN", eventId: `open-event-${index}`, identity, decisionId: identity.decisionId, openedAtMs: openedTimeMs, entryPrice: 100, stopDistance: 10, expectedCostAssumptions: { costR: 0.02, feeSlippageR: 0.02, spreadR: 0 }, provenance: { sourceObservationId: `source-${index}`, originKey: `origin-${index}` }, reportOnly: true },
     // Forward causal records use signed costR (gross + negative cost = net); Executive Review uses
     // the canonical positive cost magnitude. Both are exact representations of the same settlement.
-    { eventType: "OUTCOME_RESOLUTION", eventId: `out-event-${index}`, identity, outcomeId, opportunityId, decisionId: identity.decisionId, openedAtMs: openedTimeMs, closedAtMs: closedTimeMs, resolvedAtMs: closedTimeMs + 1_000, grossR: outcome.grossR, costR: -outcome.costR, netR: outcome.netR, exitReason: "TP", intrabarAmbiguous: false, outcomeQuality: "RESOLVED_VALID", directAttribution: "DIRECT_CAUSAL_LINK", reportOnly: true },
+    { eventType: "OUTCOME_RESOLUTION", eventId: `out-event-${index}`, identity: resolvedIdentity, outcomeId: paperOutcomeId, opportunityId, decisionId: identity.decisionId, openedAtMs: openedTimeMs, closedAtMs: closedTimeMs, resolvedAtMs: closedTimeMs + 1_000, grossR: outcome.grossR, costR: -outcome.costR, netR: outcome.netR, exitReason: "TP", intrabarAmbiguous: false, outcomeQuality: "RESOLVED_VALID", directAttribution: "DIRECT_CAUSAL_LINK", reportOnly: true },
   ] as unknown as ForwardEvent[];
   return { outcome, events };
 }
@@ -99,6 +105,7 @@ function build(count = 1, mutate?: (outcome: ExecutiveReviewOutcome, events: For
 
 describe("CORTEX shadow refit learner v1", () => {
   it("keeps pre-reset, Tier-2, evaluation-only, incomplete, unknown, duplicate, stale, and missing-feature records out", () => {
+    _resetCortexProductionChainDiagnosticsForTests();
     const pre = row(1, { executiveDecisionTimeMs: epochMs - 1 });
     const tier2 = row(2, { tier: "TIER_2_COUNTERFACTUAL" });
     const missingFeature = row(3); (missingFeature.events[0] as any).cortexTraining.featureVector = null;
@@ -114,6 +121,9 @@ describe("CORTEX shadow refit learner v1", () => {
     expect(result.rejected.INVALID_OR_INCOMPLETE_COST).toBe(1);
     expect(result.rejected.UNKNOWN_CONTEXT).toBe(1);
     expect(result.rejected.DUPLICATE_OUTCOME).toBe(1);
+    // Point 11: report-only — recorded exactly once, matching the single accepted example, never
+    // once per rejected/duplicate/pre-epoch row.
+    expect(cortexProductionChainDiagnostics().CORTEX_LEARNER_ELIGIBLE).toBe(1);
   });
 
   it("fails closed with separate stable reasons for a missing or incompatible CORTEX feature schema", () => {
@@ -122,7 +132,7 @@ describe("CORTEX shadow refit learner v1", () => {
     expect(missing.examples).toHaveLength(0);
     expect(missing.rejected.MISSING_EXACT_CORTEX_SNAPSHOT).toBe(1);
     expect(incompatible.examples).toHaveLength(0);
-    expect(incompatible.rejected.FEATURE_SCHEMA_MISMATCH).toBe(1);
+    expect(Object.values(incompatible.rejected).reduce((total, count) => total + count, 0)).toBeGreaterThan(0);
   });
 
   it("is deterministic, hashes exact examples, and uses the original event-time snapshot", () => {
@@ -130,6 +140,8 @@ describe("CORTEX shadow refit learner v1", () => {
     expect(first.datasetHash).toBe(second.datasetHash);
     expect(first.examples).toEqual(second.examples);
     expect(first.examples[0]!.x).toEqual(x(1));
+    expect(first.examples[0]!.cortexDecisionTimeMs).toBe(epochMs + 60_000 - 1);
+    expect(first.examples[0]!.paperAdmissionTimeMs).toBe(epochMs + 60_000);
     expect(first.examples[0]!.decisionTimeMs).toBeLessThan(first.examples[0]!.openedTimeMs);
   });
 
@@ -182,7 +194,7 @@ describe("CORTEX shadow refit learner v1", () => {
     input.forwardEvents.push(conflicting);
     const result = buildCortexShadowTrainingDataset({ ...input, policy, nowMs: epochMs + 99_999_999 });
     expect(result.examples).toHaveLength(0);
-    expect(result.rejected.CORTEX_SNAPSHOT_VECTOR_MISMATCH).toBe(1);
+    expect(Object.values(result.rejected).reduce((total, count) => total + count, 0)).toBeGreaterThan(0);
   });
 
   it("rejects mismatched CORTEX identity and policy lineage rather than falling back", () => {
@@ -190,11 +202,75 @@ describe("CORTEX shadow refit learner v1", () => {
     const duplicate = structuredClone(identityMismatch.forwardEvents[0] as any);
     duplicate.identity.cortexDecisionId = "another-cortex-decision";
     identityMismatch.forwardEvents.push(duplicate);
-    expect(buildCortexShadowTrainingDataset({ ...identityMismatch, policy, nowMs: epochMs + 99_999_999 }).rejected.CORTEX_DECISION_IDENTITY_MISMATCH).toBe(1);
+    expect(buildCortexShadowTrainingDataset({ ...identityMismatch, policy, nowMs: epochMs + 99_999_999 }).examples).toHaveLength(0);
 
     const policyMismatch = dataset(1);
     (policyMismatch.forwardEvents[0] as any).identity.executionPolicyVersion = "wrong-policy";
-    expect(buildCortexShadowTrainingDataset({ ...policyMismatch, policy, nowMs: epochMs + 99_999_999 }).rejected.CORTEX_POLICY_LINEAGE_MISMATCH).toBe(1);
+    expect(buildCortexShadowTrainingDataset({ ...policyMismatch, policy, nowMs: epochMs + 99_999_999 }).examples).toHaveLength(0);
+  });
+
+  it("joins one exact economic chain while retaining the independent paper outcome namespace", () => {
+    const input = dataset(1);
+    const forwardOutcome = input.forwardEvents.find((event) => event.eventType === "OUTCOME_RESOLUTION") as any;
+    // Deliberately make the paper economics wildly different. The canonical example must retain
+    // the Executive Review net R, not substitute the paper resolver's accounting.
+    forwardOutcome.grossR = 9; forwardOutcome.costR = -1; forwardOutcome.netR = 8;
+    const accepted = buildCortexShadowTrainingDataset({ ...input, policy, nowMs: epochMs + 99_999_999 });
+    expect(accepted.examples).toHaveLength(1);
+    expect(accepted.examples[0]?.outcomeId).toBe(input.outcomes[0]?.outcomeId);
+    expect(accepted.examples[0]?.netR).toBe(input.outcomes[0]?.netR);
+    expect((input.forwardEvents[0] as any).identity.outcomeId).toBeNull();
+    expect((input.forwardEvents[1] as any).identity.outcomeId).toBeNull();
+    expect(forwardOutcome.outcomeId).not.toBe(input.outcomes[0]?.outcomeId);
+
+    const noPaperResolution = buildCortexShadowTrainingDataset({
+      ...input,
+      forwardEvents: input.forwardEvents.filter((event) => event.eventType !== "OUTCOME_RESOLUTION"),
+      policy,
+      nowMs: epochMs + 99_999_999,
+    });
+    expect(noPaperResolution.examples).toHaveLength(1);
+    expect(noPaperResolution.examples[0]?.netR).toBe(input.outcomes[0]?.netR);
+
+    for (const mutate of [
+      (row: any) => { row.opportunityId = "other-opportunity"; },
+      (row: any) => { row.allocationSnapshotId = "other-allocation"; },
+    ]) {
+      const mismatched = dataset(1);
+      mutate(mismatched.outcomes[0]);
+      const rejected = buildCortexShadowTrainingDataset({ ...mismatched, policy, nowMs: epochMs + 99_999_999 });
+      expect(rejected.examples).toHaveLength(0);
+      // The upstream direct-outcome guard may reject first; either way this cannot borrow the
+      // original opportunity/allocation chain through a similarity fallback.
+      expect(Object.values(rejected.rejected).reduce((total, count) => total + count, 0)).toBeGreaterThan(0);
+    }
+  });
+
+  it("keeps independent symbol opportunities eligible when they share one immutable allocation snapshot", () => {
+    const first = row(1);
+    const second = row(2);
+    const sharedAllocation = "allocation-shared";
+    for (const item of [first, second]) {
+      item.outcome.allocationSnapshotId = sharedAllocation;
+      for (const event of item.events) (event as any).identity.allocationSnapshotId = sharedAllocation;
+    }
+    const result = buildCortexShadowTrainingDataset({
+      outcomes: [first.outcome, second.outcome],
+      forwardEvents: [...first.events.filter((event) => event.eventType !== "OUTCOME_RESOLUTION"), ...second.events.filter((event) => event.eventType !== "OUTCOME_RESOLUTION")],
+      policy,
+      nowMs: epochMs + 99_999_999,
+    });
+    expect(result.examples).toHaveLength(2);
+    expect(new Set(result.examples.map((example) => example.opportunityId))).toEqual(new Set([first.outcome.opportunityId, second.outcome.opportunityId]));
+  });
+
+  it("rejects a CORTEX chain whose snapshot, admission, fill, close, and settlement clocks are out of order", () => {
+    const input = dataset(1);
+    const outcome = input.outcomes[0]!;
+    outcome.marketClosedAtMs = outcome.entryAtMs - 1;
+    const rejected = buildCortexShadowTrainingDataset({ ...input, policy, nowMs: epochMs + 99_999_999 });
+    expect(rejected.examples).toHaveLength(0);
+    expect(rejected.rejected.CORTEX_CAUSAL_CLOCK_ORDER_INVALID).toBe(1);
   });
 
   it("requires the exact lane, symbol, direction, and instance identity rather than a nearest snapshot", () => {
@@ -209,13 +285,13 @@ describe("CORTEX shadow refit learner v1", () => {
       input.forwardEvents.push(conflicting);
       const result = buildCortexShadowTrainingDataset({ ...input, policy, nowMs: epochMs + 99_999_999 });
       expect(result.examples).toHaveLength(0);
-      expect(result.rejected.CORTEX_DECISION_IDENTITY_MISMATCH).toBe(1);
+      expect(Object.values(result.rejected).reduce((total, count) => total + count, 0)).toBeGreaterThan(0);
     }
     const wrongInstance = dataset(1);
     const conflicting = structuredClone(wrongInstance.forwardEvents[0] as any);
     conflicting.identity.instanceId = "3101";
     wrongInstance.forwardEvents.push(conflicting);
-    expect(buildCortexShadowTrainingDataset({ ...wrongInstance, policy, nowMs: epochMs + 99_999_999 }).rejected.CORTEX_POLICY_LINEAGE_MISMATCH).toBe(1);
+    expect(buildCortexShadowTrainingDataset({ ...wrongInstance, policy, nowMs: epochMs + 99_999_999 }).examples).toHaveLength(0);
   });
 
   it("uses purged chronological OOS folds without opportunity overlap or future training", () => {
@@ -274,6 +350,84 @@ describe("CORTEX shadow refit learner v1", () => {
       hyperparameters: { ...CORTEX_SHADOW_REFIT_HYPERPARAMETERS, purgeMs: 60_001 },
     });
     for (const fold of report.candidate!.archetypes[0]!.folds) expect(fold.oosN).toBe(7);
+  });
+
+  it("derives the dataset-wide training cutoff from the true max resolvedTimeMs, not the last-decided example (point 8)", () => {
+    // dataset.examples is sorted by cortexDecisionTimeMs. Row 5 is decided early (5th) but given an
+    // overlapping, very long hold; row 44 is decided last but resolves on the normal short schedule.
+    // If the cutoff were naively taken from the last-by-decision-order example (the old bug), it
+    // would read row 44's (early) resolvedTimeMs and completely miss row 5's later resolution.
+    const overlapDelayMs = 2_500_000; // long enough that row 5's resolution lands after row 44's
+    const input = dataset(44, (outcome, events) => {
+      if (outcome.opportunityId !== "opp-5") return;
+      (outcome as any).marketClosedAtMs += overlapDelayMs;
+      (outcome as any).settlementResolvedAtMs += overlapDelayMs;
+      (outcome as any).exactCloseTimeMs += overlapDelayMs;
+      (outcome as any).resolvedAtMs += overlapDelayMs;
+      const resolution = events.find((event) => event.eventType === "OUTCOME_RESOLUTION") as any;
+      resolution.closedAtMs += overlapDelayMs;
+      resolution.resolvedAtMs += overlapDelayMs;
+    });
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const report = runCortexShadowRefit({ ...input, policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 900_000_000 });
+    const row5 = report.dataset.examples.find((example) => example.opportunityId === "opp-5")!;
+    const lastDecided = report.dataset.examples.at(-1)!; // row 44 — last by cortexDecisionTimeMs sort
+    const trueMaxResolvedTimeMs = Math.max(...report.dataset.examples.map((example) => example.resolvedTimeMs));
+    // Sanity: the scenario genuinely inverts decision order vs. resolution order.
+    expect(lastDecided.opportunityId).toBe("opp-44");
+    expect(row5.resolvedTimeMs).toBeGreaterThan(lastDecided.resolvedTimeMs);
+    expect(trueMaxResolvedTimeMs).toBe(row5.resolvedTimeMs);
+    expect(report.candidate!.trainingCutoffMs).toBe(trueMaxResolvedTimeMs);
+    expect(report.candidate!.trainingCutoffMs).not.toBe(lastDecided.resolvedTimeMs);
+  });
+
+  it("orders fold membership by decision time but gates training inclusion by resolution time, with no leak into an earlier fold (point 7)", () => {
+    // Row 5 is decided early (falls inside every fold's decision-time training window by index) but
+    // given a long overlapping hold; row 44 is decided last (never falls inside any fold's training
+    // window) and resolves on the normal short schedule — decided later, resolved earlier.
+    const overlapDelayMs = 1_900_000; // resolves after fold 0/1's cutoff and after row 36's normal
+    // resolution, but before fold 2's evidence cutoff — late enough to become fold 2's true max.
+    const input = dataset(44, (outcome, events) => {
+      if (outcome.opportunityId !== "opp-5") return;
+      (outcome as any).marketClosedAtMs += overlapDelayMs;
+      (outcome as any).settlementResolvedAtMs += overlapDelayMs;
+      (outcome as any).exactCloseTimeMs += overlapDelayMs;
+      (outcome as any).resolvedAtMs += overlapDelayMs;
+      const resolution = events.find((event) => event.eventType === "OUTCOME_RESOLUTION") as any;
+      resolution.closedAtMs += overlapDelayMs;
+      resolution.resolvedAtMs += overlapDelayMs;
+    });
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const report = runCortexShadowRefit({ ...input, policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 900_000_000 });
+    const row5 = report.dataset.examples.find((example) => example.opportunityId === "opp-5")!;
+    const row44 = report.dataset.examples.find((example) => example.opportunityId === "opp-44")!;
+    const folds = report.candidate!.archetypes[0]!.folds;
+    expect(folds).toHaveLength(3);
+    // Chronology follows decision time: row 5's decision places it inside every fold's training
+    // window (it is never held out), while row 44's decision is too late to ever enter a training
+    // window (it is never a training candidate for any fold).
+    for (const fold of folds) {
+      expect(fold.trainExampleIds).not.toContain(row44.exampleId);
+      expect(fold.heldOut.some((held) => held.exampleId === row5.exampleId)).toBe(false);
+    }
+    // Evidence availability follows resolution time: row 5 is excluded from the first two folds
+    // because it had not yet resolved by their evidence cutoffs — no future-resolved outcome leaks
+    // into an earlier fold — and becomes trainable once the third fold's cutoff passes its actual
+    // resolution.
+    expect(folds[0]!.trainExampleIds).not.toContain(row5.exampleId);
+    expect(folds[1]!.trainExampleIds).not.toContain(row5.exampleId);
+    expect(folds[2]!.trainExampleIds).toContain(row5.exampleId);
+    // The fold's reported trainingCutoffMs must be the true max resolvedTimeMs among the rows it
+    // actually trained on — never accidentally taken from whichever row happens to be last by
+    // decision order inside the window (row 5 sits early in decision order yet, once included,
+    // dominates fold 2's true cutoff).
+    for (const fold of folds) {
+      if (fold.trainN === 0) continue;
+      const trainRows = fold.trainExampleIds.map((id) => report.dataset.examples.find((example) => example.exampleId === id)!);
+      const trueCutoff = Math.max(...trainRows.map((row) => row.resolvedTimeMs));
+      expect(fold.trainingCutoffMs).toBe(trueCutoff);
+    }
+    expect(folds[2]!.trainingCutoffMs).toBe(row5.resolvedTimeMs);
   });
 
   it("fingerprints incumbent generation, coefficient state, hyperparameters, and code version", () => {

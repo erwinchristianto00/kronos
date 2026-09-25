@@ -2,13 +2,26 @@ import type { CoreScanAutoRefreshStatus } from "./core-scan-auto-refresh.js";
 import {
   BULL_SCALEOUT_VARIANT_ID,
   BULL_TREND_VARIANT_ID,
+  EVIDENCE_RESET_CUTOVER_VARIANT_IDS,
+  MAX_TOP_SYMBOL_SHARE,
   PF_STRONG,
+  PROMOTION_MIN_DEV_ROWS,
+  PROMOTION_MIN_EFFECTIVE_N,
+  PROMOTION_MIN_HOLDOUT_ROWS,
+  PROMOTION_MIN_HOLDOUT_EFFECTIVE_N,
+  STABLE_MIN_DEV_ROWS,
+  STABLE_MIN_EFFECTIVE_N,
   STABLE_MIN_FRESH,
+  STABLE_MIN_HOLDOUT_ROWS,
+  STABLE_MIN_HOLDOUT_EFFECTIVE_N,
   VARIANT_MATRIX_DEFINITIONS,
   WATCHABLE_MIN_FRESH,
   type CurrentGuardVariantMatrixReport,
+  type LaneEvidenceVersionSummary,
   type VariantBreakdownRow,
   type VariantContextEvidenceRow,
+  type VariantMatrixStageProof,
+  type VariantMatrixPreFreezeCollection,
 } from "./current-guard-variant-matrix.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
@@ -81,6 +94,83 @@ export interface NeuralLaneCohortStats {
   statusReason?: string | null;
 }
 
+/**
+ * Display projection of one immutable stage-proof window (`VariantMatrixStageProof`).
+ *
+ * This exists because raw row counts stopped being the STABLE/PROMOTION gate. `freshValid` is the
+ * FULL fresh-valid population and grows without bound, so "freshValid vs STABLE_MIN_FRESH(100)" is
+ * no longer a maturity measure — a lane can sit at thousands of rows with no frozen window at all.
+ * `deriveVariantStatus` reads `ok` here and nothing else, so this is the only honest source for
+ * "how far is this lane from the next stage".
+ */
+export interface NeuralLaneStageProof {
+  stage: "stable" | "promotion";
+  /** False ⇒ no window frozen for this stage yet; `ok` is false and every count below is 0. */
+  frozen: boolean;
+  /** The gate verdict. Dev floors AND dev economics AND holdout sufficiency, all ANDed. */
+  ok: boolean;
+  devRows: number;
+  devEffectiveN: number;
+  /** Distinct symbols contributing to the dev slice. Diversity input to the dev gate. */
+  devDistinctSymbolCount: number;
+  /** Distinct regime EPISODES (run-length-encoded, not distinct string labels) in the dev slice. */
+  devDistinctRegimes: number;
+  /** Calendar-day span of the dev slice. Null while unfrozen or the slice is empty. */
+  devCalendarDays: number | null;
+  /** Fraction of dev-slice PnL attributable to the single largest-PnL symbol — the concentration
+   *  term MAX_TOP_SYMBOL_SHARE gates. Compare against policyThresholds.maxTopSymbolPnlShare on the
+   *  top-level telemetry response; never hardcode the 0.4 floor in a consumer. */
+  devTopSymbolPnlShare: number | null;
+  devNetAvgR: number | null;
+  devPf: number | null;
+  holdoutRows: number;
+  holdoutEffectiveN: number;
+  /** Rows for which the stress figure is genuinely computable — see VariantMatrixStageHoldoutEvidence's
+   *  own doc. Can be less than holdoutRows; `sufficient` already accounts for this, exposed here only
+   *  as a diagnostic so a caller can explain a `sufficient:false` holdout that still has plenty of rows. */
+  holdoutStressableRows: number;
+  holdoutDistinctSymbolCount: number;
+  holdoutNetAvgR: number | null;
+  holdoutPf: number | null;
+  holdoutStressNetAvgR: number | null;
+  /** THE holdout proof — all five terms ANDed. Redundant with `ok` at the aggregate level (ok is
+   *  dev floors AND dev economics AND this), exposed separately so a caller can tell "dev is fine,
+   *  holdout isn't" apart from "dev itself is short". */
+  holdoutSufficient: boolean;
+  /** Diagnostic split-out of holdout economics: net, PF, or stress reads actively negative. */
+  holdoutNegative: boolean;
+  /** One entry per failing term, each already carrying its numeric shortfall. */
+  blockers: string[];
+}
+
+/**
+ * Display projection of one lane's provisional (unfrozen) collection progress.
+ *
+ * READ-ONLY. This exists so the dashboard can tell "collecting, 3 of 10 episodes in" apart from
+ * "nothing here" — both of which the frozen proofs render identically as zeros. It must never be
+ * substituted for `stableProof`/`promotionProof` in any readiness, promotion, campaign, or CORTEX
+ * decision: it is the full current population with no dev/holdout split, so it is in-sample by
+ * construction. See VariantMatrixPreFreezeCollection in current-guard-variant-matrix.ts.
+ */
+export interface NeuralLanePreFreezeCollection {
+  eligibleRows: number;
+  provisionalEpisodes: number;
+  rowsPerEpisode: number | null;
+  calendarDays: number | null;
+  distinctSymbolCount: number;
+  distinctRegimes: number;
+  largestEpisodeRows: number;
+  largestEpisodeShare: number | null;
+  topSymbolPnlShare: number | null;
+  evidenceVersion: string | null;
+  cutoverSource: "CANONICAL" | "INFERRED";
+  /** What is still missing before a STABLE DEV window can FREEZE — distinct from a gate failure. */
+  freezeBlockers: string[];
+  minRowsToAttemptFreeze: number;
+  minDevRows: number;
+  minDevEpisodes: number;
+}
+
 export interface NeuralMapLane {
   id: string;
   label: string;
@@ -89,20 +179,60 @@ export interface NeuralMapLane {
   active: boolean;
   open: number;
   closed: number;
-  /** VM-sim freshValid (CLOSED_WIN+CLOSED_LOSS) for this lane's geometry, vs the
-   *  threshold to leave SHADOW_ONLY. This is the REAL per-lane OOS maturity meter,
-   *  distinct from the mixed-regime guardrail OOS (inactive outside a Mixed regime).
+  /** VM-sim freshValid (CLOSED_WIN+CLOSED_LOSS) for this lane's geometry: the RAW DEPTH of the full
+   *  fresh-valid population, which grows for as long as the lane trades.
+   *
+   *  NOT a maturity meter beyond WATCHABLE. It gates exactly one rung — `oosThreshold`
+   *  (WATCHABLE_MIN_FRESH), the floor to leave SHADOW_ONLY. STABLE/PROMOTION are gated on the frozen
+   *  stage windows below, whose independence floors are on a ~1000x different scale, so rendering
+   *  this count against STABLE_MIN_FRESH(100)/PROMOTION_MIN_FRESH(200) reads as "proven" for a lane
+   *  the gate still rejects. Use `stableProof`/`promotionProof` for stage progress.
    *  null for paper-evidence lanes that have no VM row. */
   oosFreshValid: number | null;
+  /** WATCHABLE_MIN_FRESH only — the one rung `oosFreshValid` legitimately measures. */
   oosThreshold: number;
+  /**
+   * The two immutable stage-proof windows behind `status`. Both are the AGGREGATE row's copies,
+   * which is the self-consistent pairing: `status` here is the aggregate diagnostic status, and
+   * `deriveVariantStatus` produced it by reading these exact structs. Per-context proof (the copy
+   * that gates live eligibility) is surfaced separately through `cohorts`.
+   *
+   * null for paper-book lanes with no VM evidence row — the dashboard must render "no proof" there
+   * and must never substitute a raw row count.
+   */
+  stableProof: NeuralLaneStageProof | null;
+  promotionProof: NeuralLaneStageProof | null;
+  /** Provisional, UNFROZEN collection progress for the current evidence version. Rendered as its own
+   *  section, never merged into the three frozen-proof sections above. Null when the upstream report
+   *  predates this field. */
+  preFreezeCollection: NeuralLanePreFreezeCollection | null;
   netAvgR: number | null;
   pf: number | null;
+  /** See NeuralPfStatus's own doc comment. Display-only — never gate, sort, rank, or color a lane;
+   *  `pf` is already `null` (not a sentinel) in every case this isn't "COMPUTED". */
+  pfStatus: NeuralPfStatus;
   wr: number | null;
   /**
    * Where netAvgR/pf/wr/closed come from. The sources are DIFFERENT measurements — without this tag
    * a sim/research netAvgR rendered next to paper PnL dollars reads as one dataset (audit finding).
    */
   statsSource: NeuralLaneStatsSource;
+  /**
+   * Lane's evidence-version split — see LaneEvidenceVersionSummary's own doc. All-null/zero for any
+   * lane with no active reset (nothing to split). netAvgR/pf/wr/closed above are ALREADY current-only
+   * for a reset lane (isFreshValidObs enforces that at the source); these fields exist to make that
+   * split visible and auditable, not to gate anything themselves.
+   */
+  evidenceVersion: string | null;
+  resetCutoverAt: string | null;
+  legacyExcludedRows: number;
+  legacyExclusionReasons: { reason: string; count: number }[];
+  previousEvidenceVersion: string | null;
+  policyVersion: string | null;
+  /** "INFERRED" for every lane today (no canonical reset registry exists yet — see
+   *  resolveCanonicalCutoverMetadata's own doc comment in current-guard-variant-matrix.ts). Exposed
+   *  for auditability: a dashboard/operator can tell a derived fact from a stored one. */
+  cutoverSource: "CANONICAL" | "INFERRED";
   cohorts: {
     LONG: NeuralLaneCohortStats | null;
     SHORT: NeuralLaneCohortStats | null;
@@ -194,10 +324,24 @@ export interface DiagnosticDirectionStats {
   wr: number | null;
 }
 
+/** The exact independent-episode/row thresholds each stage's proof is gated on, read directly from
+ *  current-guard-variant-matrix.ts's own exported constants — never duplicated as separate literals
+ *  here or in any consumer. `comparator` is the exact relation `ok`/`blockers` are computed with
+ *  (effectiveN/rows compared against these floors); do not assume `>` or `>=` without reading it. */
+export interface NeuralMapPolicyThresholds {
+  comparator: ">=";
+  stable: { minDevRows: number; minDevEffectiveN: number; minHoldoutRows: number; minHoldoutEffectiveN: number };
+  promotion: { minDevRows: number; minDevEffectiveN: number; minHoldoutRows: number; minHoldoutEffectiveN: number };
+  /** Dev-slice concentration floor (fraction of PnL from the single largest symbol). A dev slice at
+   *  or under this is fine; strictly over it is one of the dev blockers. */
+  maxTopSymbolPnlShare: number;
+}
+
 export interface NeuralMapTelemetry {
   version: "neural-map-v1";
   generatedAt: string;
   staleAfterSec: number;
+  policyThresholds: NeuralMapPolicyThresholds;
   controller: {
     regime: string | null;
     mode: string;
@@ -313,7 +457,20 @@ const CLOSED = new Set(["PAPER_CLOSED_WIN", "PAPER_CLOSED_LOSS"]);
 const OPEN = new Set(["CREATED", "PAPER_SUBMITTED"]);
 const MARK_CANDLE_MS = 5 * 60 * 1000;
 const DEFAULT_MARK_FETCH_TIMEOUT_MS = 2_500;
-const PERFECT_PF_SENTINEL = 999_999;
+
+/**
+ * 2026-08-05 fix: PF is mathematically undefined (a division by zero) when a lane has wins but no
+ * losses yet — the removed `PERFECT_PF_SENTINEL = 999_999` stood in for that, and being a real
+ * finite number, it silently cleared every `pf > PF_STRONG`/`HEADLINE_PF_FLOOR` gate a lane with a
+ * single lucky winning trade and zero loss data could reach, promoting/coloring/ranking it as
+ * exceptional on an insufficient sample. `pf` is now `null` in every zero-denominator case (matching
+ * current-guard-variant-matrix.ts's own profitFactor(), which never used a sentinel) — every existing
+ * `pf !== null && pf > X` / `pf ?? NEGATIVE_INFINITY` consumer already treats null as "does not clear
+ * the floor", so this alone removes the ranking/coloring hazard. `pfStatus` exists ONLY to pick the
+ * right display wording (NO_LOSSES_YET vs NO_WINS_YET vs no data at all) — it must never gate, sort,
+ * rank, or color anything itself.
+ */
+export type NeuralPfStatus = "COMPUTED" | "NO_LOSSES_YET" | "NO_WINS_YET" | "NO_DATA";
 
 export interface PaperMarkPriceClient {
   getCandles(symbol: string, interval: string, limit: number): Promise<Array<{
@@ -412,6 +569,74 @@ function cohortFromContextEvidence(row: VariantContextEvidenceRow | undefined): 
     payoffRatio: row.payoffRatio,
     status: row.status,
     statusReason: row.statusReason,
+  };
+}
+
+/**
+ * Project a stage proof for display. `undefined` in (paper-book lane with no VM row, or a report
+ * shape that predates the stage-proof fields) ⇒ null out, so the dashboard shows "no proof". It must
+ * never fall back to a row count: that substitution is the exact failure this projection removes.
+ */
+function neuralStageProof(
+  stage: NeuralLaneStageProof["stage"],
+  proof: VariantMatrixStageProof | undefined,
+): NeuralLaneStageProof | null {
+  if (!proof) return null;
+  return {
+    stage,
+    frozen: proof.frozen === true,
+    ok: proof.ok === true,
+    devRows: proof.dev?.rows ?? 0,
+    devEffectiveN: proof.dev?.effectiveN ?? 0,
+    devDistinctSymbolCount: proof.dev?.distinctSymbolCount ?? 0,
+    devDistinctRegimes: proof.dev?.distinctRegimes ?? 0,
+    devCalendarDays: proof.dev?.calendarDays ?? null,
+    devTopSymbolPnlShare: proof.dev?.topSymbolPnlShare ?? null,
+    devNetAvgR: proof.dev?.netAvgR ?? null,
+    devPf: proof.dev?.pf ?? null,
+    holdoutRows: proof.holdout?.rows ?? 0,
+    holdoutEffectiveN: proof.holdout?.effectiveN ?? 0,
+    holdoutStressableRows: proof.holdout?.stressableRows ?? 0,
+    holdoutDistinctSymbolCount: proof.holdout?.distinctSymbolCount ?? 0,
+    holdoutNetAvgR: proof.holdout?.netAvgR ?? null,
+    holdoutPf: proof.holdout?.pf ?? null,
+    holdoutStressNetAvgR: proof.holdout?.stressNetAvgR ?? null,
+    holdoutSufficient: proof.holdout?.sufficient === true,
+    holdoutNegative: proof.holdout?.negative === true,
+    blockers: Array.isArray(proof.blockers) ? proof.blockers : [],
+  };
+}
+
+/**
+ * Display projection of `VariantMatrixPreFreezeCollection` — provisional, UNFROZEN collection
+ * progress for the lane's current evidence version.
+ *
+ * Defensive `?? `-defaults throughout for the same reason `neuralStageProof` has them: an older
+ * instance's report shape may not carry this field at all, and a dashboard must render "nothing
+ * collected yet" rather than crash or silently show a stale panel. Returns null when the field is
+ * absent entirely, which the UI renders as "no provisional data" — never as zeros, which would be
+ * indistinguishable from a real empty collection.
+ */
+function neuralPreFreezeCollection(
+  preFreeze: VariantMatrixPreFreezeCollection | undefined,
+): NeuralLanePreFreezeCollection | null {
+  if (!preFreeze) return null;
+  return {
+    eligibleRows: preFreeze.eligibleRows ?? 0,
+    provisionalEpisodes: preFreeze.provisionalEpisodes ?? 0,
+    rowsPerEpisode: preFreeze.rowsPerEpisode ?? null,
+    calendarDays: preFreeze.calendarDays ?? null,
+    distinctSymbolCount: preFreeze.distinctSymbolCount ?? 0,
+    distinctRegimes: preFreeze.distinctRegimes ?? 0,
+    largestEpisodeRows: preFreeze.largestEpisodeRows ?? 0,
+    largestEpisodeShare: preFreeze.largestEpisodeShare ?? null,
+    topSymbolPnlShare: preFreeze.topSymbolPnlShare ?? null,
+    evidenceVersion: preFreeze.evidenceVersion ?? null,
+    cutoverSource: preFreeze.cutoverSource ?? "INFERRED",
+    freezeBlockers: Array.isArray(preFreeze.freezeBlockers) ? preFreeze.freezeBlockers : [],
+    minRowsToAttemptFreeze: preFreeze.minRowsToAttemptFreeze ?? 0,
+    minDevRows: preFreeze.minDevRows ?? 0,
+    minDevEpisodes: preFreeze.minDevEpisodes ?? 0,
   };
 }
 
@@ -800,18 +1025,33 @@ function laneEconomics(orders: PaperOrder[], laneId: string) {
   const nets = closed.map((order) => order.netR).filter(finite);
   const positive = nets.filter((value) => value > 0).reduce((sum, value) => sum + value, 0);
   const negative = nets.filter((value) => value < 0).reduce((sum, value) => sum + Math.abs(value), 0);
+  // Real division only when BOTH sides are nonzero; every zero-denominator/zero-numerator case is
+  // `null` (mathematically undefined, never a finite stand-in) — see NeuralPfStatus's own doc comment.
+  const pf = positive > 0 && negative > 0 ? positive / negative : null;
+  const pfStatus: NeuralPfStatus =
+    nets.length === 0 ? "NO_DATA" :
+    positive > 0 && negative === 0 ? "NO_LOSSES_YET" :
+    negative > 0 && positive === 0 ? "NO_WINS_YET" :
+    "COMPUTED";
   return {
     open: scoped.filter((order) => OPEN.has(order.paperStatus)).length,
     closed: closed.length,
     headlineClosed: headline.length,
     netAvgR: nets.length > 0 ? nets.reduce((sum, value) => sum + value, 0) / nets.length : null,
-    // JSON serializes Infinity as null, so use a large finite sentinel for no-loss profitable lanes.
-    pf: negative > 0 ? positive / negative : positive > 0 ? PERFECT_PF_SENTINEL : null,
+    pf,
+    pfStatus,
     wr: closed.length > 0 ? closed.filter((order) => order.paperStatus === "PAPER_CLOSED_WIN").length / closed.length : null,
     headlinePnl: headline.reduce((sum, order) => sum + (order.netPnlAmount ?? 0), 0),
     diagnosticPnl: diagnostic.reduce((sum, order) => sum + (order.netPnlAmount ?? 0), 0),
     totalPnl: closed.reduce((sum, order) => sum + (order.netPnlAmount ?? 0), 0),
   };
+}
+
+function fmtPfForStatusText(pf: number | null, pfStatus: NeuralPfStatus): string {
+  if (pfStatus === "NO_LOSSES_YET") return "N/A (no losing outcome yet — insufficient sample)";
+  if (pfStatus === "NO_WINS_YET") return "N/A (no winning outcome yet — insufficient sample)";
+  if (pf === null) return "n/a";
+  return pf.toFixed(2);
 }
 
 function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
@@ -824,6 +1064,9 @@ function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
   const freshValid = economics.closed;
   const net = economics.netAvgR;
   const pf = economics.pf;
+  // pf is null (never a sentinel) whenever pfStatus !== "COMPUTED" — `pf !== null && pf > PF_STRONG`
+  // already fails closed for NO_LOSSES_YET/NO_WINS_YET/NO_DATA on its own; this line is unchanged
+  // from before the PF-sentinel fix precisely because removing the sentinel was the whole fix.
   const clearsHeadline =
     freshValid >= WATCHABLE_MIN_FRESH &&
     net !== null && net > 0 &&
@@ -833,7 +1076,7 @@ function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
     if (freshValid < STABLE_MIN_FRESH) blockers.push(`freshValid ${freshValid} < ${STABLE_MIN_FRESH} for stable`);
     return {
       status: "WATCHABLE",
-      statusReason: `paper-realized freshValid=${freshValid}, net=${fmtR(net)} PF=${pf >= PERFECT_PF_SENTINEL ? "inf" : pf.toFixed(2)} — headline/watchable`,
+      statusReason: `paper-realized freshValid=${freshValid}, net=${fmtR(net)} PF=${fmtPfForStatusText(pf, economics.pfStatus)} — headline/watchable`,
       blockers,
       cautions: ["paper-book lane: VM-only OOS/payoff/stress fields are not required for headline display"],
     };
@@ -841,12 +1084,18 @@ function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
 
   if (freshValid < WATCHABLE_MIN_FRESH) blockers.push(`freshValid ${freshValid} < ${WATCHABLE_MIN_FRESH}`);
   if (net === null || net <= 0) blockers.push("netAvgR not positive");
-  if (pf === null || pf <= PF_STRONG) blockers.push(`PF <= ${PF_STRONG}`);
+  if (pf === null || pf <= PF_STRONG) {
+    blockers.push(
+      economics.pfStatus === "NO_LOSSES_YET"
+        ? "PF undefined — no losing outcome yet (insufficient sample, not evidence of an edge)"
+        : `PF <= ${PF_STRONG}`,
+    );
+  }
 
   return {
     status: economics.open > 0 || freshValid > 0 ? "PAPER_EVIDENCE" : "COLLECTING",
     statusReason: economics.open > 0 || freshValid > 0
-      ? `paper-realized evidence: freshValid=${freshValid}, net=${fmtR(net)} PF=${pf !== null && pf >= PERFECT_PF_SENTINEL ? "inf" : pf !== null ? pf.toFixed(2) : "n/a"}`
+      ? `paper-realized evidence: freshValid=${freshValid}, net=${fmtR(net)} PF=${fmtPfForStatusText(pf, economics.pfStatus)}`
       : "no paper-book evidence yet",
     blockers,
     cautions: ["paper-book lane: VM-only OOS/payoff/stress fields are not available until a VM row exists"],
@@ -1212,7 +1461,27 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
 
   const paperAndVmLanes = laneIds.map((id): NeuralMapLane => {
     const row = rowsById.get(id);
-    const economics = laneEconomics(input.orders, id);
+    // 2026-08-05 evidence-version fix: laneEconomics() pools PaperOrder history with NO knowledge of
+    // EVIDENCE_RESET_CUTOVER_VARIANT_IDS/openMaxHoldMs (that field lives on the VM observation type,
+    // not PaperOrder) — a reset lane with pre-reset paper-order history (all 3 reset lanes have
+    // hundreds of such rows in production) would silently show that legacy-inclusive pool as
+    // "current" evidence downstream via usePaperEvidence, the exact false-readiness bug this closes.
+    // Filtered at the SOURCE (laneEconomics' own input) rather than by disabling usePaperEvidence
+    // outright, so the pre-existing "paper book promotes a lane the VM row hasn't caught up to" path
+    // (deliberately tested with freshValid:0 + real paper orders) keeps working unchanged whenever no
+    // cutover is knowable yet — there is nothing proven current/legacy to split in that case.
+    // cutoverAtMs is null until this lane's OWN VM evidence proves at least one genuinely post-reset
+    // row (see LaneEvidenceVersionSummary.resetCutoverAtMs) — never guessed from a wall-clock date.
+    const cutoverAtMs = row?.evidenceVersionSummary?.resetCutoverAtMs ?? null;
+    const isResetLane = row != null && EVIDENCE_RESET_CUTOVER_VARIANT_IDS.has(row.variantId);
+    const ordersForEconomics =
+      isResetLane && cutoverAtMs !== null
+        ? input.orders.filter((order) => {
+            const openedMs = Date.parse(order.openedAt);
+            return Number.isFinite(openedMs) && openedMs >= cutoverAtMs;
+          })
+        : input.orders;
+    const economics = laneEconomics(ordersForEconomics, id);
     const unrealized = input.paperUnrealized?.lanes[id] ?? null;
     // LONG lanes are admitted from fresh scan candidates into the paper book.
     // Once that book has evidence, it is the honest source of truth; the VM row
@@ -1226,6 +1495,23 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     // rendered next to paper PnL dollars can never read as one dataset. Lanes without a VM row
     // (e.g. CG_LONG_VARIANT_MATRIX:*) show paper-realized stats under the same fields.
     const statsSource: NeuralLaneStatsSource = evidenceRow ? "VM_SIM" : "PAPER_BOOK";
+    // evidenceRow.pf already comes from profitFactor() in current-guard-variant-matrix.ts, which has
+    // never used a sentinel (null on every zero-denominator case) — only laneEconomics()'s pfStatus
+    // needed the fix. wr===1/wr===0 is the closest available signal to "no losses yet"/"no wins yet"
+    // for a VM row (no win/loss ROW COUNT field exists at this granularity, only wr); a lane with a
+    // breakeven (netR===0) row that is neither a win nor counted as a loss can fall through to
+    // COMPUTED with pf still null — a known, narrow edge case, not the case this fix targets.
+    const pfStatus: NeuralPfStatus = evidenceRow
+      ? evidenceRow.pf !== null
+        ? "COMPUTED"
+        : evidenceRow.freshValid === 0
+          ? "NO_DATA"
+          : evidenceRow.wr === 1
+            ? "NO_LOSSES_YET"
+            : evidenceRow.wr === 0
+              ? "NO_WINS_YET"
+              : "COMPUTED"
+      : economics.pfStatus;
     const infraReady = row
       ? input.variantMatrix.killSwitchReady && input.variantMatrix.orderReconciliationReady && input.variantMatrix.exchangeHealthReady
       : null;
@@ -1281,10 +1567,33 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       closed: evidenceRow?.freshValid ?? economics.closed,
       oosFreshValid: evidenceRow?.freshValid ?? null,
       oosThreshold: WATCHABLE_MIN_FRESH,
+      // Fail closed on a row that predates the stage-proof fields (older report shape, or a
+      // hand-built evidence object): absent proof renders as "no proof", never as satisfied.
+      stableProof: neuralStageProof("stable", evidenceRow?.stableProof),
+      promotionProof: neuralStageProof("promotion", evidenceRow?.promotionProof),
+      // Read off the aggregate `row` (not evidenceRow): preFreezeCollection is built once per lane on
+      // the aggregate row, alongside evidenceVersionSummary, whose identity it mirrors.
+      preFreezeCollection: neuralPreFreezeCollection(row?.preFreezeCollection),
       netAvgR,
       pf: evidenceRow?.pf ?? economics.pf,
+      pfStatus,
       wr: evidenceRow?.wr ?? economics.wr,
       statsSource,
+      // Read from the raw VM row (not the conditionally-nulled evidenceRow) — the version split is
+      // diagnostic about the LANE, independent of which source netAvgR/pf/wr/closed above are drawn
+      // from this cycle. All-null/zero when row is absent or carries no active reset.
+      // Optional-chained past evidenceVersionSummary itself, not just row: some report shapes in this
+      // codebase (test fixtures, older callers) hand-build a row-shaped object without it, and this
+      // must fail closed to "no version split" rather than throw.
+      evidenceVersion: row?.evidenceVersionSummary?.evidenceVersion ?? null,
+      resetCutoverAt: row?.evidenceVersionSummary?.resetCutoverAt ?? null,
+      legacyExcludedRows: row?.evidenceVersionSummary?.legacyExcludedRows ?? 0,
+      legacyExclusionReasons: row?.evidenceVersionSummary?.legacyExclusionReasons ?? [],
+      previousEvidenceVersion: row?.evidenceVersionSummary?.previousEvidenceVersion ?? null,
+      policyVersion: row?.evidenceVersionSummary?.policyVersion ?? null,
+      // INFERRED is the correct fail-closed default when evidenceVersionSummary itself is absent —
+      // absence of a summary is itself "not a stored canonical fact".
+      cutoverSource: row?.evidenceVersionSummary?.cutoverSource ?? "INFERRED",
       cohorts: {
         LONG: cohortFromBreakdown(directionRows.find((candidate) => candidate.key === "LONG")) ?? paperOnlyLongCohort,
         SHORT: cohortFromBreakdown(directionRows.find((candidate) => candidate.key === "SHORT")) ?? paperOnlyShortCohort,
@@ -1637,6 +1946,22 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     version: "neural-map-v1",
     generatedAt,
     staleAfterSec: 30,
+    policyThresholds: {
+      comparator: ">=",
+      stable: {
+        minDevRows: STABLE_MIN_DEV_ROWS,
+        minDevEffectiveN: STABLE_MIN_EFFECTIVE_N,
+        minHoldoutRows: STABLE_MIN_HOLDOUT_ROWS,
+        minHoldoutEffectiveN: STABLE_MIN_HOLDOUT_EFFECTIVE_N,
+      },
+      promotion: {
+        minDevRows: PROMOTION_MIN_DEV_ROWS,
+        minDevEffectiveN: PROMOTION_MIN_EFFECTIVE_N,
+        minHoldoutRows: PROMOTION_MIN_HOLDOUT_ROWS,
+        minHoldoutEffectiveN: PROMOTION_MIN_HOLDOUT_EFFECTIVE_N,
+      },
+      maxTopSymbolPnlShare: MAX_TOP_SYMBOL_SHARE,
+    },
     controller: {
       regime: input.controller.currentRegime,
       mode: input.controller.controllerMode,

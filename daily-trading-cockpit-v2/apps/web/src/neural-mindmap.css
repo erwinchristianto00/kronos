@@ -443,6 +443,261 @@
   cursor: default;
 }
 
+.neural-evidence-version-panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-bottom: 1px solid #20313a;
+  background:
+    radial-gradient(circle at 12% 12%, rgba(111, 183, 201, 0.08), transparent 30%),
+    linear-gradient(180deg, #09141a 0%, #0b171d 100%);
+}
+
+.neural-evidence-version-panel-head {
+  border: 1px solid #243740;
+  border-radius: 8px;
+  background: rgba(7, 16, 22, 0.76);
+  padding: 14px;
+}
+
+.neural-evidence-version-panel-head span {
+  display: block;
+  color: #70858f;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-evidence-version-panel-head strong {
+  display: block;
+  margin-top: 8px;
+  color: #e6f4ee;
+  font-size: 17px;
+  line-height: 1.15;
+}
+
+.neural-evidence-version-panel-head p {
+  margin: 8px 0 0;
+  color: #9ab0b9;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.neural-evidence-version-list {
+  display: grid;
+  gap: 12px;
+}
+
+.neural-evidence-version-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(111, 183, 201, 0.35);
+  border-radius: 8px;
+  background: rgba(7, 16, 22, 0.76);
+}
+
+.neural-evidence-version-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.neural-evidence-version-head span {
+  color: #e7eef8;
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.neural-evidence-version-head strong {
+  color: #6fb7c9;
+  font: 700 11px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.02em;
+}
+
+.neural-evidence-version-head small {
+  color: #70858f;
+  font-size: 10px;
+}
+
+.neural-cutover-source-badge {
+  display: inline-block !important;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font: 700 9px/1.4 "IBM Plex Mono", "Cascadia Code", monospace !important;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #9ab0b9 !important;
+  border: 1px solid #2c4048;
+  background: rgba(9, 20, 26, 0.6);
+}
+
+.neural-cutover-source-badge.source-canonical {
+  color: #5ce4a6 !important;
+  border-color: rgba(92, 228, 166, 0.4);
+}
+
+.neural-cutover-source-badge.source-inferred {
+  color: #f3bf5a !important;
+  border-color: rgba(243, 191, 90, 0.35);
+}
+
+.neural-evidence-version-label {
+  display: block;
+  color: #728993;
+  font: 700 9px/1.25 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.neural-evidence-version-current {
+  display: grid;
+  gap: 6px;
+}
+
+.neural-evidence-version-legacy {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px dashed rgba(243, 191, 90, 0.4);
+  border-radius: 6px;
+  background: rgba(91, 66, 12, 0.16);
+}
+
+.neural-evidence-version-legacy-label {
+  color: #f3bf5a;
+  font: 800 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.05em;
+}
+
+.neural-evidence-version-legacy small {
+  display: block;
+  color: #ffdca0;
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.neural-evidence-version-legacy p {
+  margin: 2px 0 0;
+  color: #d8c39a;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.neural-evidence-version-legacy-reason {
+  color: #b9a687 !important;
+  font-size: 10.5px !important;
+}
+
+.neural-evidence-gate-sides-stacked {
+  grid-template-columns: 1fr;
+}
+
+.neural-evidence-gate {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid #243740;
+  border-radius: 6px;
+  background: rgba(9, 20, 26, 0.6);
+}
+
+/* Provisional pre-freeze collection: deliberately distinguished from the frozen gate sections it
+   sits above — dashed border + no gate-colored verdict, so accumulated-but-unproven progress can
+   never be misread as an earned PASS. */
+.neural-evidence-gate-prefreeze {
+  border-style: dashed;
+  border-color: #35505c;
+  background: rgba(9, 20, 26, 0.35);
+}
+
+.neural-evidence-gate-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.neural-evidence-gate-head span {
+  color: #9ab0b9;
+  font: 700 11px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-evidence-gate-head b {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.neural-evidence-gate-empty {
+  margin: 0;
+  color: #70858f;
+  font-size: 11px;
+}
+
+.neural-evidence-gate-sides {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.neural-evidence-gate-side {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid #1c2a31;
+  border-radius: 6px;
+  background: rgba(7, 16, 22, 0.5);
+}
+
+.neural-evidence-gate-side-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #7d929f;
+  font: 700 9px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-evidence-gate-side-title b {
+  font-size: 9px;
+}
+
+.neural-evidence-gate-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.neural-evidence-gate-metrics span {
+  display: block;
+  color: #70858f;
+  font: 600 9px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-evidence-gate-metrics strong {
+  display: block;
+  margin-top: 2px;
+  color: #e6f4ee;
+  font-size: 12px;
+}
+
+.neural-evidence-gate-blockers {
+  margin: 0;
+  color: #ffdca0;
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+@media (max-width: 720px) {
+  .neural-evidence-gate-sides {
+    grid-template-columns: 1fr;
+  }
+}
+
 .neural-milestone-panel {
   display: grid;
   gap: 12px;
@@ -779,6 +1034,34 @@
 .neural-milestone-table-wrap .neural-shortlist-cell {
   min-width: 210px;
   max-width: 270px;
+}
+
+/* Stage-proof verdict cell. Only a PASSED frozen proof gets the green "proven" read; an unfrozen
+   or absent window is deliberately neutral grey, NOT green — it must never look like progress
+   toward promotion, which is how the old raw-row bars misread. */
+.neural-milestone-table-wrap .neural-proof-cell {
+  min-width: 150px;
+  max-width: 210px;
+  white-space: normal;
+}
+
+.neural-milestone-table-wrap .neural-proof-cell small {
+  display: block;
+  margin-top: 2px;
+  color: #7f8f96;
+  font: 500 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.neural-milestone-table-wrap .neural-proof-cell.proof-ok {
+  color: #5ce4a6;
+}
+
+.neural-milestone-table-wrap .neural-proof-cell.proof-blocked {
+  color: #f3bf5a;
+}
+
+.neural-milestone-table-wrap .neural-proof-cell.proof-none {
+  color: #9aa7ad;
 }
 
 .rotation-empty {
@@ -1968,7 +2251,8 @@ i.health-diagnostic {
 }
 
 .testnet-statusbar {
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  /* Eight readable tiles: row two keeps unrealized, realized today and realized all-time adjacent. */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .testnet-grid {
@@ -2040,6 +2324,470 @@ i.health-diagnostic {
   line-height: 1.55;
 }
 
+/* Cross-sectional cards have dense inline financial values. Do not inherit the
+   dashboard's title-only span/strong layout inside their report body. */
+.cross-sectional-report span,
+.cross-sectional-report strong {
+  display: inline;
+  margin-top: 0;
+  color: inherit;
+  font: inherit;
+  text-transform: none;
+}
+
+.cross-sectional-report > header > div > span,
+.cross-sectional-report > header > span {
+  display: block;
+  color: #70858f;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.cross-sectional-report > header > div > strong {
+  display: block;
+  margin-top: 6px;
+  color: #e6f4ee;
+  font-size: 16px;
+}
+
+/* Candle review has dense inline level/indicator copy. The dashboard defaults
+   make every span and strong a heading block, which turns this copy into a
+   vertical stack and makes the chart context harder to read. */
+.candle-review-card span,
+.candle-review-card strong {
+  display: inline;
+  margin-top: 0;
+  color: inherit;
+  font: inherit;
+  text-transform: none;
+}
+
+.candle-review-card > header > div > span,
+.candle-review-card > header > span {
+  display: block;
+  color: #70858f;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.candle-review-card > header > div > strong {
+  display: block;
+  margin-top: 6px;
+  color: #e6f4ee;
+  font-size: 16px;
+}
+
+.candle-review-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 10px;
+  padding: 9px 12px;
+  color: #93a8b0;
+  font: 600 11px/1.4 "IBM Plex Mono", "Cascadia Code", monospace;
+  border-bottom: 1px solid #20313a;
+  background: rgba(8, 20, 26, 0.45);
+}
+
+.candle-review-summary > span {
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid rgba(43, 70, 80, 0.7);
+  border-radius: 4px;
+  background: rgba(5, 13, 18, 0.48);
+  overflow-wrap: anywhere;
+}
+
+.candle-review-summary b {
+  color: #6fb3d6;
+  font-weight: 800;
+}
+
+.candle-review-guide {
+  padding: 0;
+  color: #91a6af;
+  font-size: 11px;
+  line-height: 1.55;
+  border-bottom: 1px solid #20313a;
+  background: rgba(8, 20, 26, 0.28);
+}
+
+.candle-review-guide > summary {
+  padding: 8px 12px;
+  color: #7caec2;
+  font: 700 10px/1.35 "IBM Plex Mono", "Cascadia Code", monospace;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.candle-review-guide > div,
+.candle-review-guide > span {
+  display: block;
+  padding: 0 12px 10px;
+}
+
+.candle-review-level-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 7px;
+  padding: 7px 9px;
+  color: #b1c0c4;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  border-top: 1px solid #20313a;
+  background: rgba(5, 13, 18, 0.56);
+}
+
+.candle-review-level-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 3px 5px;
+  border: 1px solid rgba(43, 70, 80, 0.65);
+  border-radius: 4px;
+  background: rgba(15, 28, 35, 0.72);
+  white-space: nowrap;
+}
+
+.candle-review-level-legend i {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+}
+
+.candle-review-level-legend b {
+  color: #d7e6e5;
+  font-weight: 800;
+}
+
+.candle-review-status-line {
+  padding: 0 12px 12px;
+  color: #90a5ae;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+/* Cross-sectional stays compact; Daily Range compares historical 4H and 5m execution side by side. */
+.candle-review-chart-stack {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  padding: 14px;
+}
+
+.candle-review-chart-stack--daily-range {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+@media (max-width: 1180px) {
+  .candle-review-chart-stack--daily-range {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 700px) {
+  .candle-review-summary {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .candle-review-level-legend > span {
+    white-space: normal;
+  }
+}
+
+.cross-open-basket-table th,
+.cross-open-basket-table td {
+  padding: 8px 10px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.cross-open-basket-table th {
+  color: #70858f;
+  font: 700 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+/* Daily Range is one lane with real trade ownership. Present it as a concise
+   ledger rather than a wall of tiles, while retaining symbol -> candle review. */
+.daily-range-report-note {
+  padding: 9px 12px;
+  color: #7d97a3;
+  font-size: 11px;
+  line-height: 1.55;
+  border-bottom: 1px solid #20313a;
+  background: #0f1c23;
+}
+
+.daily-range-message {
+  padding: 12px;
+  color: #7d97a3;
+  font-size: 12px;
+}
+
+.daily-range-message strong {
+  color: #dbe7ec;
+}
+
+.daily-range-message small {
+  display: block;
+  margin-top: 4px;
+  color: #f0b54b;
+  font: 700 10px/1.4 "IBM Plex Mono", "Cascadia Code", monospace;
+  overflow-wrap: anywhere;
+}
+
+.daily-range-geometry-candidates {
+  padding: 10px 12px 12px;
+  border-bottom: 1px solid #20313a;
+  background: #0b151a;
+}
+
+.daily-range-geometry-candidates > span {
+  display: block;
+  margin-bottom: 7px;
+  color: #6fb3d6;
+  font: 700 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.daily-range-geometry-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 7px;
+}
+
+.daily-range-geometry-grid > div {
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid #20313a;
+  border-radius: 5px;
+  background: #0f1c23;
+}
+
+.daily-range-geometry-grid > div.is-pass {
+  border-color: rgba(70, 211, 154, 0.35);
+}
+
+.daily-range-geometry-grid > div.is-fail {
+  border-color: rgba(255, 107, 107, 0.4);
+}
+
+.daily-range-geometry-grid strong,
+.daily-range-geometry-grid small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.daily-range-geometry-grid strong {
+  margin-bottom: 3px;
+  color: #dbe7ec;
+  font: 700 11px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.daily-range-geometry-grid small {
+  color: #8da5ae;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.daily-range-breakdown {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  color: #8da5ae;
+  font-size: 11px;
+  border-bottom: 1px solid #17272e;
+}
+
+.daily-range-breakdown span:last-child {
+  color: #6fb3d6;
+}
+
+/* The V3 operational detail is intentionally grouped into readable cards. The
+   older flex rows put several long machine-facing values on one line, making
+   the page difficult to scan on a live decision screen. */
+.daily-range-ops-summary {
+  display: grid;
+  gap: 14px;
+  padding: 12px;
+  border-bottom: 1px solid #20313a;
+  background: #0b151a;
+}
+
+.daily-range-ops-section {
+  min-width: 0;
+}
+
+.daily-range-ops-heading {
+  margin: 0 0 7px;
+  color: #6fb3d6;
+  font: 700 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.daily-range-ops-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.daily-range-ops-grid--four {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.daily-range-ops-grid--three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.daily-range-info-card {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid #20313a;
+  border-radius: 6px;
+  background: #0f1c23;
+}
+
+.daily-range-info-card-label {
+  display: block;
+  margin-bottom: 5px;
+  color: #718791;
+  font: 700 9px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.daily-range-info-card strong {
+  display: block;
+  color: #dbe7ec;
+  font: 700 11px/1.4 "IBM Plex Mono", "Cascadia Code", monospace;
+  overflow-wrap: anywhere;
+}
+
+.daily-range-info-card p {
+  margin: 6px 0 0;
+  color: #8da5ae;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 1500px) {
+  .daily-range-ops-grid--four {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .daily-range-ops-grid--three,
+  .daily-range-ops-grid--four {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.daily-range-table {
+  min-width: 1420px !important;
+}
+
+.daily-range-table th,
+.daily-range-table td {
+  padding: 9px 10px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.daily-range-table td small {
+  margin-left: 3px;
+  color: #718791;
+  font-size: 10px;
+}
+
+.daily-range-symbol-button {
+  padding: 0;
+  border: 0;
+  color: #dbe7ec;
+  background: transparent;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: rgba(111, 179, 214, 0.75);
+  text-underline-offset: 3px;
+}
+
+.daily-range-symbol-button[aria-pressed="true"] {
+  color: #6fb3d6;
+}
+
+.daily-range-state {
+  display: inline-flex !important;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 6px;
+  border: 1px solid #35505a;
+  border-radius: 999px;
+  color: #a9c2cb !important;
+  font: 700 9px/1 "IBM Plex Mono", "Cascadia Code", monospace !important;
+  letter-spacing: 0.02em;
+}
+
+.daily-range-state.is-tp {
+  border-color: rgba(70, 211, 154, 0.48);
+  color: #46d39a !important;
+}
+
+.daily-range-state.is-stop {
+  border-color: rgba(255, 107, 107, 0.48);
+  color: #ff8b8b !important;
+}
+
+.daily-range-action {
+  color: #6fb3d6 !important;
+  font-size: 10px !important;
+}
+
+.daily-range-action-group {
+  display: grid;
+  justify-items: start;
+  gap: 5px;
+}
+
+.daily-range-close-button {
+  min-width: 82px;
+  padding: 5px 7px;
+  border: 1px solid #d9606b;
+  border-radius: 4px;
+  background: #32191f;
+  color: #ffd9dd;
+  cursor: pointer;
+  font: 700 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.daily-range-close-button:hover:not(:disabled) {
+  border-color: #ff8b96;
+  background: #492129;
+}
+
+.daily-range-close-button:disabled {
+  border-color: #41545d;
+  background: #17242b;
+  color: #7d97a3;
+  cursor: wait;
+}
+
+.daily-range-reconcile {
+  display: block;
+  max-width: 190px;
+  margin: 4px 0 0 !important;
+  white-space: normal;
+}
+
 .testnet-kpis {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2082,6 +2830,69 @@ i.health-diagnostic {
   color: #6f8690;
   font: 700 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
   text-transform: uppercase;
+}
+
+/* Whole-basket exit controls are summarized once above the legs.  Keeping the
+   grouping explicit prevents Dynamic MOM36's MFE runner from turning the
+   operator table into a repeating wall of text. */
+.xsec-open-basket-summary {
+  display: grid;
+  grid-template-columns: minmax(210px, 1.15fr) minmax(88px, 0.45fr) minmax(205px, 1fr) minmax(130px, 0.65fr) minmax(250px, 1.2fr);
+  gap: 8px 16px;
+  align-items: start;
+  margin: 8px 0;
+  padding: 10px 0;
+  border-top: 1px solid #17272e;
+}
+
+.xsec-open-basket-summary:first-child {
+  border-top: 0;
+}
+
+.xsec-open-basket-summary > div {
+  min-width: 0;
+}
+
+.xsec-open-basket-summary .xsec-open-basket-identity > span,
+.xsec-open-basket-summary .xsec-open-basket-metric > span,
+.xsec-open-basket-summary .xsec-open-basket-window > span {
+  display: block;
+}
+
+.xsec-open-basket-summary strong {
+  display: block;
+  margin-top: 3px;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.xsec-open-basket-detail {
+  margin-top: 4px;
+  color: #8ea6af !important;
+  font: 600 10px/1.4 "IBM Plex Mono", "Cascadia Code", monospace !important;
+  letter-spacing: 0;
+  text-transform: none !important;
+}
+
+@media (max-width: 1440px) {
+  .xsec-open-basket-summary {
+    grid-template-columns: minmax(210px, 1.2fr) repeat(3, minmax(140px, 0.7fr));
+  }
+
+  .xsec-open-basket-window {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 900px) {
+  .xsec-open-basket-summary {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .xsec-open-basket-identity,
+  .xsec-open-basket-window {
+    grid-column: 1 / -1;
+  }
 }
 
 .testnet-table-wrap tbody tr:hover {

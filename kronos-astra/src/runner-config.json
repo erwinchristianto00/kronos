@@ -1,0 +1,1 @@
+{"enabled": true, "gatewayPort": 3112, "cadence": {"formationIntervalMs": 3600000, "manageIntervalMs": 600000, "reviewIntervalMs": 3600000, "planFloor": 3, "dailyModelCallBudget": 200, "emptyPipelineIntervalMs": 900000, "dailyCoachingCallBudget": 24}}

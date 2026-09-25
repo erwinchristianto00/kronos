@@ -71,6 +71,28 @@ describe("cortex collection status", () => {
     expect(report.lineage.totalEvents).toBe(1);
   });
 
+  // 2026-08-05: resolveCollectionStatus used to be an independent reimplementation of
+  // resolveCausalCollectionActivation's own gating logic — a second copy that had no way to learn
+  // about FourBrainLogicalRole when the writer gained role-based staging authorization, and silently
+  // kept reporting unknown-instance-fail-closed for an instance the real writer had already started
+  // collecting on. Now delegates to the canonical function directly; this proves the two can no
+  // longer disagree, on the exact shape (role-granted staging mirror) that broke before the fix.
+  it("[2026-08-05 fix] a role-granted staging mirror reports the SAME activation as the real journal writer — never a stale unknown-instance-fail-closed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cortex-status-role-")); dirs.push(dir);
+    const env = {
+      PORT: "3111",
+      FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH",
+      CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow",
+      CAUSAL_EXPERIENCE_COLLECTION_DIR: dir,
+    };
+    const writerActivation = resolveCausalCollectionActivation(env as unknown as NodeJS.ProcessEnv);
+    expect(writerActivation).toMatchObject({ active: true, instanceId: "3111", logicalRole: "RESEARCH", reason: "shadow-active" });
+
+    const report = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 2_000 });
+    expect(report.collection).toMatchObject({ mode: "shadow", instanceId: "3111", logicalRole: "RESEARCH", status: "shadow-active" });
+    expect(report.collection.instanceId).not.toBe("3101");
+  });
+
   it("only re-reads bytes appended since the last call — never the whole file again (2026-07-20 incident fix)", () => {
     const dir = mkdtempSync(join(tmpdir(), "cortex-status-incremental-")); dirs.push(dir);
     const causalDir = join(dir, "causal-experience", "3101"); mkdirSync(causalDir, { recursive: true });

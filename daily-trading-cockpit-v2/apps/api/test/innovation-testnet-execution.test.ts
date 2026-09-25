@@ -29,14 +29,27 @@ describe("innovation testnet execution adapters", () => {
   });
 
   it("bypasses research/allocation vetoes but never bypasses the operational account gate", () => {
-    expect(innovationTestnetAdmissionAllowed(true)).toBe(true);
-    expect(innovationTestnetAdmissionAllowed(false)).toBe(false);
+    expect(innovationTestnetAdmissionAllowed(true, true)).toBe(true);
+    expect(innovationTestnetAdmissionAllowed(false, true)).toBe(false);
     expect(innovationTestnetWeight(0)).toBe(100);
     expect(innovationTestnetWeight(Number.NaN)).toBe(100);
     expect(innovationTestnetWeight(35)).toBe(100);
     expect(innovationTestnetLegUsd(Number.NaN)).toBe(55);
     expect(innovationTestnetLegUsd(10)).toBe(55);
     expect(innovationTestnetLegUsd(75)).toBe(75);
+  });
+
+  // 2026-08 canonical-market-regime addition (requirement #7): innovationTestnetAdmissionAllowed
+  // gained a second required parameter, AND-ed alongside the pre-existing armed/kill/drain check.
+  // The two tests above prove the pre-existing operational-gate behavior still holds with the
+  // canonical-regime input held permissive (true); this test proves the NEW AND itself — the
+  // fail-without/pass-with case for this round's wiring: without the AND, mutating the
+  // implementation back to `return canOpenIgnoringManualDirectional;` would leave this exact
+  // assertion green (regimeAllowed=false but the function ignores it), so this is the assertion a
+  // mutation of the AND must break.
+  it("blocks admission when the canonical regime policy denies it, even with the account gate open", () => {
+    expect(innovationTestnetAdmissionAllowed(true, false)).toBe(false);
+    expect(innovationTestnetAdmissionAllowed(false, false)).toBe(false);
   });
 
   it("starts the executor immediately before registering its five-minute interval", async () => {

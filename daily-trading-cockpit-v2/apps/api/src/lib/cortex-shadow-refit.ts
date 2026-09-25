@@ -24,10 +24,11 @@ import {
 } from "./four-brain-economic-experience.js";
 import type { ExecutiveReviewOutcome } from "./executive-review-store.js";
 import {
-  buildCortexExperienceBridge,
-  type CortexExperienceBridgeResult,
+  buildCortexFeatureProvenance,
+  type CortexFeatureProvenance,
 } from "../experience-engine/cortex-experience-bridge.js";
 import type { CanonicalPolicyContext, ForwardEvent } from "../experience-engine/forward-causal-collection.js";
+import { recordCortexProductionChainDiagnostic } from "./cortex-production-chain-diagnostics.js";
 
 export const CORTEX_SHADOW_REFIT_SCHEMA_VERSION = "cortex-shadow-refit/3" as const;
 export const CORTEX_SHADOW_REFIT_DEFAULT_EPOCH = "2026-08-01T07:19:35.000Z";
@@ -60,6 +61,7 @@ export type CortexShadowRejectionReason =
   | "INVALID_IMMUTABLE_RISK"
   | "CORTEX_SNAPSHOT_VECTOR_MISMATCH"
   | "CORTEX_DECISION_IDENTITY_MISMATCH"
+  | "CORTEX_CAUSAL_CLOCK_ORDER_INVALID"
   | "CORTEX_POLICY_LINEAGE_MISMATCH";
 
 export type CortexShadowRunStatus = "CANDIDATE_CREATED" | "NO_NEW_ELIGIBLE_DATA" | "NO_REFIT" | "BLOCKED";
@@ -70,10 +72,16 @@ export interface CortexShadowTrainingExample {
   readonly opportunityId: string;
   readonly outcomeId: string;
   readonly laneId: string;
+  readonly canonicalCortexLaneId: string;
   readonly symbolOrBasketId: string;
   readonly direction: "LONG" | "SHORT";
   readonly archetype: CortexArchetype;
   readonly regimeFamily: string;
+  /** Original CORTEX snapshot clock; this is the only model chronology clock. */
+  readonly cortexDecisionTimeMs: number;
+  /** Paper-admission provenance, retained separately from the model clock. */
+  readonly paperAdmissionTimeMs: number;
+  /** Compatibility alias for persisted readers; equal to cortexDecisionTimeMs. */
   readonly decisionTimeMs: number;
   readonly openedTimeMs: number;
   readonly closedTimeMs: number;
@@ -110,8 +118,18 @@ export interface CortexShadowFoldResult {
   readonly fold: number;
   readonly trainStartMs: number | null;
   readonly trainEndMs: number | null;
-  /** The only recency-weighting clock allowed for this fold: the final resolved training row. */
+  /** The only recency-weighting clock allowed for this fold: an explicit max over the resolvedTimeMs
+   * of every row actually included in `trainExampleIds`. Never derived from array position — fold
+   * membership is ordered by cortexDecisionTimeMs, so the last element in that order is not
+   * guaranteed to be the latest-resolved one (a later-decided row can resolve before an
+   * earlier-decided one still open). */
   readonly trainingCutoffMs: number | null;
+  /** Decision-time boundary between this fold's training window and its held-out window (the arrival
+   * time of the first held-out candidate). Fold membership, the train/OOS split, and the purge/embargo
+   * boundary are all defined on this clock. A row decided inside the training window is promoted into
+   * `trainExampleIds` only once its own resolvedTimeMs is <= this cutoff: a decided-but-still-open
+   * position is real future information relative to this fold and must never train it. */
+  readonly evidenceCutoffMs: number | null;
   readonly oosStartMs: number | null;
   readonly oosEndMs: number | null;
   readonly trainN: number;
@@ -211,6 +229,7 @@ const emptyRejections = (): Record<CortexShadowRejectionReason, number> => ({
   INVALID_IMMUTABLE_RISK: 0,
   CORTEX_SNAPSHOT_VECTOR_MISMATCH: 0,
   CORTEX_DECISION_IDENTITY_MISMATCH: 0,
+  CORTEX_CAUSAL_CLOCK_ORDER_INVALID: 0,
   CORTEX_POLICY_LINEAGE_MISMATCH: 0,
 });
 
@@ -234,23 +253,19 @@ const equalVector = (left: readonly number[], right: readonly number[]): boolean
 
 type ForwardDecision = Extract<ForwardEvent, { eventType: "DECISION_SNAPSHOT" }>;
 type ForwardOpen = Extract<ForwardEvent, { eventType: "OPPORTUNITY_OPEN" }>;
-type ForwardOutcome = Extract<ForwardEvent, { eventType: "OUTCOME_RESOLUTION" }>;
 
 /** Every identity comparison is exact. This is intentionally stricter than the bridge: the bridge
  * proves its own causal chain, while this boundary proves that Executive Review, the raw decision
  * snapshot, the bridge representation, and the reconstructed lane slice are the SAME decision. */
 function snapshotConsistencyReason(input: {
   outcome: ExecutiveReviewOutcome;
-  experience: CortexExperienceBridgeResult["experiences"][number] | undefined;
-  decision: CortexExperienceBridgeResult["decisions"][number] | undefined;
-  forwardDecision: ForwardDecision | undefined;
-  forwardOpen: ForwardOpen | undefined;
-  forwardOutcome: ForwardOutcome | undefined;
+  feature: CortexFeatureProvenance | undefined;
   policy: CanonicalPolicyContext & { instanceId: "3101" | "3102"; fourBrainPolicyVersion: string };
 }): CortexShadowRejectionReason | null {
-  const { outcome, experience, decision, forwardDecision, forwardOpen, forwardOutcome, policy } = input;
-  if (!forwardDecision || !forwardOpen || !forwardOutcome) return "FORWARD_CAUSAL_INELIGIBLE";
-  const identities = [forwardDecision.identity, forwardOpen.identity, forwardOutcome.identity];
+  const { outcome, feature, policy } = input;
+  if (!feature) return "FORWARD_CAUSAL_INELIGIBLE";
+  const { decisionEvent: forwardDecision, opportunityEvent: forwardOpen, identity, decision } = feature;
+  const identities = [forwardDecision.identity, forwardOpen.identity];
   const policyMatches = identities.every((identity) =>
     identity.instanceId === policy.instanceId &&
     identity.decisionPolicyVersion === policy.decisionPolicyVersion &&
@@ -266,27 +281,29 @@ function snapshotConsistencyReason(input: {
     outcome.fourBrainPolicyVersion === policy.fourBrainPolicyVersion &&
     outcome.policyDeploymentAt === policy.policyDeploymentAt;
   if (!policyMatches) return "CORTEX_POLICY_LINEAGE_MISMATCH";
-  if (!experience || !decision) return "FORWARD_CAUSAL_INELIGIBLE";
   const symbol = outcome.symbolOrBasketId;
-  const identityMatches = !!symbol && identities.every((identity) =>
-    identity.opportunityId === outcome.opportunityId && identity.outcomeId === outcome.outcomeId &&
-    identity.laneId === outcome.laneId && identity.symbolOrBasketId === symbol &&
-    identity.direction === outcome.direction && identity.allocationSnapshotId === outcome.allocationSnapshotId,
-  ) && forwardDecision.identity.cortexDecisionId === forwardDecision.cortexTraining.decisionId &&
-    forwardDecision.identity.cortexFeatureSchemaVersion === forwardDecision.cortexTraining.featureSchemaVersion &&
-    forwardDecision.asOfMs === outcome.executiveDecisionTimeMs &&
-    forwardOpen.decisionId === forwardDecision.identity.decisionId && forwardOutcome.decisionId === forwardDecision.identity.decisionId &&
-    forwardOutcome.opportunityId === outcome.opportunityId && forwardOutcome.outcomeId === outcome.outcomeId &&
-    experience.decisionId === forwardDecision.cortexTraining.decisionId && experience.opportunityId === outcome.opportunityId &&
-    experience.outcomeId === outcome.outcomeId && experience.laneId === outcome.laneId &&
-    experience.symbolOrBasketId === symbol && experience.direction === outcome.direction &&
-    decision.decisionId === forwardDecision.cortexTraining.decisionId;
+  const identityMatches = !!symbol && identity.outcomeId === null &&
+    identity.opportunityId === outcome.opportunityId && identity.laneId === outcome.laneId &&
+    identity.symbolOrBasketId === symbol && identity.direction === outcome.direction &&
+    identity.allocationSnapshotId === outcome.allocationSnapshotId &&
+    identity.canonicalCortexLaneId === outcome.canonicalCortexLaneId &&
+    identity.cortexDecisionId === forwardDecision.cortexTraining.decisionId &&
+    identity.cortexFeatureSchemaVersion === forwardDecision.cortexTraining.featureSchemaVersion &&
+    forwardOpen.decisionId === identity.decisionId && decision.decisionId === identity.cortexDecisionId;
   if (!identityMatches) return "CORTEX_DECISION_IDENTITY_MISMATCH";
-  const lane = decision.lanes.get(outcome.laneId);
+  if (
+    forwardDecision.cortexTraining.snapshotAtMs == null ||
+    forwardDecision.cortexTraining.snapshotAtMs > forwardDecision.asOfMs ||
+    forwardDecision.asOfMs > forwardOpen.openedAtMs ||
+    (outcome.executiveDecisionTimeMs != null && forwardOpen.openedAtMs > outcome.executiveDecisionTimeMs) ||
+    forwardOpen.openedAtMs > outcome.entryAtMs ||
+    (outcome.marketClosedAtMs != null && outcome.entryAtMs > outcome.marketClosedAtMs) ||
+    (outcome.settlementResolvedAtMs != null && outcome.marketClosedAtMs != null && outcome.marketClosedAtMs > outcome.settlementResolvedAtMs)
+  ) return "CORTEX_CAUSAL_CLOCK_ORDER_INVALID";
+  const lane = outcome.canonicalCortexLaneId ? decision.lanes.get(outcome.canonicalCortexLaneId) : undefined;
   const raw = forwardDecision.cortexTraining;
   if (!lane || lane.direction !== outcome.direction || raw.featureSchemaVersion !== decision.featureSchemaVersion ||
-    experience.featureSchemaVersion !== String(raw.featureSchemaVersion) || !raw.featureVector || !experience.featureVector ||
-    !equalVector(raw.featureVector, experience.featureVector) || !equalVector(raw.featureVector, lane.x)) {
+    !raw.featureVector || !equalVector(raw.featureVector, lane.x)) {
     return "CORTEX_SNAPSHOT_VECTOR_MISMATCH";
   }
   return null;
@@ -315,18 +332,8 @@ export function buildCortexShadowTrainingDataset(input: {
     fourBrainPolicyVersion: input.policy.fourBrainPolicyVersion,
     policyDeploymentAt: input.policy.policyDeploymentAt,
   }, input.nowMs);
-  const bridge: CortexExperienceBridgeResult = buildCortexExperienceBridge(input.forwardEvents, input.policy);
-  const bridgeByOutcome = new Map(bridge.experiences.map((row) => [row.outcomeId, row]));
-  const decisionByCortexLane = new Map(bridge.decisions.map((row) => [`${row.decisionId ?? ""}\u001f${[...row.lanes.keys()][0] ?? ""}`, row]));
-  const forwardDecisionByAllocation = new Map(input.forwardEvents
-    .filter((event): event is Extract<ForwardEvent, { eventType: "DECISION_SNAPSHOT" }> => event.eventType === "DECISION_SNAPSHOT")
-    .map((event) => [event.identity.allocationSnapshotId ?? "", event]));
-  const forwardOpenByOpportunity = new Map(input.forwardEvents
-    .filter((event): event is ForwardOpen => event.eventType === "OPPORTUNITY_OPEN")
-    .map((event) => [event.identity.opportunityId, event]));
-  const forwardOutcomeByOutcome = new Map(input.forwardEvents
-    .filter((event): event is ForwardOutcome => event.eventType === "OUTCOME_RESOLUTION")
-    .map((event) => [event.outcomeId, event]));
+  const featureProvenance = buildCortexFeatureProvenance(input.forwardEvents, input.policy);
+  const featureByOpportunity = new Map(featureProvenance.rows.map((row) => [row.identity.opportunityId, row]));
   const seen = new Set<string>();
   let archivedPreEpoch = 0;
   const examples: CortexShadowTrainingExample[] = [];
@@ -341,13 +348,22 @@ export function buildCortexShadowTrainingDataset(input: {
     if (!outcome.settlementFetchComplete || outcome.missingRequiredOrderIds.length > 0 || !finite(outcome.costR) || !finite(outcome.netR) || Math.abs((outcome.grossR - outcome.costR) - outcome.netR) > 1e-9) {
       rejected.INVALID_OR_INCOMPLETE_COST += 1; continue;
     }
-    if (!directOutcomeIds.has(outcome.outcomeId)) { rejected.FOUR_BRAIN_NOT_DIRECT += 1; continue; }
-    const experience = bridgeByOutcome.get(outcome.outcomeId);
-    const forwardDecision = outcome.allocationSnapshotId ? forwardDecisionByAllocation.get(outcome.allocationSnapshotId) : undefined;
-    const decision = forwardDecision?.cortexTraining.decisionId
-      ? decisionByCortexLane.get(`${forwardDecision.cortexTraining.decisionId}\u001f${outcome.laneId}`)
-      : undefined;
+    const feature = featureByOpportunity.get(outcome.opportunityId);
+    const forwardDecision = feature?.decisionEvent;
+    const forwardOpen = feature?.opportunityEvent;
     const rawSnapshot = forwardDecision?.cortexTraining;
+    // Clock integrity is a source invariant, not an attribute of Four-Brain eligibility. Check it
+    // before any downstream direct-outcome filter so a malformed real chain remains observable.
+    if (
+      rawSnapshot?.snapshotAtMs != null && forwardOpen &&
+      (!finite(rawSnapshot.snapshotAtMs) || rawSnapshot.snapshotAtMs > forwardDecision!.asOfMs ||
+        forwardDecision!.asOfMs > forwardOpen.openedAtMs ||
+        (outcome.executiveDecisionTimeMs != null && forwardOpen.openedAtMs > outcome.executiveDecisionTimeMs) ||
+        forwardOpen.openedAtMs > outcome.entryAtMs ||
+        (outcome.marketClosedAtMs != null && outcome.entryAtMs > outcome.marketClosedAtMs) ||
+        (outcome.settlementResolvedAtMs != null && outcome.marketClosedAtMs != null && outcome.marketClosedAtMs > outcome.settlementResolvedAtMs))
+    ) { rejected.CORTEX_CAUSAL_CLOCK_ORDER_INVALID += 1; continue; }
+    if (!directOutcomeIds.has(outcome.outcomeId)) { rejected.FOUR_BRAIN_NOT_DIRECT += 1; continue; }
     if (!rawSnapshot || rawSnapshot.status !== "PRESENT" || !rawSnapshot.featureVector) {
       rejected.MISSING_EXACT_CORTEX_SNAPSHOT += 1; continue;
     }
@@ -358,41 +374,45 @@ export function buildCortexShadowTrainingDataset(input: {
       rejected.UNKNOWN_CONTEXT += 1; continue;
     }
     const consistency = snapshotConsistencyReason({
-      outcome, experience, decision, forwardDecision,
-      forwardOpen: forwardOpenByOpportunity.get(outcome.opportunityId),
-      forwardOutcome: forwardOutcomeByOutcome.get(outcome.outcomeId), policy: input.policy,
+      outcome, feature, policy: input.policy,
     });
     if (consistency) { rejected[consistency] += 1; continue; }
     // snapshotConsistencyReason has just proven these exact representations exist; repeat the
     // guard so TypeScript also retains that fact rather than allowing an accidental future access.
-    if (!experience || !experience.decisionId || !decision || !forwardDecision) { rejected.FORWARD_CAUSAL_INELIGIBLE += 1; continue; }
-    if (!experience.featureVector || experience.featureSchemaVersion !== String(CORTEX_FEATURE_SCHEMA_VERSION)) { rejected.MISSING_EXACT_CORTEX_SNAPSHOT += 1; continue; }
-    if (experience.featureVector.length !== CORTEX_FEATURE_DIM || !experience.featureVector.every(finite)) { rejected.FEATURE_SCHEMA_MISMATCH += 1; continue; }
-    const lane = decision.lanes.get(outcome.laneId);
+    if (!feature || !forwardDecision) { rejected.FORWARD_CAUSAL_INELIGIBLE += 1; continue; }
+    const decision = feature.decision;
+    const lane = outcome.canonicalCortexLaneId ? decision.lanes.get(outcome.canonicalCortexLaneId) : undefined;
     if (!lane || lane.x.length !== CORTEX_FEATURE_DIM || !lane.x.every(finite)) { rejected.MISSING_EXACT_CORTEX_SNAPSHOT += 1; continue; }
     const regimeFamily = decision.regimeFamily.trim().toUpperCase();
     if (!regimeFamily || regimeFamily === "UNKNOWN" || regimeFamily === "UNKNOWN_CONTEXT") { rejected.UNKNOWN_CONTEXT += 1; continue; }
     if (outcome.direction !== "LONG" && outcome.direction !== "SHORT") { rejected.LINEAGE_MISMATCH += 1; continue; }
     examples.push({
       exampleId: `cortex-shadow:${outcome.executiveReviewOutcomeId}`,
-      decisionId: experience.decisionId,
+      decisionId: feature.identity.cortexDecisionId!,
       opportunityId: outcome.opportunityId,
       outcomeId: outcome.outcomeId,
       laneId: outcome.laneId,
+      canonicalCortexLaneId: outcome.canonicalCortexLaneId!,
       symbolOrBasketId: outcome.symbolOrBasketId!,
       direction: outcome.direction,
-      archetype: cortexArchetypeForLane(outcome.laneId),
+      archetype: cortexArchetypeForLane(outcome.canonicalCortexLaneId!),
       regimeFamily,
-      decisionTimeMs: outcome.executiveDecisionTimeMs,
+      cortexDecisionTimeMs: rawSnapshot.snapshotAtMs!,
+      paperAdmissionTimeMs: forwardDecision.asOfMs,
+      decisionTimeMs: rawSnapshot.snapshotAtMs!,
       openedTimeMs: outcome.entryFilledAtMs,
       closedTimeMs: outcome.marketClosedAtMs ?? outcome.resolvedAtMs,
       resolvedTimeMs: outcome.resolvedAtMs,
-      x: [...experience.featureVector],
+      x: [...lane.x],
       netR: outcome.netR,
       policyDeploymentAt: outcome.policyDeploymentAt ?? "",
     });
+    // Point 11: report-only — this resolved outcome just fed the shadow-learner training dataset.
+    // Never read by fitArchetype/candidateForDataset or anything downstream; purely a visibility
+    // counter for how much Tier-1 evidence actually becomes learner-eligible.
+    recordCortexProductionChainDiagnostic("CORTEX_LEARNER_ELIGIBLE");
   }
-  const ordered = sorted(examples, (a, b) => a.resolvedTimeMs - b.resolvedTimeMs || a.exampleId.localeCompare(b.exampleId));
+  const ordered = sorted(examples, (a, b) => a.cortexDecisionTimeMs - b.cortexDecisionTimeMs || a.exampleId.localeCompare(b.exampleId));
   return {
     resetEpoch: new Date(epochMs).toISOString(),
     examined: input.outcomes.length,
@@ -463,8 +483,9 @@ function metricsFromHeldOut(
 ): CortexShadowMetrics {
   const rows: CortexShadowTrainingExample[] = heldOut.map((row) => ({
     exampleId: row.exampleId, decisionId: row.exampleId, opportunityId: row.opportunityId, outcomeId: row.exampleId,
-    laneId: "held-out", symbolOrBasketId: row.symbolOrBasketId, direction: "LONG", archetype: "BREADTH",
-    regimeFamily: row.regimeFamily, decisionTimeMs: row.decisionTimeMs, openedTimeMs: row.decisionTimeMs,
+    laneId: "held-out", canonicalCortexLaneId: "held-out", symbolOrBasketId: row.symbolOrBasketId, direction: "LONG", archetype: "BREADTH",
+    regimeFamily: row.regimeFamily, cortexDecisionTimeMs: row.decisionTimeMs, paperAdmissionTimeMs: row.decisionTimeMs,
+    decisionTimeMs: row.decisionTimeMs, openedTimeMs: row.decisionTimeMs,
     closedTimeMs: row.resolvedTimeMs, resolvedTimeMs: row.resolvedTimeMs, x: [], netR: row.netR, policyDeploymentAt: "held-out",
   }));
   const base = metrics(rows, null);
@@ -481,14 +502,18 @@ function heldOutDelta(heldOut: readonly CortexShadowHeldOutPrediction[]): number
 }
 
 function fitArchetype(
-  rows: readonly CortexShadowTrainingExample[], prior: readonly number[], fitCutoffMs: number | null,
+  rows: readonly CortexShadowTrainingExample[], prior: readonly number[], latestTrainingResolvedTimeMs: number | null,
   hyperparameters: CortexShadowRefitHyperparameters,
 ): { fit: CortexEconomicFit; folds: CortexShadowFoldResult[]; blockers: string[]; cautions: string[] } {
-  const ordered = sorted(rows, (a, b) => a.resolvedTimeMs - b.resolvedTimeMs || a.exampleId.localeCompare(b.exampleId));
+  // Chronology for fold construction is the CORTEX decision clock, never the resolution clock — this
+  // is the order candidates actually arrive in production. Evidence *availability* inside each fold
+  // is still governed by resolution time (see the resolvedTimeMs filter below); the two clocks are
+  // deliberately different and must never be collapsed back into one sort key.
+  const ordered = sorted(rows, (a, b) => a.cortexDecisionTimeMs - b.cortexDecisionTimeMs || a.exampleId.localeCompare(b.exampleId));
   // A candidate must be a function of immutable evidence, not the operator's wall clock.
-  const fullFit = fitCutoffMs == null
+  const fullFit = latestTrainingResolvedTimeMs == null
     ? { coefficients: [...prior], residualScale: null, effectiveSampleSize: 0, status: "INSUFFICIENT_DATA" as const }
-    : refitCortexEconomicModel(ordered.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs: fitCutoffMs, ...hyperparameters });
+    : refitCortexEconomicModel(ordered.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs: latestTrainingResolvedTimeMs, ...hyperparameters });
   const folds: CortexShadowFoldResult[] = [];
   const blockers: string[] = [];
   const cautions: string[] = [];
@@ -497,13 +522,33 @@ function fitArchetype(
   if (foldSize < hyperparameters.minOosExamples) blockers.push("OOS_FOLDS_BELOW_MINIMUM");
   else for (let fold = 0; fold < hyperparameters.folds; fold += 1) {
     const trainEnd = hyperparameters.minTrainExamples + fold * foldSize;
-    const train = ordered.slice(0, trainEnd);
-    const oos = ordered.slice(trainEnd, Math.min(ordered.length, trainEnd + foldSize));
+    const decisionWindow = ordered.slice(0, trainEnd);
+    const oosCandidate = ordered.slice(trainEnd, Math.min(ordered.length, trainEnd + foldSize));
+    // The actual decision-time boundary of the training window (last decided row inside it). This is
+    // the anchor for the purge/embargo gap — the same role the old resolvedTimeMs-based
+    // trainingCutoffMs played, just expressed on the decision clock as the spec requires.
+    const trainWindowDecisionEndMs = decisionWindow.at(-1)?.cortexDecisionTimeMs ?? null;
+    // The fold's evidence cutoff is the decision-time arrival of the first held-out candidate — the
+    // exact moment a real system would need a prediction. It is deliberately NOT
+    // trainWindowDecisionEndMs: a decision can never resolve before itself, so using the training
+    // window's own last decision time here would always fail the resolvedTimeMs filter below and
+    // silently shrink every fold's training set by one.
+    const evidenceCutoffMs = oosCandidate[0]?.cortexDecisionTimeMs ?? trainWindowDecisionEndMs;
+    // Evidence availability gate: a row decided inside the window but not yet resolved by the
+    // evidence cutoff is real future information relative to this fold and must not train it — even
+    // though its decision time places it inside the window. No future-resolved outcome leaks into an
+    // earlier fold; it becomes trainable again once a later fold's cutoff has moved past its
+    // resolution.
+    const train = evidenceCutoffMs == null ? [] : decisionWindow.filter((row) => row.resolvedTimeMs <= evidenceCutoffMs);
     const opportunities = new Set(train.map((row) => row.opportunityId));
-    const trainingCutoffMs = train.at(-1)?.resolvedTimeMs;
-    const purgeBoundaryMs = (trainingCutoffMs ?? -Infinity) + hyperparameters.purgeMs;
-    const safeOos = oos.filter((row) => !opportunities.has(row.opportunityId) && row.decisionTimeMs > purgeBoundaryMs);
-    // OOS rows must never influence recency weights. The model's clock is frozen at the last
+    // Explicit max over the *included* training rows, never the last element of a decision-ordered
+    // array: a later-decided row inside this fold can still resolve earlier than an earlier-decided
+    // one, so "last by decision order" is not "latest resolved" — the same class of bug as the
+    // dataset-level fitCutoffMs this mirrors.
+    const trainingCutoffMs = train.length ? Math.max(...train.map((row) => row.resolvedTimeMs)) : null;
+    const purgeBoundaryMs = (trainWindowDecisionEndMs ?? -Infinity) + hyperparameters.purgeMs;
+    const safeOos = oosCandidate.filter((row) => !opportunities.has(row.opportunityId) && row.decisionTimeMs > purgeBoundaryMs);
+    // OOS rows must never influence recency weights. The model's clock is frozen at the true latest
     // resolved training observation, even when the held-out period extends far into the future.
     const fit: CortexEconomicFit = trainingCutoffMs == null
       ? { coefficients: [...prior], residualScale: null, effectiveSampleSize: 0, status: "INSUFFICIENT_DATA" }
@@ -524,6 +569,7 @@ function fitArchetype(
     folds.push({
       fold: fold + 1,
       trainStartMs: train[0]?.decisionTimeMs ?? null, trainEndMs: trainingCutoffMs ?? null, trainingCutoffMs: trainingCutoffMs ?? null,
+      evidenceCutoffMs: evidenceCutoffMs ?? null,
       oosStartMs: safeOos[0]?.decisionTimeMs ?? null, oosEndMs: safeOos.at(-1)?.resolvedTimeMs ?? null,
       trainN: train.length, oosN: safeOos.length, trainExampleIds: train.map((row) => row.exampleId), heldOut, fitStatus: fit.status,
       candidate, incumbent, expectedEconomicDeltaR,
@@ -561,7 +607,14 @@ function candidateForDataset(
 ): CortexShadowCandidateGeneration {
   const incumbentCoefficientFingerprint = incumbentFingerprint(incumbent);
   const fingerprint = generationFingerprint({ datasetHash: dataset.datasetHash, incumbentGeneration, incumbentCoefficientFingerprint, hyperparameters, codeVersion });
-  const fitCutoffMs = dataset.examples.at(-1)?.resolvedTimeMs ?? null;
+  // Explicit max over the whole dataset, independent of examples' sort order. dataset.examples is
+  // sorted by cortexDecisionTimeMs (buildCortexShadowTrainingDataset), so the last element is the
+  // latest-DECIDED example, not necessarily the latest-RESOLVED one: a later decision with a short
+  // hold can resolve before an earlier decision with a long hold that is still open.
+  const latestTrainingResolvedTimeMs = dataset.examples.length
+    ? Math.max(...dataset.examples.map((example) => example.resolvedTimeMs))
+    : null;
+  const fitCutoffMs = latestTrainingResolvedTimeMs;
   const archetypes = ARCHETYPES.map((archetype) => {
     const rows = dataset.examples.filter((row) => row.archetype === archetype);
     const prior = incumbent.archetypes[archetype].w;

@@ -1,0 +1,280 @@
+/**
+ * Immutable, pre-result validation contract for the free Binance Vision
+ * BTCUSDT/ETHUSDT 1h REAL_TIER1 study.  This module deliberately contains no
+ * runner or data access: execution must bind this exact artifact before it can
+ * interpret any result.
+ */
+import { tournamentHash } from "../contract/tournament-contract.js";
+import {
+  donchianStrategy,
+  emaCrossStrategy,
+  macdStrategy,
+  rsiMeanReversionStrategy,
+  type TournamentStrategy,
+} from "../strategies/challengers.js";
+import type { TournamentStrategyId, TournamentValidationSpec } from "../tournament-types.js";
+
+const HOUR_MS = 3_600_000;
+const DAY_BARS = 24;
+// The raw verified Binance Vision BBO bundle has no BTCUSDT/ETHUSDT common
+// observation before this tick (both May archives first observe 11:49:47Z on
+// May 16). This v2 plan is frozen before result generation and replaces the
+// unavailable May 1 candidate rather than silently treating missing BBO as
+// eligibility.
+const FREE_SCOPE_START_MS = Date.UTC(2023, 4, 16, 12);
+const FREE_SCOPE_END_MS = Date.UTC(2024, 3, 1);
+const FREE_SCOPE_TOTAL_BARS = (FREE_SCOPE_END_MS - FREE_SCOPE_START_MS) / HOUR_MS;
+const SEALED_HOLDOUT_MINIMUM_BARS = 60 * DAY_BARS;
+const SEALED_HOLDOUT_BARS = Math.max(SEALED_HOLDOUT_MINIMUM_BARS, Math.ceil(FREE_SCOPE_TOTAL_BARS * 0.2));
+
+export const FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN_VERSION = "free-binance-vision-btceth-1h-real-tier1-validation-plan-v5" as const;
+
+export const FREE_BINANCE_VISION_2023_05_TO_2024_03_BASELINE_ALLOWLIST = [
+  "CASH",
+  "BTC_BUY_AND_HOLD",
+  "EQUAL_WEIGHT_HOLD",
+  "DONCHIAN",
+  "MACD",
+  "EMA_CROSS",
+  "RSI_MEAN_REVERSION",
+  "RANDOM_CONTROL",
+] as const satisfies readonly TournamentStrategyId[];
+
+const TACTICAL_CHALLENGERS = [donchianStrategy(), macdStrategy(), emaCrossStrategy(), rsiMeanReversionStrategy()] as const satisfies readonly TournamentStrategy[];
+
+function maxHoldBars(strategy: TournamentStrategy): number {
+  const value = strategy.parameters.maxHoldBars;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) throw new Error(`FREE_TIER1_DIRECTIONAL_HOLDING_HORIZON_INVALID_${strategy.id}`);
+  return value;
+}
+
+/**
+ * Benchmarks intentionally hold to end-of-data and are not tactical
+ * challenger horizons. RANDOM_CONTROL inherits its complete trade template,
+ * including this horizon, from Donchian in the bound Tier-1 assembly.
+ */
+export const FREE_BINANCE_VISION_2023_05_TO_2024_03_MAX_TACTICAL_HOLD_BARS = Math.max(...TACTICAL_CHALLENGERS.map(maxHoldBars));
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const nested of Object.values(value)) deepFreeze(nested);
+  }
+  return value;
+}
+
+const validation: TournamentValidationSpec = {
+  trainBars: 120 * DAY_BARS,
+  testBars: 30 * DAY_BARS,
+  stepBars: 30 * DAY_BARS,
+  purgeBars: FREE_BINANCE_VISION_2023_05_TO_2024_03_MAX_TACTICAL_HOLD_BARS,
+  embargoBars: FREE_BINANCE_VISION_2023_05_TO_2024_03_MAX_TACTICAL_HOLD_BARS,
+  sealedHoldoutStartMs: FREE_SCOPE_END_MS - SEALED_HOLDOUT_BARS * HOUR_MS,
+  minIndependentEpisodes: 10,
+  // Interpretability is gated separately below; this is not a performance pass threshold.
+  minOosProfitabilityFraction: 0,
+};
+
+const artifactPayload = {
+  artifactKind: "TOURNAMENT_VALIDATION_PLAN",
+  schemaVersion: "v1",
+  planVersion: FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN_VERSION,
+  studyId: "free-binance-vision-usdm-btceth-1h-2023-05-16_to_2024-03",
+  scope: {
+    symbols: ["BTCUSDT", "ETHUSDT"],
+    timeframe: "1h",
+    timeframeMs: HOUR_MS,
+    startMs: FREE_SCOPE_START_MS,
+    endMs: FREE_SCOPE_END_MS,
+    totalBars: FREE_SCOPE_TOTAL_BARS,
+  },
+  sourceScopeSelection: {
+    policyVersion: "binance-vision-usdm-bookticker-common-start-v1",
+    requestedStartMs: Date.UTC(2023, 4, 1, 1),
+    selectedStartMs: FREE_SCOPE_START_MS,
+    rawBookTickerBundleHash: "3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a",
+    firstObservedEventTimeBySymbol: {
+      BTCUSDT: { eventTimeMs: 1684237787214, rawObjectSha256: "93a787d1c1f69118f04b40fcc99607ab1f6504cb790672725359a2b94509251e" },
+      ETHUSDT: { eventTimeMs: 1684237787207, rawObjectSha256: "7c39ed37defad7b62df39f7a8c901dd5858a2db91f6dd28454e238977c5d0d61" },
+    },
+  },
+  executionPolicy: {
+    researchMode: "REAL_TIER1",
+    capabilityTier: "TIER_1_BASELINE",
+    executionModes: ["CONSERVATIVE"],
+    baselineAllowlist: FREE_BINANCE_VISION_2023_05_TO_2024_03_BASELINE_ALLOWLIST,
+    kronosCurrentForbidden: true,
+    rankingForbidden: true,
+    promotionForbidden: true,
+  },
+  /**
+   * Frozen before empirical execution. Every decision still needs a PIT BBO
+   * row; candle presence can never assert liquidity. The US$50k min-side
+   * displayed depth is five times the fixed US$10k paper wallet, providing a
+   * depth cushion without treating displayed liquidity as a fill guarantee.
+   */
+  tier1EligibilityPolicy: {
+    minimumHistory: {
+      version: "free-binance-vision-prior-completed-bars-v1",
+      minimumCompletedBars: 168,
+      strictlyPrior: true,
+    },
+    liquiditySpread: {
+      version: "free-binance-vision-bbo-liquidity-spread-v1",
+      minVolume: 0,
+      minLiquidityNotional: 50_000,
+      maxSpreadBps: 5,
+      maxAgeMs: HOUR_MS,
+    },
+  },
+  /**
+   * Tier 1 lacks an account-specific historical fee-tier artifact. These are
+   * fixed Conservative research assumptions, not a claim about fee history.
+   */
+  tier1ConservativeExecution: {
+    makerFeeBps: 0,
+    takerFeeBps: 4,
+    baseSlippageBps: 2,
+    pessimisticSlippageMultiplier: 2,
+    fundingEnabled: true,
+    fillMode: "NEXT_OPEN",
+    intrabarAmbiguity: "STOP_FIRST",
+  },
+  tier1Portfolio: {
+    startingCapital: 10_000,
+    riskPerTradeFraction: 0.01,
+    maxPositions: 2,
+    maxGrossExposureFraction: 1,
+    maxNetExposureFraction: 1,
+    maxBtcBetaFraction: 1,
+    maxCorrelationClusterFraction: 1,
+    liquidationBufferFraction: 0.2,
+    initialMarginFraction: 0.1,
+    maxPortfolioRiskSnapshotAgeMs: HOUR_MS,
+  },
+  challengerHoldingHorizon: {
+    tacticalStrategyIds: [...TACTICAL_CHALLENGERS.map((strategy) => strategy.id), "RANDOM_CONTROL"],
+    directionalStrategyVersions: TACTICAL_CHALLENGERS.map((strategy) => ({ id: strategy.id, version: strategy.version, maxHoldBars: maxHoldBars(strategy) })),
+    randomControlReferenceStrategyId: "DONCHIAN",
+    maxTacticalHoldBars: FREE_BINANCE_VISION_2023_05_TO_2024_03_MAX_TACTICAL_HOLD_BARS,
+    maxTacticalHoldMs: FREE_BINANCE_VISION_2023_05_TO_2024_03_MAX_TACTICAL_HOLD_BARS * HOUR_MS,
+  },
+  validation,
+  sealedHoldout: {
+    allocation: "LATEST_20_PERCENT_OF_CANONICAL_1H_CLOCK",
+    minimumBars: SEALED_HOLDOUT_MINIMUM_BARS,
+    actualBars: SEALED_HOLDOUT_BARS,
+    actualFraction: SEALED_HOLDOUT_BARS / FREE_SCOPE_TOTAL_BARS,
+  },
+  evidenceGates: {
+    minimumOosWindows: 3,
+    minimumCompletedTradesPerInterpretedStrategy: 20,
+    minimumCanonicalIndependentEpisodes: 10,
+    maximumInvalidFolds: 0,
+    maximumTerminalUnresolvedPositions: 0,
+    insufficientEvidenceVerdict: "INCONCLUSIVE",
+  },
+  /**
+   * Frozen before empirical execution. These are diagnostic replays of the
+   * same immutable Tier-1 assembly, never alternatives used to select a
+   * strategy after inspecting OOS or sealed-holdout results.
+   */
+  robustness: {
+    version: "free-binance-vision-tier1-robustness-v2",
+    costFundingStress: {
+      scenarioId: "CONSERVATIVE_FEE_SLIPPAGE_AND_FUNDING_STRESS",
+      executionMode: "CONSERVATIVE",
+      takerFeeBps: 6,
+      baseSlippageBps: 3,
+      pessimisticSlippageMultiplier: 2,
+      fundingRateMultiplier: 2,
+      policy: "REPLAY_SAME_IMMUTABLE_PIT_INPUTS_WITH_ADVERSE_COST_TRANSFORM_ONLY",
+    },
+    parameterNeighborhoods: {
+      policyVersion: "one-axis-neighbors-no-post-result-expansion-v1",
+      DONCHIAN: [
+        { lookback: 16, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { lookback: 20, stopAtr: 1.5, targetAtr: 3, maxHoldBars: 48 },
+        { lookback: 20, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { lookback: 20, stopAtr: 2, targetAtr: 2.5, maxHoldBars: 48 },
+        { lookback: 20, stopAtr: 2, targetAtr: 3.5, maxHoldBars: 48 },
+        { lookback: 20, stopAtr: 2.5, targetAtr: 3, maxHoldBars: 48 },
+        { lookback: 24, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+      ],
+      MACD: [
+        { fast: 10, slow: 26, signal: 9, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 12, slow: 22, signal: 9, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 12, slow: 26, signal: 7, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 12, slow: 26, signal: 9, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 12, slow: 26, signal: 11, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 12, slow: 30, signal: 9, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 14, slow: 26, signal: 9, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+      ],
+      EMA_CROSS: [
+        { fast: 10, slow: 48, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 12, slow: 40, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 12, slow: 48, stopAtr: 1.5, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 12, slow: 48, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 12, slow: 48, stopAtr: 2, targetAtr: 3.5, maxHoldBars: 48 },
+        { fast: 12, slow: 56, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { fast: 14, slow: 48, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+      ],
+      RSI_MEAN_REVERSION: [
+        { period: 10, oversold: 30, overbought: 70, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { period: 14, oversold: 25, overbought: 75, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { period: 14, oversold: 30, overbought: 70, stopAtr: 1.5, targetAtr: 3, maxHoldBars: 48 },
+        { period: 14, oversold: 30, overbought: 70, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { period: 14, oversold: 30, overbought: 70, stopAtr: 2, targetAtr: 3.5, maxHoldBars: 48 },
+        { period: 14, oversold: 35, overbought: 65, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+        { period: 18, oversold: 30, overbought: 70, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
+      ],
+    },
+    /**
+     * The frozen default parameter set must sit on an OOS-only plateau. The
+     * sealed holdout is deliberately excluded here so it can remain a final
+     * evaluation rather than a source of parameter selection.
+     */
+    parameterStability: {
+      policyVersion: "oos-only-neighborhood-plateau-v1",
+      decisionBasis: "OOS_ONLY",
+      minimumStableNeighbourFraction: 0.6,
+      requiresSelectedConfigurationEvidenceGate: true,
+      requiresSelectedConfigurationPositiveExpectancy: true,
+      insufficientEvidenceVerdict: "INCONCLUSIVE",
+    },
+    candidateVerdictPolicy: {
+      requiresBaseOosAndHoldoutEvidence: true,
+      requiresCostFundingStress: true,
+      requiresParameterNeighborhoodAssessment: true,
+      verdictWhenAnyRequirementMissing: "INCONCLUSIVE",
+    },
+  },
+} as const;
+
+export type FreeBinanceVision2023ValidationPlan = Readonly<typeof artifactPayload & { artifactHash: string }>;
+
+/** Hash excludes itself and binds every static scope, policy, and evidence gate. */
+export const FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN: FreeBinanceVision2023ValidationPlan = deepFreeze({
+  ...artifactPayload,
+  artifactHash: tournamentHash(artifactPayload),
+});
+
+/** Fail closed if a strategy default changes without an explicit plan revision. */
+export function assertFreeBinanceVision2023ValidationPlan(): void {
+  const plan = FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN;
+  if (plan.scope.totalBars !== FREE_SCOPE_TOTAL_BARS || !Number.isInteger(plan.scope.totalBars)) throw new Error("FREE_TIER1_VALIDATION_SCOPE_CLOCK_INVALID");
+  if (plan.validation.trainBars !== 120 * DAY_BARS || plan.validation.testBars !== 30 * DAY_BARS || plan.validation.stepBars !== 30 * DAY_BARS) throw new Error("FREE_TIER1_VALIDATION_WINDOW_CONTRACT_INVALID");
+  if (plan.validation.purgeBars < plan.challengerHoldingHorizon.maxTacticalHoldBars || plan.validation.embargoBars < plan.challengerHoldingHorizon.maxTacticalHoldBars) throw new Error("FREE_TIER1_VALIDATION_HOLDING_HORIZON_LEAKAGE_GUARD_INVALID");
+  if (plan.sealedHoldout.actualBars < plan.sealedHoldout.minimumBars || plan.sealedHoldout.actualFraction < 0.2) throw new Error("FREE_TIER1_VALIDATION_SEALED_HOLDOUT_TOO_SHORT");
+  if (plan.executionPolicy.executionModes.length !== 1 || plan.executionPolicy.executionModes[0] !== "CONSERVATIVE" || (plan.executionPolicy.baselineAllowlist as readonly TournamentStrategyId[]).includes("KRONOS_CURRENT")) throw new Error("FREE_TIER1_VALIDATION_EXECUTION_POLICY_INVALID");
+  if (plan.tier1EligibilityPolicy.minimumHistory.minimumCompletedBars !== 168 || !plan.tier1EligibilityPolicy.minimumHistory.strictlyPrior || plan.tier1EligibilityPolicy.liquiditySpread.minLiquidityNotional !== 50_000 || plan.tier1EligibilityPolicy.liquiditySpread.maxSpreadBps !== 5 || plan.tier1EligibilityPolicy.liquiditySpread.maxAgeMs !== HOUR_MS) throw new Error("FREE_TIER1_VALIDATION_ELIGIBILITY_POLICY_INVALID");
+  if (plan.tier1ConservativeExecution.takerFeeBps !== 4 || plan.tier1ConservativeExecution.baseSlippageBps !== 2 || plan.tier1ConservativeExecution.pessimisticSlippageMultiplier !== 2 || !plan.tier1ConservativeExecution.fundingEnabled || plan.tier1ConservativeExecution.fillMode !== "NEXT_OPEN" || plan.tier1ConservativeExecution.intrabarAmbiguity !== "STOP_FIRST") throw new Error("FREE_TIER1_VALIDATION_CONSERVATIVE_EXECUTION_INVALID");
+  if (plan.tier1Portfolio.startingCapital !== 10_000 || plan.tier1Portfolio.maxPositions !== 2 || plan.tier1Portfolio.maxPortfolioRiskSnapshotAgeMs !== HOUR_MS) throw new Error("FREE_TIER1_VALIDATION_PORTFOLIO_POLICY_INVALID");
+  if (plan.evidenceGates.minimumOosWindows < 3 || plan.evidenceGates.minimumCompletedTradesPerInterpretedStrategy < 20 || plan.evidenceGates.minimumCanonicalIndependentEpisodes < 10 || plan.evidenceGates.maximumInvalidFolds !== 0 || plan.evidenceGates.maximumTerminalUnresolvedPositions !== 0) throw new Error("FREE_TIER1_VALIDATION_EVIDENCE_GATE_WEAKENED");
+  if (plan.robustness.costFundingStress.executionMode !== "CONSERVATIVE" || plan.robustness.costFundingStress.takerFeeBps < plan.tier1ConservativeExecution.takerFeeBps || plan.robustness.costFundingStress.baseSlippageBps < plan.tier1ConservativeExecution.baseSlippageBps || plan.robustness.costFundingStress.pessimisticSlippageMultiplier < plan.tier1ConservativeExecution.pessimisticSlippageMultiplier || plan.robustness.costFundingStress.fundingRateMultiplier < 1) throw new Error("FREE_TIER1_VALIDATION_ROBUSTNESS_STRESS_WEAKENED");
+  const requiredNeighborhoods = ["DONCHIAN", "MACD", "EMA_CROSS", "RSI_MEAN_REVERSION"] as const;
+  if (requiredNeighborhoods.some((strategyId) => plan.robustness.parameterNeighborhoods[strategyId].length < 5) || plan.robustness.parameterStability.policyVersion !== "oos-only-neighborhood-plateau-v1" || plan.robustness.parameterStability.decisionBasis !== "OOS_ONLY" || plan.robustness.parameterStability.minimumStableNeighbourFraction !== 0.6 || !plan.robustness.parameterStability.requiresSelectedConfigurationEvidenceGate || !plan.robustness.parameterStability.requiresSelectedConfigurationPositiveExpectancy || plan.robustness.parameterStability.insufficientEvidenceVerdict !== "INCONCLUSIVE" || !plan.robustness.candidateVerdictPolicy.requiresBaseOosAndHoldoutEvidence || !plan.robustness.candidateVerdictPolicy.requiresCostFundingStress || !plan.robustness.candidateVerdictPolicy.requiresParameterNeighborhoodAssessment || plan.robustness.candidateVerdictPolicy.verdictWhenAnyRequirementMissing !== "INCONCLUSIVE") throw new Error("FREE_TIER1_VALIDATION_ROBUSTNESS_POLICY_INVALID");
+  if (plan.artifactHash !== tournamentHash(artifactPayload)) throw new Error("FREE_TIER1_VALIDATION_PLAN_HASH_MISMATCH");
+}
+
+assertFreeBinanceVision2023ValidationPlan();

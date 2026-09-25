@@ -211,7 +211,13 @@ describe("LaneSelectorV2 — excludedSymbols (per-symbol real-admission block)",
         ],
       },
       laneStates: [
-        { variantId: "CG_WIDE_STOP_TP_WIDE", status: "REJECT", freshValid: 200, netAvgR: -0.3, pf: 0.6, wr: 0.45, byAxisSymbol: [{ key: "SHORT_BEARISH|NEARUSDT", n: 18, netAvgR: 0.22 }] },
+        // Point 2 fix note: this fixture used to carry status: "REJECT" and relied on the
+        // now-fixed bug (rotation shortlist ALLOW alone admitting a non-mature lane) to reach
+        // selection at all. That made this test's real assertion — per-symbol exclusion scope is
+        // per-VARIANT, not global — collateral damage of the maturity-gate fix, not something the
+        // fix should break. STABLE_CANDIDATE is required maturity proof; the point being tested
+        // (NEARUSDT still works on an unrelated, unexcluded lane) is unchanged.
+        { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.3, pf: 1.3, wr: 0.6, byAxisSymbol: [{ key: "SHORT_BEARISH|NEARUSDT", n: 18, netAvgR: 0.22 }] },
       ],
     });
     expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
@@ -341,69 +347,162 @@ describe("LaneSelectorV2 — manualEnabledVariantIds bypass on the LONG+WIDE_TRE
 });
 
 describe("LaneSelectorV2", () => {
-  it("allows a non-stable lane only when the bearish rotation shortlist proves that exact symbol", () => {
-    const result = selectLaneV2({
+  // Point 2 fix (§0 of the implementation plan): this test used to be titled "allows a non-stable
+  // lane only when the bearish rotation shortlist proves that exact symbol" and ASSERTED that a
+  // REJECT-status lane got selected purely because the shortlist ALLOWed the symbol — i.e. it
+  // locked in the exact bug the operator wants fixed (the rotation shortlist substituting for
+  // exact-context maturity proof). Rewritten per plan: the same REJECT-status lane + ALLOW
+  // shortlist must now be BLOCKED, and the block reason must correctly attribute to the lane's own
+  // unmet status (not a rotation-shortlist reason — the shortlist was never consulted because
+  // maturity failed first).
+  function injShortRotationShortlist() {
+    return {
+      generatedAt: "2026-07-05T04:00:00.000Z",
+      minAllowSample: 10,
+      minWatchSample: 5,
+      bearishGlobal: [],
+      bullishGlobal: [],
+      lanes: [
+        {
+          laneId: laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"),
+          variantId: "CG_WIDE_STOP_TP_WIDE" as const,
+          label: "Wide",
+          bullish: [],
+          bearish: [
+            {
+              symbol: "INJUSDT",
+              n: 18,
+              netAvgR: 0.22,
+              pf: 2.1,
+              wr: 0.78,
+              score: 30,
+              verdict: "ALLOW" as const,
+              reason: "test allow",
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  function injShortCandidateInputs(
+    laneStates: Parameters<typeof selectLaneV2>[0]["laneStates"],
+    over: Partial<Parameters<typeof selectLaneV2>[0]> = {},
+  ) {
+    return {
       candidate: {
         symbol: "INJUSDT",
-        direction: "SHORT",
+        direction: "SHORT" as const,
         currentPrice: 100,
         stopLoss: 104,
         takeProfitLevels: [94],
         stopDistanceBps: 400,
       },
       regime: "Bearish pressure",
-      controllerMode: "SHORT_ONLY",
-      controllerConfidence: "MEDIUM",
+      controllerMode: "SHORT_ONLY" as const,
+      controllerConfidence: "MEDIUM" as const,
       now: "2026-07-05T04:00:00.000Z",
-      rotationShortlist: {
-        generatedAt: "2026-07-05T04:00:00.000Z",
-        minAllowSample: 10,
-        minWatchSample: 5,
-        bearishGlobal: [],
-        bullishGlobal: [],
-        lanes: [
-          {
-            laneId: laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"),
-            variantId: "CG_WIDE_STOP_TP_WIDE",
-            label: "Wide",
-            bullish: [],
-            bearish: [
-              {
-                symbol: "INJUSDT",
-                n: 18,
-                netAvgR: 0.22,
-                pf: 2.1,
-                wr: 0.78,
-                score: 30,
-                verdict: "ALLOW",
-                reason: "test allow",
-              },
-            ],
-          },
-        ],
-      },
-      laneStates: [
-        {
-          variantId: "CG_WIDE_STOP_TP_WIDE",
-          status: "REJECT",
-          freshValid: 200,
-          netAvgR: -0.3,
-          pf: 0.6,
-          wr: 0.45,
-          byAxisSymbol: [{ key: "SHORT_BEARISH|INJUSDT", n: 18, netAvgR: 0.22 }],
-        },
-        {
-          variantId: "CG_WIDE_FAST_SHORT",
-          status: "REJECT",
-          freshValid: 200,
-          netAvgR: 9,
-          pf: 9,
-        },
-      ],
-    });
+      rotationShortlist: injShortRotationShortlist(),
+      laneStates,
+      ...over,
+    };
+  }
 
+  it("[ADVERSARIAL / fail-without] a REJECT-status lane is BLOCKED even though the bearish rotation shortlist ALLOWs that exact symbol", () => {
+    const result = selectLaneV2(injShortCandidateInputs([
+      {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        status: "REJECT",
+        freshValid: 200,
+        netAvgR: -0.3,
+        pf: 0.6,
+        wr: 0.45,
+        byAxisSymbol: [{ key: "SHORT_BEARISH|INJUSDT", n: 18, netAvgR: 0.22 }],
+      },
+      {
+        variantId: "CG_WIDE_FAST_SHORT",
+        status: "REJECT",
+        freshValid: 200,
+        netAvgR: 9,
+        pf: 9,
+      },
+    ]));
+
+    expect(result.selected).toBeNull();
+    expect(result.rejected).toContain("CG_WIDE_STOP_TP_WIDE:status_REJECT");
+  });
+
+  it("[ADVERSARIAL] a COLLECTING-status lane is BLOCKED even though the bearish rotation shortlist ALLOWs that exact symbol", () => {
+    const result = selectLaneV2(injShortCandidateInputs([
+      { variantId: "CG_WIDE_STOP_TP_WIDE", status: "COLLECTING", freshValid: 20, netAvgR: 0.1, pf: 1.2 },
+    ]));
+    expect(result.selected).toBeNull();
+    expect(result.rejected).toContain("CG_WIDE_STOP_TP_WIDE:status_COLLECTING");
+  });
+
+  it("[ADVERSARIAL] a WATCHABLE-status lane is BLOCKED even though the bearish rotation shortlist ALLOWs that exact symbol", () => {
+    const result = selectLaneV2(injShortCandidateInputs([
+      { variantId: "CG_WIDE_STOP_TP_WIDE", status: "WATCHABLE", freshValid: 60, netAvgR: 0.1, pf: 1.2 },
+    ]));
+    expect(result.selected).toBeNull();
+    expect(result.rejected).toContain("CG_WIDE_STOP_TP_WIDE:status_WATCHABLE");
+  });
+
+  it("[ADVERSARIAL] a lane with missing exact-context proof (exactContextResolved: false) is BLOCKED regardless of the shortlist, and never reaches the status branch", () => {
+    const result = selectLaneV2(injShortCandidateInputs([
+      { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", exactContextResolved: false, freshValid: 200, netAvgR: 0.3, pf: 1.3 },
+    ]));
+    expect(result.selected).toBeNull();
+    expect(result.rejected).toContain("CG_WIDE_STOP_TP_WIDE:missing_exact_context");
+  });
+
+  it("[PASS-WITH / positive] a genuinely STABLE_CANDIDATE lane is still selected when the bearish rotation shortlist ALSO ALLOWs that exact symbol (post-fix regression guard)", () => {
+    const result = selectLaneV2(injShortCandidateInputs([
+      {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        status: "STABLE_CANDIDATE",
+        freshValid: 200,
+        netAvgR: 0.3,
+        pf: 1.3,
+        wr: 0.6,
+        byAxisSymbol: [{ key: "SHORT_BEARISH|INJUSDT", n: 18, netAvgR: 0.22 }],
+      },
+    ]));
     expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
     expect(result.evaluated.map((item) => item.variantId)).toContain("CG_WIDE_STOP_TP_WIDE");
+  });
+
+  it("[PASS-WITH / force] a force-eligible lane with REAL exact-context proof (exactContextResolved: true) is selected even without STABLE_CANDIDATE status, and the shortlist ALLOW still applies as a refinement", () => {
+    const result = selectLaneV2(injShortCandidateInputs([
+      {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        status: "COLLECTING",
+        exactContextResolved: true,
+        operatorForceEligible: true,
+        freshValid: 20,
+        netAvgR: 0.1,
+        pf: 1.1,
+      },
+    ]));
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
+    // The underlying evidence status must never be rewritten/faked by the force path.
+    expect(result.selected).not.toBeNull();
+  });
+
+  it("[ADVERSARIAL / force] a force-eligible lane with NO real exact-context proof (exactContextResolved: false) is still BLOCKED — force cannot invent context", () => {
+    const result = selectLaneV2(injShortCandidateInputs([
+      {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        status: "COLLECTING",
+        exactContextResolved: false,
+        operatorForceEligible: true,
+        freshValid: 20,
+        netAvgR: 0.1,
+        pf: 1.1,
+      },
+    ]));
+    expect(result.selected).toBeNull();
+    expect(result.rejected).toContain("CG_WIDE_STOP_TP_WIDE:missing_exact_context");
   });
 
   it("does not let a rejected lane trade a bearish symbol outside its rotation shortlist", () => {

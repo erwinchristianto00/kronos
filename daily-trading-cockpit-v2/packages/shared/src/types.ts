@@ -272,7 +272,7 @@ export interface CapabilitySnapshot {
 export interface SymbolFailure {
   symbol: string;
   stage: string;
-  failureType: "timeout" | "429" | "network" | "invalid_response" | "unsupported";
+  failureType: "timeout" | "429" | "418" | "network" | "invalid_response" | "unsupported";
   reason: string;
 }
 

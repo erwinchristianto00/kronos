@@ -69,6 +69,9 @@ import {
   type LaneConfidence,
   type PaperOrder,
 } from "./paper-execution-router.js";
+import { exactCortexDecisionSnapshotForScan, type CortexDecisionSnapshot } from "./cortex-decision-snapshot.js";
+import { canonicalCortexLaneForPaperLane } from "./paper-cortex-lane-mapping.js";
+import { recordCortexProductionChainDiagnostic } from "./cortex-production-chain-diagnostics.js";
 import {
   buildMixedAdmissionDecisionLedger,
   buildMixedRegimeReport,
@@ -81,6 +84,11 @@ import {
   type LaneSymbolCurationTier,
   type PerSymbolLaneBookEdgeReport,
 } from "./per-symbol-lane-book-edge.js";
+import {
+  isMfeGivebackLaneId,
+  isTestnetCrossSectionalHorizonSourceAllowed,
+  isTestnetMfeGivebackSymbolAllowed,
+} from "./live-executor-wiring.js";
 
 // ─── public report types ──────────────────────────────────────────────────────
 
@@ -202,6 +210,12 @@ export interface PaperOpportunityAllocatorReport {
   paperOrdersCreated: number;
   duplicateSuppressed: number;
   rejected: number;
+  /** Report-only exact CORTEX hand-off diagnostics. They never affect allocation or admission. */
+  cortexLinkageDiagnostics: {
+    CORTEX_SNAPSHOT_SCAN_MISSING: number;
+    CORTEX_PAPER_LANE_UNMAPPED: number;
+    CORTEX_CANONICAL_LANE_MISMATCH: number;
+  };
 
   // ── adaptive lane quarantine / diagnostic-mode state ──────────────────────
   /** Posture of the active paper lane this batch. */
@@ -288,6 +302,9 @@ export interface PaperOpportunityAllocatorInputs {
   /** Immutable paper-start anchor; candidates before it are excluded from admission. */
   paperStartAt: string | null;
   paperValidationAllowed?: boolean;
+  /** Snapshots captured for this exact `scanBatchId` by the CORTEX allocation tick. They are
+   * producer-owned data, not a router lookup; missing input leaves the opportunity unlabelled. */
+  cortexDecisionSnapshots?: readonly CortexDecisionSnapshot[];
   /**
    * Testnet-only high-throughput collection mode. Every fresh candidate × lane
    * with valid executable geometry is admitted as DIAGNOSTIC_ONLY, including
@@ -1398,6 +1415,11 @@ export function buildPaperOpportunityAllocatorReport(
     paperOrdersCreated: 0,
     duplicateSuppressed: 0,
     rejected: 0,
+    cortexLinkageDiagnostics: {
+      CORTEX_SNAPSHOT_SCAN_MISSING: 0,
+      CORTEX_PAPER_LANE_UNMAPPED: 0,
+      CORTEX_CANONICAL_LANE_MISMATCH: 0,
+    },
     laneAdmissionStatus: laneDecision.laneAdmissionStatus,
     rotationAction: laneDecision.rotationAction,
     paperOrderMode: laneDecision.batchOrderMode === "DIAGNOSTIC_ONLY" ? "DIAGNOSTIC_ONLY" : "HEADLINE",
@@ -1734,6 +1756,8 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "ECONOMICS_REJECT", econFresh, econNet);
         continue;
       }
+      // Raw closes over the full fresh-valid population (P_all) against a raw-row floor — see
+      // current-guard-variant-matrix.ts's `freshValid` doc. Never an independent-episode count.
       if (!skipEconomics && econ!.freshValid < WATCHABLE_MIN_FRESH) {
         if (econ!.source === "AGGREGATE") {
           recordReject(symbol, direction, def.id, "ECONOMICS_INSUFFICIENT_SAMPLE", econFresh, econNet);
@@ -1806,6 +1830,28 @@ export function buildPaperOpportunityAllocatorReport(
           : `CG_VARIANT_MATRIX:${def.id}`;
       if (bullTrendCollection && laneId !== `CG_LONG_VARIANT_MATRIX:${def.id}`) {
         recordReject(symbol, direction, def.id, "BULL_TREND_LANE_ID_MISMATCH", rowFresh, rowNet);
+        continue;
+      }
+      // Testnet diagnostic collection may stay broad for research, but the
+      // executable CG_MFE_GIVEBACK rollout is not a broad research lane. Do
+      // not even create a new paper candidate unless BOTH its lane namespace
+      // and symbol are explicitly approved. Historical rows stay untouched for
+      // audit; this only governs forward admission.
+      if (
+        testnetCollectAllLanes &&
+        isMfeGivebackLaneId(laneId) &&
+        !isTestnetCrossSectionalHorizonSourceAllowed("testnet", laneId, symbol)
+      ) {
+        recordReject(
+          symbol,
+          direction,
+          def.id,
+          isTestnetMfeGivebackSymbolAllowed("testnet", laneId, symbol)
+            ? "TESTNET_MFE_GIVEBACK_LANE_NOT_ALLOWED"
+            : "TESTNET_MFE_GIVEBACK_SYMBOL_NOT_ALLOWED",
+          rowFresh,
+          rowNet,
+        );
         continue;
       }
       if (!testnetCollectAllLanes && manualQuarantinedPaperLanes.has(laneId)) {
@@ -2088,6 +2134,31 @@ export function buildPaperOpportunityAllocatorReport(
       }
 
       const buildOpportunity = (mode: PaperOrderMode): PaperOpportunity => {
+        const canonicalCortexLaneId = canonicalCortexLaneForPaperLane(laneId, direction);
+        if (!canonicalCortexLaneId) {
+          report.cortexLinkageDiagnostics.CORTEX_PAPER_LANE_UNMAPPED += 1;
+          recordCortexProductionChainDiagnostic("CORTEX_PAPER_LANE_UNMAPPED");
+        }
+        const sameScanSnapshots = (inputs.cortexDecisionSnapshots ?? []).filter((snapshot) =>
+          snapshot.scanBatchId === inputs.scanBatchId && snapshot.direction === direction,
+        );
+        const cortexDecisionSnapshot = canonicalCortexLaneId
+          ? exactCortexDecisionSnapshotForScan({
+            scanBatchId: inputs.scanBatchId,
+            canonicalCortexLaneId,
+            direction,
+            snapshots: inputs.cortexDecisionSnapshots,
+          })
+          : null;
+        if (canonicalCortexLaneId && !cortexDecisionSnapshot) {
+          if (sameScanSnapshots.some((snapshot) => snapshot.laneId !== canonicalCortexLaneId)) {
+            report.cortexLinkageDiagnostics.CORTEX_CANONICAL_LANE_MISMATCH += 1;
+            recordCortexProductionChainDiagnostic("CORTEX_CANONICAL_LANE_MISMATCH");
+          } else {
+            report.cortexLinkageDiagnostics.CORTEX_SNAPSHOT_SCAN_MISSING += 1;
+            recordCortexProductionChainDiagnostic("CORTEX_SNAPSHOT_SCAN_MISSING");
+          }
+        }
         const manualCgWideTarget =
           def.id === "CG_WIDE_STOP_TP_WIDE"
             ? cgWideTargetFromEntry(geo.entryPrice, direction, paperControls.cgWideTpPct)
@@ -2180,6 +2251,10 @@ export function buildPaperOpportunityAllocatorReport(
           riskMultiplierAfterOccupancy: mixedBudgetState?.risk.riskMultiplier,
           budgetUsed: mixedBudgetLedgerEntry?.budgetUsed,
           budgetReason: mixedBudgetLedgerEntry?.occupancyReason,
+          cortexDecisionSnapshot,
+          canonicalCortexLaneId,
+          cortexDecisionId: cortexDecisionSnapshot?.decisionId ?? null,
+          cortexAllocationSnapshotId: cortexDecisionSnapshot?.allocationSnapshotId ?? null,
         };
       };
 

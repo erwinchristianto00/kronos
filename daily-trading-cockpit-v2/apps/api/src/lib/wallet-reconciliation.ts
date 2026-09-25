@@ -106,6 +106,88 @@ export function emptyDailyIncomeSummary(dayUtc: string): DailyIncomeSummary {
   };
 }
 
+/**
+ * Narrow, durable projection of a Daily Range close used by the wallet
+ * reconciliation route. Daily Range settlement records funding separately;
+ * this bridge deliberately uses only gross P&L and commission so it matches
+ * Binance's REALIZED_PNL comparison basis without treating funding as trade
+ * P&L.
+ */
+export interface DailyRangeClosedAccountingSource {
+  status: string;
+  exitTimestamp: string | null;
+  grossPnlUsd: number | null;
+  feesUsd: number | null;
+}
+
+export interface DailyRangeClosedAccountingSummary {
+  dayUtc: string;
+  /** Exact trade gross P&L included in the REALIZED_PNL comparison. */
+  grossRealizedPnlUsd: number;
+  /** Gross P&L less closed commissions; funding is intentionally excluded. */
+  netRealizedExcludingFundingUsd: number;
+  /** Entry + exit commissions for the same included closes. */
+  closedFeesUsd: number;
+  completedTrades: number;
+  /** CLOSED rows for the target day that lack a safe gross/fee accounting pair. */
+  incompleteTrades: number;
+}
+
+function utcDayOfIsoTimestamp(iso: string): string | null {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : null;
+}
+
+/**
+ * Converts settled Daily Range records into the same net-plus-closed-fees
+ * representation used by the pre-existing external-lane reconciliation path.
+ * A malformed/incomplete close is deliberately excluded rather than guessed:
+ * that leaves a visible exchange mismatch instead of manufacturing agreement.
+ */
+export function summarizeDailyRangeClosedAccounting(
+  trades: ReadonlyArray<DailyRangeClosedAccountingSource>,
+  dayUtc: string,
+): DailyRangeClosedAccountingSummary {
+  let grossRealizedPnlUsd = 0;
+  let netRealizedExcludingFundingUsd = 0;
+  let closedFeesUsd = 0;
+  let completedTrades = 0;
+  let incompleteTrades = 0;
+
+  for (const trade of trades) {
+    if (trade.status !== "CLOSED") continue;
+    const closedDay = trade.exitTimestamp ? utcDayOfIsoTimestamp(trade.exitTimestamp) : null;
+    if (closedDay === null) {
+      incompleteTrades += 1;
+      continue;
+    }
+    if (closedDay !== dayUtc) continue;
+    if (
+      !Number.isFinite(trade.grossPnlUsd) ||
+      !Number.isFinite(trade.feesUsd) ||
+      (trade.feesUsd ?? 0) < 0
+    ) {
+      incompleteTrades += 1;
+      continue;
+    }
+    const gross = trade.grossPnlUsd!;
+    const fees = trade.feesUsd!;
+    grossRealizedPnlUsd += gross;
+    netRealizedExcludingFundingUsd += gross - fees;
+    closedFeesUsd += fees;
+    completedTrades += 1;
+  }
+
+  return {
+    dayUtc,
+    grossRealizedPnlUsd,
+    netRealizedExcludingFundingUsd,
+    closedFeesUsd,
+    completedTrades,
+    incompleteTrades,
+  };
+}
+
 /** UTC calendar day ("YYYY-MM-DD") an income entry's epoch-ms timestamp falls on. */
 function utcDayOf(epochMs: number): string {
   return new Date(epochMs).toISOString().slice(0, 10);

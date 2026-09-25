@@ -6,6 +6,17 @@ const BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com";
 // Matches FETCH_TIMEOUT_MS in external-candidate-metadata-fetcher.ts — survives cold TLS handshakes
 const REQUEST_TIMEOUT_MS = 6_000;
 const MAX_RETRIES = 2;
+/**
+ * Public USD-M reads are shared by scan, chart, execution-reference, and research-adjacent
+ * paths in the same API process.  A scan may fan out dozens of futures requests concurrently;
+ * serialize only those public USD-M reads and leave spot/fallback behaviour untouched.
+ *
+ * Vitest exercises request semantics rather than wall-clock pacing, so keep its unit suite
+ * deterministic and instant. Production retains a deliberately conservative 8 reads/sec cap.
+ */
+const FUTURES_READ_MIN_DISPATCH_GAP_MS = process.env.NODE_ENV === "test" ? 0 : 125;
+const HTTP_418_FALLBACK_COOLDOWN_MS = 2 * 60_000;
+const HTTP_429_FALLBACK_COOLDOWN_MS = 5_000;
 const DEFAULT_KLINE_CACHE_TTL_MS = 30_000;
 // Throttle for the stale-entry sweep in BinanceClient.pruneStaleCache() — the sweep
 // piggybacks on every setCache() write (no dedicated timer), so this bounds how often
@@ -152,7 +163,7 @@ export interface FuturesAggTradeSnapshot {
   timestamp: number;
 }
 
-export type BinanceFailureType = "timeout" | "429" | "network" | "invalid_response" | "unsupported";
+export type BinanceFailureType = "timeout" | "429" | "418" | "network" | "invalid_response" | "unsupported";
 type FetchSourceMode = "LIVE" | "CACHE_FRESH";
 
 interface CacheEntry<T> {
@@ -177,6 +188,7 @@ export class BinanceRequestError extends Error {
     readonly failureType: BinanceFailureType,
     readonly stage: string,
     message: string,
+    readonly retryAt: string | null = null,
   ) {
     super(message);
     this.name = "BinanceRequestError";
@@ -205,7 +217,22 @@ export function computeBasis(markPrice: number | null, indexPrice: number | null
 }
 
 function isRetryable(error: BinanceRequestError): boolean {
+  // A USD-M transport cooldown already has a concrete retry time. Retrying at the generic
+  // 150/300ms cadence only adds pressure and is how a short 429 can escalate into an IP 418.
+  if (error.retryAt !== null) return false;
   return error.failureType === "timeout" || error.failureType === "429" || error.failureType === "network";
+}
+
+function parseBanUntilMs(bodyText: string): number | null {
+  // Binance's -1003 ban message currently includes a Unix-ms expiry, but the exact wording is
+  // not contractual. Accept only a plausible 2020–2100 epoch so unrelated numeric text cannot
+  // silence the scanner indefinitely.
+  const values = bodyText.match(/\b\d{13}\b/g) ?? [];
+  for (const value of values) {
+    const ms = Number(value);
+    if (Number.isFinite(ms) && ms >= 1_577_836_800_000 && ms <= 4_102_444_800_000) return ms;
+  }
+  return null;
 }
 
 function delay(ms: number): Promise<void> {
@@ -234,6 +261,11 @@ export class BinanceClient {
   private readonly cache = new Map<string, CacheEntry<unknown>>();
   private readonly symbolFetchSummary = new Map<string, SymbolFetchSummary>();
   private lastCachePruneAt = 0;
+  /** One public USD-M queue per API process; spot requests never wait behind it. */
+  private futuresTransportTail: Promise<void> = Promise.resolve();
+  private futuresNextReadDispatchAtMs = 0;
+  private futuresCooldownUntilMs = 0;
+  private futuresLastRateLimitStatus: 418 | 429 | null = null;
 
   constructor(
     private readonly fetchImpl: typeof fetch = fetch,
@@ -377,7 +409,52 @@ export class BinanceClient {
     }
   }
 
-  private async fetchWithTimeout(url: URL, stage: string): Promise<Response> {
+  private isUsdMFuturesUrl(url: URL): boolean {
+    return url.origin === BINANCE_FUTURES_BASE_URL;
+  }
+
+  private assertFuturesCircuitClosed(stage: string): void {
+    const now = Date.now();
+    if (this.futuresCooldownUntilMs <= now) return;
+    const retryAt = new Date(this.futuresCooldownUntilMs).toISOString();
+    const status = this.futuresLastRateLimitStatus ?? 418;
+    throw new BinanceRequestError(
+      status === 418 ? "418" : "429",
+      stage,
+      `${status}: Binance USD-M transport cooldown until ${retryAt}`,
+      retryAt,
+    );
+  }
+
+  private registerFuturesRateLimit(status: 418 | 429, bodyText: string): void {
+    const now = Date.now();
+    const fallbackMs = status === 418 ? HTTP_418_FALLBACK_COOLDOWN_MS : HTTP_429_FALLBACK_COOLDOWN_MS;
+    const retryUntilMs = Math.max(now + fallbackMs, parseBanUntilMs(bodyText) ?? 0);
+    this.futuresCooldownUntilMs = Math.max(this.futuresCooldownUntilMs, retryUntilMs);
+    this.futuresLastRateLimitStatus = status;
+  }
+
+  private async withFuturesReadSlot<T>(stage: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.futuresTransportTail;
+    let release = (): void => {};
+    this.futuresTransportTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      this.assertFuturesCircuitClosed(stage);
+      const now = Date.now();
+      const dispatchAt = Math.max(now, this.futuresNextReadDispatchAtMs);
+      this.futuresNextReadDispatchAtMs = dispatchAt + FUTURES_READ_MIN_DISPATCH_GAP_MS;
+      const waitMs = dispatchAt - now;
+      if (waitMs > 0) await delay(waitMs);
+      // Another queued reader may have received the first 418 while this request waited.
+      this.assertFuturesCircuitClosed(stage);
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async dispatchFetchWithTimeout(url: URL, stage: string): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
@@ -395,6 +472,42 @@ export class BinanceClient {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  private async fetchWithTimeout(url: URL, stage: string): Promise<Response> {
+    if (!this.isUsdMFuturesUrl(url)) return this.dispatchFetchWithTimeout(url, stage);
+    return this.withFuturesReadSlot(stage, async () => {
+      const response = await this.dispatchFetchWithTimeout(url, stage);
+      // Register inside the serialized slot. This matters: otherwise the next queued request can
+      // leave before getJson() has inspected the first 418 response body.
+      if (response.status === 418 || response.status === 429) {
+        const bodyText = await response.clone().text().catch(() => "");
+        this.registerFuturesRateLimit(response.status, bodyText);
+      }
+      return response;
+    });
+  }
+
+  /**
+   * Shared, read-only USD-M public transport for modules that need a bulk endpoint not represented
+   * by one of this client's typed convenience methods (for example exchangeInfo or the all-symbol
+   * 24h ticker).  Keeping those callers on this transport is essential: a raw global fetch would
+   * bypass the per-process queue/circuit and keep extending an IP-level 418 while the engine itself
+   * correctly stands down.
+   *
+   * This deliberately returns the response unchanged.  The caller owns endpoint-specific shape
+   * validation, while this client owns request pacing and 418/429 containment.
+   */
+  async fetchFuturesPublic(url: string | URL, stage: string): Promise<Response> {
+    const parsed = url instanceof URL ? new URL(url.toString()) : new URL(url);
+    if (!this.isUsdMFuturesUrl(parsed)) {
+      throw new BinanceRequestError(
+        "unsupported",
+        stage,
+        `unsupported: shared USD-M public transport only permits ${BINANCE_FUTURES_BASE_URL}`,
+      );
+    }
+    return this.fetchWithTimeout(parsed, stage);
   }
 
   private async getJson<T>(
@@ -433,6 +546,18 @@ export class BinanceClient {
           const response = await this.fetchWithTimeout(url, stage);
           this.recordSymbolFetchTiming(symbol, stage, { providerWaitMs: Date.now() - providerStartedMs, requestCount: 1 });
           if (!response.ok) {
+            if (response.status === 418 || (response.status === 429 && this.isUsdMFuturesUrl(url))) {
+              const status = response.status as 418 | 429;
+              const retryAt = this.futuresCooldownUntilMs > Date.now()
+                ? new Date(this.futuresCooldownUntilMs).toISOString()
+                : null;
+              throw new BinanceRequestError(
+                status === 418 ? "418" : "429",
+                stage,
+                `${status}: Binance USD-M IP rate limited ${symbol} on ${stage}${retryAt ? `; cooldown until ${retryAt}` : ""}`,
+                retryAt,
+              );
+            }
             if (response.status === 429) {
               throw new BinanceRequestError("429", stage, `429: Binance rate limited ${symbol} on ${stage}`);
             }
@@ -514,6 +639,45 @@ export class BinanceClient {
     // Binance includes the in-progress kline. `getCandles` is the shared
     // decision/resolver boundary, so no downstream lane can accidentally use
     // a mutable candle as a feature or as a terminal outcome bar.
+    return completedCandles(candles, interval, Date.now());
+  }
+
+  /**
+   * Public USD-M candles for audit/reconciliation paths.  Do not route
+   * futures-only perpetual symbols through the spot `/api/v3/klines` endpoint:
+   * a spot 404 would otherwise be misclassified upstream as missing outcome
+   * data.  This deliberately remains a public, read-only request and does not
+   * use exchange credentials or the testnet order client.
+   */
+  async getFuturesCandles(symbol: string, interval: string, limit: number, options?: { startTime?: number; endTime?: number }): Promise<Candle[]> {
+    const stage = `futures_candles_${interval}`;
+    const payload = await this.getJson<BinanceKline[]>(
+      symbol,
+      stage,
+      "/fapi/v1/klines",
+      {
+        symbol,
+        interval,
+        limit: String(limit),
+        ...(options?.startTime ? { startTime: String(options.startTime) } : {}),
+        ...(options?.endTime ? { endTime: String(options.endTime) } : {}),
+      },
+      BINANCE_FUTURES_BASE_URL,
+      false,
+    );
+
+    if (!Array.isArray(payload) || payload.some((entry) => !Array.isArray(entry) || entry.length < 6)) {
+      throw new BinanceRequestError("invalid_response", stage, `invalid_response: Binance futures klines were malformed for ${symbol} ${interval}`);
+    }
+
+    const candles = payload.map((entry) => ({
+      openTime: entry[0],
+      open: Number(entry[1]),
+      high: Number(entry[2]),
+      low: Number(entry[3]),
+      close: Number(entry[4]),
+      volume: Number(entry[5]),
+    }));
     return completedCandles(candles, interval, Date.now());
   }
 

@@ -1,0 +1,33 @@
+[Unit]
+Description=Kronos Claude Hermes TESTNET wait-armed runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kronos-astra
+Group=kronos-astra
+WorkingDirectory=/opt/kronos-astra/releases/sonnet-v4-state-compact-v1-20260924
+Environment=HOME=/opt/kronos-astra/runtime
+Environment=HERMES_HOME=/opt/kronos-astra/releases/sonnet-v4-state-compact-v1-20260924/hermes-home
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/kronos-astra/runtime/work/hermes-agent/.venv/bin/python -u /opt/kronos-astra/releases/sonnet-v4-state-compact-v1-20260924/astra_v8_supervisor.py --loop
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/kronos-astra/releases/sonnet-v4-state-compact-v1-20260924/hermes-home /opt/kronos-astra/runtime/logs /opt/kronos-astra/releases/sonnet-v4-state-compact-v1-20260924/runner.lock
+RestrictSUIDSGID=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+StandardOutput=append:/opt/kronos-astra/runtime/logs/vps-service.log
+StandardError=append:/opt/kronos-astra/runtime/logs/vps-service-error.log
+
+[Install]
+WantedBy=multi-user.target

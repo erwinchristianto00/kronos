@@ -92,14 +92,19 @@ function rowForAxisSymbol(rows: VariantBreakdownRow[] | null | undefined, axis: 
 function verdictFor(row: VariantBreakdownRow, minAllowSample: number, minWatchSample: number): { verdict: RotationShortlistVerdict; reason: string } {
   const net = numeric(row.netAvgR);
   const pf = row.pf;
-  if (row.n >= minAllowSample && net >= MIN_ALLOW_NET_R && (pf === null || pf === undefined || pf >= MIN_ALLOW_PF)) {
+  // A null/undefined PF is missing proof, not a free pass. It used to pass the PF bar in both the
+  // ALLOW and WATCH branches (treating "we don't know" as "acceptable"), which let axis-symbol rows
+  // with no resolvable profit factor still reach ALLOW/WATCH on sample+net alone. PF must now be a
+  // real, present number that clears the bar.
+  if (row.n >= minAllowSample && net >= MIN_ALLOW_NET_R && pf !== null && pf !== undefined && pf >= MIN_ALLOW_PF) {
     return { verdict: "ALLOW", reason: `allow: n>=${minAllowSample}, net>=${MIN_ALLOW_NET_R.toFixed(3)}R, PF>=${MIN_ALLOW_PF.toFixed(1)}` };
   }
-  if (row.n >= minWatchSample && net > MIN_WATCH_NET_R && (pf === null || pf === undefined || pf >= MIN_WATCH_PF)) {
+  if (row.n >= minWatchSample && net > MIN_WATCH_NET_R && pf !== null && pf !== undefined && pf >= MIN_WATCH_PF) {
     return { verdict: "WATCH", reason: `watch: sample or PF below live allow bar` };
   }
   if (row.n < minWatchSample) return { verdict: "BLOCK", reason: `sample<${minWatchSample}` };
   if (!(net > MIN_WATCH_NET_R)) return { verdict: "BLOCK", reason: "non-positive axis-symbol edge" };
+  if (pf === null || pf === undefined) return { verdict: "BLOCK", reason: "PF unresolved (null)" };
   return { verdict: "BLOCK", reason: "PF below watch bar" };
 }
 

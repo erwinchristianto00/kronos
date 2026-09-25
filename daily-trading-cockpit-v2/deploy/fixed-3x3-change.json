@@ -1,0 +1,13 @@
+{
+  "old": "/root/kronos-testnet-releases/cross-entry-quote-20260921-r1/daily-trading-cockpit-v2",
+  "new": "/root/kronos-testnet-releases/cross-fixed-3x3-20260925-r1/daily-trading-cockpit-v2",
+  "changes": {
+    "CROSS_SECTIONAL_DYNAMIC_ALLOWED_ALLOCATIONS": "3L3S",
+    "CROSS_SECTIONAL_TESTNET_THREE_LEG_FALLBACK": "0",
+    "CROSS_SECTIONAL_TESTNET_THREE_LEG_QUALITY_V2": "0",
+    "CROSS_SECTIONAL_TESTNET_THREE_LEG_QUALITY_V3": "0",
+    "CROSS_SECTIONAL_CURRENT_POLICY_FORWARD_STARTED_AT": "2026-09-25T02:52:50Z",
+    "CROSS_SECTIONAL_STRATEGY_DEPLOYED_AT": "2026-09-25T02:52:50Z"
+  },
+  "scope": "Testnet geometry only; quote guards, exits, sizing, other lanes unchanged"
+}

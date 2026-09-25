@@ -1,0 +1,11 @@
+{
+  "name": "testnet",
+  "old": "/root/kronos-testnet-releases/testnet-cross-curation20-v1-20260906-r1/daily-trading-cockpit-v2",
+  "new": "/root/kronos-testnet-releases/testnet-cross-curation20-v1-20260906-r2/daily-trading-cockpit-v2",
+  "sourceChanged": [
+    "apps/api/src/lib/cross-sectional-curated-universe.ts",
+    "apps/api/src/routes/shadow.ts"
+  ],
+  "envIdentical": true,
+  "stateTarget": "/root/kronos-testnet-releases/128b09f/daily-trading-cockpit-v2/apps/api/data"
+}

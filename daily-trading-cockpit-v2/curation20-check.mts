@@ -1,0 +1,1 @@
+import 'dotenv/config'; const e=await import('./apps/api/src/lib/cross-sectional-edge.ts'); for(const k of ['CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST','CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST']) { const s=e[k]; if(s.size!==20 || s.has('1000PEPEUSDT') || s.has('ARBUSDT')) throw Error(k); } console.log('EFFECTIVE_ALLOWLIST20_PASS');

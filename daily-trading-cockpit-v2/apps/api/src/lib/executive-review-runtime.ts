@@ -69,6 +69,8 @@ function positionLink(
     positionId: intent.positionId,
     laneId: link.laneId,
     marketContextSnapshotId: link.marketContextSnapshotId,
+    allocationSnapshotId: link.allocationSnapshotId,
+    canonicalCortexLaneId: link.canonicalCortexLaneId,
     // Legacy name, legacy meaning: intent-CREATION time, kept for backward compatibility and the
     // store's own structural sanity gate. Never the exact open clock for direct economic eligibility
     // — that is entryFilledAtMs below, sourced only from a confirmed fill.
@@ -130,6 +132,8 @@ function outcomeLink(
     executiveReviewId: link.executiveReviewId,
     opportunityId: link.opportunityId,
     positionId: intent.positionId ?? null,
+    allocationSnapshotId: link.allocationSnapshotId,
+    canonicalCortexLaneId: link.canonicalCortexLaneId,
     outcomeId: Number.isFinite(closedAtMs)
       ? `live-executive-outcome:${intent.executionIntentId ?? "missing"}:${closedAtMs}:${link.executionPolicyVersion}`
       : null,

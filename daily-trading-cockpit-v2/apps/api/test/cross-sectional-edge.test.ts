@@ -1,16 +1,17 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import type { Candle } from "@dtc/shared";
 import {
   deriveAdaptiveSymbolFilters,
   getCrossSectionalFilteredExecutionFilters,
+  shouldApplyCandleLiquidityFloor,
   crossSectionalMomentumScore,
   buildCrossSectionalBasket,
   buildFilteredCrossSectionalBasket,
+  filteredWeightingModel,
   buildTrendCrossSectionalBasket,
   buildMixedCrossSectionalBasket,
   resolveCrossSectional,
   buildCrossSectionalReport,
-  getCrossSectionalReportSinceMs,
   runCrossSectionalCycle,
   CrossSectionalStore,
   CROSS_SECTIONAL_HORIZON_MS,
@@ -20,7 +21,6 @@ import {
   buildCrossSectionalRegimeContext,
   CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
   CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
-  CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
   CROSS_SECTIONAL_TREND_LONG_ALLOWLIST,
   CROSS_SECTIONAL_TREND_LONG_BLOCKLIST,
   CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST,
@@ -29,22 +29,21 @@ import {
   CROSS_SECTIONAL_MIXED_MIN_SCORE_GAP,
   crossSectionalMixedLongAllowlist,
   crossSectionalMixedShortBlocklist,
+  crossSectionalLegScaleAnomaly,
+  crossSectionalScaleAnomalies,
   isCrossSectionalMixedWideLongPoolEnabled,
   getCrossSectionalAdaptiveConfig,
   regimeSkewedK,
   regimeSkewCounterfactual,
-  liquidCrossSectionalSymbols,
-  narrowAllowlistToLiquid,
-  CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR,
-  CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS,
-  crossSectionalLiquidityStarved,
-  isCrossSectionalAdaptiveDemotionFrozen,
   type ScoredSymbol,
   type CrossSectionalObservation,
+  nonOverlappingClosedSample,
 } from "../src/lib/cross-sectional-edge.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { clusterOf } from "../src/lib/correlation-clusters.js";
+import type { SymbolReliabilitySnapshot } from "../src/lib/cross-sectional-symbol-reliability.js";
 
 function mkCandle(close: number): Candle {
   return { openTime: 0, open: close, high: close, low: close, close, volume: 1 };
@@ -60,6 +59,39 @@ function freshStore(): CrossSectionalStore {
 }
 const T0 = "2099-01-02T00:00:00.000Z";
 const T0ms = new Date(T0).getTime();
+const DAY_MS = 24 * 60 * 60_000;
+
+function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T): T {
+  const previous = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  try {
+    for (const [key, value] of Object.entries(overrides)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+async function withEnvAsync<T>(overrides: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const previous = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  try {
+    for (const [key, value] of Object.entries(overrides)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return await fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
 
 describe("cross-sectional-edge — market-neutral measurement lane", () => {
   it("[SCORE] momentum score is the N-bar return + latest close", () => {
@@ -78,6 +110,163 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     expect(b.longLeg.map((l) => l.symbol)).toEqual(["A"]); // highest score
     expect(b.shortLeg.map((l) => l.symbol)).toEqual(["D"]); // lowest score
     expect(b.status).toBe("OPEN");
+  });
+
+  describe("[SCORE-RANK] CAPPED_SCORE_RANK sizes by conviction, not by calmness", () => {
+    // 2026-08-17. The live basket xb-msw8ddsf-ltered sized WLD (+4.674% MOM36) at weight 0.132 and
+    // TAO (+0.051%) at 0.219 under CAPPED_INVERSE_VOL, because TAO was the calmest leg. These pin
+    // the reversal: the leg carrying the signal must get the most capital on BOTH sides.
+    const wlBasket = (model: "CAPPED_INVERSE_VOL" | "CAPPED_SCORE_RANK") =>
+      buildCrossSectionalBasket(
+        [
+          { symbol: "WLDUSDT", score: 0.04674, price: 0.3629, volatility: 0.009044, fastReturn: 0, extensionVol: 0 },
+          { symbol: "UNIUSDT", score: 0.02191, price: 3.306, volatility: 0.003762, fastReturn: 0, extensionVol: 0 },
+          { symbol: "TAOUSDT", score: 0.00051, price: 197.46, volatility: 0.001776, fastReturn: 0, extensionVol: 0 },
+          { symbol: "1000PEPEUSDT", score: -0.02264, price: 0.0025915, volatility: 0.004067, fastReturn: 0, extensionVol: 0 },
+          { symbol: "BNBUSDT", score: -0.00896, price: 606.36, volatility: 0.001281, fastReturn: 0, extensionVol: 0 },
+          { symbol: "SUIUSDT", score: -0.00850, price: 0.6771, volatility: 0.001896, fastReturn: 0, extensionVol: 0 },
+        ],
+        {
+          k: 3, signal: "MOM36", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+          weightingModel: model,
+          volBySymbol: { WLDUSDT: 0.009044, UNIUSDT: 0.003762, TAOUSDT: 0.001776, "1000PEPEUSDT": 0.004067, BNBUSDT: 0.001281, SUIUSDT: 0.001896 },
+        },
+      )!;
+
+    it("reproduces the inversion under the OLD model — strongest signal, smallest weight", () => {
+      const b = wlBasket("CAPPED_INVERSE_VOL");
+      const w = Object.fromEntries(b.longLeg.map((l) => [l.symbol, l.weight!]));
+      expect(w.WLDUSDT!).toBeLessThan(w.TAOUSDT!); // the defect, pinned
+    });
+
+    it("REVERSES it: the strongest long score now carries the most capital", () => {
+      const b = wlBasket("CAPPED_SCORE_RANK");
+      const w = Object.fromEntries(b.longLeg.map((l) => [l.symbol, l.weight!]));
+      expect(w.WLDUSDT!).toBeGreaterThan(w.UNIUSDT!);
+      expect(w.UNIUSDT!).toBeGreaterThan(w.TAOUSDT!);
+    });
+
+    it("tilts the SHORT side toward the MOST NEGATIVE score, not the highest", () => {
+      const b = wlBasket("CAPPED_SCORE_RANK");
+      const w = Object.fromEntries(b.shortLeg.map((l) => [l.symbol, l.weight!]));
+      expect(w["1000PEPEUSDT"]!).toBeGreaterThan(w.BNBUSDT!); // -2.264% is the strongest short
+      expect(w["1000PEPEUSDT"]!).toBeGreaterThan(w.SUIUSDT!);
+    });
+
+    it("keeps each side's capital at 0.5 and respects the 0.75-1.25 clip (max 1.67x spread)", () => {
+      const b = wlBasket("CAPPED_SCORE_RANK");
+      for (const legs of [b.longLeg, b.shortLeg]) {
+        expect(legs.reduce((sum, l) => sum + l.weight!, 0)).toBeCloseTo(0.5, 9);
+        const ws = legs.map((l) => l.weight!);
+        expect(Math.max(...ws) / Math.min(...ws)).toBeLessThanOrEqual(1.25 / 0.75 + 1e-9);
+      }
+    });
+
+    it("equal scores on a side fall back to equal weights, never a divide-by-zero", () => {
+      const b = buildCrossSectionalBasket(
+        [
+          { symbol: "A", score: 0.05, price: 10, volatility: 0.01, fastReturn: 0, extensionVol: 0 },
+          { symbol: "B", score: 0.05, price: 10, volatility: 0.02, fastReturn: 0, extensionVol: 0 },
+          { symbol: "C", score: -0.05, price: 10, volatility: 0.01, fastReturn: 0, extensionVol: 0 },
+          { symbol: "D", score: -0.05, price: 10, volatility: 0.02, fastReturn: 0, extensionVol: 0 },
+        ],
+        { k: 2, signal: "MOM36", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS, weightingModel: "CAPPED_SCORE_RANK" },
+      )!;
+      for (const legs of [b.longLeg, b.shortLeg]) {
+        expect(legs[0]!.weight!).toBeCloseTo(legs[1]!.weight!, 12);
+        expect(legs.reduce((s, l) => s + l.weight!, 0)).toBeCloseTo(0.5, 12);
+      }
+    });
+  });
+
+  describe("[GAP-REJECT] the gate now records what it refused", () => {
+    // Before this hook a rejected basket was written nowhere, so the live store held ZERO
+    // observations below the 0.02 floor and the gate could never be evaluated from real data.
+    const scoredPair = (longScore: number, shortScore: number) => [
+      { symbol: "A", score: longScore, price: 10, volatility: 0.01, fastReturn: 0, extensionVol: 0 },
+      { symbol: "B", score: shortScore, price: 20, volatility: 0.02, fastReturn: 0, extensionVol: 0 },
+    ];
+    const opts = (extra: Record<string, unknown>) => ({
+      k: 1, signal: "MOM36_FILTERED", now: T0, openedAtMs: T0ms,
+      horizonMs: CROSS_SECTIONAL_HORIZON_MS, minScoreGap: 0.02, ...extra,
+    });
+
+    it("fires with the composition it WOULD have opened when the gap is too small", () => {
+      const seen: unknown[] = [];
+      const b = buildCrossSectionalBasket(scoredPair(0.005, -0.004), opts({ onGapReject: (i: unknown) => seen.push(i) }));
+      expect(b).toBeNull(); // still refused — the gate itself is unchanged
+      expect(seen).toHaveLength(1);
+      const info = seen[0] as { scoreGap: number; minScoreGap: number; longs: Array<{ symbol: string }>; shorts: Array<{ symbol: string }> };
+      expect(info.scoreGap).toBeCloseTo(0.009, 9);
+      expect(info.minScoreGap).toBe(0.02);
+      expect(info.longs.map((l) => l.symbol)).toEqual(["A"]);
+      expect(info.shorts.map((l) => l.symbol)).toEqual(["B"]);
+    });
+
+    it("does NOT fire when the gap passes — only refusals are recorded", () => {
+      const seen: unknown[] = [];
+      const b = buildCrossSectionalBasket(scoredPair(0.05, -0.05), opts({ onGapReject: (i: unknown) => seen.push(i) }));
+      expect(b).not.toBeNull();
+      expect(seen).toHaveLength(0);
+    });
+
+    it("behaves exactly as before when no hook is supplied", () => {
+      expect(buildCrossSectionalBasket(scoredPair(0.005, -0.004), opts({}))).toBeNull();
+    });
+
+    it("a THROWING hook never breaks basket formation", () => {
+      expect(() =>
+        buildCrossSectionalBasket(scoredPair(0.005, -0.004), opts({ onGapReject: () => { throw new Error("sink down"); } })),
+      ).not.toThrow();
+    });
+  });
+
+  describe("[SCORE-RANK] filteredWeightingModel env selection", () => {
+    it("accepts the four real models, case-insensitively", () => {
+      expect(filteredWeightingModel({ CROSS_SECTIONAL_FILTERED_WEIGHTING: "CAPPED_SCORE_RANK" } as NodeJS.ProcessEnv)).toBe("CAPPED_SCORE_RANK");
+      expect(filteredWeightingModel({ CROSS_SECTIONAL_FILTERED_WEIGHTING: " equal_notional " } as NodeJS.ProcessEnv)).toBe("EQUAL_NOTIONAL");
+    });
+
+    it("falls back to the PREVIOUS production model on anything unrecognised — never equal-weight by accident", () => {
+      expect(filteredWeightingModel({} as NodeJS.ProcessEnv)).toBe("CAPPED_INVERSE_VOL");
+      expect(filteredWeightingModel({ CROSS_SECTIONAL_FILTERED_WEIGHTING: "typo" } as NodeJS.ProcessEnv)).toBe("CAPPED_INVERSE_VOL");
+      expect(filteredWeightingModel({ CROSS_SECTIONAL_FILTERED_WEIGHTING: "" } as NodeJS.ProcessEnv)).toBe("CAPPED_INVERSE_VOL");
+    });
+  });
+
+  it("[OPERATOR-VOID] retains a raw source observation but removes it from the report and future edge cohort", () => {
+    const store = freshStore();
+    const closed = (observationId: string, netReturn: number): CrossSectionalObservation => ({
+      ...buildCrossSectionalBasket(
+        scored([["SOLUSDT", 0.2, 100], ["DOGEUSDT", -0.2, 0.1]]),
+        { k: 1, signal: "MOM24", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS },
+      )!,
+      observationId,
+      status: "CLOSED",
+      grossReturn: netReturn + 0.001,
+      costReturn: 0.001,
+      netReturn,
+      longLegReturn: netReturn,
+      shortLegReturn: 0,
+      resolvedAt: T0,
+    });
+    store.add(closed("kept", 0.02));
+    store.add(closed("voided", -0.5));
+
+    const voided = store.voidObservationForReporting("voided", {
+      reason: "linked executed basket was operator-voided",
+      voidedAt: T0,
+      sourceBasketId: "xb-test-void",
+    });
+    expect(voided).toMatchObject({ ok: true, alreadyVoided: false, observationId: "voided" });
+    expect(store.all).toHaveLength(2); // raw record remains for audit
+    expect(store.reportable.map((observation) => observation.observationId)).toEqual(["kept"]);
+
+    const report = buildCrossSectionalReport(store, T0ms + 1, { signal: "MOM24" });
+    expect(report.closed).toBe(1);
+    expect(report.totalNetReturn).toBeCloseTo(0.02, 12);
+    expect(report.recentNetReturns).toEqual([0.02]);
+    expect(store.voidObservationForReporting("voided", { reason: "retry" })).toMatchObject({ ok: true, alreadyVoided: true });
   });
 
   it("[FILTERED] applies long/short symbol guardrails and score-gap floor", () => {
@@ -108,19 +297,190 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     expect(b.scoreGap).toBeGreaterThanOrEqual(0.05);
   });
 
-  it("[FILTERED-SIZING] keeps 50/50 sides while capping inverse-vol legs near equal size", () => {
-    const b = buildFilteredCrossSectionalBasket(
-      scored([["SOLUSDT", 0.2, 100], ["ETHUSDT", 0.1, 100], ["WLDUSDT", -0.1, 100], ["DOGEUSDT", -0.2, 100]]),
-      {
-        k: 2, now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS, minScoreGap: 0.01,
-        longAllowlist: new Set(["SOLUSDT", "ETHUSDT"]), shortAllowlist: new Set(["WLDUSDT", "DOGEUSDT"]),
-        volBySymbol: { SOLUSDT: 0.01, ETHUSDT: 0.20, WLDUSDT: 0.02, DOGEUSDT: 0.30 },
-      },
-    )!;
-    expect(b.weightingModel).toBe("CAPPED_INVERSE_VOL");
-    expect(b.longLeg.reduce((sum, leg) => sum + (leg.weight ?? 0), 0)).toBeCloseTo(0.5, 9);
-    expect(b.shortLeg.reduce((sum, leg) => sum + (leg.weight ?? 0), 0)).toBeCloseTo(0.5, 9);
-    expect(Math.max(...b.longLeg.map((leg) => leg.weight ?? 0))).toBeLessThanOrEqual(0.3125 + 1e-9);
+  describe("[FILTERED SIDE TREND] refuses to force a symbol onto the wrong side", () => {
+    const common = {
+      k: 3,
+      now: T0,
+      openedAtMs: T0ms,
+      horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+      minScoreGap: 0,
+      maxPerCluster: 0,
+    };
+
+    it("uses only slow-and-fast aligned names and fails closed when the market has no eligible hedge side", () => {
+      const aligned = withEnv({ CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "1" }, () =>
+        buildFilteredCrossSectionalBasket([
+          { symbol: "L_REVERSING", score: 0.30, price: 100, fastReturn: -0.01 },
+          { symbol: "L1", score: 0.25, price: 100, fastReturn: 0.03 },
+          { symbol: "L2", score: 0.20, price: 100, fastReturn: 0.02 },
+          { symbol: "L3", score: 0.15, price: 100, fastReturn: 0.01 },
+          { symbol: "S_REVERSING", score: -0.30, price: 100, fastReturn: 0.01 },
+          { symbol: "S1", score: -0.25, price: 100, fastReturn: -0.03 },
+          { symbol: "S2", score: -0.20, price: 100, fastReturn: -0.02 },
+          { symbol: "S3", score: -0.15, price: 100, fastReturn: -0.01 },
+        ], {
+          ...common,
+          longAllowlist: new Set(["L_REVERSING", "L1", "L2", "L3"]),
+          shortAllowlist: new Set(["S_REVERSING", "S1", "S2", "S3"]),
+        }),
+      )!;
+      expect(aligned.longLeg.map((leg) => leg.symbol)).toEqual(["L1", "L2", "L3"]);
+      expect(aligned.shortLeg.map((leg) => leg.symbol)).toEqual(["S1", "S2", "S3"]);
+
+      const fallingOnly: ScoredSymbol[] = [
+        { symbol: "F1", score: -0.30, price: 100, fastReturn: -0.03 },
+        { symbol: "F2", score: -0.20, price: 100, fastReturn: -0.02 },
+        { symbol: "F3", score: -0.10, price: 100, fastReturn: -0.01 },
+        { symbol: "F4", score: -0.05, price: 100, fastReturn: -0.01 },
+      ];
+      withEnv({ CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "1" }, () => {
+        expect(buildFilteredCrossSectionalBasket(fallingOnly, {
+          ...common,
+          longAllowlist: new Set(fallingOnly.map((row) => row.symbol)),
+          shortAllowlist: new Set(fallingOnly.map((row) => row.symbol)),
+        })).toBeNull();
+      });
+    });
+
+    it("keeps rank-only selection available only behind the explicit OFF setting", () => {
+      const risingOnly: ScoredSymbol[] = [
+        { symbol: "R1", score: 0.30, price: 100, fastReturn: 0.03 },
+        { symbol: "R2", score: 0.20, price: 100, fastReturn: 0.02 },
+        { symbol: "R3", score: 0.10, price: 100, fastReturn: 0.01 },
+        { symbol: "R4", score: 0.05, price: 100, fastReturn: 0.01 },
+        { symbol: "R5", score: 0.04, price: 100, fastReturn: 0.01 },
+        { symbol: "R6", score: 0.03, price: 100, fastReturn: 0.01 },
+      ];
+      const allSymbols = new Set(risingOnly.map((row) => row.symbol));
+      const legacy = withEnv({ CROSS_SECTIONAL_FILTERED_SIDE_TREND_ALIGNMENT: "0" }, () =>
+        buildFilteredCrossSectionalBasket(risingOnly, {
+          ...common,
+          longAllowlist: allSymbols,
+          shortAllowlist: allSymbols,
+        }),
+      )!;
+      expect(legacy.shortLeg.map((leg) => leg.symbol)).toEqual(["R6", "R5", "R4"]);
+    });
+  });
+
+  it("[SMART BASKET V1] keeps the same FILTERED universe/K but prefers a close-ranked, confirmed normal-range leg over a stretched reversal", () => {
+    const detailed: ScoredSymbol[] = [
+      // Raw top long, but it just reversed hard after a 3σ extension.  This is the NEAR/AVAX
+      // failure shape from the testnet review: not excluded, merely no longer automatic top-k.
+      { symbol: "L1", score: 0.2200, price: 100, fastReturn: -0.04, volatility: 0.02, extensionVol: 3 },
+      { symbol: "L2", score: 0.2199, price: 100, fastReturn: 0.04, volatility: 0.02, extensionVol: 0 },
+      { symbol: "L3", score: 0.2198, price: 100, fastReturn: 0.04, volatility: 0.02, extensionVol: 0 },
+      { symbol: "L4", score: 0.2197, price: 100, fastReturn: 0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "S1", score: -0.20, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "S2", score: -0.19, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "S3", score: -0.18, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+    ];
+    const common = {
+      k: 2,
+      now: T0,
+      openedAtMs: T0ms,
+      horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+      minScoreGap: 0,
+      maxPerCluster: 0,
+      longAllowlist: new Set(["L1", "L2", "L3", "L4"]),
+      shortAllowlist: new Set(["S1", "S2", "S3"]),
+    };
+    const legacy = buildFilteredCrossSectionalBasket(detailed, { ...common, smartFormation: { enabled: false } })!;
+    const smart = buildFilteredCrossSectionalBasket(detailed, {
+      ...common,
+      smartFormation: { enabled: true, axisScore: -0.4 },
+    })!;
+
+    expect(legacy.longLeg.map((leg) => leg.symbol)).toEqual(["L1", "L2"]);
+    expect(smart.longLeg.map((leg) => leg.symbol)).toEqual(["L2", "L3"]);
+    expect(smart.shortLeg).toHaveLength(2);
+    expect(smart.smartFormation).toMatchObject({ version: "SMART_BASKET_V1", axisScore: -0.4 });
+    expect(smart.smartFormation!.candidates.find((candidate) => candidate.symbol === "L1")!.selected).toBe(false);
+    expect(smart.longLeg.every((leg) => leg.fastReturnAtOpen !== undefined && leg.extensionVolAtOpen !== undefined)).toBe(true);
+  });
+
+  describe("[FORMATION MODE] lifecycle flags never select symbols", () => {
+    const detailed: ScoredSymbol[] = [
+      { symbol: "SOLUSDT", score: 0.2200, price: 100, fastReturn: -0.04, volatility: 0.02, extensionVol: 3 },
+      { symbol: "AVAXUSDT", score: 0.2199, price: 100, fastReturn: 0.04, volatility: 0.02, extensionVol: 0 },
+      { symbol: "SUIUSDT", score: 0.2198, price: 100, fastReturn: 0.04, volatility: 0.02, extensionVol: 0 },
+      { symbol: "UNIUSDT", score: 0.2197, price: 100, fastReturn: 0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "AAVEUSDT", score: 0.2196, price: 100, fastReturn: 0.04, volatility: 0.02, extensionVol: 0 },
+      { symbol: "DOGEUSDT", score: -0.2000, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "1000PEPEUSDT", score: -0.1900, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "XRPUSDT", score: -0.1800, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+      { symbol: "WLDUSDT", score: -0.1700, price: 100, fastReturn: -0.01, volatility: 0.02, extensionVol: 0 },
+    ];
+    const common = {
+      k: 3,
+      now: T0,
+      openedAtMs: T0ms,
+      horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+      minScoreGap: 0.058,
+      maxPerCluster: 2,
+      weightingModel: "CAPPED_SCORE_RANK" as const,
+      longAllowlist: new Set(["SOLUSDT", "AVAXUSDT", "SUIUSDT", "UNIUSDT", "AAVEUSDT"]),
+      shortAllowlist: new Set(["DOGEUSDT", "1000PEPEUSDT", "XRPUSDT", "WLDUSDT"]),
+    };
+    const shape = (basket: NonNullable<ReturnType<typeof buildFilteredCrossSectionalBasket>>) => ({
+      formationMode: basket.formationMode,
+      smartFormation: basket.smartFormation,
+      scoreGap: basket.scoreGap,
+      weightingModel: basket.weightingModel,
+      long: basket.longLeg.map((leg) => ({ symbol: leg.symbol, weight: leg.weight })),
+      short: basket.shortLeg.map((leg) => ({ symbol: leg.symbol, weight: leg.weight })),
+    });
+
+    it("SMART_BASKET_V1=1 plus RERANK=0 is exactly the canonical Plain MOM36 basket", () => {
+      const canonical = buildCrossSectionalBasket(detailed, {
+        ...common,
+        signal: CROSS_SECTIONAL_FILTERED_SIGNAL,
+        variant: "FILTERED",
+        formationMode: "PLAIN_MOM36",
+      })!;
+      const production = withEnv({
+        CROSS_SECTIONAL_SMART_BASKET_V1: "1",
+        CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+      }, () => buildFilteredCrossSectionalBasket(detailed, common)!);
+
+      expect(production.formationMode).toBe("PLAIN_MOM36");
+      expect(production.smartFormation).toBeNull();
+      expect(shape(production)).toEqual(shape(canonical));
+    });
+
+    it("RERANK=1 enters the Smart Formation path even when the lifecycle flag is OFF", () => {
+      const plain = withEnv({
+        CROSS_SECTIONAL_SMART_BASKET_V1: "1",
+        CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+      }, () => buildFilteredCrossSectionalBasket(detailed, common)!);
+      const smart = withEnv({
+        CROSS_SECTIONAL_SMART_BASKET_V1: "0",
+        CROSS_SECTIONAL_SMART_FORMATION_RERANK: "1",
+      }, () => buildFilteredCrossSectionalBasket(detailed, common)!);
+
+      expect(smart.formationMode).toBe("SMART_FORMATION_RERANK");
+      expect(smart.smartFormation).toMatchObject({ version: "SMART_BASKET_V1" });
+      expect(smart.longLeg.map((leg) => leg.symbol)).not.toEqual(plain.longLeg.map((leg) => leg.symbol));
+    });
+
+    it("lifecycle and ghost toggles leave plain symbols, cluster cap, scoreGap, and weights unchanged", () => {
+      const lifecycleOff = withEnv({
+        CROSS_SECTIONAL_SMART_BASKET_V1: "0",
+        CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+        CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED: "0",
+        CROSS_SECTIONAL_SMART_INVALIDATION_SCANS: "2",
+      }, () => buildFilteredCrossSectionalBasket(detailed, common)!);
+      const lifecycleOn = withEnv({
+        CROSS_SECTIONAL_SMART_BASKET_V1: "1",
+        CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+        CROSS_SECTIONAL_ADAPTIVE_EXITS_ENABLED: "1",
+        CROSS_SECTIONAL_SMART_INVALIDATION_SCANS: "999",
+      }, () => buildFilteredCrossSectionalBasket(detailed, common)!);
+
+      expect(shape(lifecycleOn)).toEqual(shape(lifecycleOff));
+      expect(lifecycleOn.weightingModel).toBe("CAPPED_SCORE_RANK");
+      expect(lifecycleOn.scoreGap).toBeGreaterThanOrEqual(0.058);
+    });
   });
 
   it("[FILTERED-GAP] refuses low-dispersion baskets", () => {
@@ -183,6 +543,31 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     expect(late.status).toBe("CLOSED");
     // long A +10%, short B +10% (price fell 10% → short gains 10%) → gross = (0.1+0.1)/2 = 0.1
     expect(late.grossReturn!).toBeCloseTo(0.1, 9);
+  });
+
+  it("[SCALE-GUARD] voids a 1000PEPE spot/futures price-scale mismatch from reporting", () => {
+    // The multiplier contract is priced near 0.003, while bare spot PEPE is
+    // near 0.000003.  A resolver may close the observation for auditability,
+    // but it must never let that ~1000x unit mismatch into learned results.
+    const basket = buildCrossSectionalBasket(
+      scored([["SOLUSDT", 0.5, 100], ["1000PEPEUSDT", -0.4, 0.003]]),
+      { k: 1, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: 1_000 },
+    )!;
+    const resolved = resolveCrossSectional(
+      basket,
+      { SOLUSDT: 101, "1000PEPEUSDT": 0.000003 },
+      new Date(T0ms + 2_000).toISOString(),
+      0,
+    );
+
+    expect(crossSectionalLegScaleAnomaly(0.003, 0.000003)).toBe(true);
+    expect(crossSectionalScaleAnomalies([...resolved.longLeg, ...resolved.shortLeg])).toEqual([
+      "1000PEPEUSDT entry=0.003 exit=0.000003",
+    ]);
+    expect(resolved.reportingExclusion).toMatchObject({
+      kind: "OPERATOR_VOID",
+      reason: expect.stringContaining("AUTOMATIC SCALE GUARD"),
+    });
   });
 
   it("[COST] netReturn = grossReturn − roundtrip bps", () => {
@@ -330,18 +715,173 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     const filtered = buildCrossSectionalReport(store, T0ms, { variant: "FILTERED" });
     expect(filtered.closed).toBe(1);
     expect(filtered.netAvgReturn).toBeCloseTo(0.5, 9);
-    store.add({ ...close(0.04), observationId: "xsec:new-era", openedAt: new Date(T0ms + 1).toISOString(), openedAtMs: T0ms + 1 });
-    const freshEra = buildCrossSectionalReport(store, T0ms + 2, { variant: "RAW", sinceMs: T0ms + 1 });
-    expect(freshEra.closed).toBe(1);
-    expect(freshEra.totalNetReturn).toBeCloseTo(0.04, 9);
+  });
+});
+
+// ── Symbol Reliability V1 formation wiring ─────────────────────────────────
+
+const RELIABILITY_TEST_UNIVERSE = [
+  "ETHUSDT", "SOLUSDT", "OPUSDT", "BNBUSDT", "ADAUSDT", "SUIUSDT", "1000PEPEUSDT",
+  "WLDUSDT", "DOGEUSDT", "SEIUSDT", "ARBUSDT", "XRPUSDT", "LINKUSDT", "WIFUSDT", "AAVEUSDT",
+];
+
+function reliabilityCandles(score: number): Candle[] {
+  const start = 100;
+  const end = start * (1 + score);
+  return Array.from({ length: 30 }, (_, index) => {
+    const fraction = index < 5 ? 0 : (index - 5) / 24;
+    return mkCandle(start + (end - start) * fraction);
+  });
+}
+
+const RELIABILITY_TEST_SCORES: Record<string, number> = {
+  ETHUSDT: 0.16, SOLUSDT: 0.14, OPUSDT: 0.12, BNBUSDT: 0.10, ADAUSDT: 0.08, SUIUSDT: 0.06, "1000PEPEUSDT": 0.04,
+  WLDUSDT: -0.16, DOGEUSDT: -0.14, SEIUSDT: -0.12, ARBUSDT: -0.10, XRPUSDT: -0.08, LINKUSDT: -0.06, WIFUSDT: -0.04, AAVEUSDT: -0.02,
+};
+
+function reliabilitySnapshot(quarantined: Array<{ symbol: string; side: "LONG" | "SHORT" }> = []): SymbolReliabilitySnapshot {
+  return {
+    version: "SYMBOL_RELIABILITY_V1",
+    enabled: true,
+    persistence: { status: "HEALTHY", source: "PRIMARY", reason: null, recoveredAt: null },
+    evidenceContract: "ACTUAL_NO_TP_HOLD_36H_INDEPENDENT_EPISODES_V1",
+    evaluatedAt: T0,
+    evaluationId: "sr-v1-test",
+    evaluationCycle: 1,
+    evidenceChanged: false,
+    independentEpisodes: 0,
+    eligibleBaskets: 0,
+    excludedBaskets: {},
+    minimumIndependentEpisodes: 8,
+    statuses: [
+      { symbol: "ETHUSDT", side: "LONG", status: "HEALTHY" },
+      { symbol: "SOLUSDT", side: "LONG", status: "QUARANTINED" },
+      { symbol: "OPUSDT", side: "LONG", status: "DEGRADED" },
+      { symbol: "WLDUSDT", side: "SHORT", status: "INSUFFICIENT_DATA" },
+    ] as SymbolReliabilitySnapshot["statuses"],
+    quarantined: quarantined.map((row) => ({ ...row, reason: "strict two-cycle evidence" })),
+    lastFormationDecision: null,
+  };
+}
+
+async function runReliabilityFormation(
+  snapshot: SymbolReliabilitySnapshot | null,
+  now: number,
+): Promise<{ store: CrossSectionalStore; decisions: NonNullable<CrossSectionalObservation["symbolReliability"]>[] }> {
+  const store = freshStore();
+  const decisions: NonNullable<CrossSectionalObservation["symbolReliability"]>[] = [];
+  await runCrossSectionalCycle({
+    store,
+    universe: RELIABILITY_TEST_UNIVERSE,
+    now,
+    fetchCandles: async (symbol) => reliabilityCandles(RELIABILITY_TEST_SCORES[symbol]!),
+    symbolReliabilitySnapshotGetter: () => snapshot,
+    symbolReliabilityDecisionRecorder: (decision) => {
+      decisions.push(decision);
+      return true;
+    },
+  });
+  return { store, decisions };
+}
+
+function filteredShape(store: CrossSectionalStore): { long: Array<{ symbol: string; score: number | undefined; weight: number | null | undefined }>; short: Array<{ symbol: string; score: number | undefined; weight: number | null | undefined }>; scoreGap: number | null | undefined } {
+  const basket = store.all.find((row) => row.variant === "FILTERED")!;
+  return {
+    long: basket.longLeg.map((leg) => ({ symbol: leg.symbol, score: leg.scoreAtOpen, weight: leg.weight })),
+    short: basket.shortLeg.map((leg) => ({ symbol: leg.symbol, score: leg.scoreAtOpen, weight: leg.weight })),
+    scoreGap: basket.scoreGap,
+  };
+}
+
+describe("[SYMBOL-RELIABILITY] Plain MOM36 formation gate", () => {
+  const formationEnv = {
+    CROSS_SECTIONAL_ADAPTIVE_DISABLED: "1",
+    CROSS_SECTIONAL_FILTERED_DISABLED: "0",
+    CROSS_SECTIONAL_SMART_FORMATION_RERANK: "0",
+    CROSS_SECTIONAL_REGIME_SKEW_ENABLED: "0",
+    CROSS_SECTIONAL_STAND_DOWN_14D_PCT: undefined,
+  };
+
+  it("keeps scores, universe, selection, gap, and weights bit-for-bit unchanged for HEALTHY/DEGRADED/INSUFFICIENT_DATA", async () => {
+    await withEnvAsync({ ...formationEnv, CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: undefined }, async () => {
+      const baseline = await runReliabilityFormation(null, T0ms + 10 * DAY_MS);
+      await withEnvAsync({ CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "1" }, async () => {
+        const observed = await runReliabilityFormation(reliabilitySnapshot(), T0ms + 11 * DAY_MS);
+        expect(filteredShape(observed.store)).toEqual(filteredShape(baseline.store));
+        const basket = observed.store.all.find((row) => row.variant === "FILTERED")!;
+        expect(basket.symbolReliability?.quarantined).toEqual([]);
+        expect(basket.formationMode).toBe("PLAIN_MOM36");
+      });
+    });
   });
 
-  it("[REPORT CUTOFF] parses the shared evidence-era cutoff", () => {
-    expect(getCrossSectionalReportSinceMs({ CROSS_SECTIONAL_REPORT_START_AT: "2026-08-12T00:00:00.000Z" })).toBe(
-      Date.parse("2026-08-12T00:00:00.000Z"),
-    );
-    expect(getCrossSectionalReportSinceMs({ CROSS_SECTIONAL_REPORT_START_AT: "not-a-date" })).toBeUndefined();
-    expect(getCrossSectionalReportSinceMs({})).toBeUndefined();
+  it("removes only a QUARANTINED LONG, reselects a full hedge, and records exact provenance", async () => {
+    await withEnvAsync({ ...formationEnv, CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "1" }, async () => {
+      const baseline = await runReliabilityFormation(reliabilitySnapshot(), T0ms + 12 * DAY_MS);
+      const observed = await runReliabilityFormation(reliabilitySnapshot([{ symbol: "SOLUSDT", side: "LONG" }]), T0ms + 13 * DAY_MS);
+      const basket = observed.store.all.find((row) => row.variant === "FILTERED")!;
+      const before = filteredShape(baseline.store);
+      const after = filteredShape(observed.store);
+
+      expect(before.long.map((leg) => leg.symbol)).toContain("SOLUSDT");
+      expect(after.long.map((leg) => leg.symbol)).not.toContain("SOLUSDT");
+      expect(after.short).toEqual(before.short); // LONG quarantine cannot rewrite the short hedge
+      expect(after.long).toHaveLength(3);
+      expect(after.short).toHaveLength(3);
+      expect(after.scoreGap).toBeGreaterThanOrEqual(0.02);
+      expect(basket.longLeg.reduce((sum, leg) => sum + (leg.weight ?? 0), 0)).toBeCloseTo(0.5, 12);
+      expect(basket.shortLeg.reduce((sum, leg) => sum + (leg.weight ?? 0), 0)).toBeCloseTo(0.5, 12);
+      for (const side of [basket.longLeg, basket.shortLeg]) {
+        const byCluster = new Map<string, number>();
+        for (const leg of side) byCluster.set(clusterOf(leg.symbol), (byCluster.get(clusterOf(leg.symbol)) ?? 0) + 1);
+        expect([...byCluster.entries()].every(([cluster, count]) => cluster === "MAJORS" || count <= 2)).toBe(true);
+      }
+      expect(basket.symbolReliability).toMatchObject({
+        decision: "PASS",
+        selectedBefore: { LONG: before.long.map((leg) => leg.symbol), SHORT: before.short.map((leg) => leg.symbol) },
+        selectedAfter: { LONG: after.long.map((leg) => leg.symbol), SHORT: after.short.map((leg) => leg.symbol) },
+        scoreGapBefore: before.scoreGap,
+        scoreGapAfter: after.scoreGap,
+      });
+      expect(basket.symbolReliability?.replacements).toContainEqual({ side: "LONG", removed: "SOLUSDT", replacement: "BNBUSDT" });
+      expect(observed.decisions).toHaveLength(1);
+    });
+  });
+
+  it("fails closed to NO_TRADE when quarantine leaves fewer than 3 LONG candidates, while preserving the audit record", async () => {
+    await withEnvAsync({ ...formationEnv, CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "1" }, async () => {
+      const result = await runReliabilityFormation(reliabilitySnapshot([
+        { symbol: "ETHUSDT", side: "LONG" }, { symbol: "SOLUSDT", side: "LONG" }, { symbol: "OPUSDT", side: "LONG" },
+        { symbol: "BNBUSDT", side: "LONG" }, { symbol: "ADAUSDT", side: "LONG" }, { symbol: "SUIUSDT", side: "LONG" }, { symbol: "1000PEPEUSDT", side: "LONG" },
+      ]), T0ms + 14 * DAY_MS);
+      expect(result.store.all.some((row) => row.variant === "FILTERED")).toBe(false);
+      expect(result.decisions).toHaveLength(1);
+      expect(result.decisions[0]).toMatchObject({
+        decision: "NO_TRADE_INSUFFICIENT_ELIGIBLE",
+        selectedAfter: { LONG: [], SHORT: [] },
+        scoreGapAfter: null,
+      });
+    });
+  });
+
+  it("holds a new FILTERED basket when reliability persistence is unavailable instead of treating it as insufficient evidence", async () => {
+    await withEnvAsync({ ...formationEnv, CROSS_SECTIONAL_SYMBOL_RELIABILITY_ENABLED: "1" }, async () => {
+      const snapshot = reliabilitySnapshot();
+      snapshot.persistence = {
+        status: "UNAVAILABLE",
+        source: null,
+        reason: "primary and backup ledger are invalid",
+        recoveredAt: null,
+      };
+      const result = await runReliabilityFormation(snapshot, T0ms + 15 * DAY_MS);
+      expect(result.store.all.some((row) => row.variant === "FILTERED")).toBe(false);
+      expect(result.decisions).toHaveLength(1);
+      expect(result.decisions[0]).toMatchObject({
+        decision: "NO_TRADE_OTHER",
+        persistence: { status: "UNAVAILABLE" },
+        selectedAfter: { LONG: [], SHORT: [] },
+      });
+    });
   });
 });
 
@@ -920,23 +1460,6 @@ const BAR_FUDGE = 60 * 60_000 + 1000; // one 1h bar + a little, to push past the
 
 describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard operator lists", () => {
 
-  it("[STATIC-POOL] disables old-book auto-demotion when the operator flag is on", () => {
-    const store = freshStore();
-    for (let i = 0; i < 3; i++) {
-      store.add(closedObs(`static-${i}`, [], [["DOGEUSDT", 1, 1.02]]) as never);
-    }
-    vi.stubEnv("CROSS_SECTIONAL_ADAPTIVE_DISABLED", "1");
-    try {
-      const f = getCrossSectionalFilteredExecutionFilters(store);
-      expect(f.adaptiveDisabled).toBe(true);
-      expect(f.longAllowlist).toEqual([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST]);
-      expect(f.shortAllowlist).toEqual([...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST]);
-      expect(f.shortBlocklist).toEqual([...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST]);
-    } finally {
-      vi.unstubAllEnvs();
-    }
-  });
-
   function closedObs(id: string, longLegs: Array<[string, number, number]>, shortLegs: Array<[string, number, number]>) {
     return {
       observationId: id,
@@ -953,6 +1476,25 @@ describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard oper
       resolvedAt: T0,
     };
   }
+
+  it("[AUTO-POOL-CEILING] uses a runtime C1/C2 list as a strict execution ceiling and preserves the manual short block", () => {
+    withEnv({ CROSS_SECTIONAL_ADAPTIVE_DISABLED: "1" }, () => {
+      const filters = getCrossSectionalFilteredExecutionFilters(freshStore(), {
+        baseLongAllowlist: ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        baseShortAllowlist: ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        baseShortBlocklist: ["SOLUSDT"],
+      });
+      expect(filters.longAllowlist).toEqual(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+      expect(filters.shortAllowlist).toEqual(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+      expect(filters.shortBlocklist).toEqual(["SOLUSDT"]);
+    });
+  });
+
+  it("[AUTO-POOL-VENUE] skips the unrelated spot candle-liquidity floor only after a valid USD-M pool is active", () => {
+    expect(shouldApplyCandleLiquidityFloor(null)).toBe(true);
+    expect(shouldApplyCandleLiquidityFloor({ enabled: true, state: "STALE_FALLBACK" } as never)).toBe(true);
+    expect(shouldApplyCandleLiquidityFloor({ enabled: true, state: "ACTIVE" } as never)).toBe(false);
+  });
 
   it("keeps allowlists inside operator filters while demoting measured losers", () => {
     const store = freshStore();
@@ -984,6 +1526,54 @@ describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard oper
     expect(f.longAllowlist).toContain("SOLUSDT");
     expect(f.shortAllowlist).toContain("DOGEUSDT");
     expect(f.longBlocklist).toEqual([]);
+  });
+
+  it("[SOFT-THEN-HARD] ignores pre-cutoff history, nudges rank first, then only hard-demotes after current-era proof", () => {
+    const keys = [
+      "CROSS_SECTIONAL_ADAPTIVE_MODE",
+      "CROSS_SECTIONAL_ADAPTIVE_START_AT",
+      "CROSS_SECTIONAL_ADAPTIVE_HARD_MIN_LEG_SAMPLES",
+      "CROSS_SECTIONAL_ADAPTIVE_HARD_MIN_CLOSED_BASKETS",
+      "CROSS_SECTIONAL_ADAPTIVE_SOFT_SCORE_WEIGHT",
+    ] as const;
+    const before = new Map(keys.map((key) => [key, process.env[key]]));
+    try {
+      const cutoffMs = T0ms;
+      Object.assign(process.env, {
+        CROSS_SECTIONAL_ADAPTIVE_MODE: "SOFT_THEN_HARD",
+        CROSS_SECTIONAL_ADAPTIVE_START_AT: new Date(cutoffMs).toISOString(),
+        CROSS_SECTIONAL_ADAPTIVE_HARD_MIN_LEG_SAMPLES: "3",
+        CROSS_SECTIONAL_ADAPTIVE_HARD_MIN_CLOSED_BASKETS: "8",
+        CROSS_SECTIONAL_ADAPTIVE_SOFT_SCORE_WEIGHT: "0.35",
+      });
+      const store = freshStore();
+      // Older bad history is deliberately outside the new evidence era.
+      const old = closedObs("old", [], [["DOGEUSDT", 1, 1.05]]) as CrossSectionalObservation;
+      old.openedAtMs = cutoffMs - 1;
+      store.add(old);
+      for (let i = 0; i < 3; i++) {
+        const fresh = closedObs(`fresh-${i}`, [], [["DOGEUSDT", 1, 1.02]]) as CrossSectionalObservation;
+        fresh.openedAtMs = cutoffMs + i + 1;
+        store.add(fresh);
+      }
+
+      const soft = deriveAdaptiveSymbolFilters(store);
+      expect(soft.provenance).toMatchObject({ closedBaskets: 3, mode: "SOFT_THEN_HARD", hardDemotionsActive: false, sinceMs: cutoffMs });
+      expect(soft.provenance.demotedShort).toContain("DOGEUSDT");
+      expect(soft.shortAllowlist).toContain("DOGEUSDT"); // still rankable in the soft phase
+      expect(soft.shortScoreAdjustmentBySymbol.DOGEUSDT).toBeGreaterThan(0); // weaker short ranks less aggressively
+
+      process.env.CROSS_SECTIONAL_ADAPTIVE_HARD_MIN_CLOSED_BASKETS = "3";
+      const hard = deriveAdaptiveSymbolFilters(store);
+      expect(hard.provenance.hardDemotionsActive).toBe(true);
+      expect(hard.shortAllowlist).not.toContain("DOGEUSDT");
+    } finally {
+      for (const key of keys) {
+        const value = before.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   // [FLOOR] 2026-07-07 audit: demotion has no recovery path (a demoted symbol only regains
@@ -1085,144 +1675,40 @@ describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard oper
   });
 });
 
-describe("cross-sectional-edge — liquidity floor (2026-08-12)", () => {
-  // quote volume per bar = close * volume, so these are $/bar directly
-  const bars = (perBar: number, n = 400): Candle[] =>
-    Array.from({ length: n }, () => ({ openTime: 0, open: 1, high: 1, low: 1, close: 1, volume: perBar }));
 
-  it("[LIQ-DEFAULT] ships DISABLED — a non-zero default would silently narrow live's universe", () => {
-    expect(CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR).toBe(0);
+describe("nonOverlappingClosedSample — hourly opens, 48h holds", () => {
+  const H = 48 * 3_600_000;
+  const at = (hoursFromStart: number) => ({ openedAtMs: 1_000_000_000_000 + hoursFromStart * 3_600_000, horizonMs: H });
+
+  it("keeps ONE sample per horizon when baskets open every hour", () => {
+    // 96 hourly opens across 4 days. Naively that is 96 'trials'; only 2 of them
+    // fail to share a holding period with a kept neighbour.
+    const closed = Array.from({ length: 96 }, (_, i) => at(i));
+    const kept = nonOverlappingClosedSample(closed);
+    expect(kept.length).toBe(2);
+    expect(kept[0]!.openedAtMs).toBe(at(0).openedAtMs);
+    expect(kept[1]!.openedAtMs).toBe(at(48).openedAtMs);
   });
 
-  it("[LIQ-OFF] floor of 0 admits every symbol, thin ones included", () => {
-    const out = liquidCrossSectionalSymbols({ FATUSDT: bars(5_000_000), THINUSDT: bars(1) }, 0);
-    expect(out.has("FATUSDT")).toBe(true);
-    expect(out.has("THINUSDT")).toBe(true);
-  });
-
-  it("[LIQ-FLOOR] keeps symbols at/above the floor and drops the ones below", () => {
-    const out = liquidCrossSectionalSymbols(
-      { FATUSDT: bars(5_000_000), EDGEUSDT: bars(1_000_000), THINUSDT: bars(50_000) },
-      1_000_000,
-    );
-    expect([...out].sort()).toEqual(["EDGEUSDT", "FATUSDT"]); // >= is inclusive
-  });
-
-  it("[LIQ-MEDIAN] uses the MEDIAN, so one fat bar cannot rescue a thin symbol", () => {
-    const spiky = bars(1_000, 400);
-    spiky[399] = { openTime: 0, open: 1, high: 1, low: 1, close: 1, volume: 10_000_000_000 };
-    const mean = spiky.reduce((s, c) => s + c.close * c.volume, 0) / spiky.length;
-    expect(mean).toBeGreaterThan(1_000_000); // the mean WOULD have passed
-    expect(liquidCrossSectionalSymbols({ SPIKYUSDT: spiky }, 1_000_000).has("SPIKYUSDT")).toBe(false);
-  });
-
-  it("[LIQ-THIN-HISTORY] under a day of bars is EXCLUDED, but a day is enough to judge on", () => {
-    const floor = 1_000;
-    expect(liquidCrossSectionalSymbols({ NEWUSDT: bars(9_000_000, 10) }, floor).has("NEWUSDT")).toBe(false);
-    expect(liquidCrossSectionalSymbols({ NEWUSDT: bars(9_000_000, 24) }, floor).has("NEWUSDT")).toBe(true);
-    expect(liquidCrossSectionalSymbols({ EMPTYUSDT: [] }, floor).has("EMPTYUSDT")).toBe(false);
-  });
-
-  it("[LIQ-FETCH-DEPTH] judges on whatever history the caller fetched — a deep window must not starve it", () => {
-    // THE 2026-08-12 TESTNET BUG. The sample minimum was bars/4 (180 of the 720-bar default) while
-    // runCrossSectionalCycleGuarded's caller fetches only MOMENTUM_BARS + 5 candles. Every symbol
-    // failed, the liquid set came back EMPTY, and an empty allowlist is "allow everything" — so the
-    // floor deleted the allowlists instead of narrowing them. ARKMUSDT ($0.05M/h) traded on the
-    // very first basket. 41 bars is what the caller actually supplies; it must be judged, not skipped.
-    const fetched = 41;
-    const fat = liquidCrossSectionalSymbols({ FATUSDT: bars(5_000_000, fetched) }, 1_000_000, 720);
-    expect(fat.has("FATUSDT")).toBe(true);
-    const thin = liquidCrossSectionalSymbols({ THINUSDT: bars(50_000, fetched) }, 1_000_000, 720);
-    expect(thin.has("THINUSDT")).toBe(false);
-  });
-
-  it("[LIQ-LOOKBACK-DEFAULT] the default window is not deeper than a cycle plausibly fetches", () => {
-    expect(CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS).toBeLessThanOrEqual(168);
-  });
-
-  it("[LIQ-NULL] a null liquid set is a byte-for-byte passthrough, including the empty list", () => {
-    expect([...narrowAllowlistToLiquid(["AUSDT", "BUSDT"], null)]).toEqual(["AUSDT", "BUSDT"]);
-    expect([...narrowAllowlistToLiquid([], null)]).toEqual([]); // stays "allow everything"
-  });
-
-  it("[LIQ-EMPTY-TRAP] an EMPTY allowlist means allow-everything, so the liquid set BECOMES the allowlist", () => {
-    const liquid = new Set(["AUSDT", "BUSDT"]);
-    // the bug this guards: intersecting [] with liquid yields [], which allowed() reads as
-    // "allow every symbol" — silently discarding the floor on exactly the widened-pool config
-    // this feature exists for.
-    expect([...narrowAllowlistToLiquid([], liquid)].sort()).toEqual(["AUSDT", "BUSDT"]);
-  });
-
-  it("[LIQ-INTERSECT] a non-empty allowlist is intersected, never widened", () => {
-    const liquid = new Set(["AUSDT", "CUSDT"]);
-    expect([...narrowAllowlistToLiquid(["AUSDT", "BUSDT"], liquid)]).toEqual(["AUSDT"]);
-    expect([...narrowAllowlistToLiquid(["ausdt"], liquid)]).toEqual(["ausdt"]); // case-insensitive match
-  });
-
-  it("[LIQ-STARVED] a floor that admits nothing blocks the basket instead of widening it", () => {
-    const empty = new Set<string>();
-    const some = new Set(["AUSDT"]);
-    // floor OFF -> never starved, the un-floored path must be untouched
-    expect(crossSectionalLiquidityStarved(empty, empty, null)).toBe(false);
-    // floor ON and a side narrowed to nothing -> starved, because building would read that empty
-    // list as "allow everything" and trade the WHOLE universe, thin names included
-    expect(crossSectionalLiquidityStarved(empty, some, new Set(["AUSDT"]))).toBe(true);
-    expect(crossSectionalLiquidityStarved(some, empty, new Set(["AUSDT"]))).toBe(true);
-    expect(crossSectionalLiquidityStarved(some, some, new Set(["AUSDT"]))).toBe(false);
-  });
-
-  it("[LIQ-BASKET] fail-without/pass-with: the floor keeps a thin top-ranked symbol OUT of the legs", () => {
-    // SEIUSDT is the strongest short candidate here and is on the FILTERED short allowlist.
-    const rows = scored([
-      ["ETHUSDT", 0.09, 100], ["SOLUSDT", 0.08, 100], ["BNBUSDT", 0.07, 100], ["ADAUSDT", 0.06, 100],
-      ["SEIUSDT", -0.09, 100], ["WLDUSDT", -0.08, 100], ["ARBUSDT", -0.07, 100], ["XRPUSDT", -0.06, 100],
-    ]);
-    const opts = {
-      k: 3, now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS,
-      longAllowlist: new Set<string>(), shortBlocklist: new Set<string>(), maxPerCluster: 0,
-    };
-    const withoutFloor = buildFilteredCrossSectionalBasket(rows, {
-      ...opts, shortAllowlist: narrowAllowlistToLiquid([], null),
-    })!;
-    expect(withoutFloor.shortLeg.map((l) => l.symbol)).toContain("SEIUSDT");
-
-    const liquid = new Set(["ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT", "WLDUSDT", "ARBUSDT", "XRPUSDT"]);
-    const withFloor = buildFilteredCrossSectionalBasket(rows, {
-      ...opts, longAllowlist: narrowAllowlistToLiquid([], liquid), shortAllowlist: narrowAllowlistToLiquid([], liquid),
-    })!;
-    expect(withFloor.shortLeg.map((l) => l.symbol)).not.toContain("SEIUSDT");
-    expect(withFloor.shortLeg).toHaveLength(3); // still forms a full basket from what remains
-  });
-});
-
-describe("cross-sectional-edge — adaptive demotion freeze (2026-08-12)", () => {
-  it("[FREEZE-DEFAULT] ships OFF, and only the exact string \"1\" enables it", () => {
-    expect(isCrossSectionalAdaptiveDemotionFrozen({} as NodeJS.ProcessEnv)).toBe(false);
-    expect(isCrossSectionalAdaptiveDemotionFrozen({ CROSS_SECTIONAL_ADAPTIVE_DEMOTION_FROZEN: "1" } as NodeJS.ProcessEnv)).toBe(true);
-    for (const v of ["0", "", "true", "yes"]) {
-      expect(isCrossSectionalAdaptiveDemotionFrozen({ CROSS_SECTIONAL_ADAPTIVE_DEMOTION_FROZEN: v } as NodeJS.ProcessEnv)).toBe(false);
+  it("never keeps two samples whose holding periods touch", () => {
+    const closed = Array.from({ length: 200 }, (_, i) => at(i * 0.5));
+    const kept = nonOverlappingClosedSample(closed);
+    for (const [a, b] of kept.slice(0, -1).map((x, i) => [x, kept[i + 1]!] as const)) {
+      expect(b.openedAtMs).toBeGreaterThanOrEqual(a.openedAtMs + a.horizonMs);
     }
   });
 
-  it("[FREEZE-OFF-UNCHANGED] with the flag off, demotion still runs exactly as before", () => {
-    // a symbol with >= 3 measured LONG legs averaging negative must still be demoted
-    const store = freshStore();
-    for (let i = 0; i < 3; i++) {
-      store.add({
-        observationId: `o${i}`, openedAt: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS,
-        signal: CROSS_SECTIONAL_FILTERED_SIGNAL, variant: "FILTERED", strategyFamily: "MOMENTUM_DISPERSION",
-        k: 3, longK: 1, shortK: 1,
-        longLeg: [{ symbol: "ADAUSDT", entryPrice: 100, exitPrice: 90, weight: 0.5 }],
-        shortLeg: [{ symbol: "DOGEUSDT", entryPrice: 100, exitPrice: 90, weight: 0.5 }],
-        status: "CLOSED", scoreGap: 0.1, regimeContext: null, regimeClassAtOpen: null,
-        longCapitalWeight: 0.5, shortCapitalWeight: 0.5, weightingModel: "EQUAL_NOTIONAL",
-        takeProfitReturn: null, stopLossReturn: null, riskDistanceAtOpen: 0.003, regimeFlipExit: false,
-        exitReason: "HORIZON", grossReturn: 0, costReturn: 0, netReturn: 0,
-        longLegReturn: -0.1, shortLegReturn: 0.1, resolvedAt: T0,
-      } as CrossSectionalObservation);
-    }
-    const out = deriveAdaptiveSymbolFilters(store);
-    expect(out.provenance.demotedLong).toContain("ADAUSDT");
-    expect(out.longAllowlist).not.toContain("ADAUSDT");
+  it("does not depend on input order — it sorts by open time", () => {
+    const forward = [at(0), at(1), at(48), at(49), at(96)];
+    const shuffled = [at(49), at(96), at(0), at(48), at(1)];
+    expect(nonOverlappingClosedSample(shuffled).map((o) => o.openedAtMs))
+      .toEqual(nonOverlappingClosedSample(forward).map((o) => o.openedAtMs));
+    expect(nonOverlappingClosedSample(forward).length).toBe(3);
+  });
+
+  it("returns every row when they already do not overlap, and handles 0/1 rows", () => {
+    expect(nonOverlappingClosedSample([]).length).toBe(0);
+    expect(nonOverlappingClosedSample([at(0)]).length).toBe(1);
+    expect(nonOverlappingClosedSample([at(0), at(48), at(96)]).length).toBe(3);
   });
 });

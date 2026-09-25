@@ -50,6 +50,7 @@ import {
   TAKER_ROUNDTRIP_BPS,
   STOP_OUT_SLIPPAGE_BPS,
 } from "./current-guard-variant-matrix.js";
+import { CORTEX_FEATURE_DIM, CORTEX_FEATURE_SCHEMA_VERSION } from "./cortex-brain.js";
 import {
   excludeSubFloorRowsForReport,
   subFloorExclusionEnabledForDecisions,
@@ -81,7 +82,7 @@ import {
   withResolvedCausalIdentity,
   type CausalIdentity,
 } from "../experience-engine/forward-causal-collection.js";
-import { latestCortexDecisionSnapshotForLane, type CortexDecisionSnapshot } from "./cortex-decision-snapshot.js";
+import type { CortexDecisionSnapshot } from "./cortex-decision-snapshot.js";
 import type { ExecutiveReviewExecutionLink } from "./executive-review-store.js";
 
 // ─── public enums / type tokens ──────────────────────────────────────────────
@@ -445,6 +446,14 @@ export interface PaperOrder {
   sourceCandidateId?: string | null;
   /** Allocator-lane only: the scan batch (generatedAt) this order belongs to. */
   scanBatchId?: string | null;
+  /**
+   * Half of THE canonical persisted candidate-ownership identity, together with `selectedLaneId`
+   * (below) and `direction`. This triple — never anything else — is what every downstream
+   * consumer (the CORTEX/paper allocation bridge, the executive-review admission path, Tier-1
+   * outcome attribution) joins a live candidate back to this order through. See
+   * `paperOrderOwnershipKey`/`buildPaperOrderOwnershipIndex` in paper-order-ownership-index.ts
+   * for the one shared implementation of that join — never reimplement the equality inline.
+   */
   sourceObservationId: string;
   sourceSignalId: string | null;
   dedupeKey: string; // `${sourceObservationId}:${selectedLaneId}`
@@ -501,6 +510,12 @@ export interface PaperOrder {
   axisKey?: string;
   controllerMode: string;
   controllerConfidence?: string | null;
+  /**
+   * The other half of THE canonical persisted candidate-ownership identity — see the doc comment
+   * on `sourceObservationId` above. Prefixed (e.g. `CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG`),
+   * exact, and the same value every downstream ownership-key consumer compares against; never
+   * substitute the bare variant/lane id.
+   */
   selectedLaneId: string;
   routerPermission: string;
   entryPrice: number;
@@ -567,6 +582,12 @@ export interface PaperOrder {
   causalIdentity?: CausalIdentity | null;
   /** Exact CORTEX x captured at admission; absent means explicitly ineligible for CORTEX learning. */
   cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
+  /** Exact roster lane whose CORTEX vector was captured. Separate from selectedLaneId. */
+  canonicalCortexLaneId?: string | null;
+  /** Immutable IDs paired with the exact snapshot at admission. They are persisted separately so
+   * rehydrated causal collection can prove the handoff without an in-memory lookup. */
+  cortexDecisionId?: string | null;
+  cortexAllocationSnapshotId?: string | null;
   /** Present only when an exact Four-Brain review was persisted before admission. */
   executiveReviewLink?: ExecutiveReviewExecutionLink | null;
   // ── forward-gate shadow label (report-only OOS validation; NEVER blocks admission) ──
@@ -1290,6 +1311,9 @@ export function selectEligiblePaperLanes(
     } else if (contextProof.status === "REJECT" || contextProof.status === "NOT_APPLICABLE") {
       continue;
     }
+    // Raw closes, full fresh-valid population (P_all) — see current-guard-variant-matrix.ts's
+    // `freshValid` doc. This is an admission DEPTH floor, not an independence or out-of-sample
+    // claim: `contextProof.status` above is what carries the stage-proof verdict.
     if (evidence.freshValid < 50) continue;
     if ((evidence.netAvgR ?? 0) <= 0) continue;
     // PF can be null when there are no losses; treat as "infinite, passes".
@@ -1424,9 +1448,8 @@ function _buildBaseOrder(
     reportOnly: true,
     paperOnly: true,
   }, now);
-  // Persist the exact CORTEX lane snapshot available at admission. This is a
-  // direct hand-off, never a later nearest-timestamp attribution.
-  order.cortexDecisionSnapshot = latestCortexDecisionSnapshotForLane(order.selectedLaneId);
+  // Variant-matrix observations do not carry an exact CORTEX admission handoff.
+  // Keep it explicitly missing; a lane-only in-memory lookup could attach a prior-cycle decision.
   const identity = prepareForwardCausalIdentity(order);
   if (identity) order.causalIdentity = identity;
   return order;
@@ -1597,6 +1620,13 @@ export interface PaperOpportunity {
   budgetReason?: string;
   /** Optional exact Four-Brain review hand-off supplied by the originating candidate producer. */
   executiveReviewLink?: ExecutiveReviewExecutionLink | null;
+  /** Exact CORTEX snapshot handed over by the same admission decision. Never populated by lookup. */
+  cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
+  canonicalCortexLaneId?: string | null;
+  /** Immutable handoff identities created with this opportunity. A snapshot is not causally valid
+   * unless it matches both; lane, direction, and age are defensive checks only. */
+  cortexDecisionId?: string | null;
+  cortexAllocationSnapshotId?: string | null;
 }
 
 export interface PaperOpportunityAdmissionInputs {
@@ -1733,12 +1763,29 @@ function _buildAllocatorOrder(
     budgetUsed: o.budgetUsed,
     budgetReason: o.budgetReason,
     executiveReviewLink: o.executiveReviewLink ?? null,
+    canonicalCortexLaneId: o.canonicalCortexLaneId ?? null,
     reportOnly: true,
     paperOnly: true,
   }, now);
-  // Persist the exact CORTEX lane snapshot available at admission. This is a
-  // direct hand-off, never a later nearest-timestamp attribution.
-  order.cortexDecisionSnapshot = latestCortexDecisionSnapshotForLane(order.selectedLaneId);
+  // Only a caller-owned, exact admission snapshot may cross this boundary. Missing or mismatched
+  // handoffs stay missing and make the eventual row learning-ineligible rather than guessing.
+  const snapshot = o.cortexDecisionSnapshot ?? null;
+  if (
+    snapshot && o.cortexDecisionId === snapshot.decisionId &&
+    o.cortexAllocationSnapshotId === snapshot.allocationSnapshotId &&
+    o.canonicalCortexLaneId !== null && o.canonicalCortexLaneId !== undefined &&
+    snapshot.laneId === o.canonicalCortexLaneId && snapshot.direction === order.direction &&
+    snapshot.scanBatchId === order.scanBatchId && snapshot.sourceScanBatchId === order.scanBatchId &&
+    snapshot.featureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION && Array.isArray(snapshot.featureVector) &&
+    snapshot.featureVector.length === CORTEX_FEATURE_DIM && snapshot.featureVector.every(Number.isFinite) &&
+    Number.isFinite(snapshot.atMs) && snapshot.atMs <= Date.parse(order.firstSeenAt ?? order.createdAt) &&
+    snapshot.atMs >= Date.parse(order.firstSeenAt ?? order.createdAt) - CORTEX_SNAPSHOT_MAX_ADMISSION_AGE_MS
+  ) {
+    order.cortexDecisionSnapshot = { ...snapshot, featureVector: [...snapshot.featureVector] };
+    order.cortexDecisionId = snapshot.decisionId;
+    order.cortexAllocationSnapshotId = snapshot.allocationSnapshotId;
+    order.canonicalCortexLaneId = o.canonicalCortexLaneId;
+  }
   const identity = prepareForwardCausalIdentity(order);
   if (identity) order.causalIdentity = identity;
   return order;
@@ -1760,6 +1807,9 @@ function _buildAllocatorOrder(
 export const HEADLINE_MAX_OPEN = Number(process.env.HEADLINE_MAX_OPEN) || 50;
 export const HEADLINE_MAX_PER_SYMBOL = Number(process.env.HEADLINE_MAX_PER_SYMBOL) || 2;
 export const HEADLINE_MAX_PER_DIRECTION = Number(process.env.HEADLINE_MAX_PER_DIRECTION) || 30;
+/** Defense in depth only. Exact immutable IDs are the admission proof; this prevents an otherwise
+ * exact but abandoned prior-cycle handoff from being reused after a stalled scan. */
+export const CORTEX_SNAPSHOT_MAX_ADMISSION_AGE_MS = 5 * 60_000;
 
 const HEADLINE_OPEN_STATUSES = new Set<PaperOrder["paperStatus"]>(["CREATED", "PAPER_SUBMITTED"]);
 

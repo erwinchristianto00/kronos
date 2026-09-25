@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { _resetLaneRuntimeForTests } from "../src/lib/lane-context-journal-runtime.js";
 import {
@@ -38,6 +38,9 @@ import {
   type LiveIntent,
   type LivePrivateClient,
   type PaperStoreReader,
+  isLiveIntentReportingExcluded,
+  sumLiveIntentReportingExclusions,
+  reportedDailyLedger,
 } from "../src/lib/live-execution-engine.js";
 import {
   SingleSymbolLaneExecutor,
@@ -111,12 +114,13 @@ describe("userTrades settlement coverage", () => {
   });
 });
 
-class FakeLiveClient {
+export class FakeLiveClient {
   env = "testnet" as const;
   placed: PlaceOrderParams[] = [];
   leverageCalls: Array<{ symbol: string; leverage: number }> = [];
   canceled: Array<{ symbol: string; orderId: string }> = [];
   cancelAllSymbols: string[] = [];
+  openAlgoOrderSymbols: Array<string | undefined> = [];
   positionsBySymbol = new Map<string, number>();
   markPriceBySymbol = new Map<string, number>();
   unrealizedPnlBySymbol = new Map<string, number>();
@@ -194,7 +198,8 @@ class FakeLiveClient {
   async getOpenOrders() {
     return [];
   }
-  async getOpenAlgoOrders() {
+  async getOpenAlgoOrders(symbol?: string) {
+    this.openAlgoOrderSymbols.push(symbol);
     return [];
   }
   async queryAlgoOrder(_algoId: string): Promise<FuturesAlgoOrder> {
@@ -312,7 +317,7 @@ class FakeLiveClient {
   }
 }
 
-function paperOrder(overrides: Partial<PaperOrder> = {}): PaperOrder {
+export function paperOrder(overrides: Partial<PaperOrder> = {}): PaperOrder {
   return {
     paperOrderId: `paper-${Math.random().toString(36).slice(2, 10)}`,
     symbol: "ETHUSDT",
@@ -330,11 +335,11 @@ function paperOrder(overrides: Partial<PaperOrder> = {}): PaperOrder {
   } as unknown as PaperOrder;
 }
 
-function makePaperStore(orders: PaperOrder[], halted = false): PaperStoreReader {
+export function makePaperStore(orders: PaperOrder[], halted = false): PaperStoreReader {
   return { all: orders, isAdmissionHalted: () => halted };
 }
 
-function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecutionConfig {
+export function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecutionConfig {
   return {
     enabled: true,
     env: "testnet",
@@ -393,7 +398,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
   };
 }
 
-function makeEngine(opts: {
+export function makeEngine(opts: {
   client?: FakeLiveClient;
   paper?: PaperStoreReader;
   config?: Partial<LiveExecutionConfig>;
@@ -402,9 +407,15 @@ function makeEngine(opts: {
   paperLaneWeightPct?: (order: PaperOrder) => number | null;
   getControllerSnapshot?: () => { regime: string | null; mode: string | null; confidence?: string | null; capturedAt?: string | null } | null;
   newEntryGate?: () => { allowed: boolean; reason: string | null };
+  // 2026-08 manual-directional canonical-regime enforcement fix: optional, mirrors newEntryGate's
+  // own plumbing exactly. Omitted (most existing tests) => LiveExecutionEngine's own
+  // default-permissive fallback, matching production's default-permissive convention for an
+  // options field with exactly one real (always-wired) call site.
+  regimeSafetyGate?: () => { allowed: boolean; reason: string | null };
   nowIso?: () => string;
   marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
   externalManagedNetQty?: () => Map<string, number>;
+  externalEntryBlockReason?: (symbol: string) => string | null;
   getExternalRealizedPnlUsd?: () => { today: number; allTime: number };
   onKillSwitchEngaged?: (reason: string) => Promise<void>;
   laneDirectionForId?: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
@@ -423,10 +434,12 @@ function makeEngine(opts: {
     paperLaneWeightPct: opts.paperLaneWeightPct,
     getControllerSnapshot: opts.getControllerSnapshot,
     newEntryGate: opts.newEntryGate,
+    regimeSafetyGate: opts.regimeSafetyGate,
     nowIso: opts.nowIso ?? (() => "2099-01-02T12:00:00.000Z"),
     marketDataClient: opts.marketDataClient,
     fillConfirmRetryDelayMs: 0,
     externalManagedNetQty: opts.externalManagedNetQty,
+    externalEntryBlockReason: opts.externalEntryBlockReason,
     getExternalRealizedPnlUsd: opts.getExternalRealizedPnlUsd,
     onKillSwitchEngaged: opts.onKillSwitchEngaged,
     laneDirectionForId: opts.laneDirectionForId,
@@ -793,6 +806,44 @@ describe("LiveExecutionEngine", () => {
     expect(engine.isArmed()).toBe(false);
   });
 
+  it("disarms when no tick COMPLETES, even though the error streak never moves", async () => {
+    // 2026-09-04: 3103 and 3102 each traded blind for the better part of an hour with every health
+    // field green — armed, errorStreak 0, lastTickError null, no rate-limit cooldown. The
+    // error-streak latch only counts ticks that ran and FAILED; a tick wedged inside an await never
+    // fails, never returns, and never increments anything. lastTickAt was recorded the whole time
+    // and nothing compared it to the clock.
+    const previous = process.env.LIVE_TICK_STALL_DISARM_MS;
+    process.env.LIVE_TICK_STALL_DISARM_MS = "60000";
+    vi.useFakeTimers();
+    try {
+      let clockMs = Date.parse("2099-01-02T12:00:00.000Z");
+      const client = new FakeLiveClient();
+      // The tick's first await never settles: `ticking` latches true and its finally never runs,
+      // so lastTickAt is frozen exactly as it was on both instances.
+      client.ensureTimeSync = () => new Promise<void>(() => {});
+      const { engine } = makeEngine({ client, nowIso: () => new Date(clockMs).toISOString() });
+      expect((await engine.arm()).ok).toBe(true);
+
+      engine.start(25_000);
+      await vi.advanceTimersByTimeAsync(25_000);      // wedge the first tick
+      expect(engine.isArmed()).toBe(true);            // still inside the limit
+
+      clockMs += 61_000;                              // now past it
+      await vi.advanceTimersByTimeAsync(25_000);
+
+      const status = engine.getStatus();
+      expect(engine.isArmed()).toBe(false);
+      expect(status.health.errorStreak).toBe(0);      // the old latch never fired, and never would
+      expect(String(status.health.lastDisarm?.reason)).toContain("no completed tick");
+      expect(status.health.lastDisarm?.kind).toBe("TRANSIENT_EXCHANGE_ERROR");
+      engine.stop();
+    } finally {
+      vi.useRealTimers();
+      if (previous === undefined) delete process.env.LIVE_TICK_STALL_DISARM_MS;
+      else process.env.LIVE_TICK_STALL_DISARM_MS = previous;
+    }
+  });
+
   it("new-entry drain blocks fresh opens while the engine remains armed", async () => {
     const { engine, client, store } = makeEngine({ paper: makePaperStore([paperOrder()]) });
     expect((await engine.arm()).ok).toBe(true);
@@ -803,6 +854,41 @@ describe("LiveExecutionEngine", () => {
     expect(engine.getStatus()).toMatchObject({
       armed: true,
       newEntries: { allowed: false, drainActive: true, pauseReason: "test drain" },
+    });
+  });
+
+  it("HTTP 418 transport cooldown blocks new exposure while keeping the engine armed and observable", async () => {
+    const client = new FakeLiveClient() as FakeLiveClient & {
+      getRateLimitStatus: () => {
+        coolingDown: boolean;
+        retryAt: string | null;
+        lastHttpStatus: 418 | 429 | null;
+        lastFailure: string | null;
+      };
+    };
+    client.getRateLimitStatus = () => ({
+      coolingDown: true,
+      retryAt: "2099-01-02T12:02:00.000Z",
+      lastHttpStatus: 418,
+      lastFailure: "rate limited (HTTP 418)",
+    });
+    const { engine } = makeEngine({ client, paper: makePaperStore([paperOrder()]) });
+    expect((await engine.arm()).ok).toBe(true);
+
+    expect(engine.canOpenNewEntries()).toBe(false);
+    expect(engine.canOpenNewEntriesIgnoringManualDirectional()).toBe(false);
+    expect(engine.getStatus()).toMatchObject({
+      armed: true,
+      newEntries: {
+        allowed: false,
+        blockReason: expect.stringContaining("HTTP 418"),
+      },
+      health: {
+        rateLimit: {
+          coolingDown: true,
+          retryAt: "2099-01-02T12:02:00.000Z",
+        },
+      },
     });
   });
 
@@ -1770,6 +1856,21 @@ describe("LiveExecutionEngine", () => {
     expect(account.lanes.map((lane) => lane.laneId)).toEqual(["LANE_A"]);
   });
 
+  it("getAccountSnapshot reads open algo orders once for the complete USD-M account, not once per intent", async () => {
+    const { engine, client, store } = makeEngine();
+    // The snapshot only needs `state` and `symbol` for these rows because the fake exchange has no
+    // positions. This deliberately simulates multiple active intents without invoking entry logic.
+    store.getState().intents.push(
+      { state: "OPEN", symbol: "ETHUSDT" } as never,
+      { state: "OPEN", symbol: "BTCUSDT" } as never,
+      { state: "OPEN", symbol: "SOLUSDT" } as never,
+    );
+
+    await engine.getAccountSnapshot();
+
+    expect(client.openAlgoOrderSymbols).toEqual([undefined]);
+  });
+
   it("testnet mirror-all accepts a diagnostic source outside the operator lane selection", async () => {
     const order = paperOrder({
       paperOrderId: "testnet-collect-all",
@@ -2342,11 +2443,59 @@ describe("LiveExecutionEngine", () => {
   it("exchange error streak auto-disarms", async () => {
     const { engine, client } = makeEngine({});
     await engine.arm();
-    client.failNextTicks = 3;
-    await engine.tick();
-    await engine.tick();
-    await engine.tick();
+    client.failNextTicks = 6;
+    for (let i = 0; i < 6; i++) await engine.tick();
     expect(engine.isArmed()).toBe(false);
+  });
+
+  // 2026-08-17. The threshold was 3 and the disarm was LATCHED, so ~75s of Binance trouble took
+  // testnet down until a human noticed hours later — twice in one day. Recovery is now allowed, but
+  // ONLY for this cause; the tests below exist to keep every other cause latched.
+  describe("brief exchange trouble no longer latches the account off", () => {
+    it("survives a blip: 3 consecutive failures used to disarm, and must not any more", async () => {
+      const { engine, client } = makeEngine({});
+      await engine.arm();
+      client.failNextTicks = 3;
+      for (let i = 0; i < 3; i++) await engine.tick();
+      expect(engine.isArmed()).toBe(true);
+    });
+
+    it("re-arms itself once the exchange has answered cleanly again for a run of ticks", async () => {
+      const { engine, client } = makeEngine({});
+      await engine.arm();
+      client.failNextTicks = 6;
+      for (let i = 0; i < 6; i++) await engine.tick();
+      expect(engine.isArmed()).toBe(false);
+      await engine.tick();
+      expect(engine.isArmed()).toBe(false); // one good tick is not recovery
+      for (let i = 0; i < 3; i++) await engine.tick();
+      expect(engine.isArmed()).toBe(true);
+    });
+
+    it("NEVER undoes an operator disarm, however healthy the exchange gets", async () => {
+      const { engine } = makeEngine({});
+      await engine.arm();
+      engine.disarm("manual disarm via /api/live/disarm");
+      for (let i = 0; i < 20; i++) await engine.tick();
+      expect(engine.isArmed()).toBe(false);
+    });
+
+    it("NEVER undoes a reconciliation disarm — an orphan position needs a human, not a clean tick", async () => {
+      const { engine } = makeEngine({});
+      await engine.arm();
+      engine.disarm("reconciliation mismatch: orphan exchange position WLDUSDT amt=55 (not opened by engine)");
+      for (let i = 0; i < 20; i++) await engine.tick();
+      expect(engine.isArmed()).toBe(false);
+    });
+
+    it("reports why it went down, and keeps reporting after the exchange recovers", async () => {
+      const { engine, client } = makeEngine({});
+      await engine.arm();
+      client.failNextTicks = 6;
+      for (let i = 0; i < 6; i++) await engine.tick();
+      const health = (engine.getStatus() as { health: { lastDisarm: { reason: string } | null } }).health;
+      expect(health.lastDisarm?.reason).toMatch(/exchange error streak/);
+    });
   });
 
   it("refuses to arm in hedge mode", async () => {
@@ -3366,6 +3515,40 @@ describe("copyExternalIntent (testnet→live copy button)", () => {
     const res = await engine.copyExternalIntent({ ...spec, stopLossPrice: 1900, tp1Price: 2100 });
     expect(res.ok).toBe(false);
     expect(res.reason).toMatch(/geometry/);
+  });
+
+  // 2026-08 adversarial-review follow-up to the manual-directional canonical-regime enforcement
+  // fix: this composed its OWN reason string from this.strategyEntryGate() (the NON-manual gate)
+  // instead of the new this.newEntryBlockReason() (entryGateDecision()'s own reason, which is
+  // manual-mode-aware). The two only ever disagree when canOpenNewEntries() is false for a
+  // manual-mode-specific cause (here, the new regimeSafetyGate) while the ordinary strategy gate
+  // would itself have said "allowed" for the SAME tick — exactly what this test constructs, by
+  // leaving newEntryGate at its default-permissive fallback while regimeSafetyGate blocks.
+  it("[diagnostics] a manual-directional entry blocked by the regime-safety gate reports the ACTUAL block reason via copyExternalIntent, not the generic 'new-entry gate is closed' fallback", async () => {
+    const { engine } = makeEngine({
+      // newEntryGate left unset ⇒ engine's own default-permissive fallback (allowed: true) — the
+      // ordinary (non-manual) gate is NOT what is blocking this tick.
+      regimeSafetyGate: () => ({ allowed: false, reason: "canonical regime PANIC active" }),
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }],
+      short: [],
+    });
+    engine.setManualSelectorMode(true);
+    engine.setManualEntryDecision({
+      action: "WAIT_PULLBACK",
+      directionalBias: "LONG",
+      reason: "test",
+      observedAt: "2099-01-02T12:00:00.000Z",
+    });
+    // Sanity: canOpenNewEntries() really is false, and for the regime-safety cause specifically —
+    // not armed/kill/drain (none configured here) and not a stale decision (fresh, matches nowIso()).
+    expect(engine.canOpenNewEntries()).toBe(false);
+    expect(engine.newEntryBlockReason()).toBe("canonical regime PANIC active");
+    const res = await engine.copyExternalIntent(spec);
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("canonical regime PANIC active");
   });
 
   it("getOpenIntentCopySpec returns the relay spec for an OPEN intent only", async () => {
@@ -4544,6 +4727,21 @@ describe("netted-position closes act on the ENGINE SHARE only (never the basket'
     expect(store.getState().intents[0]!.state).toBe("OPEN");
   });
 
+  it("[DAILY-RANGE-OWNERSHIP] a Testnet-only isolated lease blocks even a same-direction legacy mirror entry", async () => {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("ETHUSDT", -EXT);
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore([paperOrder()]), // SHORT ETHUSDT: same direction as the external claim
+      externalManagedNetQty: () => new Map([["ETHUSDT", -EXT]]),
+      externalEntryBlockReason: (symbol) => symbol === "ETHUSDT" ? "daily range lane lease drra1-open (OPEN)" : null,
+    });
+    await engine.arm();
+    await engine.tick();
+    expect(store.getState().intents).toHaveLength(0);
+    expect(client.placed.filter((p) => p.type === "MARKET")).toHaveLength(0);
+  });
+
   it("[MISSING-QTY-ALERT] reconcile reports (without disarming) when managed exposure was consumed", async () => {
     const client = new FakeLiveClient();
     const { engine, store } = makeEngine({
@@ -5558,6 +5756,84 @@ describe("openIntent execution-lifecycle tap — report-only, cannot alter the e
   });
 });
 
+describe("LiveIntent.causalLineage (point 2): immutable lineage snapshot stamped once at intent open", () => {
+  const causalIdentity = {
+    lineageSchemaVersion: "causal-lineage-1",
+    decisionId: "causal-decision-1",
+    opportunityId: "opportunity-1",
+    outcomeId: null,
+    instanceId: "3101",
+    laneId: "LANE",
+    symbolOrBasketId: "ETHUSDT",
+    direction: "SHORT",
+    featureSchemaVersion: "causal-paper-opportunity/1",
+    decisionRuleVersion: "paper-opportunity-admission/1",
+    attributionRuleVersion: "direct-paper-order-link/1",
+    cortexDecisionId: "cortex-decision-1",
+    allocationSnapshotId: "cortex-allocation-1",
+    canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
+    cortexFeatureSchemaVersion: 1,
+    decisionPolicyVersion: "decision-policy/1",
+    executionPolicyVersion: "execution-policy/1",
+    evidencePolicyVersion: "evidence-policy/1",
+    evidenceEra: "era/1",
+    policyDeploymentAt: "2099-01-01T00:00:00.000Z",
+  };
+
+  it("stamps causalLineage on the primary intent AND its sourcePaperOrders entry, verbatim off the PaperOrder's causalIdentity at open time", async () => {
+    const order = paperOrder({ paperOrderId: "paper-lineage01", variantExitRule: "tp1_full", causalIdentity });
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    const expectedLineage = {
+      opportunityId: "opportunity-1",
+      cortexDecisionId: "cortex-decision-1",
+      allocationSnapshotId: "cortex-allocation-1",
+      canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
+      instanceId: "3101",
+      policyDeploymentAt: "2099-01-01T00:00:00.000Z",
+      // 6 additional fields (blocker 2), read directly off `order`, not off causalIdentity — the
+      // paperOrder() fixture here uses a loose cast (`as unknown as PaperOrder`) and never sets
+      // sourceObservationId/scanBatchId/selectedLaneId, so those come through as their real
+      // (undefined/undefined/null) values, exactly like production would for an order missing them.
+      paperOrderId: "paper-lineage01",
+      sourceObservationId: undefined,
+      scanBatchId: null,
+      paperLaneId: undefined,
+      symbol: "ETHUSDT",
+      direction: "SHORT",
+    };
+    // Only the immutable subset is copied — never the whole CausalIdentity, never re-derived.
+    expect(intent.causalLineage).toEqual(expectedLineage);
+    expect(intent.sourcePaperOrders?.[0]?.causalLineage).toEqual(expectedLineage);
+  });
+
+  it("leaves causalLineage undefined when the PaperOrder carried no causalIdentity at open time — never fabricated", async () => {
+    const order = paperOrder({ paperOrderId: "paper-lineage02", variantExitRule: "tp1_full" });
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    expect(intent.causalLineage).toBeUndefined();
+    expect(intent.sourcePaperOrders?.[0]?.causalLineage).toBeUndefined();
+  });
+
+  it("never overwrites causalLineage on a later tick — the snapshot stays exactly what it was stamped at open", async () => {
+    const order = paperOrder({ paperOrderId: "paper-lineage03", variantExitRule: "tp1_full", causalIdentity });
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const beforeLineage = store.getState().intents[0]!.causalLineage;
+    expect(beforeLineage).toBeDefined();
+    // A later tick with no new candidates must not touch the already-open intent's lineage.
+    await engine.tick();
+    expect(store.getState().intents[0]!.causalLineage).toEqual(beforeLineage);
+  });
+});
+
 // ── 2026-07-19 real-money audit fix (BUG 1) ─────────────────────────────────
 
 describe("[BUG 1] kill-switch flatten failure tracking + retry", () => {
@@ -6191,5 +6467,82 @@ describe("LiveIntent.confirmedEntryFills (exact confirmed-fill identity)", () =>
     expect(closed.confirmedEntryFills).toHaveLength(1);
     expect(closed.confirmedEntryFills![0]!.orderId).toBe(originalEntryOrderId);
     expect(closed.confirmedEntryFills!.some((f) => f.orderId === pyramidAddOrderId)).toBe(false);
+  });
+});
+
+describe("live-execution-engine — operator reporting void (2026-08-15)", () => {
+  const voided = (realized: number, fees: number) => ({
+    reportingExclusion: { kind: "OPERATOR_VOID" as const, voidedAt: "2026-08-15T04:40:00.000Z",
+      reason: "config change forced the exit", excludedRealizedPnlUsd: realized, excludedFeesUsd: fees },
+  });
+
+  it("[VOID-FLAG] only an explicit OPERATOR_VOID excludes an intent", () => {
+    expect(isLiveIntentReportingExcluded(voided(-4.21, 0.48))).toBe(true);
+    expect(isLiveIntentReportingExcluded({})).toBe(false);
+    expect(isLiveIntentReportingExcluded({ reportingExclusion: null })).toBe(false);
+  });
+
+  it("[VOID-SUM] sums only voided intents, and reports the amount rather than hiding it", () => {
+    const out = sumLiveIntentReportingExclusions([
+      voided(-4.21, 0.48), {}, voided(-1.0, 0.1), { reportingExclusion: null },
+    ]);
+    expect(out.count).toBe(2);
+    expect(out.realizedPnlUsd).toBeCloseTo(-5.21, 9);
+    expect(out.feesUsd).toBeCloseTo(0.58, 9);
+  });
+
+  it("[TODAY-STALE] a ledger from another day reports ZERO for today, not yesterday's number", () => {
+    // The real defect: dailyLedger only rolls inside rollDailyLedger(), which the kill-switch path
+    // calls before every read and the status path never did. So on a day with no closes the card
+    // printed YESTERDAY's realized under the label "today" — for as many quiet days as followed.
+    const yesterday = { dateUtc: "2026-08-15", realizedPnlUsd: -4.21074343, wins: 0, losses: 1 };
+    const out = reportedDailyLedger(yesterday, "2026-08-16");
+    expect(out.realizedPnlUsd).toBe(0);
+    expect(out.wins).toBe(0);
+    expect(out.losses).toBe(0);
+    expect(out.dateUtc).toBe("2026-08-16");
+    // the stale date is CARRIED, so a reader can tell "no trades today" from "ledger is another day's"
+    expect(out.staleLedgerDateUtc).toBe("2026-08-15");
+  });
+
+  it("[TODAY-STALE] today's own ledger is returned untouched, including a profit", () => {
+    const today = { dateUtc: "2026-08-16", realizedPnlUsd: 12.5, wins: 3, losses: 1, scratches: 2 };
+    const out = reportedDailyLedger(today, "2026-08-16");
+    expect(out).toBe(today);
+    expect(out.staleLedgerDateUtc).toBeUndefined();
+  });
+
+  it("[TODAY-STALE] a stale PROFIT is zeroed too — this is not a loss-hiding rule", () => {
+    // Mirror of the case above with the sign flipped: a reporter that only zeroed losses would
+    // quietly flatter the card, which is the same defect wearing the opposite sign.
+    const out = reportedDailyLedger({ dateUtc: "2026-08-14", realizedPnlUsd: 31.4, wins: 5, losses: 0 }, "2026-08-16");
+    expect(out.realizedPnlUsd).toBe(0);
+    expect(out.wins).toBe(0);
+    expect(out.staleLedgerDateUtc).toBe("2026-08-14");
+  });
+
+  it("[VOID-OTHER-KIND] an exclusion of some OTHER kind must NOT be treated as an operator void", () => {
+    // guards the `kind` check itself: without it, any future exclusion kind (e.g. an accounting
+    // marker) would silently start subtracting itself from the reported totals.
+    const other: any = { reportingExclusion: { kind: "ACCOUNTING_INCOMPLETE",
+      voidedAt: "x", reason: "y", excludedRealizedPnlUsd: -99, excludedFeesUsd: 9 } };
+    expect(isLiveIntentReportingExcluded(other)).toBe(false);
+    expect(sumLiveIntentReportingExclusions([other])).toEqual({ count: 0, realizedPnlUsd: 0, feesUsd: 0 });
+  });
+
+  it("[VOID-EMPTY] nothing voided yields a clean zero, never NaN", () => {
+    const out = sumLiveIntentReportingExclusions([{}, { reportingExclusion: null }]);
+    expect(out).toEqual({ count: 0, realizedPnlUsd: 0, feesUsd: 0 });
+  });
+
+  it("[VOID-GARBAGE] an unusable amount is counted but never poisons the total with NaN", () => {
+    const out = sumLiveIntentReportingExclusions([
+      { reportingExclusion: { kind: "OPERATOR_VOID" as const, voidedAt: "x", reason: "y",
+        excludedRealizedPnlUsd: Number.NaN, excludedFeesUsd: Number.NaN } },
+      voided(-2, 0.2),
+    ]);
+    expect(out.count).toBe(2);
+    expect(out.realizedPnlUsd).toBeCloseTo(-2, 9);
+    expect(Number.isNaN(out.feesUsd)).toBe(false);
   });
 });

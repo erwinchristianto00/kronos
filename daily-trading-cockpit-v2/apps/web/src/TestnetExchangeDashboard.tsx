@@ -1,11 +1,19 @@
+import BasketSelectionBadge from './BasketSelectionBadge';
 import { useEffect, useRef, useState } from 'react';
 import './neural-mindmap.css';
 // 2026-07-23 dashboard consolidation (23 sections -> 7 composites + 2 always-on zones): shared
 // table/accordion primitives also used by the Research dashboard's InnovationLanesCard.
 import { Disclosure, LaneMaturityTable, laneEdgeBadge, type LaneMaturityRow } from './LaneMaturityTable';
 import CrossSectionalReportCard from './CrossSectionalReportCard';
+import DailyRangeReportCard from './DailyRangeReportCard';
+import MarketRegimeCard, { type MarketRegimeDisplay } from './MarketRegimeCard';
 
 const REFRESH_MS = 5_000;
+// Mainnet account reads fan out to signed USD-M endpoints. Keep the familiar faster testnet
+// presentation cadence, but give LIVE one shared 15s window so a normal open dashboard cannot
+// turn into repeated private-account reads when several panels mount together.
+const LIVE_EXCHANGE_REFRESH_MS = 15_000;
+const LIVE_RATE_LIMIT_BACKOFF_MS = 60_000;
 const TESTNET_API_PREFIX = '/testnet/api';
 // The REAL-MONEY mainnet engine, proxied by Caddy (/live/api/* → 127.0.0.1:3103).
 const LIVE_API_PREFIX = '/live/api';
@@ -177,7 +185,14 @@ interface LiveStatus {
     clockSkewMs: number | null;
     lastTickAt: string | null;
     lastTickError: string | null;
+    rateLimit?: {
+      coolingDown: boolean;
+      retryAt: string | null;
+      lastHttpStatus: 418 | 429 | null;
+      lastFailure: string | null;
+    } | null;
   };
+  marketRegimeDisplay?: MarketRegimeDisplay;
   controller?: {
     regime: string | null;
     mode: string | null;
@@ -210,6 +225,11 @@ interface LiveStatus {
   };
   consecutiveLosses?: number;
   totalRealizedPnlUsd?: number;
+  /** Realized total with operator-voided closes removed — for DISPLAY only. The raw
+   *  totalRealizedPnlUsd above stays exchange-true and is what the kill-switches read. */
+  totalRealizedPnlUsdExcludingVoids?: number;
+  reportingExcluded?: { count: number; realizedPnlUsd: number; feesUsd: number };
+  reportingExcludedToday?: { count: number; realizedPnlUsd: number; feesUsd: number };
   unifiedOrchestrator?: {
     enabled: boolean;
     mode: 'UNIFIED_TESTNET' | 'DISABLED';
@@ -252,6 +272,13 @@ interface LiveAccount {
   accountEquity: number | null;
   openPositionCount: number;
   openOrderCount: number;
+  openAlgoOrdersObserved?: boolean;
+  openOrderCountCoverage?:
+    | 'EXCHANGE_OPEN_ORDERS'
+    | 'EXCHANGE_OPEN_AND_ALGO_ORDERS'
+    | 'EXCHANGE_OPEN_ORDERS_PLUS_RECONCILED_DAILY_RANGE_BRACKETS'
+    | 'EXCHANGE_OPEN_ORDERS_DAILY_RANGE_RECONCILIATION_REQUIRED';
+  dailyRangeReconciledProtectiveOrderCount?: number | null;
   positions: Array<{
     symbol: string;
     direction: 'LONG' | 'SHORT';
@@ -274,6 +301,19 @@ interface LiveAccount {
     basketQty?: number | null;
     basketUnrealizedPnl?: number | null;
     singleSymbolStopPrice?: number | null;
+    dailyRangeTradeId?: string | null;
+    dailyRangeQty?: number | null;
+    dailyRangeEntryPrice?: number | null;
+    dailyRangeUnrealizedPnl?: number | null;
+    dailyRangeStopPrice?: number | null;
+    dailyRangeTakeProfitPrice?: number | null;
+    dailyRangeOpenedAt?: string | null;
+    dailyRangeStatus?: string | null;
+    dailyRangeEntryPolicy?: string | null;
+    dailyRangeExitPolicyId?: string | null;
+    dailyRangeTpMultipleR?: number | null;
+    dailyRangeThesisInvalidationType?: string | null;
+    dailyRangeLastReconcileError?: string | null;
   }>;
   lanes: Array<{
     laneId: string;
@@ -336,7 +376,10 @@ interface LanePerformanceSeries {
   since: string;
   until: string;
   anchor: string | null;
+  timeZone?: string;
   regimeFilter: string;
+  /** Closed cross-basket audit P&L before the selected chart period; never blended into its curve. */
+  crossSectionalAuditBeforePeriod?: { closedBaskets: number; totalNetPnlUsd: number; lastClosedAt: string | null } | null;
   regimeOptions: Array<{ value: string; label: string }>;
   cohort?: { id: string; label: string; rolloutStartAt: string | null } | null;
   bucketStarts: string[];
@@ -349,6 +392,7 @@ interface LanePerformanceSeries {
     losses: number;
     winRatePct: number | null;
     symbols: string[];
+    lastClosedAt?: string | null;
     regimes: Array<{
       family: string;
       bucket: string;
@@ -356,6 +400,28 @@ interface LanePerformanceSeries {
     }>;
     points: LanePerformancePoint[];
   }>;
+}
+
+interface ReportedLanePnl {
+  ok?: boolean;
+  timeZone: 'Asia/Taipei';
+  closeDateTaipei: string;
+  accountingComplete: boolean;
+  incompleteRecords: number;
+  today: {
+    baskets: number;
+    dailyRange: number;
+    singleSymbol: number;
+    total: number;
+    closedCount: number;
+  };
+  allTime: {
+    baskets: number;
+    dailyRange: number;
+    singleSymbol: number;
+    total: number;
+    closedCount: number;
+  };
 }
 
 interface MainNeuralLane {
@@ -386,14 +452,83 @@ function plain(value: number | null | undefined, suffix = ''): string {
 
 function price(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value) || value <= 0) return 'n/a';
-  if (value >= 1000) return value.toFixed(2);
-  if (value >= 1) return value.toFixed(4);
-  return value.toFixed(6);
+  const digits = value < 0.0001 ? 10 : value < 0.01 ? 8 : value < 1 ? 6 : value < 100 ? 4 : 2;
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits: digits }).format(value);
 }
 
 function percent(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return 'n/a';
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+}
+
+/** Formats a net return stored as a fraction, e.g. -0.02 → -2.0%. */
+function netReturnPercent(value: number | null | undefined, digits = 2): string {
+  if (value == null || !Number.isFinite(value)) return '—';
+  return `${value >= 0 ? '+' : ''}${(value * 100).toFixed(digits)}%`;
+}
+
+function dynamicMfePlanText(exit: XsecBasketExitPlan): string {
+  if (!exit.hasMfeGiveback || exit.mfeArmNetReturn == null || exit.mfeGivebackFraction == null) return '—';
+  return `arm ${netReturnPercent(exit.mfeArmNetReturn, 1)} → GB ${(exit.mfeGivebackFraction * 100).toFixed(0)}%`;
+}
+
+function dynamicMfeStatusText(exit: XsecBasketExitPlan): string {
+  if (!exit.hasMfeGiveback) return '—';
+  if (exit.mfeTrailArmed) {
+    return exit.mfeTrailingFloor == null
+      ? `armed · GB ${((exit.mfeGivebackFraction ?? 0) * 100).toFixed(0)}%`
+      : `armed · floor ${netReturnPercent(exit.mfeTrailingFloor)} · GB ${((exit.mfeGivebackFraction ?? 0) * 100).toFixed(0)}%`;
+  }
+  return exit.peakMfeReturn == null
+    ? 'belum armed'
+    : `belum armed · peak ${netReturnPercent(exit.peakMfeReturn)}`;
+}
+
+/** Short form for the per-leg table; the full explanation stays in the basket summary above it. */
+function dynamicMfeTablePlanText(exit: XsecBasketExitPlan): string {
+  if (!exit.hasMfeGiveback || exit.mfeArmNetReturn == null || exit.mfeGivebackFraction == null) return '—';
+  return `MFE ${netReturnPercent(exit.mfeArmNetReturn, 0)} / GB ${(exit.mfeGivebackFraction * 100).toFixed(0)}%`;
+}
+
+function dynamicMfeTableStatusText(exit: XsecBasketExitPlan): string {
+  if (!exit.hasMfeGiveback) return '—';
+  if (exit.mfeTrailArmed) {
+    return exit.mfeTrailingFloor == null
+      ? 'armed'
+      : `armed · ${netReturnPercent(exit.mfeTrailingFloor, 1)}`;
+  }
+  return exit.peakMfeReturn == null
+    ? 'pending'
+    : `pending · ${netReturnPercent(exit.peakMfeReturn)}`;
+}
+
+function netUsd(value: number | null | undefined): string {
+  return value == null || !Number.isFinite(value)
+    ? '—'
+    : `${value >= 0 ? '+' : ''}${value.toFixed(2)} USDT`;
+}
+
+function dynamicNetLadderPlanText(ladder: XsecDynamicNetLadderExit): string {
+  const arm = positiveFinite(ladder.armNetPnlUsd);
+  const step = positiveFinite(ladder.armStepNetPnlUsd);
+  const fullTp = positiveFinite(ladder.fullTakeProfitCapitalFraction);
+  const armText = arm == null ? 'arm —' : `arm +${arm.toFixed(2)} USDT`;
+  const stepText = step == null ? 'step —' : `+${step.toFixed(2)} / level`;
+  const tpText = fullTp == null ? 'full TP —' : `full TP ${(fullTp * 100).toFixed(0)}% modal`;
+  return `${armText} · ${stepText} · ${tpText}`;
+}
+
+function dynamicNetLadderStatusText(ladder: XsecDynamicNetLadderExit): string {
+  if (!ladder.trailArmed) {
+    const peak = netUsd(ladder.peakNetPnlUsd);
+    return `belum arm · peak ${peak}`;
+  }
+  const level = Number.isFinite(ladder.highestArmLevel) ? `L${ladder.highestArmLevel}` : 'armed';
+  const peak = netUsd(ladder.peakNetPnlUsd);
+  const floor = netUsd(ladder.trailingFloorNetUsd);
+  const room = netUsd(ladder.allowedGivebackUsd);
+  const volatility = netUsd(ladder.fiveMinuteVolatilityUsd);
+  return `${level} · peak ${peak} · floor ${floor} · GB ${room} · σ5m ${volatility}`;
 }
 
 function tone(value: number | null | undefined): string {
@@ -410,8 +545,26 @@ function timeAgo(iso: string | null | undefined): string {
   return `${Math.floor(ageMin / 60)}h ago`;
 }
 
+function formatTaipeiDateTime(iso: string | null | undefined): string {
+  if (!iso) return '—';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '—';
+  return new Intl.DateTimeFormat('id-ID', {
+    day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Taipei',
+  }).format(date).replace(',', '');
+}
+
 function compactLane(laneId: string): string {
+  if (laneId === 'DAILY_4H_RANGE_ACCEPTANCE') return 'DAILY RANGE 4H';
   return laneId.replace(/^CG_VARIANT_MATRIX:/, '').replace(/^CG_LONG_VARIANT_MATRIX:/, '');
+}
+
+/** Compact table labels keep the per-leg ledger readable; the exact lane remains in its tooltip. */
+function compactOpenPositionLane(laneId: string): string {
+  if (laneId === 'CROSS_SECTIONAL_MARKET_NEUTRAL') return 'Cross basket';
+  if (laneId === 'CROSS_SECTIONAL_TREND') return 'Cross trend';
+  if (laneId === 'CROSS_SECTIONAL_MIXED') return 'Cross mixed';
+  return compactLane(laneId);
 }
 
 function allocationLaneValue(raw: string | null | undefined): string | null {
@@ -456,19 +609,35 @@ function formatWinRate(value: number | null | undefined): string {
   return `${value.toFixed(1)}%`;
 }
 
+function xsecEntryAttemptStageLabel(stage: string): string {
+  const labels: Record<string, string> = {
+    ENTRY_ADMISSION: 'admission',
+    FOUR_BRAIN_BRIDGE: 'Four-Brain bridge',
+    LOSS_REENTRY_GUARD: 'guard re-entry rugi',
+    OVERLAP_GUARD: 'guard overlap',
+    SMART_ENTRY_REVALIDATION: 'cek harga Smart Basket',
+    EXCHANGE_FILTERS: 'filter Binance',
+    SIZING: 'sizing leg',
+    NOTIONAL_CAP: 'batas notional bersama',
+    EXPOSURE_RESERVATION: 'reservasi eksposur',
+    BASKET_RESERVED: 'basket sudah direservasi',
+  };
+  return labels[stage] ?? stage;
+}
+
 function formatBucketLabel(iso: string, view: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
   if (view === 'hourly') {
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Taipei' });
   }
   if (view === 'daily' || view === 'weekly') {
-    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    return date.toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'Asia/Taipei' });
   }
   if (view === 'monthly') {
-    return date.toLocaleDateString([], { month: 'short' });
+    return date.toLocaleDateString([], { month: 'short', timeZone: 'Asia/Taipei' });
   }
-  return date.toLocaleDateString([], { year: 'numeric' });
+  return date.toLocaleDateString([], { year: 'numeric', timeZone: 'Asia/Taipei' });
 }
 
 // Terser than formatBucketLabel: hourly/daily views plot up to 24-31 ticks, so the axis
@@ -477,8 +646,8 @@ function formatBucketLabel(iso: string, view: string): string {
 function formatAxisTick(iso: string, view: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return '';
-  if (view === 'hourly') return `${date.getHours()}`.padStart(2, '0');
-  if (view === 'daily') return `${date.getDate()}`;
+  if (view === 'hourly') return new Intl.DateTimeFormat('en-GB', { hour: '2-digit', hour12: false, timeZone: 'Asia/Taipei' }).format(date);
+  if (view === 'daily') return new Intl.DateTimeFormat('en-GB', { day: '2-digit', timeZone: 'Asia/Taipei' }).format(date);
   return formatBucketLabel(iso, view);
 }
 
@@ -516,13 +685,110 @@ function localMonthInput(date = new Date()): string {
   return localDateInput(date).slice(0, 7);
 }
 
+type XsecDynamicV3Exit = {
+  hardCutLossNetReturn?: number | null;
+  /** Runtime executor spelling retained for baskets opened by the current V3 engine. */
+  hardCutLossThreshold?: number | null;
+  mfeArmNetReturn?: number | null;
+  /** Runtime executor spelling retained for baskets opened by the current V3 engine. */
+  mfeArmThreshold?: number | null;
+  mfeGivebackFraction?: number | null;
+  mfeTrailArmed?: boolean | null;
+  peakMfeReturn?: number | null;
+  mfeTrailingFloor?: number | null;
+};
+
+/** Frozen state for baskets admitted after the net-dollar ladder cutover. */
+type XsecDynamicNetLadderExit = {
+  policyId?: string;
+  hardCutLossThreshold?: number | null;
+  armNetPnlUsd?: number | null;
+  armStepNetPnlUsd?: number | null;
+  fullTakeProfitCapitalFraction?: number | null;
+  givebackFraction?: number | null;
+  entryCapitalUsd?: number | null;
+  currentNetPnlUsd?: number | null;
+  peakNetPnlUsd?: number | null;
+  highestArmLevel?: number | null;
+  trailArmed?: boolean | null;
+  fiveMinuteVolatilityUsd?: number | null;
+  minimumAllowedGivebackUsd?: number | null;
+  allowedGivebackUsd?: number | null;
+  trailingFloorNetUsd?: number | null;
+};
+
+type XsecExitPolicy = {
+  executionCapHours?: number | null;
+  takeProfitEnabled?: boolean;
+  takeProfitNetReturn?: number | null;
+  stopLossEnabled?: boolean;
+  stopLossNetReturn?: number | null;
+  adaptiveExitsEnabled?: boolean;
+  /** Dynamic MOM36 V3 exits are whole-basket net-return controls, not price TP/SLs per leg. */
+  dynamicV3Exit?: XsecDynamicV3Exit | null;
+  dynamicNetLadderExit?: XsecDynamicNetLadderExit | null;
+};
+
+type XsecBasketPolicyFingerprint = {
+  execution?: XsecExitPolicy | null;
+};
+
+type XsecOpenBasket = {
+  dynamicMom36?: { recentStrengthPreference?: unknown } | null;
+  basketId: string;
+  openedAt: string;
+  /** Measurement horizon, not necessarily the executor's earlier HORIZON cap. */
+  closesAtMs: number;
+  policyFingerprint?: XsecBasketPolicyFingerprint | null;
+  /** Runtime state for the frozen Dynamic MOM36 V3 exit policy, when this basket uses it. */
+  dynamicMom36V3Exit?: XsecDynamicV3Exit | null;
+  /** Newer baskets carry an explicit net-dollar ladder dispatch marker. */
+  dynamicMom36NetLadderExit?: XsecDynamicNetLadderExit | null;
+  lastNetReturn?: number | null;
+  lastNetAt?: string | null;
+  legs: Array<{ symbol: string; side: string; exitOrderId: string | null }>;
+  operatorException?: {
+    kind: 'OPERATOR_ACCEPTED_MISSING_LEG';
+    reason: string;
+    missingLegs: Array<{ symbol: string; side: string }>;
+  } | null;
+};
+
 type XsecExecStatus = {
   enabled: boolean;
-  tpNetReturnPct?: number;
+  tpNetReturnPct?: number | null;
+  tpDisabled?: boolean;
+  stopNetReturnPct?: number | null;
+  maxHoldHours?: number | null;
+  /** Frozen compatibility contract applied to baskets created before fingerprints existed. */
+  legacyExitPolicy?: XsecExitPolicy | null;
   dailyRealizedUsd?: number;
   dailyMaxLossUsd?: number;
   openHalted?: string | null;
   lastError?: string | null;
+  entryAttemptAudit?: {
+    latest?: {
+      at: string;
+      sourceObservationId: string;
+      longSymbols: string[];
+      shortSymbols: string[];
+      stage: string;
+      outcome: 'ADMITTED' | 'DEFERRED' | 'SKIPPED' | 'IN_PROGRESS';
+      reason: string | null;
+      basket?: {
+        basketId: string;
+        status: 'RESERVED' | 'PLACING' | 'PARTIALLY_FILLED' | 'COMPLETE' | 'CLOSED' | 'ABORTED';
+        terminal: boolean;
+        closedAt: string | null;
+        closeReason: string | null;
+      } | null;
+    } | null;
+    unattributedConsumedSignal?: {
+      sourceObservationId: string;
+      openedAt: string;
+      reason: string;
+    } | null;
+  };
   formationEvaluation?: {
     activationClosedBaskets: number;
     closedBaskets: number;
@@ -530,15 +796,198 @@ type XsecExecStatus = {
     autoSwitch: false;
     metrics: Array<{ model: string; samples: number; meanNetReturnPct: number | null; winRatePct: number | null; worstNetReturnPct: number | null }>;
   };
-  openBaskets?: Array<{
-    basketId: string;
-    openedAt: string;
-    closesAtMs: number;
-    lastNetReturn?: number | null;
-    lastNetAt?: string | null;
-    legs: Array<{ symbol: string; side: string; exitOrderId: string | null }>;
-  }>;
+  dynamicMom36Status?: {
+    latestFormation?: {
+      finalAllocation?: { label?: string; longCount?: number; shortCount?: number } | null;
+      admission?: {
+        scoreGapApplicable?: boolean;
+        scoreGap?: number | null;
+        scoreGapReason?: string | null;
+        oneSidedDirectionalQuality?: {
+          policyId?: string;
+          score?: number;
+          minScore?: number;
+          decision?: 'PASS' | 'REJECT';
+          reason?: string;
+          components?: {
+            breadthPersistence?: { score?: number; qualifyingScans?: number; validScans?: number; scans?: Array<{ directionalRatio?: number | null }> };
+            strictEligibleDepth?: { score?: number; strictEligibleCount?: number };
+            btcEthAlignment?: { score?: number; btcFast4hReturn?: number | null; ethFast4hReturn?: number | null };
+            selectedTrajectory?: { score?: number; medianOneHourReturn?: number | null; alignedCount?: number };
+            modelSupport?: { score?: number; continuationDecision?: string; shockState?: string };
+            exhaustionRisk?: { score?: number; medianAbsMom36Percentile?: number | null };
+          };
+          strongReversal?: { veto?: boolean; count?: number };
+        } | null;
+      };
+    } | null;
+  } | null;
+  openBaskets?: XsecOpenBasket[];
 };
+
+function positiveFinite(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function finiteNumber(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+type XsecBasketExitPlan = {
+  policy: XsecExitPolicy | null;
+  fixedTakeProfitNetReturn: number | null;
+  stopNetReturn: number | null;
+  dynamicHardCutNetReturn: number | null;
+  hasMfeGiveback: boolean;
+  mfeArmNetReturn: number | null;
+  mfeGivebackFraction: number | null;
+  mfeTrailArmed: boolean;
+  peakMfeReturn: number | null;
+  mfeTrailingFloor: number | null;
+  netLadder: XsecDynamicNetLadderExit | null;
+};
+
+/**
+ * Resolves the exit policy frozen into a basket. Runtime status fields such as
+ * `tpDisabled` only describe old fixed exits, so they must never hide the V3
+ * MFE runner or its whole-basket hard cut in the operator display.
+ */
+export function basketExitPlan(basket: XsecOpenBasket, executor: XsecExecStatus | null): XsecBasketExitPlan {
+  const policy = basket.policyFingerprint?.execution ?? executor?.legacyExitPolicy ?? null;
+  const runtimeNetLadder = basket.dynamicMom36NetLadderExit ?? null;
+  // The compatibility V3 fingerprint remains on fresh rows so old dashboards
+  // can read them. The persisted ladder dispatch marker is authoritative.
+  if (runtimeNetLadder) {
+    const hardCut = finiteNumber(runtimeNetLadder.hardCutLossThreshold);
+    const dynamicHardCutNetReturn = hardCut != null && hardCut < 0 ? hardCut : null;
+    return {
+      policy,
+      fixedTakeProfitNetReturn: null,
+      stopNetReturn: dynamicHardCutNetReturn,
+      dynamicHardCutNetReturn,
+      hasMfeGiveback: false,
+      mfeArmNetReturn: null,
+      mfeGivebackFraction: null,
+      mfeTrailArmed: false,
+      peakMfeReturn: null,
+      mfeTrailingFloor: null,
+      netLadder: runtimeNetLadder,
+    };
+  }
+  const fingerprintDynamic = policy?.dynamicV3Exit ?? null;
+  const runtimeDynamic = basket.dynamicMom36V3Exit ?? null;
+  const dynamic = fingerprintDynamic != null || runtimeDynamic != null
+    ? { ...fingerprintDynamic, ...runtimeDynamic }
+    : null;
+  const dynamicHardCutCandidate = finiteNumber(
+    dynamic?.hardCutLossNetReturn ?? dynamic?.hardCutLossThreshold,
+  );
+  const dynamicHardCutNetReturn = dynamicHardCutCandidate != null && dynamicHardCutCandidate < 0
+    ? dynamicHardCutCandidate
+    : null;
+  const mfeArmNetReturn = positiveFinite(dynamic?.mfeArmNetReturn ?? dynamic?.mfeArmThreshold);
+  const mfeGivebackCandidate = finiteNumber(dynamic?.mfeGivebackFraction);
+  const mfeGivebackFraction = mfeGivebackCandidate != null && mfeGivebackCandidate >= 0 && mfeGivebackCandidate <= 1
+    ? mfeGivebackCandidate
+    : null;
+  const fixedTpEnabled = policy?.takeProfitEnabled ?? !executor?.tpDisabled;
+  const fixedTakeProfitNetReturn = fixedTpEnabled
+    ? finiteNumber(policy?.takeProfitNetReturn ?? (executor?.tpNetReturnPct == null ? null : executor.tpNetReturnPct / 100))
+    : null;
+  const staticStopEnabled = policy?.stopLossEnabled ?? executor?.stopNetReturnPct != null;
+  const staticStopNetReturn = staticStopEnabled
+    ? finiteNumber(policy?.stopLossNetReturn ?? (executor?.stopNetReturnPct == null ? null : executor.stopNetReturnPct / 100))
+    : null;
+  return {
+    policy,
+    fixedTakeProfitNetReturn,
+    stopNetReturn: dynamicHardCutNetReturn ?? staticStopNetReturn,
+    dynamicHardCutNetReturn,
+    hasMfeGiveback: mfeArmNetReturn != null && mfeGivebackFraction != null,
+    mfeArmNetReturn,
+    mfeGivebackFraction,
+    mfeTrailArmed: dynamic?.mfeTrailArmed === true,
+    peakMfeReturn: finiteNumber(dynamic?.peakMfeReturn),
+    mfeTrailingFloor: finiteNumber(dynamic?.mfeTrailingFloor),
+    netLadder: null,
+  };
+}
+
+export function basketHorizonSchedule(basket: XsecOpenBasket, executor: XsecExecStatus | null): {
+  closeAtMs: number | null;
+  capHours: number | null;
+  source: 'basket fingerprint' | 'legacy basket contract' | 'runtime fallback' | 'measurement fallback';
+  earlyExitPossible: boolean;
+} {
+  const fingerprintPolicy = basket.policyFingerprint?.execution ?? null;
+  const legacyPolicy = executor?.legacyExitPolicy ?? null;
+  const fingerprintCap = positiveFinite(fingerprintPolicy?.executionCapHours);
+  const legacyCap = positiveFinite(legacyPolicy?.executionCapHours);
+  const runtimeCap = positiveFinite(executor?.maxHoldHours);
+  const policy = fingerprintPolicy ?? legacyPolicy;
+  const exitPlan = basketExitPlan(basket, executor);
+  const source = fingerprintCap != null
+    ? 'basket fingerprint'
+    : legacyCap != null
+      ? 'legacy basket contract'
+      : runtimeCap != null
+        ? 'runtime fallback'
+        : 'measurement fallback';
+  const capHours = fingerprintCap ?? legacyCap ?? runtimeCap;
+  const openedAtMs = Date.parse(basket.openedAt);
+  const capCloseAtMs = capHours != null && Number.isFinite(openedAtMs)
+    ? openedAtMs + capHours * 3_600_000
+    : null;
+  const measurementCloseAtMs = Number.isFinite(basket.closesAtMs) ? basket.closesAtMs : null;
+  const closeAtMs = capCloseAtMs != null && measurementCloseAtMs != null
+    ? Math.min(capCloseAtMs, measurementCloseAtMs)
+    : capCloseAtMs ?? measurementCloseAtMs;
+  return {
+    closeAtMs,
+    capHours,
+    source,
+    earlyExitPossible: Boolean(
+      exitPlan.fixedTakeProfitNetReturn != null ||
+      exitPlan.stopNetReturn != null ||
+      exitPlan.hasMfeGiveback ||
+      exitPlan.netLadder != null ||
+      policy?.takeProfitEnabled ||
+      policy?.stopLossEnabled ||
+      policy?.adaptiveExitsEnabled,
+    ),
+  };
+}
+
+/** Operator-facing timestamps are always explicit about the timezone. */
+export function taipeiDateTime(value: string | number | null | undefined): string | null {
+  const ms = typeof value === 'number'
+    ? value
+    : typeof value === 'string'
+      ? Date.parse(value)
+      : Number.NaN;
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).toLocaleString('en-GB', {
+    timeZone: 'Asia/Taipei',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).replace(',', '');
+}
+
+/** The complete Taipei timestamp remains in the tooltip; the table needs only day/month and time. */
+function compactTaipeiDateTime(value: string | number | null | undefined): string | null {
+  return taipeiDateTime(value)?.replace(/\/\d{4}(?= )/, '') ?? null;
+}
+
+function horizonDetail(closeAtMs: number | null, source: string, earlyExitPossible: boolean): string {
+  if (closeAtMs == null) return `HORIZON source: ${source}; waktu tidak tersedia`;
+  const taipei = taipeiDateTime(closeAtMs);
+  if (taipei == null) return `HORIZON source: ${source}; waktu tidak valid`;
+  return `HORIZON: ${taipei} Taipei · source: ${source}${earlyExitPossible ? ' · TP/SL/emergency may close earlier' : ''}`;
+}
 
 type SingleSymbolLanePosition = {
   laneId: string;
@@ -548,8 +997,18 @@ type SingleSymbolLanePosition = {
   qty: number;
   entryPrice: number;
   stopPrice: number;
+  targetPrice: number | null;
+  targetTpGapPct: number | null;
+  targetMode: 'FIXED' | 'MFE_PROFIT_LOCK' | 'DYNAMIC';
+  mfeProfitLockPrice: number | null;
+  mfeProfitLockGapPct: number | null;
+  mfeProfitLockNetReturn: number | null;
+  staticTpMaxNetReturn: number | null;
   markPrice: number | null;
   unrealizedPnl: number | null;
+  leverage: number | null;
+  estimatedCloseCostUsd: number | null;
+  unrealizedAfterEstimatedCloseCostUsd: number | null;
   peakFavorableR: number;
   openedAt: string;
 };
@@ -733,7 +1192,7 @@ function RegimeAxisChart({ data, mode = 'full' }: { data: RegimeAxisTimelineData
   const forecastColor = forecast?.bias === 'BEARISH' ? '#ff6b6b' : forecast?.bias === 'NEUTRAL' ? '#f0b54b' : forecast?.bias === 'UNCERTAIN' ? '#9db1ba' : '#5ce4a6';
   const entryDecision = data.entryDecision;
   const entryColor = entryDecision?.directionalBias === 'SHORT' ? '#ff6b6b' : entryDecision?.directionalBias === 'LONG' ? '#5ce4a6' : '#f0b54b';
-  const timeLabel = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const timeLabel = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Taipei' });
   const signed = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}`;
   const pct = (value: number | null | undefined) => value == null ? 'n/a' : `${Math.round(value * 100)}%`;
 
@@ -873,24 +1332,23 @@ function SingleSymbolPriceTimelineChart({ data, positions }: { data: SingleSymbo
     return <div className="testnet-chart-empty"><strong>Loading BTC / ETH / SOL timeline…</strong><p>Need fresh 5m and 1h Binance candles.</p></div>;
   }
   const toneFor = (directive: string) => directive === 'ENTER_LONG' ? '#5ce4a6' : directive === 'ENTER_SHORT' ? '#ff6b6b' : '#f0b54b';
-  const signedPct = (value: number) => `${value >= 0 ? '+' : ''}${(value * 100).toFixed(2)}%`;
   return (
     <div className="testnet-price-timeline-list">
       {rows.map((row) => {
         if (!row.available || row.points.length < 2 || row.price == null) {
           return <div className="testnet-chart-empty" key={row.symbol}><strong>{row.symbol}: timeline unavailable</strong><p>{row.reason ?? 'Waiting for candle data.'}</p></div>;
         }
-        const width = 960; const height = 160; const px = 46; const py = 22;
-        const forecast = row.forecasts ?? [];
-        const values = [...row.points.map((p) => p.price), ...forecast.flatMap((p) => [p.lowerPrice, p.upperPrice])];
+        const width = 960; const height = 190; const px = 46; const py = 22;
+        // Do not turn a heuristic gate into a price target. The former dotted 1/3/6h line was
+        // based on score × ATR and could visually point the same way across unrelated symbols.
+        // This panel is now strictly an actual-price history with its gate/indicator context.
+        const values = row.points.map((p) => p.price);
         const rawMin = Math.min(...values); const rawMax = Math.max(...values); const pad = Math.max((rawMax - rawMin) * 0.12, row.price * 0.002);
         const min = rawMin - pad; const max = rawMax + pad; const currentAt = new Date(row.points.at(-1)!.at).getTime();
-        const t0 = new Date(row.points[0]!.at).getTime(); const t1 = currentAt + 6 * 3_600_000; const span = Math.max(1, t1 - t0);
+        const t0 = new Date(row.points[0]!.at).getTime(); const t1 = currentAt; const span = Math.max(1, t1 - t0);
         const xy = (at: string, priceValue: number) => ({ x: px + ((new Date(at).getTime() - t0) / span) * (width - px * 2), y: py + (1 - (priceValue - min) / Math.max(max - min, 1e-9)) * (height - py * 2) });
         const line = (points: Array<{ at: string; price: number }>) => points.map((p, i) => { const v = xy(p.at, p.price); return `${i ? 'L' : 'M'} ${v.x.toFixed(1)} ${v.y.toFixed(1)}`; }).join(' ');
-        const current = xy(row.points.at(-1)!.at, row.price); const targetPoints = forecast.map((p) => ({ at: new Date(currentAt + p.hours * 3_600_000).toISOString(), price: p.targetPrice }));
-        const forecastLine = line([{ at: row.points.at(-1)!.at, price: row.price }, ...targetPoints]);
-        const rangePath = forecast.length ? line([{ at: row.points.at(-1)!.at, price: row.price }, ...forecast.map((p) => ({ at: new Date(currentAt + p.hours * 3_600_000).toISOString(), price: p.lowerPrice })), ...[...forecast].reverse().map((p) => ({ at: new Date(currentAt + p.hours * 3_600_000).toISOString(), price: p.upperPrice }))]) + ' Z' : '';
+        const current = xy(row.points.at(-1)!.at, row.price);
         const color = toneFor(row.directive); const m5 = row.indicators.m5; const h1 = row.indicators.h1;
         // 2026-07-21 operator ask: the directive/confidence above is a GATE, not a trigger — it never
         // opens anything by itself (a lane must independently propose this symbol as a fresh candidate,
@@ -901,31 +1359,26 @@ function SingleSymbolPriceTimelineChart({ data, positions }: { data: SingleSymbo
         const posColor = openPosition ? (openPosition.direction === 'LONG' ? '#5ce4a6' : '#ff6b6b') : '#9db1ba';
         return <div key={row.symbol} className="testnet-price-timeline">
           <div className="testnet-regime-forecast-head"><span>{row.symbol} PRICE TIMELINE</span><strong style={{ color }}>{row.directive.replace('_', ' ')}</strong><em>{row.confidence == null ? 'n/a' : `${Math.round(row.confidence * 100)}% confidence`}</em></div>
-          {/* 2026-07-23 dashboard consolidation: chart + m5/h1 indicator detail collapse behind a
-             per-symbol Disclosure — the Keputusan-trade line + entry/exit reason text below stay
-             outside it, always visible (real open-position state must never require a click). */}
-          <Disclosure summary="Chart & forecast ▸">
-            <svg className="testnet-lane-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${row.symbol} price timeline and forecast`}>
+          {/* Chart + m5/h1 indicator detail collapse behind a per-symbol Disclosure — the
+             Keputusan-trade line + entry/exit reason stay outside it, always visible. */}
+          <Disclosure summary="12h actual price + indicators ▸">
+            <svg className="testnet-lane-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${row.symbol} actual 12h price timeline`}>
               <rect x="0" y="0" width={width} height={height} rx="12" className="testnet-chart-bg" />
               {[0.2, 0.5, 0.8].map((ratio) => <line key={ratio} x1={px} x2={width - px} y1={py + ratio * (height - py * 2)} y2={py + ratio * (height - py * 2)} className="testnet-chart-grid" />)}
               <line x1={current.x} x2={current.x} y1={py} y2={height - py} className="testnet-chart-now" />
               <path d={line(row.points)} fill="none" stroke="#8bd3f0" strokeWidth="2.2" strokeLinejoin="round" strokeLinecap="round" />
-              {rangePath && <path d={rangePath} fill={color} opacity="0.12" />}
-              {forecastLine && <path d={forecastLine} fill="none" stroke={color} strokeWidth="2" strokeDasharray="6 5" />}
               <circle cx={current.x} cy={current.y} r="4.5" fill={color} stroke="#071016" strokeWidth="1.5" />
               <text x={px} y={15} className="testnet-chart-axis">{price(max)}</text><text x={px} y={height - py - 4} className="testnet-chart-axis">{price(min)}</text>
-              <text x={px} y={height - 7} className="testnet-chart-time">{new Date(row.points[0]!.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · -12h</text><text x={current.x} y={height - 7} className="testnet-chart-time middle">NOW</text><text x={width - px} y={height - 7} className="testnet-chart-time end">+6h</text>
-              {forecast.map((f) => { const pt = xy(new Date(currentAt + f.hours * 3_600_000).toISOString(), f.targetPrice); return <g key={f.hours}><circle cx={pt.x} cy={pt.y} r="3.5" fill={color} /><text x={pt.x} y={Math.max(18, pt.y - 8)} textAnchor="middle" className="testnet-chart-forecast-label">+{f.hours}h {price(f.targetPrice)}</text></g>; })}
+              <text x={px} y={height - 7} className="testnet-chart-time">{new Date(row.points[0]!.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Taipei' })} Taipei · -12h</text><text x={width - px} y={height - 7} className="testnet-chart-time end">NOW</text>
             </svg>
             <div className="testnet-price-timeline-meta">
               <span><b>Now</b> {price(row.price)} · score {row.score == null ? 'n/a' : `${row.score >= 0 ? '+' : ''}${row.score.toFixed(2)}`}</span>
               <span><b>Turn</b> {row.turningPoint.replaceAll('_', ' ')}</span>
               <span><b>5m</b> RSI {m5?.rsi14.toFixed(0) ?? 'n/a'} · {m5?.trend ?? 'n/a'} · vol {m5?.volumeRatio?.toFixed(2) ?? 'n/a'}x</span>
               <span><b>1h</b> RSI {h1?.rsi14.toFixed(0) ?? 'n/a'} · {h1?.trend ?? 'n/a'} · ATR {h1?.atrPercent.toFixed(2) ?? 'n/a'}%</span>
-              {forecast.map((f) => <span key={f.hours}><b>+{f.hours}h</b> {price(f.targetPrice)} ({signedPct(f.expectedMovePct)}) · {price(f.lowerPrice)}–{price(f.upperPrice)}</span>)}
             </div>
           </Disclosure>
-          <p className="tone-measure" style={{ margin: '5px 0 12px', fontSize: 12 }}>{row.entryReason}. Long exit: {row.exitLongReason ?? 'hold lane/stop'} · Short exit: {row.exitShortReason ?? 'hold lane/stop'}.</p>
+          <p className="tone-measure" style={{ margin: '5px 0 12px', fontSize: 12 }}>{row.entryReason}. Tidak ada target harga/proyeksi garis di chart ini; directive adalah gate, bukan prediksi. Long exit: {row.exitLongReason ?? 'hold lane/stop'} · Short exit: {row.exitShortReason ?? 'hold lane/stop'}.</p>
           <p style={{ margin: '0 0 12px', fontSize: 12 }}>
             <b>Keputusan trade:</b>{' '}
             {openPosition ? (
@@ -964,9 +1417,9 @@ function LanePerformanceChart({ series }: { series: LanePerformanceSeries | null
   const zeroY = padding + plotHeight - ((0 - minY) / Math.max(maxY - minY, 1)) * plotHeight;
   const labelBuckets = series?.bucketStarts ?? [];
   const tickCount = labelBuckets.length;
-  // Cap tick density so a future higher-resolution view can't render illegibly-overlapping
-  // labels; every view shipped today (max 31 daily buckets) renders one tick per bucket.
-  const MAX_TICKS = 31;
+  // Keep actual axis labels readable at the narrow Live layout too. Hourly/daily views can have
+  // 24–31 buckets, but rendering every one made the time axis overlap into an unreadable ribbon.
+  const MAX_TICKS = 12;
   const tickStep = tickCount > MAX_TICKS ? Math.ceil(tickCount / MAX_TICKS) : 1;
   const axisTicks = labelBuckets
     .map((iso, index) => ({ iso, index }))
@@ -1053,11 +1506,33 @@ function LanePerformanceChart({ series }: { series: LanePerformanceSeries | null
   );
 }
 
+class ApiRequestError extends Error {
+  readonly retryAt: string | null;
+
+  constructor(message: string, retryAt?: unknown) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.retryAt = typeof retryAt === 'string' ? retryAt : null;
+  }
+}
+
+function isBinanceRateLimit(error: unknown): error is ApiRequestError {
+  return error instanceof ApiRequestError && /rate limit|HTTP 418|HTTP 429/i.test(error.message);
+}
+
+/** The shared exchange-health banner owns active cooldown status, not each trade row. */
+function reconcileErrorForDisplay(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return /^(?:account reconciliation unavailable|bracket transition recheck unavailable):\s*.*(?:rate limited|HTTP\s*(?:418|429)|transport cooldown)/i.test(value)
+    ? null
+    : value;
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const response = await fetch(url, { cache: 'no-store' });
-  const body = await readJsonResponse<T & { ok?: boolean; reason?: string }>(response);
+  const body = await readJsonResponse<T & { ok?: boolean; reason?: string; retryAt?: string | null }>(response);
   if (!response.ok || body?.ok === false) {
-    throw new Error(body?.reason ?? `Request failed (${response.status})`);
+    throw new ApiRequestError(body?.reason ?? `Request failed (${response.status})`, body?.retryAt);
   }
   return body as T;
 }
@@ -1096,8 +1571,12 @@ export default function TestnetExchangeDashboard() {
   const pageSubtitle = isLivePage ? 'Binance mainnet mirror' : 'Binance testnet mirror';
   const pageScope = isLivePage ? 'Exchange-only LIVE view' : 'Exchange-only testnet view';
   const walletLabel = isLivePage ? 'mainnet wallet' : 'testnet wallet';
+  const exchangeRefreshMs = isLivePage ? LIVE_EXCHANGE_REFRESH_MS : REFRESH_MS;
   const allocationLabel = isLivePage ? 'LIVE lane allocation' : 'Testnet lane allocation';
   const [account, setAccount] = useState<LiveAccount | null>(null);
+  // The headline is a single API read model: all three books are classified by their actual
+  // exit timestamp in Taipei, so it cannot mix incompatible calendar definitions.
+  const [reportedLanePnl, setReportedLanePnl] = useState<ReportedLanePnl | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const [laneSeries, setLaneSeries] = useState<LanePerformanceSeries | null>(null);
   const [mfeRolloutSeries, setMfeRolloutSeries] = useState<LanePerformanceSeries | null>(null);
@@ -1105,6 +1584,9 @@ export default function TestnetExchangeDashboard() {
   // of the MOST RECENTLY STARTED loadExchangeOnly() call is ever applied, so a slower older
   // request can't resolve after a newer one and overwrite fresher wallet/position/P&L state.
   const exchangeLoadSeqRef = useRef(0);
+  // Server-side cache/coalescing protects Binance too, but this client guard stops a cold-start
+  // 418 from continually repainting the same error until the server's advertised cooldown ends.
+  const liveRateLimitUntilRef = useRef(0);
   // 2026-07-12 fix: same race class as exchangeLoadSeqRef above — the 15s auto-refresh poll and a
   // manual close's own post-close refresh call loadSingleSymbolPositions() independently, with no
   // guard against an in-flight poll (started BEFORE the close) resolving AFTER the post-close
@@ -1386,6 +1868,10 @@ export default function TestnetExchangeDashboard() {
   }
 
   async function loadExchangeOnly() {
+    // Both pages ultimately read Binance USD-M account state. Honour the server-advertised
+    // cooldown on Testnet too, rather than repeatedly asking the local API for an account read
+    // that Binance has explicitly told it not to make yet.
+    if (Date.now() < liveRateLimitUntilRef.current) return;
     const seq = ++exchangeLoadSeqRef.current;
     try {
       const anchor =
@@ -1399,27 +1885,38 @@ export default function TestnetExchangeDashboard() {
       const seriesParams = new URLSearchParams({
         view: performanceView,
         regime: performanceRegime,
+        timeZone: 'Asia/Taipei',
       });
       if (anchor) seriesParams.set('anchor', anchor);
       const mfeRolloutParams = new URLSearchParams(seriesParams);
       mfeRolloutParams.set('cohort', 'testnet_mfe_giveback_xrp_wld');
-      const [nextStatus, nextAccount, nextLaneSeries, nextMfeRolloutSeries] = await Promise.all([
+      const [nextStatus, nextAccount, nextLaneSeries, nextMfeRolloutSeries, nextReportedLanePnl] = await Promise.all([
         fetchJson<LiveStatus>(`${pageApiPrefix}/live/status`),
         fetchJson<LiveAccount>(`${pageApiPrefix}/live/account`),
         fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${seriesParams.toString()}`),
-        !isLivePage
-          ? fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${mfeRolloutParams.toString()}`)
-          : Promise.resolve(null),
+        fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${mfeRolloutParams.toString()}`),
+        fetchJson<ReportedLanePnl>(`${pageApiPrefix}/live/reported-lane-pnl`),
       ]);
       if (seq !== exchangeLoadSeqRef.current) return; // a newer call already superseded this one
       setStatus(nextStatus);
       setAccount(nextAccount);
       setLaneSeries(nextLaneSeries);
       setMfeRolloutSeries(nextMfeRolloutSeries);
+      setReportedLanePnl(nextReportedLanePnl);
       setError(null);
+      liveRateLimitUntilRef.current = 0;
       setLastLoadedAt(new Date().toISOString());
     } catch (nextError) {
       if (seq !== exchangeLoadSeqRef.current) return;
+      if (isBinanceRateLimit(nextError)) {
+        const advertisedRetryMs = nextError.retryAt ? Date.parse(nextError.retryAt) : Number.NaN;
+        const retryAtMs = Number.isFinite(advertisedRetryMs)
+          ? advertisedRetryMs
+          : Date.now() + LIVE_RATE_LIMIT_BACKOFF_MS;
+        liveRateLimitUntilRef.current = retryAtMs;
+        setError(`Binance ${isLivePage ? 'mainnet' : 'testnet'} sedang membatasi pembacaan akun; dashboard menunggu sampai ${formatTaipeiDateTime(new Date(retryAtMs).toISOString())} Taipei sebelum mencoba lagi.`);
+        return;
+      }
       setError(nextError instanceof Error ? nextError.message : `Unable to load Binance ${isLivePage ? 'mainnet' : 'testnet'} mirror`);
     }
   }
@@ -1518,6 +2015,7 @@ export default function TestnetExchangeDashboard() {
   // per lane's OWN position on a symbol, not summed across lanes, so each can be inspected/closed
   // independently.
   async function loadSingleSymbolPositions() {
+    if (isLivePage && Date.now() < liveRateLimitUntilRef.current) return;
     const seq = ++singleSymbolLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/live/single-symbol/positions`, { cache: 'no-store' });
@@ -1538,6 +2036,7 @@ export default function TestnetExchangeDashboard() {
   // Evaluation section for the lanes being validated on testnet (2026-07-10) — merges each lane's
   // paper/shadow measurement stats with its real testnet-money execution stats in one table.
   async function loadLaneEvaluation() {
+    if (isLivePage && Date.now() < liveRateLimitUntilRef.current) return;
     const seq = ++laneEvaluationLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/live/lane-evaluation`, { cache: 'no-store' });
@@ -1590,7 +2089,6 @@ export default function TestnetExchangeDashboard() {
   // CORTEX_REFIT_INTERVAL_MS cycle (minutes apart), and a tighter poll was a real contributor to the
   // 2026-07-20 testnet event-loop-starvation incident.
   async function loadCortexDecisionAlpha() {
-    if (isLivePage) return;
     const seq = ++cortexDecisionAlphaLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/shadow/cortex-decision-alpha`, { cache: 'no-store' });
@@ -1605,7 +2103,6 @@ export default function TestnetExchangeDashboard() {
   // CORTEX real-USDT attribution, testnet-only — same cadence + seq/keep-last pattern as
   // loadCortexDecisionAlpha above (the figure only moves when a tilted-lane trade closes).
   async function loadCortexRealAttribution() {
-    if (isLivePage) return;
     const seq = ++cortexRealAttributionLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/live/cortex-real-attribution`, { cache: 'no-store' });
@@ -1743,9 +2240,9 @@ export default function TestnetExchangeDashboard() {
     if (!autoRefresh) return undefined;
     const timer = window.setInterval(() => {
       void loadExchangeOnly();
-    }, REFRESH_MS);
+    }, exchangeRefreshMs);
     return () => window.clearInterval(timer);
-  }, [autoRefresh, performanceView, performanceDay, performanceMonth, performanceYear, performanceRegime]);
+  }, [autoRefresh, performanceView, performanceDay, performanceMonth, performanceYear, performanceRegime, exchangeRefreshMs]);
 
   // Regime panel loads on its own cadence, independent of the exchange fetches (so it shows
   // on /live even if a live endpoint hiccups). Refreshes every 15s.
@@ -1781,7 +2278,6 @@ export default function TestnetExchangeDashboard() {
   // CORTEX #219 shadow decision-alpha — own cadence (60s, not 15s): testnet-only, and the underlying
   // figure only changes once per refit cycle (minutes apart), so a faster poll would just be chatter.
   useEffect(() => {
-    if (isLivePage) return undefined;
     void loadCortexDecisionAlpha();
     void loadCortexRealAttribution();
     if (!autoRefresh) return undefined;
@@ -1806,19 +2302,27 @@ export default function TestnetExchangeDashboard() {
     loadManualDirectionalAllocation();
   }, [status]);
 
-  const stale = lastLoadedAt ? Date.now() - new Date(lastLoadedAt).getTime() > REFRESH_MS * 2.5 : true;
-  const healthTone = status?.armed ? 'tone-healthy' : status?.health?.lastTickError ? 'tone-warning' : 'tone-measure';
+  const stale = lastLoadedAt ? Date.now() - new Date(lastLoadedAt).getTime() > exchangeRefreshMs * 2.5 : true;
+  const transportCoolingDown = status?.health?.rateLimit?.coolingDown === true;
+  const healthTone = transportCoolingDown || status?.health?.lastTickError
+    ? 'tone-warning'
+    : status?.armed ? 'tone-healthy' : 'tone-measure';
   const totalSourceEntries = account?.positions.reduce((sum, position) => sum + position.sourceOrderCount, 0) ?? 0;
   const regimeOptions = laneSeries?.regimeOptions ?? FALLBACK_REGIME_OPTIONS;
-  // Testnet is currently scoped to cross-sectional work plus the explicitly approved
-  // XRP/WLD CG_MFE_GIVEBACK rollout. Keep the live page's full history, while the testnet
-  // performance timeline shows the cross-sectional variants and this one approved CG lane.
-  const isTestnetTimelineLane = (laneId: string) => laneId.startsWith('CROSS_SECTIONAL_');
-  const timelineSeries = !isLivePage && laneSeries
+  // The timeline is intentionally limited to the operator's two displayed books: hedge baskets
+  // and Daily Range.  Daily Range has its own executor ledger, so it must be selected explicitly
+  // instead of being lost when this view filters engine-only lanes.
+  const isDisplayedTimelineLane = (laneId: string) =>
+    laneId.startsWith('CROSS_SECTIONAL_') || laneId === 'DAILY_4H_RANGE_ACCEPTANCE';
+  // 2026-08-18: dropped the `!isLivePage &&`. The section that renders this chart is already shown
+  // on /live (`isLivePage || showTestnetLaneResearch`), so gating the DATA here left live with a
+  // permanently empty chart. laneSeries is fetched on both pages; mfeRolloutSeries is testnet-only
+  // and already null-guarded below, so live simply gets the cross-sectional lanes.
+  const timelineSeries = laneSeries
     ? {
       ...laneSeries,
       lanes: [
-        ...laneSeries.lanes.filter((lane) => isTestnetTimelineLane(lane.laneId)),
+        ...laneSeries.lanes.filter((lane) => isDisplayedTimelineLane(lane.laneId)),
         ...(mfeRolloutSeries?.lanes ?? []).map((lane) => ({
           ...lane,
           laneId: mfeRolloutSeries?.cohort?.label ?? 'CG_MFE_GIVEBACK — XRP/WLD rollout',
@@ -1838,11 +2342,18 @@ export default function TestnetExchangeDashboard() {
   // rendered as an untouchable, timed basket leg — when they're actually a single real position with
   // its own exchange-side stop, no sibling leg, and no "naked directional bet" risk from closing it.
   const isSingleSymbolExecutorPosition = (laneIds: string[]) =>
+    // Directional cross-sectional uses SingleSymbolLaneExecutor too. It has an
+    // owned stop and can be closed independently, so it must never also be
+    // rendered as an auto-exit-only basket merely because its account mirror
+    // carries basketQty/basketUnrealizedPnl compatibility fields.
+    laneIds.includes('CROSS_SECTIONAL_DIRECTIONAL_LONG') ||
+    laneIds.includes('CROSS_SECTIONAL_DIRECTIONAL_SHORT') ||
     laneIds.includes('SHORT_FADE_EXHAUSTION_CROWDED') ||
     laneIds.includes('INTRADAY_MOMENTUM_BREAKOUT_LONG') ||
     laneIds.includes('REGIME_COMPOSITE_CONFIRMATION_LONG') ||
     laneIds.includes('PANIC_WASHOUT_RECLAIM_LONG') ||
     laneIds.some((id) => id.startsWith('COMPOSITE_ESTIMATOR_BIDI_'));
+  const isDailyRangePosition = (laneIds: string[]) => laneIds.includes('DAILY_4H_RANGE_ACCEPTANCE');
 
   // 2026-07-23 dashboard consolidation: split (2026-07-07/08 operator asks) the directional slot
   // vs the cross-sectional foundation the exact same way the old separate tables did — lifted up
@@ -1852,7 +2363,19 @@ export default function TestnetExchangeDashboard() {
   const allPositions = account?.positions ?? [];
   const directionalPositions = allPositions.filter((p) => intentBySymbol.has(p.symbol));
   const foundationPositions = allPositions.filter(
-    (p) => !isSingleSymbolExecutorPosition(p.laneIds) && ((p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol))),
+    (p) => !isDailyRangePosition(p.laneIds) && !isSingleSymbolExecutorPosition(p.laneIds) && ((p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol))),
+  );
+  const dailyRangePositions = allPositions.filter((p) =>
+    isDailyRangePosition(p.laneIds) && !intentBySymbol.has(p.symbol),
+  );
+  // The account headline is exchange truth, so it includes every non-zero USD-M position.  The
+  // old table only rendered positions claimed by a Kronos intent/basket/single-symbol lane; an
+  // operator-created or otherwise unclaimed exchange position therefore moved the headline uPnL
+  // while the table claimed there were zero positions.  Keep it explicitly separate: this is a
+  // reporting/reconciliation state, never a new engine book and never a permission to close it.
+  const trackedAccountPositions = new Set([...directionalPositions, ...foundationPositions, ...dailyRangePositions]);
+  const unattributedExchangePositions = allPositions.filter((p) =>
+    !trackedAccountPositions.has(p) && !isSingleSymbolExecutorPosition(p.laneIds),
   );
   // 2026-07-23 fix (adversarial review finding, HIGH-adjacent): folding Intent State into the
   // directional rows means an intent is only ever shown attached to a MATCHING Binance position.
@@ -1861,18 +2384,38 @@ export default function TestnetExchangeDashboard() {
   // its own row in the old separate Mirror Intents table. Surface that gap explicitly instead of
   // letting the merged table look clean while a real open intent sits unresolved and unseen.
   const orphanIntents = (status?.openIntents ?? []).filter((i) => !allPositions.some((p) => p.symbol === i.symbol));
-  // NEW derived display value (2026-07-23, no new fetch): sum of open positions across all 3
-  // real-money books, surfaced as a single zero-click KPI that deep-links to the merged table.
-  const openPositionsCount = directionalPositions.length + foundationPositions.length + singleSymbolLanePositions.length;
+  // Sum every position the dashboard can prove is open: the three engine-owned books plus an
+  // explicit exchange-unattributed bucket.  This must reconcile to the account count rather than
+  // hiding a position merely because no executor currently claims it.
+  const openPositionsCount = directionalPositions.length + foundationPositions.length + dailyRangePositions.length + singleSymbolLanePositions.length + unattributedExchangePositions.length;
   // 2026-07-11: the 3 CrossSectionalExecutor instances each have independent halted/error/
   // openBaskets/staleSince state — surface all 3, not just FILTERED, so a stuck TREND or MIXED
   // instance is visible instead of silently invisible. (Unchanged data, just one combined list
   // instead of the old separate xsecInstances array + separate staleSince array.)
-  const xsecInstances: Array<{ label: string; status: XsecExecStatus | null; staleSince: string | null }> = [
-    { label: 'FILTERED', status: xsecExec, staleSince: xsecExecStaleSince },
-    { label: 'TREND', status: xsecExecTrend, staleSince: xsecExecTrendStaleSince },
-    { label: 'MIXED', status: xsecExecMixed, staleSince: xsecExecMixedStaleSince },
+  const xsecInstances: Array<{ label: string; laneId: string; status: XsecExecStatus | null; staleSince: string | null }> = [
+    { label: 'FILTERED', laneId: 'CROSS_SECTIONAL_MARKET_NEUTRAL', status: xsecExec, staleSince: xsecExecStaleSince },
+    { label: 'TREND', laneId: 'CROSS_SECTIONAL_TREND', status: xsecExecTrend, staleSince: xsecExecTrendStaleSince },
+    { label: 'MIXED', laneId: 'CROSS_SECTIONAL_MIXED', status: xsecExecMixed, staleSince: xsecExecMixedStaleSince },
   ];
+  // The exchange account is netted by symbol, while executor state owns the real basket clock.
+  // Match on lane + symbol + side only; if the account is not provably tied to a current executor
+  // leg, render no time rather than assigning another basket's deadline.
+  const openBasketLegSchedules = xsecInstances.flatMap(({ label, laneId, status: xs }) =>
+    (xs?.openBaskets ?? []).flatMap((basket) => {
+      const horizon = basketHorizonSchedule(basket, xs);
+      const exit = basketExitPlan(basket, xs);
+      return basket.legs.map((leg) => ({
+        label,
+        laneId,
+        basketId: basket.basketId,
+        symbol: leg.symbol,
+        side: leg.side,
+        openedAt: basket.openedAt,
+        horizon,
+        exit,
+      }));
+    }),
+  );
   // Display-only mapping of the 3 Tier-1-3 R&D shadow lanes into the shared LaneMaturityTable's
   // row shape (2026-07-23) — no new data, just reshaping `rndLanes` state for the shared component.
   // Renamed per operator ask: disambiguate from the Research dashboard's separate single-symbol lane.
@@ -1946,11 +2489,7 @@ export default function TestnetExchangeDashboard() {
             <button type="button" disabled={controlBusy || status?.armed !== true} onClick={() => void disarmCurrent()}>Disarm</button>
           </div>
         </div>
-        <div>
-          <span>Regime</span>
-          <strong>{status?.controller?.regime ?? 'Loading'}</strong>
-          <small>{status?.controller?.mode ?? 'mode n/a'} · {status?.controller?.bias ?? 'bias n/a'} · {status?.controller?.confidence ?? 'confidence n/a'}</small>
-        </div>
+        <MarketRegimeCard snapshot={status?.marketRegimeDisplay} />
         <div>
           <span>Estimated regime</span>
           <strong>{status?.controller?.estimatedRegime?.posture === 'EXTENDED_TREND' ? 'Long/short extended' : 'Tactical / mixed'}</strong>
@@ -1975,63 +2514,64 @@ export default function TestnetExchangeDashboard() {
             const ps = account?.positions ?? [];
             const dirUnreal = ps.reduce((s, p) => s + (p.intentUnrealizedPnl ?? 0), 0);
             const baskUnreal = ps
-              .filter((p) => !isSingleSymbolExecutorPosition(p.laneIds))
+              .filter((p) => !isDailyRangePosition(p.laneIds) && !isSingleSymbolExecutorPosition(p.laneIds))
               .reduce((s, p) => s + (p.basketUnrealizedPnl ?? 0), 0);
             const singleSymbolUnreal = ps
               .filter((p) => isSingleSymbolExecutorPosition(p.laneIds))
               .reduce((s, p) => s + (p.basketUnrealizedPnl ?? 0), 0);
+            const dailyRangeUnreal = ps
+              .filter((p) => isDailyRangePosition(p.laneIds))
+              .reduce((s, p) => s + (p.dailyRangeUnrealizedPnl ?? p.unrealizedPnl), 0);
+            const unattributedUnreal = unattributedExchangePositions.reduce((s, p) => s + p.unrealizedPnl, 0);
+            // The headline deliberately uses the same ownership buckets printed below it.  The
+            // exchange total is still fetched for reconciliation, but a microscopic rounding
+            // delta must not make the visual breakdown add up to a different number.
+            const ownedUnreal = dirUnreal + baskUnreal + dailyRangeUnreal + singleSymbolUnreal + unattributedUnreal;
             return (
               <>
-                <strong className={tone(account?.unrealizedPnl)}>{signed(account?.unrealizedPnl)}</strong>
-                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · single-symbol {signed(singleSymbolUnreal)} · {account ? `${account.openPositionCount} pos` : 'loading'}</small>
+                <strong className={tone(account ? ownedUnreal : undefined)}>{signed(account ? ownedUnreal : undefined)}</strong>
+                <small>
+                  directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · daily range {signed(dailyRangeUnreal)} · single-symbol {signed(singleSymbolUnreal)}
+                  {unattributedExchangePositions.length > 0 ? <> · exchange tak terikat {signed(unattributedUnreal)}</> : null}
+                  {' · '}{account ? `${account.openPositionCount} pos` : 'loading'}
+                </small>
               </>
             );
           })()}
         </div>
         <div>
-          <span>Realized P&amp;L (today)</span>
-          {(() => {
-            // HEADLINE = HARI INI (UTC): mirror today + baskets today + single-symbol today. The
-            // lifetime numbers stay visible but clearly labeled all-time — the old headline summed
-            // lifetime mirror (which still carries the pre-fix churn-era losses) with baskets and
-            // read like a current loss ("kayanya kebawa data lama" — it wasn't stale, just mislabeled).
-            // 2026-07-09: was CROSS_SECTIONAL_MARKET_NEUTRAL-only — the 2026-07-08 TREND/MIXED
-            // instances merge into their OWN closedLanes entries (see annotateCrossSectionalAccount),
-            // so a banked TREND/MIXED basket previously vanished from this all-time headline.
-            // 2026-07-11: was single-symbol-executor-blind too — a real +$1.39 BTC close via
-            // REGIME_COMPOSITE_CONFIRMATION_LONG (already correctly folded into account.closedLanes
-            // by annotateSingleSymbolAccount) never moved this headline because nothing here summed
-            // it. Operator caught it live ("kalo memang udah TP, kok all-time nya masih sama").
-            // singleSymbolExecutorRealizedPnlUsd is backend-computed (routes/live.ts's /api/live/account)
-            // over the live list of executors, so this never has to hardcode lane ids that drift.
-            const basketsAllTime = ['CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS_SECTIONAL_TREND', 'CROSS_SECTIONAL_MIXED']
-              .reduce((sum, laneId) => sum + (account?.closedLanes?.find((l) => l.laneId === laneId)?.realizedPnlUsd ?? 0), 0);
-            const singleSymbolAllTime = account?.singleSymbolExecutorRealizedPnlUsd?.allTime;
-            const mirrorAllTime = status?.totalRealizedPnlUsd;
-            const allTime = mirrorAllTime != null ? mirrorAllTime + basketsAllTime + (singleSymbolAllTime ?? 0) : undefined;
-            const mirrorToday = status?.closedToday?.realizedPnlUsd;
-            // 2026-07-11: was FILTERED-only (xsecExec?.dailyRealizedUsd) — TREND/MIXED's own daily
-            // realized P&L never moved this "today" figure even though basketsAllTime above already
-            // correctly folds all 3 in via account.closedLanes.
-            const basketsToday = [xsecExec?.dailyRealizedUsd, xsecExecTrend?.dailyRealizedUsd, xsecExecMixed?.dailyRealizedUsd]
-              .reduce<number | undefined>((sum, v) => (v != null ? (sum ?? 0) + v : sum), undefined);
-            const singleSymbolToday = account?.singleSymbolExecutorRealizedPnlUsd?.today;
-            const today = mirrorToday != null || basketsToday != null || singleSymbolToday != null
-              ? (mirrorToday ?? 0) + (basketsToday ?? 0) + (singleSymbolToday ?? 0)
-              : undefined;
-            return (
-              <>
-                <strong className={tone(today)}>{signed(today)}</strong>
-                <small>mirror {signed(mirrorToday)} · baskets {signed(basketsToday)} · single-symbol {signed(singleSymbolToday)} · all-time {signed(allTime)}</small>
-              </>
-            );
-          })()}
+          <span>Realized P&amp;L Today</span>
+          {reportedLanePnl?.accountingComplete ? (
+            <>
+              <strong className={tone(reportedLanePnl.today.total)}>{signed(reportedLanePnl.today.total)}</strong>
+              <small>
+                baskets {signed(reportedLanePnl.today.baskets)} · daily range {signed(reportedLanePnl.today.dailyRange)} · single-symbol {signed(reportedLanePnl.today.singleSymbol)}
+                {' · '}{reportedLanePnl.today.closedCount} close · Taipei {reportedLanePnl.closeDateTaipei}
+              </small>
+            </>
+          ) : (
+            <><strong className="tone-measure">Loading…</strong><small>menunggu closed-fill ledger lengkap</small></>
+          )}
+        </div>
+        <div>
+          <span>Realized P&amp;L All-Time</span>
+          {reportedLanePnl?.accountingComplete ? (
+            <>
+              <strong className={tone(reportedLanePnl.allTime.total)}>{signed(reportedLanePnl.allTime.total)}</strong>
+              <small>
+                baskets {signed(reportedLanePnl.allTime.baskets)} · daily range {signed(reportedLanePnl.allTime.dailyRange)} · single-symbol {signed(reportedLanePnl.allTime.singleSymbol)}
+                {' · '}{reportedLanePnl.allTime.closedCount} close
+              </small>
+            </>
+          ) : (
+            <><strong className="tone-measure">Loading…</strong><small>menunggu closed-fill ledger lengkap</small></>
+          )}
         </div>
         {/* NEW merged CORTEX tile (2026-07-23, testnet-only): the two CORTEX lines used to sit as
            extra <small> rows tucked under Realized P&L, easy to miss. Both numbers now share ONE
            always-visible line; the tooltip only adds the day/all-time breakdown, never hides either
            figure. */}
-        {!isLivePage && (
+        {(
           cortexDecisionAlpha && cortexRealAttribution ? (() => {
             const da = cortexDecisionAlpha.today.decisionAlpha;
             const r = da.cumulativeTiltDeltaR;
@@ -2065,14 +2605,26 @@ export default function TestnetExchangeDashboard() {
         <div><span>Clock skew</span><strong>{status?.health?.clockSkewMs == null ? 'n/a' : `${Math.round(status.health.clockSkewMs)} ms`}</strong></div>
         <div><span>Last tick</span><strong>{timeAgo(status?.health?.lastTickAt)}</strong></div>
         <div>
-          <span>Open TP/SL orders</span>
+          <span>{account?.openOrderCountCoverage === 'EXCHANGE_OPEN_ORDERS_DAILY_RANGE_RECONCILIATION_REQUIRED'
+            ? 'TP/SL orders · reconciling'
+            : 'Open TP/SL orders'}</span>
           <strong>{account?.openOrderCount ?? 'n/a'}</strong>
-          <small>{status?.openIntents?.length ?? 0} live intents · exits can be 2x positions</small>
+          <small>
+            {account?.openOrderCountCoverage === 'EXCHANGE_OPEN_ORDERS_PLUS_RECONCILED_DAILY_RANGE_BRACKETS'
+              ? `Daily Range ${account.dailyRangeReconciledProtectiveOrderCount ?? 0} bracket reconciled · `
+              : account?.openOrderCountCoverage === 'EXCHANGE_OPEN_ORDERS_DAILY_RANGE_RECONCILIATION_REQUIRED'
+                ? 'Daily Range bracket belum terverifikasi · '
+                : ''}
+            {status?.openIntents?.length ?? 0} live intents · exits can be 2x positions
+          </small>
         </div>
         <div>
           <span>Open positions</span>
           <strong><a href="#open-positions" style={{ color: 'inherit' }}>{openPositionsCount}</a></strong>
-          <small>directional + basket + single-symbol</small>
+          <small>
+            directional + basket + daily range + single-symbol
+            {unattributedExchangePositions.length > 0 ? ' + exchange tak terikat' : ''}
+          </small>
         </div>
       </div>
 
@@ -2084,11 +2636,22 @@ export default function TestnetExchangeDashboard() {
         </section>
       )}
 
-      {status?.health?.lastTickError && (
+      {transportCoolingDown && (
         <section className="testnet-panel testnet-warning">
-          <span>Live engine warning</span>
+          <span>Binance USD-M cooldown aktif</span>
+          <strong>
+            {status?.health?.rateLimit?.lastFailure ?? 'Binance sementara membatasi request'}
+            {status?.health?.rateLimit?.retryAt ? ` · coba lagi ${formatTaipeiDateTime(status.health.rateLimit.retryAt)} Taipei` : ''}
+          </strong>
+          <p>Engine sengaja tidak mengirim request Binance sampai cooldown berakhir. Dashboard hanya menampilkan state exchange terakhir; tidak mengubah posisi atau order.</p>
+        </section>
+      )}
+
+      {!transportCoolingDown && status?.health?.lastTickError && (
+        <section className="testnet-panel testnet-warning">
+          <span>{pageName} engine warning aktif</span>
           <strong>{status.health.lastTickError}</strong>
-          <p>The page is still exchange-only; this warning is from the Binance mirror engine, not diagnostics.</p>
+          <p>Ini kegagalan tick terbaru yang masih aktif. Setelah tick berikutnya berhasil, warning akan hilang otomatis.</p>
         </section>
       )}
 
@@ -2103,7 +2666,7 @@ export default function TestnetExchangeDashboard() {
         {pageScope} — reads only `{pageApiPrefix}/live/status` and `{pageApiPrefix}/live/account`; Binance positions are netted per symbol (one exchange position can carry multiple mirrored source entries).
       </p>
 
-      {(isLivePage || showTestnetEngineControls) && (
+      {showTestnetEngineControls && (
       <section className="testnet-panel">
         <header>
           <span>Engine Controls</span>
@@ -2226,7 +2789,13 @@ export default function TestnetExchangeDashboard() {
       </section>
       )}
 
-      {!isLivePage && <CrossSectionalReportCard apiPrefix={TESTNET_API_PREFIX} />}
+      {/* 2026-08-18: was `!isLivePage && ... TESTNET_API_PREFIX`. The gate was there because the
+          card was hardcoded to testnet's prefix, NOT because /live must hide it — mainnet now runs
+          this same lane and serves every route the card reads (executor, closed-baskets, pool,
+          directional-regime, instrumentation, shadow reports: all 200 on 3103). pageApiPrefix makes
+          it follow whichever page it is rendered on. */}
+      <CrossSectionalReportCard apiPrefix={pageApiPrefix} />
+      <DailyRangeReportCard apiPrefix={pageApiPrefix} />
 
       <main className="testnet-grid">
         {/* ===== Composite 3: Open Positions (2026-07-23 dashboard consolidation) =====
@@ -2242,8 +2811,10 @@ export default function TestnetExchangeDashboard() {
           <header><span>Open Positions</span><strong>{openPositionsCount} pos</strong></header>
           <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
             Directional (operator-controlled, engine mirror) + Basket (cross-sectional hedge, automatic exit only) +
-            Single-symbol (stop-protected, own exchange-side stop) in one table. Not every column applies to every
-            book — blank cells are expected, not missing data.
+            Daily range (native structural SL / route-specific TP, lane-managed) + Single-symbol (stop-protected, own exchange-side stop)
+            {unattributedExchangePositions.length > 0
+              ? <> + Exchange tak terikat in one table. Posisi tak terikat tetap ditampilkan agar total exchange dan uPnL tidak terlihat bertentangan; dashboard tidak mengklaim pemiliknya dan tidak memberi tombol close.</>
+              : <>. Semua posisi exchange saat ini memiliki pemilik lane yang terverifikasi.</>}
           </p>
           {closeResult && <p className={closeResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{closeResult.message}</p>}
           {copyResult && (
@@ -2254,6 +2825,38 @@ export default function TestnetExchangeDashboard() {
           {xsecInstances.map(({ label, status: xs }) => xs?.openHalted && (
             <p key={`halt-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>⛔ [{label}] {xs.openHalted}</p>
           ))}
+          {xsecInstances.map(({ label, status: xs }) => {
+            const latest = xs?.entryAttemptAudit?.latest ?? null;
+            const legacy = xs?.entryAttemptAudit?.unattributedConsumedSignal ?? null;
+            const terminalBasket = latest?.basket?.terminal ? latest.basket : null;
+            if ((latest?.outcome === 'ADMITTED' && !terminalBasket) || (!latest && !legacy)) return null;
+            if (latest && terminalBasket) {
+              const aborted = terminalBasket.status === 'ABORTED';
+              return (
+                <p key={'attempt-terminal-' + label} className={aborted ? 'tone-critical' : 'tone-muted'} style={{ margin: '4px 0', fontSize: 12 }}>
+                  {aborted ? '⛔' : 'ℹ'} [{label}] Kandidat terakhir memang lolos admission {timeAgo(latest.at)}, tetapi basket {terminalBasket.basketId}
+                  {' '}berakhir {terminalBasket.status}{terminalBasket.closeReason ? ': ' + terminalBasket.closeReason : '.'}
+                </p>
+              );
+            }
+            if (latest) {
+              const outcome = latest.outcome === 'DEFERRED' ? 'ditunda' : 'dilewati';
+              return (
+                <p key={`attempt-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
+                  ⚠ [{label}] Kandidat basket terakhir {outcome} {timeAgo(latest.at)} — {xsecEntryAttemptStageLabel(latest.stage)}:
+                  {' '}{latest.reason ?? 'tanpa alasan tercatat'}.
+                  {' '}Long: {latest.longSymbols.join(', ') || '—'} · Short: {latest.shortSymbols.join(', ') || '—'}.
+                  {latest.outcome === 'SKIPPED' ? ' Menunggu scan baru.' : ' Akan diperiksa lagi pada tick berikutnya.'}
+                </p>
+              );
+            }
+            return (
+              <p key={`attempt-legacy-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
+                ℹ [{label}] Sinyal terakhir sudah dikonsumsi {timeAgo(legacy!.openedAt)}, tetapi itu terjadi sebelum audit entry dipasang.
+                {' '}{legacy!.reason}
+              </p>
+            );
+          })}
           {xsecInstances.map(({ label, status: xs }) => xs?.lastError && (
             <p key={`err-${label}`} className="tone-critical" style={{ margin: '4px 0', fontSize: 12 }}>executor error [{label}]: {xs.lastError}</p>
           ))}
@@ -2264,6 +2867,34 @@ export default function TestnetExchangeDashboard() {
               {xsecExec.formationEvaluation.status === 'EVALUATING' && ` · ${xsecExec.formationEvaluation.metrics.map((m) => `${m.model}: ${m.meanNetReturnPct == null ? '—' : `${m.meanNetReturnPct.toFixed(3)}%`} net`).join(' | ')}`}
             </p>
           )}
+          {(() => {
+            const formation = xsecExec?.dynamicMom36Status?.latestFormation;
+            const allocation = formation?.finalAllocation;
+            const quality = formation?.admission?.oneSidedDirectionalQuality;
+            const oneSided = allocation && (allocation.longCount === 6 || allocation.shortCount === 6);
+            if (!oneSided || !quality) return null;
+            const c = quality.components;
+            const pct = (value: number | null | undefined, digits = 1) =>
+              typeof value === 'number' && Number.isFinite(value) ? `${(value * 100).toFixed(digits)}%` : '—';
+            const breadthScans = c?.breadthPersistence?.scans ?? [];
+            const currentBreadth = breadthScans.length ? breadthScans.at(-1)?.directionalRatio ?? null : null;
+            const parts = [
+              `A ${c?.breadthPersistence?.score ?? 0} (breadth ${pct(currentBreadth, 0)} · ${c?.breadthPersistence?.qualifyingScans ?? 0}/${c?.breadthPersistence?.validScans ?? 0})`,
+              `B ${c?.strictEligibleDepth?.score ?? 0} (strict ${c?.strictEligibleDepth?.strictEligibleCount ?? '—'})`,
+              `C ${c?.btcEthAlignment?.score ?? 0} (BTC ${pct(c?.btcEthAlignment?.btcFast4hReturn)} · ETH ${pct(c?.btcEthAlignment?.ethFast4hReturn)})`,
+              `D ${c?.selectedTrajectory?.score ?? 0} (median ${pct(c?.selectedTrajectory?.medianOneHourReturn)} · aligned ${c?.selectedTrajectory?.alignedCount ?? '—'}/6)`,
+              `E ${c?.modelSupport?.score ?? 0} (${c?.modelSupport?.continuationDecision ?? '—'} / ${c?.modelSupport?.shockState ?? '—'})`,
+              `F ${c?.exhaustionRisk?.score ?? 0} (median ${pct(c?.exhaustionRisk?.medianAbsMom36Percentile, 0)})`,
+            ];
+            const passed = quality.decision === 'PASS';
+            return (
+              <p className={passed ? 'tone-healthy' : 'tone-warning'} style={{ margin: '4px 0', fontSize: 12 }}>
+                [FILTERED] One-Sided Directional Quality · {allocation?.label ?? '6-side'} · score {quality.score ?? '—'}/{quality.minScore ?? '—'} · {parts.join(' · ')}
+                {' · '}reversal {quality.strongReversal?.veto ? `VETO (${quality.strongReversal.count ?? 0})` : 'tidak'}
+                {' · '}{quality.decision ?? '—'} ({quality.reason ?? '—'}) · scoreGap N/A
+              </p>
+            );
+          })()}
           {xsecInstances.map(({ label, staleSince }) => staleSince && (
             <p key={`stale-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
               ⚠ [{label}] fetch gagal sejak {timeAgo(staleSince)} — data di bawah bisa basi.
@@ -2274,7 +2905,14 @@ export default function TestnetExchangeDashboard() {
               ⚠ single-symbol fetch gagal sejak {timeAgo(singleSymbolPositionsStaleSince)} — baris single-symbol di bawah bisa basi.
             </p>
           )}
-          {!isLivePage && orphanIntents.length > 0 && (
+          {unattributedExchangePositions.length > 0 && (
+            <p className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
+              ⚠ {unattributedExchangePositions.length} posisi exchange tidak terikat ke intent/basket/lane Kronos: {' '}
+              {unattributedExchangePositions.map((p) => `${p.symbol} ${p.direction}`).join(', ')}. uPnL akun memang memasukkannya;
+              posisi ini bukan basket aktif dan dashboard tidak akan menutupnya.
+            </p>
+          )}
+          {orphanIntents.length > 0 && (
             <p className="tone-critical" style={{ margin: '4px 0', fontSize: 12 }}>
               ⚠ {orphanIntents.length} intent belum punya posisi Binance yang cocok (mirror/exchange desync) — tidak muncul di tabel di bawah:{' '}
               {orphanIntents.map((i) => `${i.symbol} (${i.state})`).join(', ')}. Cek reconcileIssues / quarantinedPaperOrders.
@@ -2283,21 +2921,80 @@ export default function TestnetExchangeDashboard() {
           {xsecInstances.some(({ status: xs }) => (xs?.openBaskets ?? []).length > 0) && (
             <div style={{ margin: '6px 0', fontSize: 12 }}>
               {xsecInstances.flatMap(({ label, status: xs }) => (xs?.openBaskets ?? []).map((b) => {
-                const tp = xs?.tpNetReturnPct ?? null;
+                // An open basket keeps the exit policy it was born with.  Do not let a
+                // later runtime policy change make an old NoTP basket look as though it
+                // has a new TP target (or vice versa).
+                const exit = basketExitPlan(b, xs);
                 const net = b.lastNetReturn != null ? b.lastNetReturn * 100 : null;
-                const gap = tp != null && net != null ? tp - net : null;
-                const hoursLeft = Math.max(0, (b.closesAtMs - Date.now()) / 3600000);
+                const tpPct = exit.fixedTakeProfitNetReturn == null ? null : exit.fixedTakeProfitNetReturn * 100;
+                const gap = tpPct != null && net != null ? tpPct - net : null;
+                const stopPct = exit.stopNetReturn == null ? null : Math.abs(exit.stopNetReturn * 100);
+                const stopGap = exit.stopNetReturn != null && net != null ? net - exit.stopNetReturn * 100 : null;
+                const ladder = exit.netLadder;
+                const profitText = ladder
+                  ? `${dynamicNetLadderPlanText(ladder)} · ${dynamicNetLadderStatusText(ladder)}`
+                  : exit.hasMfeGiveback
+                    ? `${dynamicMfePlanText(exit)} · ${dynamicMfeStatusText(exit)}`
+                    : tpPct == null
+                      ? 'fixed TP off'
+                      : gap == null
+                        ? `fixed TP +${tpPct.toFixed(1)}%`
+                        : `${gap.toFixed(2)}pp (fixed TP +${tpPct.toFixed(1)}%)`;
+                const profitTitle = ladder
+                  ? 'Whole-basket net P&L after the existing round-trip cost model. It arms at +$1.50, records each +$0.50 level, fully exits at 5% of actual entry capital, and permits max(30% of peak, observed 5-minute P&L volatility) giveback.'
+                  : exit.hasMfeGiveback
+                    ? 'Whole-basket net runner: arm on the recorded MFE, then exit after the stated giveback fraction.'
+                    : 'Fixed whole-basket take-profit policy.';
+                const stopText = stopPct == null
+                  ? 'stop off'
+                  : stopGap == null
+                    ? `-${stopPct.toFixed(1)}%`
+                    : `${stopGap.toFixed(2)}pp (−${stopPct.toFixed(1)}%)`;
+                const stopTitle = exit.dynamicHardCutNetReturn != null
+                  ? 'Whole-basket net hard cut. It is not a per-leg exchange price stop.'
+                  : 'Fixed whole-basket stop policy.';
+                // Keep the established compact row layout, but derive its countdown from the policy
+                // frozen for this basket. `closesAtMs` is the research measurement horizon, not always
+                // the executor's HORIZON cap; the complete source/time remains available on hover.
+                const horizon = basketHorizonSchedule(b, xs);
+                const hoursLeft = horizon.closeAtMs == null ? null : Math.max(0, (horizon.closeAtMs - Date.now()) / 3600000);
+                const openedAt = taipeiDateTime(b.openedAt);
+                const closesAt = taipeiDateTime(horizon.closeAtMs);
+                const closeLabel = horizon.earlyExitPossible ? 'batas close' : 'tutup';
+                const missing = b.operatorException?.missingLegs ?? [];
+                const actualLegs = b.legs.length;
+                const expectedLegs = actualLegs + missing.length;
                 // Stale = the 5-min TP tick hasn't stamped in >15m. A basket younger than
                 // 15m legitimately has no stamp yet — warning there is a false alarm.
                 const oldEnough = Date.now() - new Date(b.openedAt).getTime() > 15 * 60_000;
                 const stale = b.lastNetAt ? Date.now() - new Date(b.lastNetAt).getTime() > 15 * 60_000 : oldEnough;
                 return (
-                  <div key={b.basketId} style={{ display: 'flex', gap: 14, padding: '2px 0', flexWrap: 'wrap' }}>
-                    <span className="tone-measure">[{label}] {b.basketId}</span>
-                    <span>net <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong></span>
-                    <span>TP gap <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{gap == null ? '—' : gap <= 0 ? 'REACHED — closing' : `${gap.toFixed(3)}% lagi`}</strong></span>
-                    <span className="tone-measure">horizon {hoursLeft.toFixed(1)}h lagi</span>
-                    {stale && <span className="tone-warning">stamp basi &gt;15m — cek executor</span>}
+                  <div key={b.basketId} className="xsec-open-basket-summary">
+                    <div className="xsec-open-basket-identity">
+                      <span className="tone-measure">[{label}] {b.basketId}</span>
+                      <BasketSelectionBadge preference={b.dynamicMom36?.recentStrengthPreference} />
+                      {missing.length > 0 && <span className="tone-warning xsec-open-basket-detail" title={b.operatorException?.reason}>
+                        pengecualian operator · {actualLegs}/{expectedLegs} leg nyata · {missing.map((leg) => `${leg.symbol} ${leg.side}`).join(', ')} tidak dibuka
+                      </span>}
+                    </div>
+                    <div className="xsec-open-basket-metric">
+                      <span>Net</span>
+                      <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong>
+                    </div>
+                    <div className="xsec-open-basket-metric">
+                      <span>{ladder ? 'Net ladder' : exit.hasMfeGiveback ? 'MFE runner' : 'fixed TP'}</span>
+                      <strong className={ladder?.trailArmed || exit.hasMfeGiveback && exit.mfeTrailArmed ? 'tone-healthy' : gap != null && gap <= 0 ? 'tone-healthy' : ''} title={profitTitle}>{profitText}</strong>
+                    </div>
+                    <div className="xsec-open-basket-metric">
+                      <span>{exit.dynamicHardCutNetReturn != null ? 'hard stop' : 'fixed stop'}</span>
+                      <strong className={stopGap != null && stopGap <= 0 ? 'tone-critical' : ''} title={stopTitle}>{stopText}</strong>
+                    </div>
+                    <div className="xsec-open-basket-window" title={horizonDetail(horizon.closeAtMs, horizon.source, horizon.earlyExitPossible)}>
+                      <span>Buka {openedAt == null ? '—' : `${openedAt} Taipei`}</span>
+                      <strong>{closeLabel} {closesAt == null ? '—' : `${closesAt} Taipei`}</strong>
+                      <span className="xsec-open-basket-detail">{hoursLeft == null ? '' : `${hoursLeft.toFixed(1)}h lagi`}{horizon.capHours != null ? ` · cap ${horizon.capHours}h` : ''}</span>
+                      {stale && <span className="tone-warning xsec-open-basket-detail">stamp basi &gt;15m — cek executor</span>}
+                    </div>
                   </div>
                 );
               }))}
@@ -2343,15 +3040,15 @@ export default function TestnetExchangeDashboard() {
               <thead>
                 <tr>
                   <th>Book</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th>
-                  <th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Stop</th><th>R now / peak</th>
+                  <th>Exit</th><th>State</th><th>Liq / margin call</th><th>Stop</th><th>R / MFE</th>
                   <th>Basket horizon</th><th>Unrealized</th><th>After fee+slip</th><th>Lev</th><th>Source entries</th><th>Source lane</th><th>Opened</th>
-                  {!isLivePage && <th>Intent state</th>}
+                  <th>Intent state</th>
                   <th>Action</th>
                 </tr>
               </thead>
               <tbody>
-                {directionalPositions.length === 0 && foundationPositions.length === 0 && singleSymbolLanePositions.length === 0 ? (
-                  <tr><td colSpan={!isLivePage ? 20 : 19}>No open positions across any book.</td></tr>
+                {directionalPositions.length === 0 && foundationPositions.length === 0 && dailyRangePositions.length === 0 && singleSymbolLanePositions.length === 0 && unattributedExchangePositions.length === 0 ? (
+                  <tr><td colSpan={20}>No open positions on the exchange.</td></tr>
                 ) : (
                   <>
                     {directionalPositions.map((p) => {
@@ -2382,7 +3079,7 @@ export default function TestnetExchangeDashboard() {
                           <td>{p.sourceOrderCount}</td>
                           <td>{p.laneIds.length > 0 ? p.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
                           <td>—</td>
-                          {!isLivePage && <td>{intent.state}</td>}
+                          <td>{intent.state}</td>
                           <td>
                             <button
                               type="button"
@@ -2416,6 +3113,12 @@ export default function TestnetExchangeDashboard() {
                       const unreal = p.basketUnrealizedPnl ?? p.unrealizedPnl;
                       const shareFrac = p.quantity > 0 ? qty / p.quantity : 1;
                       const afterCost = unreal - (p.estimatedCloseCostUsd ?? 0) * Math.min(1, shareFrac);
+                      const basketSchedules = openBasketLegSchedules.filter((schedule) =>
+                        schedule.symbol === p.symbol && schedule.side === side && p.laneIds.includes(schedule.laneId),
+                      );
+                      const basketScheduleStillLoading = basketSchedules.length === 0 && xsecInstances.some(
+                        ({ laneId, status: xs }) => p.laneIds.includes(laneId) && xs == null,
+                      );
                       return (
                         <tr key={`foundation-${p.symbol}`}>
                           <td>Basket</td>
@@ -2424,20 +3127,183 @@ export default function TestnetExchangeDashboard() {
                           <td>{Number(qty.toFixed(8))}</td>
                           <td>{entry == null ? 'multi-leg' : price(entry)}</td>
                           <td>{price(p.markPrice)}</td>
+                          <td>
+                            {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
+                              const exit = schedule.exit;
+                              const text = exit.hasMfeGiveback
+                                ? dynamicMfeTablePlanText(exit)
+                                : exit.fixedTakeProfitNetReturn == null
+                                  ? 'fixed TP off'
+                                  : `fixed TP ${netReturnPercent(exit.fixedTakeProfitNetReturn, 1)}`;
+                              return (
+                                <span
+                                  key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}-profit`}
+                                  style={{ display: 'block', whiteSpace: 'nowrap' }}
+                                  title={exit.hasMfeGiveback
+                                    ? 'Whole-basket net MFE runner; this is not a per-leg price target.'
+                                    : 'Whole-basket fixed take-profit policy.'}
+                                >
+                                  {text}
+                                </span>
+                              );
+                            })}
+                          </td>
+                          <td>
+                            {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
+                              const exit = schedule.exit;
+                              const text = exit.hasMfeGiveback
+                                ? dynamicMfeTableStatusText(exit)
+                                : exit.fixedTakeProfitNetReturn == null
+                                  ? '—'
+                                  : 'fixed target';
+                              return <span key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}-profit-status`} style={{ display: 'block', whiteSpace: 'nowrap' }}>{text}</span>;
+                            })}
+                          </td>
+                          <td className="tone-critical">{price(p.liquidationPrice)}</td>
+                          <td>
+                            {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
+                              const exit = schedule.exit;
+                              const text = exit.stopNetReturn == null
+                                ? 'stop off'
+                                : `${exit.dynamicHardCutNetReturn != null ? 'basket ' : ''}${netReturnPercent(exit.stopNetReturn, 1)}`;
+                              return (
+                                <span
+                                  key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}-stop`}
+                                  style={{ display: 'block', whiteSpace: 'nowrap' }}
+                                  title={exit.dynamicHardCutNetReturn != null
+                                    ? 'Whole-basket net hard cut; it is not a per-leg exchange price stop.'
+                                    : 'Whole-basket fixed stop policy.'}
+                                >
+                                  {text}
+                                </span>
+                              );
+                            })}
+                          </td>
+                          <td>
+                            {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
+                              const peak = schedule.exit.peakMfeReturn;
+                              return <span key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}-mfe`} style={{ display: 'block', whiteSpace: 'nowrap' }}>{peak == null ? '—' : netReturnPercent(peak)}</span>;
+                            })}
+                          </td>
+                          <td>
+                            {basketSchedules.length === 0 ? (
+                              <span
+                                className={basketScheduleStillLoading ? 'tone-measure' : 'tone-warning'}
+                                title={basketScheduleStillLoading
+                                  ? 'Menunggu status executor basket untuk memuat jadwal close.'
+                                  : 'Tidak ada open-basket executor yang cocok untuk lane, symbol, dan side ini; waktu close tidak ditebak dari posisi exchange yang netted.'}
+                              >
+                                {basketScheduleStillLoading ? 'schedule loading…' : 'schedule unavailable'}
+                              </span>
+                            ) : basketSchedules.map((schedule) => {
+                              const closesAt = compactTaipeiDateTime(schedule.horizon.closeAtMs);
+                              const hoursLeft = schedule.horizon.closeAtMs == null
+                                ? null
+                                : Math.max(0, (schedule.horizon.closeAtMs - Date.now()) / 3600000);
+                              return (
+                                <span
+                                  key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}`}
+                                  style={{ display: 'block', whiteSpace: 'nowrap' }}
+                                  title={horizonDetail(schedule.horizon.closeAtMs, schedule.horizon.source, schedule.horizon.earlyExitPossible)}
+                                >
+                                  {basketSchedules.length > 1 ? `[${schedule.label}] ` : ''}
+                                  {schedule.horizon.earlyExitPossible ? 'close' : 'cap'} {closesAt == null ? '—' : closesAt}
+                                  {hoursLeft == null ? '' : ` · ${hoursLeft.toFixed(1)}h`}
+                                </span>
+                              );
+                            })}
+                          </td>
+                          <td className={tone(unreal)}>{signed(unreal)}</td>
+                          <td className={tone(afterCost)}>{signed(afterCost)}</td>
+                          <td>{p.leverage}x</td>
+                          <td>{p.sourceOrderCount}</td>
+                          <td title={p.laneIds.join(', ')}>{p.laneIds.length > 0 ? p.laneIds.map(compactOpenPositionLane).join(', ') : 'unattributed'}</td>
+                          <td>
+                            {basketSchedules.length === 0 ? '—' : basketSchedules.map((schedule) => {
+                              const openedAt = taipeiDateTime(schedule.openedAt);
+                              return (
+                                <span key={`${schedule.basketId}-${schedule.symbol}-${schedule.side}`} style={{ display: 'block', whiteSpace: 'nowrap' }}>
+                                  {basketSchedules.length > 1 ? `[${schedule.label}] ` : ''}{openedAt == null ? '—' : `${openedAt} Taipei`}
+                                </span>
+                              );
+                            })}
+                          </td>
+                          <td>—</td>
+                          <td className="tone-measure" title="Menutup satu leg basket akan membuat sisa basket jadi taruhan directional telanjang — tidak ada Close now di sini, sama seperti sebelumnya.">auto-exit only</td>
+                        </tr>
+                      );
+                    })}
+                    {dailyRangePositions.map((p) => {
+                      const qty = Math.abs(p.dailyRangeQty ?? p.quantity);
+                      const side = p.dailyRangeQty != null ? (p.dailyRangeQty >= 0 ? 'LONG' : 'SHORT') : p.direction;
+                      const entry = p.dailyRangeEntryPrice ?? p.entryPrice;
+                      const stop = p.dailyRangeStopPrice ?? null;
+                      const target = p.dailyRangeTakeProfitPrice ?? null;
+                      const tpMultipleR = p.dailyRangeTpMultipleR ?? 2;
+                      const route = p.dailyRangeEntryPolicy ?? 'LEGACY_CONTINUATION';
+                      const logicExit = p.dailyRangeThesisInvalidationType === 'RANGE_REENTRY'
+                        ? '5m range re-entry'
+                        : p.dailyRangeThesisInvalidationType === 'ORIGINAL_BREAKOUT_REACCEPTANCE'
+                          ? '5m breakout re-acceptance'
+                          : '—';
+                      const risk = stop != null ? Math.abs(entry - stop) : 0;
+                      const dirSign = side === 'LONG' ? 1 : -1;
+                      const currentR = p.markPrice != null && risk > 0 ? ((p.markPrice - entry) / risk) * dirSign : null;
+                      const targetGap = target != null && p.markPrice != null && p.markPrice > 0
+                        ? ((target - p.markPrice) / p.markPrice) * dirSign * 100
+                        : null;
+                      const unreal = p.dailyRangeUnrealizedPnl ?? p.unrealizedPnl;
+                      const afterCost = unreal - (p.estimatedCloseCostUsd ?? 0);
+                      const reconcileError = reconcileErrorForDisplay(p.dailyRangeLastReconcileError);
+                      return (
+                        <tr key={`daily-range-${p.dailyRangeTradeId ?? p.symbol}`} style={{ background: 'rgba(95, 208, 168, 0.055)' }}>
+                          <td>Daily range</td>
+                          <td>{p.symbol}</td>
+                          <td className={side === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{side}</td>
+                          <td>{Number(qty.toFixed(8))}</td>
+                          <td>{price(entry)}</td>
+                          <td>{price(p.markPrice)}</td>
+                          <td>{target == null ? `native ${tpMultipleR}R pending` : `${price(target)} · ${tpMultipleR}R`}</td>
+                          <td className={tone(targetGap)}>{percent(targetGap)}</td>
+                          <td className="tone-critical">{price(p.liquidationPrice)}</td>
+                          <td>{price(stop)}</td>
+                          <td className={tone(currentR ?? 0)}>{currentR == null ? '—' : `${currentR.toFixed(2)}R`}</td>
+                          <td>route {route} · SL structural / TP {tpMultipleR}R<br /><small>{logicExit}</small></td>
+                          <td className={tone(unreal)}>{signed(unreal)}</td>
+                          <td className={tone(afterCost)}>{signed(afterCost)}</td>
+                          <td>{p.leverage}x</td>
+                          <td>{p.sourceOrderCount}</td>
+                          <td>{compactLane('DAILY_4H_RANGE_ACCEPTANCE')}</td>
+                          <td>{p.dailyRangeOpenedAt ? taipeiDateTime(p.dailyRangeOpenedAt) ?? '—' : '—'}</td>
+                          <td>{p.dailyRangeStatus ?? '—'}{reconcileError ? <small className="tone-warning" style={{ display: 'block' }}>reconcile: {reconcileError}</small> : null}</td>
+                          <td className="tone-measure" title={`Milik lane Daily Range; ${p.dailyRangeExitPolicyId ?? 'legacy 2R'} · native structural stop tetap aktif. Penutupan harus melalui lifecycle lane, bukan close net position generik.`}>lane-managed</td>
+                        </tr>
+                      );
+                    })}
+                    {unattributedExchangePositions.map((p) => {
+                      const afterCost = p.unrealizedAfterEstimatedCloseCostUsd ?? (p.unrealizedPnl - (p.estimatedCloseCostUsd ?? 0));
+                      return (
+                        <tr key={`exchange-unattributed-${p.symbol}`} style={{ background: 'rgba(240, 181, 75, 0.07)' }}>
+                          <td>Exchange tak terikat</td>
+                          <td>{p.symbol}</td>
+                          <td className={p.direction === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{p.direction}</td>
+                          <td>{Number(Math.abs(p.quantity).toFixed(8))}</td>
+                          <td>{price(p.entryPrice)}</td>
+                          <td>{price(p.markPrice)}</td>
                           <td>—</td>
                           <td>—</td>
                           <td className="tone-critical">{price(p.liquidationPrice)}</td>
                           <td>—</td>
                           <td>—</td>
-                          <td>basket horizon</td>
-                          <td className={tone(unreal)}>{signed(unreal)}</td>
+                          <td>tidak ada basket/lane yang mengklaim</td>
+                          <td className={tone(p.unrealizedPnl)}>{signed(p.unrealizedPnl)}</td>
                           <td className={tone(afterCost)}>{signed(afterCost)}</td>
                           <td>{p.leverage}x</td>
-                          <td>{p.sourceOrderCount}</td>
+                          <td>—</td>
                           <td>{p.laneIds.length > 0 ? p.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
                           <td>—</td>
-                          {!isLivePage && <td>—</td>}
-                          <td className="tone-measure" title="Menutup satu leg basket akan membuat sisa basket jadi taruhan directional telanjang — tidak ada Close now di sini, sama seperti sebelumnya.">auto-exit only</td>
+                          <td>—</td>
+                          <td className="tone-measure" title="Tidak ada ownership Kronos yang terbukti; dashboard tidak menawarkan aksi untuk posisi ini.">no action</td>
                         </tr>
                       );
                     })}
@@ -2446,6 +3312,8 @@ export default function TestnetExchangeDashboard() {
                       const dirSign = p.direction === 'LONG' ? 1 : -1;
                       const currentR = p.markPrice != null && risk > 0 ? ((p.markPrice - p.entryPrice) / risk) * dirSign : null;
                       const busyKey = `ssle:${p.positionId}`;
+                      const hasFixedTarget = p.targetPrice != null && p.targetPrice > 0;
+                      const hasMfeProfitLock = p.targetMode === 'MFE_PROFIT_LOCK' && p.mfeProfitLockPrice != null;
                       return (
                         <tr key={`single-${p.positionId}`}>
                           <td>Single-symbol</td>
@@ -2454,19 +3322,28 @@ export default function TestnetExchangeDashboard() {
                           <td>{p.qty}</td>
                           <td>{price(p.entryPrice)}</td>
                           <td>{price(p.markPrice)}</td>
-                          <td>—</td>
-                          <td>—</td>
+                          <td>{hasFixedTarget ? price(p.targetPrice) : hasMfeProfitLock ? <>
+                            <strong>MFE lock {percent((p.mfeProfitLockNetReturn ?? 0) * 100)}</strong>
+                            <small style={{ display: 'block' }}>guide {price(p.mfeProfitLockPrice)} · static cap {percent((p.staticTpMaxNetReturn ?? 0) * 100)}</small>
+                          </> : 'dynamic exit'}</td>
+                          <td className={tone(hasFixedTarget ? p.targetTpGapPct : p.mfeProfitLockGapPct)}>{hasFixedTarget
+                            ? percent(p.targetTpGapPct)
+                            : hasMfeProfitLock
+                              ? `${percent(p.mfeProfitLockGapPct)} to lock`
+                              : 'dynamic exit'}</td>
                           <td>—</td>
                           <td>{price(p.stopPrice)}</td>
                           <td className={tone(currentR ?? 0)}>{currentR == null ? '—' : `${currentR.toFixed(2)}R`} / {p.peakFavorableR.toFixed(2)}R</td>
                           <td>—</td>
                           <td className={tone(p.unrealizedPnl ?? 0)}>{p.unrealizedPnl == null ? '—' : signed(p.unrealizedPnl)}</td>
-                          <td>—</td>
-                          <td>—</td>
+                          <td className={tone(p.unrealizedAfterEstimatedCloseCostUsd)}>
+                            {p.unrealizedAfterEstimatedCloseCostUsd == null ? 'exchange position not bound' : signed(p.unrealizedAfterEstimatedCloseCostUsd)}
+                          </td>
+                          <td>{p.leverage == null ? 'exchange position not bound' : `${p.leverage}x`}</td>
                           <td>—</td>
                           <td>{compactLane(p.laneId)}</td>
                           <td>{new Date(p.openedAt).toLocaleString()}</td>
-                          {!isLivePage && <td>—</td>}
+                          <td>—</td>
                           <td>
                             <button
                               type="button"
@@ -2491,7 +3368,7 @@ export default function TestnetExchangeDashboard() {
            current score/Entry Decision, expanded-summary by default (the preset buttons write real
            lane allocation, so they stay zero-click) — full per-feature vote table + full 1/3/6h
            forecast chart behind one Disclosure. */}
-        {(isLivePage || showTestnetRegimeDirection) && (
+        {showTestnetRegimeDirection && (
         <section className="testnet-panel testnet-wide-panel">
           <header>
             <span>Regime &amp; Direction</span>
@@ -2508,7 +3385,7 @@ export default function TestnetExchangeDashboard() {
             </strong>
           </header>
 
-          {!isLivePage && status?.unifiedOrchestrator && (
+          {status?.unifiedOrchestrator && (
             <div style={{ marginBottom: 10 }}>
               <header>
                 <span>Unified Directional Core</span>
@@ -2637,7 +3514,7 @@ export default function TestnetExchangeDashboard() {
           <RegimeAxisChart data={regimeAxis} mode="entry" />
 
           <Disclosure summary="Per-feature vote table + full 1/3/6h forecast chart ▸">
-            {!isLivePage && status?.unifiedOrchestrator?.lastTrace?.votes.length ? (
+            {status?.unifiedOrchestrator?.lastTrace?.votes.length ? (
               <div className="testnet-table-wrap" style={{ marginBottom: 10 }}>
                 <table>
                   <thead><tr><th>Feature</th><th>Vote</th><th>Confidence</th><th>Reason</th></tr></thead>
@@ -2669,7 +3546,7 @@ export default function TestnetExchangeDashboard() {
         {/* ===== Composite 5: Single-symbol execution timeline ===== unchanged component, just
            relocated; the Keputusan-trade line + entry/exit reason stay outside the per-symbol
            chart Disclosure (see SingleSymbolPriceTimelineChart above). */}
-        {(isLivePage || showTestnetSingleSymbolTimeline) && (
+        {showTestnetSingleSymbolTimeline && (
         <section className="testnet-panel testnet-wide-panel">
           <header>
             <span>BTC / ETH / SOL Execution Timeline</span>
@@ -2694,7 +3571,7 @@ export default function TestnetExchangeDashboard() {
         {/* ===== Composite 6: Lane Research & Edge Status ===== lane-evaluation + book-proven
            symbols expanded by default (both real-money-relevant); the 3 Tier-1-3 R&D shadow lanes
            (none wired to execution) behind a Disclosure, rendered via the shared LaneMaturityTable. */}
-        {(isLivePage || showTestnetLaneResearch) && (
+        {showTestnetLaneResearch && (
         <section className="testnet-panel testnet-wide-panel">
           <header><span>Lane Research &amp; Edge Status</span><strong>{laneEvaluation.length} lane · {rndLanes.filter(Boolean).length}/3 R&amp;D</strong></header>
 
@@ -2836,6 +3713,27 @@ export default function TestnetExchangeDashboard() {
               </label>
             </div>
           </header>
+          {timelineSeries?.crossSectionalAuditBeforePeriod && (
+            <p className="tone-measure" style={{ margin: '7px 0 0', fontSize: 12 }}>
+              Histori cross-basket sebelum periode ini: {timelineSeries.crossSectionalAuditBeforePeriod.closedBaskets} closed basket · {signed(timelineSeries.crossSectionalAuditBeforePeriod.totalNetPnlUsd)} · terakhir {timeAgo(timelineSeries.crossSectionalAuditBeforePeriod.lastClosedAt)}. Tidak dicampur ke kurva {timelineSeries.periodLabel}; pilih tanggal close-nya untuk melihat titik chart.
+            </p>
+          )}
+          {/* The timeline plots lane CURVES; this is the per-position record behind the directional
+              ones — which exit closed each trade, and the same seven-hypothesis verdict per close.
+              Linked rather than inlined: it is a full ledger, not a summary, and it lives on the API
+              so no dashboard bundle carries it. Testnet-only, same as the note above. */}
+          {(
+            <p className="tone-measure" style={{ margin: '5px 0 0', fontSize: 12 }}>
+              <a
+                href={`${pageApiPrefix}/live/directional-overlay-counterfactual/view`}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: 'inherit' }}
+              >
+                Catatan trade directional — tiap posisi, ditutup oleh apa, evaluasi per posisi →
+              </a>
+            </p>
+          )}
           <LanePerformanceChart series={timelineSeries} />
           <div className="testnet-table-wrap testnet-performance-table">
             <table>
@@ -2855,7 +3753,7 @@ export default function TestnetExchangeDashboard() {
                     <td>{plain(lane.feesUsd, ' USDT')}</td>
                     <td>{lane.regimes.map((regime) => `${regime.bucket.toLowerCase()} ${regime.count}`).join(', ') || 'n/a'}</td>
                     <td>{lane.symbols.join(', ') || 'n/a'}</td>
-                    <td>{timeAgo(account?.closedLanes?.find((cl) => cl.laneId === lane.laneId)?.lastClosedAt)}</td>
+                    <td>{timeAgo(lane.lastClosedAt ?? account?.closedLanes?.find((cl) => cl.laneId === lane.laneId)?.lastClosedAt)}</td>
                   </tr>
                 ))}
               </tbody>

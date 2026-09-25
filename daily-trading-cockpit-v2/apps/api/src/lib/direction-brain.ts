@@ -203,6 +203,10 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
       // on BOTH sides; the SHORT twin below was found first, but the LONG one was equally silent.
       reportOnlyConflicts.push("LONG discounted 30% — regime controller posture does not lean LONG");
     }
+    if (input.longVeto) {
+      longScore *= 0.85;
+      conflicting.push("LONG proven-negative (incumbent edge-memory VETO)");
+    }
     if (input.fourBrainLongVeto) {
       longScore *= 0.85; // one bounded, independent credibility adjustment
       conflicting.push("LONG proven-negative (Four-Brain self-outcome VETO)");
@@ -227,6 +231,10 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
     if (input.leansShort === false) {
       shortScore *= 0.7; // see the LONG twin above — same discount, same reporting obligation
       reportOnlyConflicts.push("SHORT discounted 30% — regime controller posture does not lean SHORT");
+    }
+    if (input.shortVeto) {
+      shortScore *= 0.85;
+      conflicting.push("SHORT proven-negative (incumbent edge-memory VETO)");
     }
     if (input.fourBrainShortVeto) {
       shortScore *= 0.85; // one bounded, independent credibility adjustment

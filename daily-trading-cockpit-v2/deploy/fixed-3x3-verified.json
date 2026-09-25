@@ -1,0 +1,95 @@
+{
+  "cross": {
+    "enabled": true,
+    "allowed": true,
+    "lastError": null,
+    "openBaskets": [],
+    "entryExecutionQuoteGuard": {
+      "enabled": true,
+      "policyId": "testnet-cross-entry-quote-v1",
+      "maxQuoteAgeMs": 5000,
+      "maxSpreadBps": 10
+    },
+    "formationScheduler": {
+      "enabled": true,
+      "interval": "1h",
+      "postCloseGraceMs": 20000,
+      "retryIntervalMs": 60000,
+      "featureMaxAgeMs": 300000,
+      "latestAttemptStartOffsetMs": 240000,
+      "startedAt": "2026-09-25T02:54:00.617Z",
+      "nextDueAt": "2026-09-25T03:00:20.000Z",
+      "inFlight": false,
+      "activeFeatureCutoffAt": null,
+      "attemptsForActiveFeature": 0,
+      "lastAttemptAt": null,
+      "lastCompletedAt": null,
+      "lastFeatureCutoffAt": "2026-09-25T02:00:00.000Z",
+      "lastOutcome": "WINDOW_EXPIRED",
+      "lastError": null,
+      "lastExecutorHandoffAt": null,
+      "lastExecutorHandoffError": null
+    },
+    "selection": {
+      "strategyVersion": "dynamic-mom36-cont-slowfast-testnet-wide-skew-sl2-mfe30-36h-v6.5",
+      "configuredVariant": "DYNAMIC_MOM36_SHOCK",
+      "effectiveVariant": "DYNAMIC_MOM36_SHOCK",
+      "selectionMode": "DYNAMIC_MOM36_BREADTH",
+      "geometry": "BREADTH_6_TOTAL",
+      "sideTrendAlignment": "SLOW_AND_FAST",
+      "allocationPolicy": {
+        "threeLegFallback": {
+          "enabled": false,
+          "allocations": [],
+          "policyId": "testnet-three-leg-trend-fallback-v1",
+          "condition": "EMPTY_OPPOSITE_STRICT_SIDE_AND_CONFIRMED_FRESH_DIRECTIONAL_REGIME"
+        },
+        "selectionMode": "RANK_ALL_QUALIFIED",
+        "qualifiedAlternativeAllocations": [
+          "3L3S"
+        ],
+        "allowedAllocations": [
+          "3L3S"
+        ],
+        "skewContinuationConfirmationRequired": false,
+        "state": "EFFECTIVE",
+        "reason": null
+      },
+      "state": "EFFECTIVE",
+      "reason": null
+    },
+    "policyId": "xsec-ab5ecd29e3c12432",
+    "cohort": "2026-09-25T02:52:50.000Z"
+  },
+  "engine": {
+    "armed": true,
+    "newEntries": {
+      "allowed": true,
+      "blockReason": null,
+      "drainActive": false,
+      "persistedDrain": false,
+      "pausedAt": null,
+      "pauseReason": null,
+      "strategyGate": {
+        "allowed": true,
+        "reason": null
+      }
+    },
+    "environment": null
+  },
+  "processes": [
+    {
+      "name": "dtc-api-live",
+      "path": "/root/kronos-live-releases/live-three-leg-balanced-v3-20260906-r1/daily-trading-cockpit-v2/deploy/run-api.sh",
+      "status": "online",
+      "restarts": 0
+    },
+    {
+      "name": "dtc-api-testnet",
+      "path": "/root/kronos-testnet-releases/cross-fixed-3x3-20260925-r1/daily-trading-cockpit-v2/deploy/run-api.sh",
+      "status": "online",
+      "restarts": 0
+    }
+  ],
+  "astra": "inactive"
+}

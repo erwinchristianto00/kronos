@@ -37,7 +37,7 @@ export interface CrossSectionalDirectionalDecision {
   shortPicks: DirectionalRegimePick[];
   longAverageScore: number | null;
   shortAverageScore: number | null;
-  /** Independent, broader-market confirmation. Directional entry needs this to agree with scan. */
+  /** Independent, broader-market context. It sizes a scanner-led entry and vetoes only an opposite regime. */
   canonicalRegimeFamily: "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN";
   canonicalAllowed: boolean | null;
   canonicalReason: string | null;
@@ -67,12 +67,74 @@ export const DIRECTIONAL_REGIME_MAX_SIGNAL_AGE_MS = (): number => envNumber("CRO
 export const DIRECTIONAL_REGIME_DAILY_MAX_LOSS_USD = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_DAILY_MAX_LOSS_USD", 15);
 export const DIRECTIONAL_REGIME_MFE_ARM_R = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_ARM_R", 1);
 export const DIRECTIONAL_REGIME_MFE_GIVEBACK_FRACTION = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_GIVEBACK_FRACTION", 0.5);
+/** Profit is locked only after a runner has first earned this estimated-net return; it is not a full TP. */
+export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_NET_RETURN", 0.005);
+/** Profit-lock in R. Default 0 = unset, so the price-denominated lock above stays in force until an
+ *  operator opts in. Set it and the lock becomes scale-free: 0.5R means 0.5R on every symbol,
+ *  instead of 1.15R on ETH and 0.25R on SOL as the price-% form measurably did. Keep it BELOW
+ *  DIRECTIONAL_REGIME_MFE_ARM_R so the two mechanisms tile rather than shadow each other — the lock
+ *  catches peaks between itself and the arm, the giveback trails everything above the arm. */
+export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_R = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_R", 0);
+/** Floor on how far the stop sits from entry, as a PERCENT of entry. 0 = off (scanner stop used
+ *  verbatim, the behaviour every deployment had before 2026-08-16).
+ *
+ *  A FLOOR, not a multiplier, and that choice is the whole point. Commission is a fixed 8 bps round
+ *  trip while 1R is the stop distance, so the fee's share of risk is 8bps/stopWidth — measured
+ *  0.170R at the tightest scanner stop seen (0.47%) against 0.040R at 2%. A multiplier would also
+ *  inflate the stops that are already wide enough, adding risk where there was no problem; a floor
+ *  touches only the tight ones, which are exactly the ones where the fee is eating the trade.
+ *
+ *  RAISING THIS RAISES DOLLAR RISK unless the leg shrinks with it: this lane sizes by NOTIONAL
+ *  (CROSS_SECTIONAL_DIRECTIONAL_LEG_USD), not by risk, so a 2x wider stop is a 2x bigger loss when
+ *  it hits. Halve the leg when you double the floor and dollar risk is unchanged while the fee's
+ *  share halves — that is the only version of this change that is free. */
+export const DIRECTIONAL_REGIME_MIN_STOP_PCT = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MIN_STOP_PCT", 0);
+/** Full take-profit in R. 0 = off, which is what this lane ran with until 2026-08-17.
+ *  Measured: harmful below 1.5R, exactly neutral at 1.5R, noise above. See staticTpR's doc comment
+ *  in single-symbol-lane-executor.ts for why 1.5R buys variance rather than return. */
+export const DIRECTIONAL_REGIME_STATIC_TP_R = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_R", 0);
+/** Post-only ENTRY for the two directional lanes. Off by default; 18 executors share
+ *  SingleSymbolLaneExecutor and only these two were analysed for it.
+ *
+ *  Entry only, and the asymmetry is the reason: a resting ENTRY that never fills leaves you with no
+ *  position, while a resting EXIT that never fills leaves you holding a losing one — and exits fire
+ *  exactly when price is moving, which is when a passive order is least likely to fill. */
+export const DIRECTIONAL_REGIME_MAKER_ENTRY = (): boolean => process.env.CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY === "1";
+export const DIRECTIONAL_REGIME_MAKER_ENTRY_WAIT_MS = (): number => {
+  const n = Number.parseInt(process.env.CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY_WAIT_MS ?? "", 10);
+  return Number.isFinite(n) && n >= 1_000 && n <= 120_000 ? n : 120_000;
+};
+
+/**
+ * The stop this lane will actually use: the scanner's own, unless it sits closer than `minStopPct`.
+ *
+ * Only ever moves the stop FURTHER from entry, so a stop that was on the correct side stays on it
+ * and validStop() cannot be broken by widening. Returns the scanner value untouched when the floor
+ * is off, unusable, or already satisfied — no rounding, no drift, byte-identical to the old path.
+ *
+ * KNOWN SIDE EFFECT, not a bug and not avoidable: two entry gates in single-symbol-lane-executor.ts
+ * measure drift in R against this same distance — the entry-chase limit and the stop-crossed
+ * invalidation. A wider stop makes both more permissive, so widening admits trades that used to be
+ * refused. The stop-width sweep that motivated this held entries FIXED and therefore says nothing
+ * about those extra trades.
+ */
+export function effectiveDirectionalStop(
+  direction: "LONG" | "SHORT",
+  entryPrice: number,
+  scannerStop: number,
+  minStopPct: number,
+): number {
+  const ok = (v: number) => typeof v === "number" && Number.isFinite(v) && v > 0;
+  if (!ok(entryPrice) || !ok(scannerStop) || !ok(minStopPct)) return scannerStop;
+  const floor = entryPrice * (minStopPct / 100);
+  return direction === "LONG"
+    ? Math.min(scannerStop, entryPrice - floor)
+    : Math.max(scannerStop, entryPrice + floor);
+}
+/** Ceiling for any future static default TP. The active directional policy remains MFE-managed. */
+export const DIRECTIONAL_REGIME_STATIC_TP_MAX_NET_RETURN = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_MAX_NET_RETURN", 0.0065);
 export const DIRECTIONAL_REGIME_MAX_HOLD_HOURS = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MAX_HOLD_HOURS", 24);
 
-/** A reversal is only trusted after two different completed scanner batches agree.
- * The cooldown is deliberately shared between the long and short directional
- * executors, so a close cannot be immediately replaced by a flip that only
- * harvests taker fees in a choppy market. */
 export const DIRECTIONAL_REVERSAL_CONFIRMATIONS_REQUIRED = 2;
 export const DIRECTIONAL_REVERSAL_REENTRY_COOLDOWN_MS = 15 * 60_000;
 export const DIRECTIONAL_REVERSAL_EXIT_COOLDOWN_MS = 2 * 60 * 60_000;
@@ -99,9 +161,15 @@ const freshDirectionalReversalState = (): DirectionalReversalSymbolState => ({
   reentryBlockedUntilMs: null,
 });
 
-/** Pure two-scan reversal confirmation. A missing or repeated scanner batch
- * can never add a confirmation, so executor ticks alone cannot manufacture a
- * direction flip. */
+/**
+ * A protective directional exit is reserved for a confirmed *opposite* direction.
+ *
+ * NO_TRADE and BALANCED_3X3 deliberately stop new directional entries, but they are
+ * not evidence that an already-open directional thesis reversed. Treating either as
+ * a reversal made a temporary lack of candidates manufacture a close (and therefore
+ * repeated fee churn) after two scanner batches. A repeated executor tick can never
+ * manufacture a confirmation either.
+ */
 export function evaluateDirectionalReversal(
   previous: DirectionalReversalSymbolState | null | undefined,
   activeMode: "BEAR_SHORT_3" | "BULL_LONG_3",
@@ -144,7 +212,7 @@ interface DirectionalReversalPersistedState {
   symbols: Record<string, DirectionalReversalSymbolState>;
 }
 
-/** Small durable coordinator shared by the directional long/short executors. */
+/** Durable and shared between the long and short directional executors. */
 export class DirectionalReversalStateStore {
   private readonly file: string;
   private state: DirectionalReversalPersistedState;
@@ -159,11 +227,9 @@ export class DirectionalReversalStateStore {
     try {
       if (existsSync(this.file)) {
         const parsed = JSON.parse(readFileSync(this.file, "utf-8"));
-        if (parsed && parsed.version === 1 && parsed.symbols && typeof parsed.symbols === "object") {
-          return parsed as DirectionalReversalPersistedState;
-        }
+        if (parsed && parsed.version === 1 && parsed.symbols && typeof parsed.symbols === "object") return parsed as DirectionalReversalPersistedState;
       }
-    } catch { /* corrupt state is safer as a fresh confirmation sequence */ }
+    } catch { /* corrupt state starts a fresh confirmation sequence */ }
     return { version: 1, symbols: {} };
   }
 
@@ -172,7 +238,7 @@ export class DirectionalReversalStateStore {
       const tmp = `${this.file}.tmp`;
       writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
       renameSync(tmp, this.file);
-    } catch { /* persistence must never interrupt a live protective exit */ }
+    } catch { /* persistence never interrupts a protective exit */ }
   }
 
   observe(symbol: string, activeMode: "BEAR_SHORT_3" | "BULL_LONG_3", decision: Pick<CrossSectionalDirectionalDecision, "mode" | "scanBatchId">, nowMs: number): DirectionalReversalEvaluation {
@@ -187,7 +253,7 @@ export class DirectionalReversalStateStore {
     return !(typeof blockedUntil === "number" && nowMs < blockedUntil);
   }
 
-  /** Call only after Binance confirms the close. Failed close attempts must stay retryable. */
+  /** Only call after Binance confirms the close; failed close attempts stay retryable. */
   recordConfirmedReversalExit(symbol: string, nowMs: number): void {
     const current = this.state.symbols[symbol] ?? freshDirectionalReversalState();
     current.lastExitAtMs = nowMs;
@@ -237,9 +303,42 @@ function eligible(candidate: Candidate, direction: "LONG" | "SHORT"): boolean {
     && validStop(candidate, direction);
 }
 
-function picks(snapshot: CachedScanCandidates, direction: "LONG" | "SHORT"): DirectionalRegimePick[] {
+/**
+ * Explicit scanner regimes are a directional signal in their own right.  The
+ * per-symbol `finalStatus` can be WAIT for a non-directional reason even
+ * while breadth is explicit. This does NOT license an execution bypass: a
+ * direction/source conflict or a research/data-collection route remains a
+ * hard reject. The fallback exists only for a clean, profit-routable scanner
+ * candidate, never as a way to trade through a warning the scanner emitted.
+ */
+function scannerLedEligible(candidate: Candidate, direction: "LONG" | "SHORT"): boolean {
+  const plan = candidate.selectedExecutionPlan;
+  return candidate.finalDirection === direction
+    && candidate.direction === direction
+    && !candidate.sourceConflict
+    && !candidate.directionConflict
+    && !candidate.horizonConflict
+    && plan?.routeMode === "PROFIT_CANDIDATE"
+    && plan.primaryProfitEligible === true
+    && candidate.confidence >= DIRECTIONAL_REGIME_MIN_CONFIDENCE()
+    && candidate.dataQualityScore >= 70
+    && candidate.liquidityScore >= 70
+    && sideScore(candidate, direction) >= DIRECTIONAL_REGIME_MIN_SCORE()
+    && relativeEdge(candidate, direction) >= DIRECTIONAL_REGIME_MIN_RELATIVE_EDGE()
+    && validStop(candidate, direction);
+}
+
+function picks(
+  snapshot: CachedScanCandidates,
+  direction: "LONG" | "SHORT",
+  allowScannerLedFallback = false,
+  excludedSymbols: ReadonlySet<string> = new Set(),
+): DirectionalRegimePick[] {
   return snapshot.candidates
-    .filter((candidate) => eligible(candidate, direction))
+    .filter((candidate) =>
+      !excludedSymbols.has(candidate.symbol) &&
+      (eligible(candidate, direction) || (allowScannerLedFallback && scannerLedEligible(candidate, direction))),
+    )
     .map((candidate) => ({
       symbol: candidate.symbol,
       direction,
@@ -275,25 +374,65 @@ function emptyDecision(reason: string): CrossSectionalDirectionalDecision {
 }
 
 /**
- * A directional mode needs exactly three independently eligible symbols.  The
+ * A directional mode needs one to three independently eligible symbols. The
  * score lead only breaks a non-explicit regime tie; an explicitly bullish scan
  * may never produce shorts, and an explicitly bearish scan may never produce
  * longs.  This makes a conflicting evidence set fail closed rather than flip
  * its direction simply because one scalar happened to be higher.
  */
+/* 2026-08-18 merge: diambil dari research/phase3a-residual-generator.
+ * Dua yang pertama lebih KETAT (fail-closed saat pick kurang dari tiga, dan saat canonical
+ * regime tidak setuju). evaluateDirectionalReversal diambil karena satu-satunya yang punya
+ * bukti lapangan: reason DIRECTIONAL_REVERSAL_CONFIRMED:NO_TRADE muncul 9 kali di close nyata
+ * testnet, dan string itu hanya bisa dihasilkan varian ini. Varian saya (hanya mode BERLAWANAN
+ * yang menghitung; NO_TRADE mereset) belum pernah dijalankan. Konsekuensi yang diterima:
+ * regime NO_TRADE yang bertahan menutup posisi - 9 dari 17 close yang terukur. */
+/* 2026-08-18 merge: badan fungsi ini milik saya (ia mengecualikan simbol yang sudah dipegang
+ * basket - fitur yang tidak ada di sisi seberang), TAPI ambangnya diambil dari
+ * research/phase3a-residual-generator: `=== 3`, bukan `>= 1`. Mode ini bernama BEAR_SHORT_3 /
+ * BULL_LONG_3; membukanya dengan satu pick saja membuat namanya berbohong dan mengubah lane
+ * bertiga-kaki jadi taruhan tunggal. Fail-closed adalah perilaku yang benar. */
 export function buildCrossSectionalDirectionalRegimeDecision(
   snapshot: CachedScanCandidates | null,
+  opts: {
+    /** Legacy all-direction exclusion. Prefer the side-specific sets below. */
+    excludedSymbols?: ReadonlySet<string>;
+    /** Basket shorts: a directional long here would net/reverse one-way exposure. */
+    excludedLongSymbols?: ReadonlySet<string>;
+    /** Basket longs: a directional short here would net/reverse one-way exposure. */
+    excludedShortSymbols?: ReadonlySet<string>;
+  } = {},
 ): CrossSectionalDirectionalDecision {
   if (!snapshot) return emptyDecision("Belum ada scan baru; tidak membuka posisi.");
 
-  const longPicks = picks(snapshot, "LONG");
-  const shortPicks = picks(snapshot, "SHORT");
-  const longAverageScore = average(longPicks);
-  const shortAverageScore = average(shortPicks);
   const regime = snapshot.marketRegime.trim();
   const normalized = regime.toLowerCase();
   const explicitBear = normalized.includes("bear");
   const explicitBull = normalized.includes("bull");
+  // A one-way account can never admit the direction opposite to a live basket
+  // leg. Same-direction ownership stays visible: the executor then verifies
+  // the basket leg is net-positive after close cost before adding exposure.
+  const excludedSymbols = opts.excludedSymbols ?? new Set<string>();
+  const excludedLongSymbolsSet = opts.excludedLongSymbols ?? excludedSymbols;
+  const excludedShortSymbolsSet = opts.excludedShortSymbols ?? excludedSymbols;
+  const longPicks = picks(snapshot, "LONG", explicitBull, excludedLongSymbolsSet);
+  const shortPicks = picks(snapshot, "SHORT", explicitBear, excludedShortSymbolsSet);
+  const excludedLongSymbols = explicitBull
+    ? snapshot.candidates
+      .filter((candidate) => excludedLongSymbolsSet.has(candidate.symbol) &&
+        (eligible(candidate, "LONG") || scannerLedEligible(candidate, "LONG")))
+      .map((candidate) => candidate.symbol)
+      .sort()
+    : [];
+  const excludedShortSymbols = explicitBear
+    ? snapshot.candidates
+      .filter((candidate) => excludedShortSymbolsSet.has(candidate.symbol) &&
+        (eligible(candidate, "SHORT") || scannerLedEligible(candidate, "SHORT")))
+      .map((candidate) => candidate.symbol)
+      .sort()
+    : [];
+  const longAverageScore = average(longPicks);
+  const shortAverageScore = average(shortPicks);
   const base = {
     enabled: isCrossSectionalDirectionalRegimeExecEnabled(),
     marketRegime: regime || null,
@@ -310,13 +449,17 @@ export function buildCrossSectionalDirectionalRegimeDecision(
 
   if (explicitBear) {
     return shortPicks.length === 3
-      ? { ...base, mode: "BEAR_SHORT_3", reason: "Regime bearish eksplisit dan tiga short lolos skor, confidence, likuiditas, serta konfirmasi Kronos." }
-      : { ...base, mode: "NO_TRADE", reason: `Regime bearish, tetapi hanya ${shortPicks.length}/3 short yang lolos semua guard.` };
+      ? { ...base, mode: "BEAR_SHORT_3", reason: `Regime bearish eksplisit dan ${shortPicks.length} short lolos skor, confidence, likuiditas, serta konfirmasi Kronos.` }
+      : { ...base, mode: "NO_TRADE", reason: excludedShortSymbols.length
+        ? `Regime bearish, tetapi kandidat short yang lolos sedang dipakai basket (${excludedShortSymbols.join(", ")}); tidak boleh netting/reverse posisi hedge. Menunggu kandidat short bebas.`
+        : `Regime bearish, tetapi hanya ${shortPicks.length}/3 short yang lolos semua guard.` };
   }
   if (explicitBull) {
     return longPicks.length === 3
-      ? { ...base, mode: "BULL_LONG_3", reason: "Regime bullish eksplisit dan tiga long lolos skor, confidence, likuiditas, serta konfirmasi Kronos." }
-      : { ...base, mode: "NO_TRADE", reason: `Regime bullish, tetapi hanya ${longPicks.length}/3 long yang lolos semua guard.` };
+      ? { ...base, mode: "BULL_LONG_3", reason: `Regime bullish eksplisit dan ${longPicks.length} long lolos skor, confidence, likuiditas, serta konfirmasi Kronos.` }
+      : { ...base, mode: "NO_TRADE", reason: excludedLongSymbols.length
+        ? `Regime bullish, tetapi kandidat long yang lolos sedang dipakai basket (${excludedLongSymbols.join(", ")}); tidak boleh netting/reverse posisi hedge. Menunggu kandidat long bebas.`
+        : `Regime bullish, tetapi hanya ${longPicks.length}/3 long yang lolos semua guard.` };
   }
   if (longPicks.length < 3 || shortPicks.length < 3 || longAverageScore === null || shortAverageScore === null) {
     return { ...base, mode: "NO_TRADE", reason: "Regime tidak eksplisit dan bukti dua sisi belum lengkap (masing-masing perlu tiga simbol)." };
@@ -334,10 +477,9 @@ export function buildCrossSectionalDirectionalRegimeDecision(
 
 /**
  * The scan's 20-symbol direction count is useful breadth evidence, but cannot
- * by itself certify a directional trade. A separate canonical market-regime
- * engine must be fresh, eligible, non-transitioning, and agree on direction.
- * This makes disagreement a NO_TRADE rather than silently trusting whichever
- * producer happened to be more aggressive.
+ * by itself determine size. Canonical market regime remains fresh and eligible,
+ * but an explicitly scanner-led direction may take at most two reduced slots
+ * while canonical is MIXED. Only an opposite canonical regime vetoes entry.
  */
 export function confirmCrossSectionalDirectionalRegime(
   decision: CrossSectionalDirectionalDecision,
@@ -370,8 +512,9 @@ export function confirmCrossSectionalDirectionalRegime(
 export function crossSectionalDirectionalOpenSignals(
   snapshot: CachedScanCandidates | null,
   direction: "LONG" | "SHORT",
+  confirmedDecision: CrossSectionalDirectionalDecision | null = null,
 ): SingleSymbolFreshSignal[] {
-  const decision = buildCrossSectionalDirectionalRegimeDecision(snapshot);
+  const decision = confirmedDecision ?? buildCrossSectionalDirectionalRegimeDecision(snapshot);
   const allowed = direction === "LONG" ? decision.mode === "BULL_LONG_3" : decision.mode === "BEAR_SHORT_3";
   if (!allowed || !snapshot) return [];
   const openedAtMs = Date.parse(snapshot.scanFinishedAt);
@@ -381,7 +524,12 @@ export function crossSectionalDirectionalOpenSignals(
     observationId: `xsec-directional:${snapshot.scanBatchId}:${direction}:${pick.symbol}:${pick.candidate.candidateFingerprint.value}`,
     symbol: pick.symbol,
     entryPrice: pick.candidate.currentPrice!,
-    stopPrice: pick.candidate.stopLoss!,
+    stopPrice: effectiveDirectionalStop(
+      direction,
+      pick.candidate.currentPrice!,
+      pick.candidate.stopLoss!,
+      DIRECTIONAL_REGIME_MIN_STOP_PCT(),
+    ),
     openedAtMs,
   }));
 }

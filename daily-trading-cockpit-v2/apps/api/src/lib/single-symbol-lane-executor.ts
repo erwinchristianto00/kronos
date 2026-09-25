@@ -37,10 +37,14 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
+import type { ExposureReserveCampaignCap, ExposureReserveRequest, ExposureReserveResult } from "./account-exposure-coordinator.js";
 import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, type BinanceFuturesPrivateClient } from "./binance-futures-private.js";
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder } from "./execution-fill-recorder.js";
+import { makerLimitPrice, resolveMakerLeg, signedMakerEntryQtyBySymbol } from "./maker-entry-plan.js";
+import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
+import type { FourBrainBridgeCandidate, FourBrainBridgeDecision } from "./four-brain-testnet-bridge.js";
 import type { PositionPathRecorder } from "./position-path-recorder.js";
 
 export type SingleSymbolExecClient = Pick<
@@ -54,7 +58,14 @@ export type SingleSymbolExecClient = Pick<
   | "getPositions"
   | "queryOrder"
   | "getUserTrades"
->;
+> &
+  /** Optional so every existing fake client keeps compiling. Maker entry REFUSES to run without it:
+   *  a post-only order that cannot be cancelled has no safe way to stop resting, and here that
+   *  matters more than on the basket path — a partially filled resting order means a LIVE, unstopped
+   *  position. */
+  /** 2026-08-18: also optional. Without it reconcilePendingMakerEntries cannot resolve a resting
+   *  order after a restart, so it degrades to leaving the handle pending rather than guessing. */
+  Partial<Pick<BinanceFuturesPrivateClient, "cancelOrder" | "queryOrderByClientId">>;
 
 export interface SingleSymbolFreshSignal {
   observationId: string;
@@ -125,13 +136,88 @@ export function makeFixedRewardExitPolicy(opts: { rewardMultiple: number; maxHol
 }
 
 /** Bank a faded winner: arm once peak favorable-R ≥ armR, then exit once it retraces by
- *  givebackFrac of the peak. Otherwise the stop (−1R) or mark-to-market at maxHoldMs.
- *  Used by INTRADAY_MOMENTUM_BREAKOUT. */
-export function makeMfeGivebackExitPolicy(opts: { armR: number; givebackFrac: number; maxHoldMs: number }): SingleSymbolExitPolicy {
+ *  givebackFrac of the peak. A lane may additionally protect a specified estimated-net winner:
+ *  crossing that level does NOT close the runner, but a later retrace back through it does.
+ *  Otherwise the stop (−1R) or mark-to-market at maxHoldMs. */
+export function makeMfeGivebackExitPolicy(opts: {
+  armR: number;
+  givebackFrac: number;
+  maxHoldMs: number;
+  /** Optional profit-lock, as a fraction of entry after estimated close cost. Not a static TP.
+   *
+   *  MEASURED DEFECT (2026-08-16): this is denominated in PRICE, while `armR` and the stop are
+   *  denominated in R, so one config produces a different reward:risk on every position. Across 14
+   *  real directional closes the stop width ranged 0.47%-2.18% of entry, which turned a single
+   *  `profitLockNetReturn: 0.005` into a lock at 1.15R on ETH and 0.25R on SOL — reward:risk varying
+   *  4.6x by nothing but the symbol's volatility at entry. Prefer `profitLockR` below. */
+  profitLockNetReturn?: number;
+  /** Profit-lock in R, the same unit as `armR` and the stop: arm once peak favorable-R reaches this
+   *  level, exit if price retraces back through it.
+   *
+   *  Takes precedence over `profitLockNetReturn` when set, and needs neither `riskFraction` nor
+   *  `estimatedCloseCostPct` to be interpreted — the geometry is the same on every symbol and at
+   *  every volatility, which is the entire point. Additive on purpose: lanes that pass only
+   *  `profitLockNetReturn` keep their existing behavior byte for byte. */
+  profitLockR?: number;
+  /** Full take-profit in R — closes the WHOLE position the moment favorable-R reaches it. There is
+   *  no remainder: this is not a partial. Unset/0 = no TP, which is what every lane had before.
+   *
+   *  MEASURED (250 days, neutral entries, stop 2%, arm 0.75/giveback 0.30): a TP is HARMFUL below
+   *  1.5R — at 0.50R it removes 97% of the result, because it caps every winner at 0.5R while stops
+   *  still take a full −1R. At 1.5R it is exactly return-NEUTRAL (−0.0000R) and converts 14 points
+   *  of uncertain GIVEBACK exits into certain ones, shortening holds and narrowing the spread. Above
+   *  that the gain is inside the noise. So: 1.5R buys variance, not return, and anything tighter
+   *  costs real money.
+   *
+   *  FIRES ON TICK, not intrabar. The simulation that produced those numbers used candle high/low;
+   *  this policy sees whatever price the tick passes it, so in production the TP will trigger later
+   *  and less often than measured. Treat the measured figures as an upper bound. */
+  staticTpR?: number;
+  /** One-way estimated close cost used to express the lock in net terms. Unused by `profitLockR`. */
+  estimatedCloseCostPct?: number;
+}): SingleSymbolExitPolicy {
   return (ctx) => {
     const r = favorableR(ctx.direction, ctx.entryPrice, ctx.stopPrice, ctx.currentPrice);
     const nextPeakFavorableR = Math.max(ctx.peakFavorableR, r);
     if (r <= -1) return { shouldExit: true, reason: "INITIAL_STOP", nextPeakFavorableR };
+    const riskFraction = ctx.entryPrice > 0 ? Math.abs(ctx.entryPrice - ctx.stopPrice) / ctx.entryPrice : 0;
+    const costFraction = Number.isFinite(opts.estimatedCloseCostPct) && opts.estimatedCloseCostPct! > 0
+      ? opts.estimatedCloseCostPct!
+      : 0;
+    const lockNet = Number.isFinite(opts.profitLockNetReturn) && opts.profitLockNetReturn! > 0
+      ? opts.profitLockNetReturn!
+      : null;
+    // Full TP is checked BEFORE the lock and the giveback: it is the highest level of the three, so
+    // if price is there the other two would only ever book less.
+    const tpR = Number.isFinite(opts.staticTpR) && opts.staticTpR! > 0 ? opts.staticTpR! : null;
+    if (tpR !== null && r >= tpR) {
+      return { shouldExit: true, reason: "STATIC_TP", nextPeakFavorableR };
+    }
+    // R-denominated lock wins when set: same unit as armR and the stop, so no conversion and no
+    // dependence on how wide this particular position's stop happens to be.
+    const lockR = Number.isFinite(opts.profitLockR) && opts.profitLockR! > 0 ? opts.profitLockR! : null;
+    if (lockR !== null) {
+      if (nextPeakFavorableR >= lockR && r <= lockR) {
+        return { shouldExit: true, reason: "MFE_PROFIT_LOCK", nextPeakFavorableR };
+      }
+      if (nextPeakFavorableR >= opts.armR) {
+        const givebackLineR = nextPeakFavorableR * (1 - opts.givebackFrac);
+        if (r <= givebackLineR) return { shouldExit: true, reason: "MFE_GIVEBACK", nextPeakFavorableR };
+      }
+      if (ctx.msHeld >= opts.maxHoldMs) return { shouldExit: true, reason: "MAX_HOLD_MTM", nextPeakFavorableR };
+      return { shouldExit: false, reason: null, nextPeakFavorableR };
+    }
+    // `peak` is stored in R while the operator target is a net return. Convert both from the
+    // same frozen entry/stop geometry so the lock is invariant to mark-price scale and direction.
+    const peakNetReturn = nextPeakFavorableR * riskFraction - costFraction;
+    const currentNetReturn = r * riskFraction - costFraction;
+    // Floating-point price/risk arithmetic can leave an exact +0.50% lock as
+    // 0.005000000000000001. Treat only machine-noise as equal, never a meaningful
+    // undershoot/overshoot of the operator's net threshold.
+    const lockEpsilon = 1e-9;
+    if (lockNet !== null && peakNetReturn >= lockNet - lockEpsilon && currentNetReturn <= lockNet + lockEpsilon) {
+      return { shouldExit: true, reason: "MFE_PROFIT_LOCK", nextPeakFavorableR };
+    }
     if (nextPeakFavorableR >= opts.armR) {
       const givebackLine = nextPeakFavorableR * (1 - opts.givebackFrac);
       if (r <= givebackLine) return { shouldExit: true, reason: "MFE_GIVEBACK", nextPeakFavorableR };
@@ -260,6 +346,10 @@ export interface SingleSymbolPosition {
   closeFailureCount: number;
   closeFailureSinceIso: string | null;
   peakFavorableR: number;
+  /** Positive magnitude of the deepest observed adverse R. Optional for legacy persisted rows. */
+  peakAdverseR?: number;
+  /** Completeness latch for direct actual-fill learning across a partial stop lifecycle. */
+  actualFillSettlementComplete?: boolean;
   openedAt: string;
   status: "OPEN" | "CLOSED" | "ABORTED";
   closedAt: string | null;
@@ -297,6 +387,18 @@ export interface SingleSymbolPosition {
    *  when it is false. This flag stays independent of both so the before/after shift attributable to
    *  enabling the fold stays unambiguous. */
   feeSource?: "EXCHANGE" | "ESTIMATE_TAKER_FLAT";
+  /** The exit geometry this position was OPENED under, frozen at open.
+   *
+   *  Without it a reader can only show today's levels against a historical position, which reads as
+   *  fact and is not: positions opened 2026-08-13/14 ran armR 0.20 with a price-denominated lock,
+   *  nothing like the current 0.75/0.15R. Absent on every position opened before 2026-08-17, and a
+   *  reader must render those as unknown rather than substitute the running config. */
+  exitGeometryAtOpen?: { armR: number; givebackFrac: number; profitLockR: number | null; staticTpR: number | null };
+  /** How the ENTRY was actually filled, split by liquidity. Exact, not an estimate: Binance rejects
+   *  a GTX order that would cross, so it can only fill as maker, and a MARKET order can only fill as
+   *  taker — which order filled which quantity IS the split. Absent on every position opened before
+   *  maker entry existed, which by construction of the code then means taker. */
+  entryLiquidity?: { makerQty: number; takerQty: number; reason: string } | null;
   netPnlUsd: number | null;
   /** Cumulative gross/fee P&L already realized from a PRIOR partial fill on this same position
    *  (2026-07-12 fix: a triggered stop can partially fill when a sibling executor's netting has
@@ -359,6 +461,19 @@ export interface SingleSymbolPosition {
    *  exchange's entry commission is in the totals, false = the totals are exit-side only and
    *  entryCommissionUsd is additive, undefined = not answerable, do not reconstruct. */
   entryLegFoldedIntoPnl?: boolean;
+  /**
+   * Read-model provenance for a returned CLOSED position. The durable fields above
+   * remain the exchange-order settlement captured at close time. When an executor
+   * opts into own-lot attribution, getStatus()/getClosedPositions() replace the
+   * displayed P&L with this position's entry-to-exit economics and retain these
+   * three raw exchange figures for audit. They are never written back to the
+   * executor store.
+   */
+  exchangeAccountGrossPnlUsd?: number | null;
+  exchangeAccountFeeUsd?: number | null;
+  exchangeAccountNetPnlUsd?: number | null;
+  pnlAttribution?: "EXCHANGE_NETTED" | "OWN_LOT" | "INCOMPLETE";
+  pnlAttributionComplete?: boolean;
   /** CORTEX real-USDT attribution capture (2026-07-21, report-only — see cortex-real-attribution.ts):
    *  the allocation weight this executor's sizing ACTUALLY applied to this entry (laneWeightPct —
    *  wired to laneSelectionWeightPctForLane in app.ts, so it includes any active CORTEX promoted
@@ -378,9 +493,39 @@ export interface SingleSymbolPosition {
   submitRef?: SubmitReferenceQuote | null;
 }
 
+/**
+ * An entry order that has been SENT but whose outcome is not yet booked as a position.
+ *
+ * 2026-08-18. Post-only entry rests on the book for up to CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY_-
+ * WAIT_MS (120s in production) while `placeEntryMakerFirst` polls it. Until today the orderId lived
+ * only in a local variable, so a restart inside that window lost the only handle to it: the order
+ * stays REAL on the exchange, nothing knows it exists, and if it fills the result is a live position
+ * with no stop and no tracking — the "invisible naked position" class this file's own reconciliation
+ * was built to prevent. cross-sectional-executor.ts already persists makerRestingOrderId on the
+ * basket plan; this is the same protection for the directional lanes.
+ *
+ * Written BEFORE the order is sent, so even a crash between send and response leaves the handle.
+ * The handle is `clientOrderId`, which is deterministic and computed before placement, so it stays
+ * searchable via queryOrderByClientId no matter what happened to the response.
+ */
+export interface PendingMakerEntry {
+  clientOrderId: string;
+  symbol: string;
+  direction: "LONG" | "SHORT";
+  qty: number;
+  placedAt: string;
+  sourceObservationId: string;
+  /** Everything needed to build a real, STOPPED position if the order turns out to have filled. */
+  stopPrice: number;
+  targetPrice?: number | null;
+  maxHoldMs?: number | null;
+}
+
 interface SingleSymbolExecutorState {
   version: number;
   positions: SingleSymbolPosition[];
+  /** Optional so state files written before 2026-08-18 still load unchanged. */
+  pendingMakerEntries?: PendingMakerEntry[];
   lastSeenSignalMs: number;
   /** 2026-07-09 fix: per-signal dedup by observationId, bounded to the most recent 500. Replaces
    *  lastSeenSignalMs-only filtering for candidate selection, which had a real incident: when
@@ -435,6 +580,23 @@ export class SingleSymbolLaneExecutorStore {
 
   getState(): SingleSymbolExecutorState {
     return this.state;
+  }
+
+  /** Persist an entry order BEFORE it is sent. Bounded: a stuck record cannot accumulate because
+   *  reconcilePendingMakerEntries drops anything the exchange says never existed. */
+  addPendingMakerEntry(entry: PendingMakerEntry): void {
+    const list = this.state.pendingMakerEntries ?? [];
+    if (!list.some((e) => e.clientOrderId === entry.clientOrderId)) list.push(entry);
+    this.state.pendingMakerEntries = list.slice(-50);
+    this.save();
+  }
+
+  /** Called once the order's outcome is known — filled, rejected, or proven absent. */
+  clearPendingMakerEntry(clientOrderId: string): void {
+    const list = this.state.pendingMakerEntries;
+    if (!list || list.length === 0) return;
+    this.state.pendingMakerEntries = list.filter((e) => e.clientOrderId !== clientOrderId);
+    this.save();
   }
 
   private prune(): void {
@@ -509,9 +671,28 @@ export interface SingleSymbolLaneExecutorOptions {
    *  summed realizedPnl and commission survive). No extra exchange call, no extra await on the
    *  order path; every use is wrapped so a failure can NEVER affect trading or settlement. */
   executionFillRecorder?: ExecutionFillRecorder;
+  /** Durable causal binding from a Four-Brain ENTER_NOW decision to this exact exchange fill. */
+  fourBrainActualFillBindings?: FourBrainActualFillBindingStore;
+  /** Narrow pilot gate; outside the testnet focus it is absent and changes nothing. */
+  fourBrainEntryGate?: (candidate: FourBrainBridgeCandidate) => FourBrainBridgeDecision;
   /** Base position notional in USD, BEFORE allocation-weight scaling. */
   legUsd: () => number;
   leverage: () => number;
+  /** Post-only entry for THIS lane only. Default off; 18 executors share this class and only the
+   *  two directional ones were analysed for it. Measured on this account: maker 2.00 vs taker 4.00
+   *  bps per side, so entry-only takes the round trip from 8 to 6 bps — 0.040R to 0.030R at the 2%
+   *  stop floor.
+   *
+   *  ENTRY ONLY, deliberately. If a resting ENTRY never fills you simply hold no position; if a
+   *  resting EXIT never fills you still hold the position and it keeps losing — and exits fire
+   *  precisely when price is moving, which is when a passive order is least likely to fill. The
+   *  stop is a real STOP_MARKET and cannot be passive at all. */
+  /** Freeze the exit geometry onto each position at open, so a report can show the levels that
+   *  actually applied instead of substituting whatever is configured when the page is rendered. */
+  exitGeometrySnapshot?: () => { armR: number; givebackFrac: number; profitLockR: number | null; staticTpR: number | null };
+  makerEntry?: () => boolean;
+  /** How long a post-only entry may rest before it is cancelled and crossed. */
+  makerEntryWaitMs?: () => number;
   maxOpenPositions?: () => number;
   /** Only execute signals younger than this (a stale signal's edge has drifted). */
   maxSignalAgeMs?: () => number;
@@ -593,11 +774,54 @@ export interface SingleSymbolLaneExecutorOptions {
    *  (unchanged behavior) — callers that wire a shared short-TTL cache across sibling instances
    *  (see app.ts's sharedGetPositions) cut this down to one signed call per cache window. */
   sharedGetPositions?: () => ReturnType<SingleSymbolExecClient["getPositions"]>;
+  /**
+   * Narrow exception to one-way netting: a directional lane may add only to a
+   * same-direction live basket leg after the owner verifies it is net-positive
+   * after estimated close cost. Omit to retain the normal hard block.
+   */
+  allowSameDirectionExistingPosition?: (
+    symbol: string,
+    direction: "LONG" | "SHORT",
+  ) => Promise<{ allowed: boolean; reason?: string }>;
+  /**
+   * Caps this executor itself at one open record per symbol. This is deliberately
+   * separate from the cross-lane one-way-netting allowance: a directional lane may
+   * add beside an eligible basket leg, but it must never pyramid a second/third
+   * copy of its own symbol merely because a new scanner observation arrived.
+   */
+  preventSameSymbolPyramiding?: boolean;
+  /**
+   * Binance one-way accounts report realizedPnl against the account's netted
+   * position, not a strategy lot. Opt in only where a lane shares symbols with a
+   * basket and must report/train on its own entry-to-exit P&L instead.
+   */
+  useOwnLotPnlAttribution?: boolean;
   /** Atomic account-wide claim for an in-flight entry. Prevents sibling executors from sending
    * opposing orders against the same netted Binance symbol after observing stale cached state. */
   tryClaimEntrySymbol?: (symbol: string) => boolean;
   /** Releases an entry-symbol claim after every success, rejection, or failure path. */
   releaseEntrySymbol?: (symbol: string) => void;
+  /** Shared account-exposure coordinator (account-exposure-coordinator.ts). Reserves risk capacity
+   *  BEFORE an entry order is placed, synchronous and back-to-back with tryClaimEntrySymbol above
+   *  (no `await` between them) — closes the gap where sizing/admission had no shared, cross-instance
+   *  view of gross/directional/per-symbol/cluster/concurrent-position exposure (existingNotionalFor-
+   *  Symbol/existingClusterOpenSymbols above are consulted only as allow-or-skip admission gates,
+   *  never inside sizing). Defaults to an always-succeeds no-op ({ok:true, reservationId:null}) so
+   *  every existing test that doesn't wire this stays byte-for-byte unaffected — same optional-
+   *  closure-with-safe-default convention as every other injected accessor above. */
+  reserveExposure?: (req: ExposureReserveRequest) => ExposureReserveResult;
+  /** Commits a reservation from the ACTUAL fill (never the requested qty) once one lands. Optional,
+   *  defaults to a no-op — see reserveExposure above. */
+  commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
+  /** Releases unused capacity on rejection, timeout, cancellation, or failure. Optional, defaults to
+   *  a no-op — see reserveExposure above. */
+  releaseExposureReservation?: (reservationId: string, reason: string) => void;
+  /** Innovation-campaign cap context (account-exposure-coordinator.ts's ExposureReserveCampaignCap),
+   *  folded onto every reserveExposureFn() call below — see that type's own doc comment. Optional,
+   *  defaults to () => undefined so every mainnet construction site (and every existing test) is
+   *  byte-for-byte unaffected; only app.ts's innovation construction block ever wires this, via
+   *  innovation-campaign.ts's campaignCapForLane(). */
+  campaignCap?: () => ExposureReserveCampaignCap | undefined;
   /** 2026-07-19 real-money audit fix: best-effort notification fired exactly once per position
    *  fully closed (stop-triggered, policy exit, manual close, or an orderly kill-switch wind-down —
    *  every one of those paths funnels through settleIfStopTriggered()/closePosition()'s own single
@@ -612,9 +836,7 @@ export interface SingleSymbolLaneExecutorOptions {
    *  fabricated/unknown number. A throwing callback never interrupts this executor's own
    *  settlement bookkeeping — see notifyPositionClosed(). */
   onPositionClosed?: (netUsd: number) => void;
-  /** Finalized-close detail hook. This runs only after the exchange close has
-   * settled and the position is persisted, so a failed close attempt can never
-   * accidentally start a re-entry cooldown. */
+  /** Finalized-close detail hook. Runs only after exchange settlement and persistence. */
   onPositionClosedDetail?: (event: { symbol: string; direction: "LONG" | "SHORT"; reason: string; netUsd: number }) => void;
 }
 
@@ -664,6 +886,13 @@ const USER_TRADES_PAGE_LIMIT = 1000;
  *  Enable per instance with SINGLE_SYMBOL_EXEC_FOLD_ENTRY_FEE=1. */
 const FOLD_ENTRY_LEG_INTO_PNL = (): boolean => process.env.SINGLE_SYMBOL_EXEC_FOLD_ENTRY_FEE === "1";
 
+interface OwnLotPnl {
+  grossPnlUsd: number;
+  feeUsd: number;
+  netPnlUsd: number;
+  complete: boolean;
+}
+
 export class SingleSymbolLaneExecutor {
   private readonly client: SingleSymbolExecClient;
   private readonly store: SingleSymbolLaneExecutorStore;
@@ -681,6 +910,11 @@ export class SingleSymbolLaneExecutor {
   private readonly cortexRealAttribution: CortexRealAttributionStore | null;
   private readonly positionPathRecorder: PositionPathRecorder | null;
   private readonly executionFillRecorder: ExecutionFillRecorder | null;
+  private readonly fourBrainActualFillBindings: FourBrainActualFillBindingStore | null;
+  private readonly fourBrainEntryGate: ((candidate: FourBrainBridgeCandidate) => FourBrainBridgeDecision) | null;
+  private readonly exitGeometrySnapshotFn: (() => { armR: number; givebackFrac: number; profitLockR: number | null; staticTpR: number | null }) | null;
+  private readonly makerEntryFn: () => boolean;
+  private readonly makerEntryWaitMsFn: () => number;
   private readonly legUsdFn: () => number;
   private readonly leverageFn: () => number;
   private readonly maxOpenPositionsFn: () => number;
@@ -696,8 +930,18 @@ export class SingleSymbolLaneExecutor {
   private readonly readPublicQuoteFn: ((symbol: string) => PublicQuoteSnapshot | null) | null;
   private readonly maxEntryChaseStopFractionFn: () => number;
   private readonly sharedGetPositions: () => ReturnType<SingleSymbolExecClient["getPositions"]>;
+  private readonly allowSameDirectionExistingPosition: ((
+    symbol: string,
+    direction: "LONG" | "SHORT",
+  ) => Promise<{ allowed: boolean; reason?: string }>) | null;
+  private readonly preventSameSymbolPyramiding: boolean;
+  private readonly useOwnLotPnlAttribution: boolean;
   private readonly tryClaimEntrySymbol: (symbol: string) => boolean;
   private readonly releaseEntrySymbol: (symbol: string) => void;
+  private readonly reserveExposureFn: (req: ExposureReserveRequest) => ExposureReserveResult;
+  private readonly commitExposureReservationFn: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
+  private readonly releaseExposureReservationFn: (reservationId: string, reason: string) => void;
+  private readonly campaignCapFn: () => ExposureReserveCampaignCap | undefined;
   private readonly onPositionClosed: (netUsd: number) => void;
   private readonly onPositionClosedDetail: (event: { symbol: string; direction: "LONG" | "SHORT"; reason: string; netUsd: number }) => void;
   private ticking = false;
@@ -730,6 +974,11 @@ export class SingleSymbolLaneExecutor {
     this.cortexRealAttribution = opts.cortexRealAttribution ?? null;
     this.positionPathRecorder = opts.positionPathRecorder ?? null;
     this.executionFillRecorder = opts.executionFillRecorder ?? null;
+    this.fourBrainActualFillBindings = opts.fourBrainActualFillBindings ?? null;
+    this.fourBrainEntryGate = opts.fourBrainEntryGate ?? null;
+    this.exitGeometrySnapshotFn = opts.exitGeometrySnapshot ?? null;
+    this.makerEntryFn = opts.makerEntry ?? (() => false);
+    this.makerEntryWaitMsFn = opts.makerEntryWaitMs ?? (() => 120_000);
     this.legUsdFn = opts.legUsd;
     this.leverageFn = opts.leverage;
     this.maxOpenPositionsFn = opts.maxOpenPositions ?? (() => 1);
@@ -748,8 +997,15 @@ export class SingleSymbolLaneExecutor {
       return Number.isFinite(n) && n >= 0 ? n : 0.2;
     });
     this.sharedGetPositions = opts.sharedGetPositions ?? (() => this.client.getPositions());
+    this.allowSameDirectionExistingPosition = opts.allowSameDirectionExistingPosition ?? null;
+    this.preventSameSymbolPyramiding = opts.preventSameSymbolPyramiding === true;
+    this.useOwnLotPnlAttribution = opts.useOwnLotPnlAttribution === true;
     this.tryClaimEntrySymbol = opts.tryClaimEntrySymbol ?? (() => true);
     this.releaseEntrySymbol = opts.releaseEntrySymbol ?? (() => {});
+    this.reserveExposureFn = opts.reserveExposure ?? (() => ({ ok: true, reservationId: null }));
+    this.commitExposureReservationFn = opts.commitExposureReservation ?? (() => {});
+    this.releaseExposureReservationFn = opts.releaseExposureReservation ?? (() => {});
+    this.campaignCapFn = opts.campaignCap ?? (() => undefined);
     this.onPositionClosed = opts.onPositionClosed ?? (() => {});
     this.onPositionClosedDetail = opts.onPositionClosedDetail ?? (() => {});
   }
@@ -866,6 +1122,125 @@ export class SingleSymbolLaneExecutor {
     }
   }
 
+  /**
+   * Fill ONE entry post-only, then cross the spread for whatever did not fill.
+   *
+   * Returns the same three fields the MARKET path returns, with avgPrice already notional-blended,
+   * so every consumer downstream is untouched by how the entry was filled.
+   *
+   * THE DIFFERENCE FROM THE BASKET PATH, and why this is not a copy of it: here a partial fill means
+   * a LIVE, UNSTOPPED position. The caller places the STOP_MARKET only after this returns, so every
+   * second spent waiting out the rest of a partially-filled order is a second of naked exposure. The
+   * poll therefore BREAKS THE MOMENT ANY QUANTITY FILLS instead of serving out the timeout, which
+   * bounds the unprotected window to roughly one poll rather than the full wait. A basket leg can
+   * afford to wait for its remainder; a stopless position cannot.
+   *
+   * Any throw propagates to the caller's existing catch, which un-attempts the signal and retries
+   * next tick. This function deliberately owns no recovery of its own.
+   */
+  /** Keyed by entry clientOrderId. Registered the instant a post-only order is sent and removed the
+   *  instant this method returns — see pendingMakerEntryQtyBySymbol() for why reconcile needs it.
+   *  TODO(persistence): still in-memory only. A crash while an order rests loses the orderId, and
+   *  recovery has no record to query — the resulting fill becomes an unprotected naked position.
+   *  cross-sectional-executor.ts solves this by persisting makerRestingOrderId on the basket plan. */
+  private readonly inflightMakerEntries = new Map<string, { symbol: string; direction: "LONG" | "SHORT"; qty: number }>();
+
+  /**
+   * Registers the in-flight entry for the whole time an order of ours is out, then always clears it.
+   *
+   * The claim goes up BEFORE the first await, not after: `placeOrder` can time out on the RESPONSE
+   * while the order itself reached the exchange, and that is precisely the case where a position
+   * appears that nothing claims. Registering after the await would leave that hole open.
+   *
+   * Covers the MARKET path too — the claim is "this lane has an order out for qty on symbol", which
+   * is equally true there, just for a much shorter time.
+   */
+  private async placeEntryMakerFirst(
+    symbol: string,
+    side: "BUY" | "SELL",
+    qty: number,
+    clientOrderId: string,
+    refBid: number | null,
+    refAsk: number | null,
+  ): Promise<{ orderId: string; avgPrice: number; executedQty: number; liquidity: { makerQty: number; takerQty: number; reason: string } }> {
+    this.inflightMakerEntries.set(clientOrderId, { symbol, direction: side === "BUY" ? "LONG" : "SHORT", qty });
+    try {
+      return await this.placeEntryMakerFirstInner(symbol, side, qty, clientOrderId, refBid, refAsk);
+    } finally {
+      this.inflightMakerEntries.delete(clientOrderId);
+    }
+  }
+
+  private async placeEntryMakerFirstInner(
+    symbol: string,
+    side: "BUY" | "SELL",
+    qty: number,
+    clientOrderId: string,
+    refBid: number | null,
+    refAsk: number | null,
+  ): Promise<{ orderId: string; avgPrice: number; executedQty: number; liquidity: { makerQty: number; takerQty: number; reason: string } }> {
+    const dir = side === "BUY" ? "LONG" : "SHORT";
+    const limitPrice = this.client.cancelOrder ? makerLimitPrice(dir, refBid, refAsk) : null;
+    if (limitPrice === null) {
+      const o = await this.client.placeOrder({ symbol, side, type: "MARKET", quantity: qty, newClientOrderId: clientOrderId });
+      return {
+        orderId: o.orderId, avgPrice: o.avgPrice, executedQty: o.executedQty,
+        liquidity: { makerQty: 0, takerQty: qty, reason: this.client.cancelOrder ? "no usable submit-time quote" : "client cannot cancel — maker unsafe" },
+      };
+    }
+
+    const maker = await this.client.placeOrder({
+      symbol, side, type: "LIMIT", timeInForce: "GTX", price: limitPrice, quantity: qty, newClientOrderId: clientOrderId,
+    });
+    const TERMINAL = ["FILLED", "CANCELED", "EXPIRED", "REJECTED"];
+    const waitMs = this.makerEntryWaitMsFn();
+    const deadline = this.nowMs() + waitMs;
+    // Bounded by poll count as well as by the clock: nowMs() is injectable, and a frozen test clock
+    // would otherwise spin here forever.
+    const maxPolls = Math.max(1, Math.ceil(waitMs / 1_000));
+    let latest = maker;
+    for (let poll = 0; poll < maxPolls; poll++) {
+      if (TERMINAL.includes(String(latest.status).toUpperCase())) break;
+      if (Number.isFinite(latest.executedQty) && latest.executedQty > 0) break; // live and unstopped
+      if (this.nowMs() >= deadline) break;
+      await new Promise((r) => setTimeout(r, 1_000));
+      try { latest = await this.client.queryOrder(symbol, maker.orderId); } catch { break; }
+    }
+
+    if (!TERMINAL.includes(String(latest.status).toUpperCase())) {
+      try { await this.client.cancelOrder!(symbol, maker.orderId); } catch { /* already terminal */ }
+    }
+    // Cancel, THEN read: the order can fill in the window between the two, and sizing a fallback
+    // from the pre-cancel figure is how that race doubles a position.
+    try { latest = await this.client.queryOrder(symbol, maker.orderId); } catch { /* keep last known */ }
+
+    const decision = resolveMakerLeg(qty, latest.status, latest.executedQty);
+    if (decision.action !== "FALLBACK_TAKER") {
+      // DONE, or UNKNOWN_REQUERY — in which case no fallback may be sized at all and the caller
+      // books exactly what the exchange confirmed.
+      return {
+        orderId: maker.orderId, avgPrice: latest.avgPrice, executedQty: latest.executedQty,
+        liquidity: { makerQty: decision.filledQty, takerQty: 0, reason: decision.reason },
+      };
+    }
+
+    const taker = await this.client.placeOrder({
+      symbol, side, type: "MARKET", quantity: decision.fallbackQty, newClientOrderId: `${clientOrderId}f`,
+    });
+    const makerQty = decision.filledQty;
+    const takerQty = Number.isFinite(taker.executedQty) && taker.executedQty > 0 ? taker.executedQty : decision.fallbackQty;
+    const makerPx = Number.isFinite(latest.avgPrice) && latest.avgPrice > 0 ? latest.avgPrice : limitPrice;
+    const takerPx = Number.isFinite(taker.avgPrice) && taker.avgPrice > 0 ? taker.avgPrice : 0;
+    const total = makerQty + takerQty;
+    // An unconfirmed taker price (avgPrice 0 at ACK is routine) returns 0 so resolveFillPrice
+    // re-queries, rather than inventing a blend from a price we do not have.
+    const avgPrice = takerPx > 0 && total > 0 ? (makerQty * makerPx + takerQty * takerPx) / total : 0;
+    return {
+      orderId: maker.orderId, avgPrice, executedQty: total,
+      liquidity: { makerQty, takerQty, reason: decision.reason },
+    };
+  }
+
   private async resolveFillPrice(symbol: string, orderId: string, initialAvgPrice: number, fallbackPrice: number) {
     return resolveConfirmedFillPrice(this.client, symbol, orderId, initialAvgPrice, fallbackPrice, {
       retryDelayMs: this.fillConfirmRetryDelayMs,
@@ -895,6 +1270,118 @@ export class SingleSymbolLaneExecutor {
     return Math.max(0, Math.min(100, pct));
   }
 
+  /**
+   * Rebuild one strategy lot's economics from its own confirmed entry/exit
+   * prices and commissions. Binance's trade `realizedPnl` cannot be used for
+   * this when a basket and a directional lane share the same one-way symbol:
+   * the exchange correctly realizes against the account-average position, but
+   * that number belongs to neither strategy book on its own.
+   *
+   * Partial stop lifecycles are deliberately excluded until every partial leg
+   * has its own durable price/fee attribution. Returning null is safer than
+   * showing/training on a blended account figure.
+   */
+  private ownLotPnl(pos: SingleSymbolPosition): OwnLotPnl | null {
+    if (pos.status !== "CLOSED") return null;
+    if (
+      pos.realizedPartialGrossUsd !== undefined ||
+      pos.realizedPartialFeeUsd !== undefined ||
+      pos.entryPriceConfirmed !== true ||
+      pos.exitPriceConfirmed !== true ||
+      !(typeof pos.entryPrice === "number" && Number.isFinite(pos.entryPrice) && pos.entryPrice > 0) ||
+      !(typeof pos.exitPrice === "number" && Number.isFinite(pos.exitPrice) && pos.exitPrice > 0) ||
+      !(typeof pos.qty === "number" && Number.isFinite(pos.qty) && pos.qty > 0)
+    ) return null;
+
+    const dir = pos.direction === "LONG" ? 1 : -1;
+    const grossPnlUsd = dir * (pos.exitPrice - pos.entryPrice) * pos.qty;
+    let feeUsd: number;
+    let feeComplete = false;
+    if (pos.feeSource === "EXCHANGE" && typeof pos.feeEstimateUsd === "number" && Number.isFinite(pos.feeEstimateUsd)) {
+      if (pos.entryLegFoldedIntoPnl === true) {
+        feeUsd = pos.feeEstimateUsd;
+        feeComplete = true;
+      } else if (
+        pos.entryLegFoldedIntoPnl === false &&
+        typeof pos.entryCommissionUsd === "number" &&
+        Number.isFinite(pos.entryCommissionUsd)
+      ) {
+        feeUsd = pos.feeEstimateUsd + pos.entryCommissionUsd;
+        feeComplete = true;
+      } else {
+        // It is unknown whether a legacy aggregate already contains the entry
+        // fee. Do not add it speculatively and do not fall back to netted P&L.
+        return null;
+      }
+    } else if (pos.feeSource === "ESTIMATE_TAKER_FLAT" && typeof pos.feeEstimateUsd === "number" && Number.isFinite(pos.feeEstimateUsd)) {
+      // This is still the strategy's own price P&L, but it cannot become a
+      // Four-Brain/CORTEX actual-fill outcome because at least one fee leg was
+      // modelled rather than observed.
+      feeUsd = pos.feeEstimateUsd;
+    } else {
+      return null;
+    }
+
+    return {
+      grossPnlUsd,
+      feeUsd,
+      netPnlUsd: grossPnlUsd - feeUsd,
+      complete: feeComplete && pos.actualFillSettlementComplete !== false,
+    };
+  }
+
+  /** P&L used by dashboard/reporting. Never substitute an account-netted value
+   * when own-lot attribution is configured but cannot be reconstructed. */
+  private reportedNetPnl(pos: SingleSymbolPosition): number | null {
+    if (!this.useOwnLotPnlAttribution) return pos.netPnlUsd;
+    return this.ownLotPnl(pos)?.netPnlUsd ?? null;
+  }
+
+  /** P&L used by risk callbacks. Prefer the own lot when known; fall back to the
+   * incumbent exchange settlement only to preserve a conservative risk signal
+   * for a genuinely incomplete legacy record. */
+  private riskNetPnl(pos: SingleSymbolPosition): number | null {
+    return this.useOwnLotPnlAttribution ? this.ownLotPnl(pos)?.netPnlUsd ?? pos.netPnlUsd : pos.netPnlUsd;
+  }
+
+  private reportedFee(pos: SingleSymbolPosition): number | null {
+    if (!this.useOwnLotPnlAttribution) return pos.feeEstimateUsd;
+    return this.ownLotPnl(pos)?.feeUsd ?? null;
+  }
+
+  /** Returns an API/read-model clone. Durable store values stay untouched for
+   * exchange reconciliation; the clone exposes them under exchangeAccount* so
+   * a correct strategy report never erases the audit trail. */
+  private reportPosition(pos: SingleSymbolPosition): SingleSymbolPosition {
+    if (!this.useOwnLotPnlAttribution || pos.status !== "CLOSED") return pos;
+    const own = this.ownLotPnl(pos);
+    const exchange = {
+      exchangeAccountGrossPnlUsd: pos.grossPnlUsd,
+      exchangeAccountFeeUsd: pos.feeEstimateUsd,
+      exchangeAccountNetPnlUsd: pos.netPnlUsd,
+    };
+    if (!own) {
+      return {
+        ...pos,
+        ...exchange,
+        grossPnlUsd: null,
+        feeEstimateUsd: null,
+        netPnlUsd: null,
+        pnlAttribution: "INCOMPLETE",
+        pnlAttributionComplete: false,
+      };
+    }
+    return {
+      ...pos,
+      ...exchange,
+      grossPnlUsd: own.grossPnlUsd,
+      feeEstimateUsd: own.feeUsd,
+      netPnlUsd: own.netPnlUsd,
+      pnlAttribution: "OWN_LOT",
+      pnlAttributionComplete: own.complete,
+    };
+  }
+
   /** CORTEX real-USDT attribution write for one FULLY closed position (report-only). Called from
    *  the two finalization blocks every close path funnels through — settleIfStopTriggered's
    *  full-close block (exchange-side stop fill) and closePosition's finalization (policy exit,
@@ -909,13 +1396,18 @@ export class SingleSymbolLaneExecutor {
       // Positions persisted before the capture fields existed carry no open-time weights — skip
       // rather than invent a tilt share after the fact.
       if (typeof pos.cortexAppliedWeightPct !== "number" || typeof pos.cortexRawStaticWeightPct !== "number") return;
-      if (typeof pos.netPnlUsd !== "number" || !Number.isFinite(pos.netPnlUsd)) return;
+      const ownLot = this.useOwnLotPnlAttribution ? this.ownLotPnl(pos) : null;
+      // CORTEX must never reinforce an account-average result assigned by
+      // Binance to a directional lot that shares a symbol with a basket.
+      if (this.useOwnLotPnlAttribution && (!ownLot || !ownLot.complete)) return;
+      const realizedPnlUsd = ownLot?.netPnlUsd ?? pos.netPnlUsd;
+      if (typeof realizedPnlUsd !== "number" || !Number.isFinite(realizedPnlUsd)) return;
       store.recordClose({
         recordId: `ssle:${this.laneId}:${pos.positionId}`,
         closedAtIso: pos.closedAt ?? this.nowIso(),
         laneId: this.laneId,
         symbol: pos.symbol,
-        realizedPnlUsd: pos.netPnlUsd,
+        realizedPnlUsd,
         appliedWeightPct: pos.cortexAppliedWeightPct,
         rawStaticWeightPct: pos.cortexRawStaticWeightPct,
       });
@@ -928,6 +1420,68 @@ export class SingleSymbolLaneExecutor {
    *  recordCortexRealAttribution's recordId uses. */
   private positionPathKey(pos: SingleSymbolPosition): string {
     return `ssle:${this.laneId}:${pos.positionId}`;
+  }
+
+  private bindFourBrainActualFill(pos: SingleSymbolPosition): void {
+    try {
+      this.fourBrainActualFillBindings?.bindActualFill({
+        bindingKey: this.positionPathKey(pos),
+        source: "SINGLE_SYMBOL",
+        laneId: this.laneId,
+        symbol: pos.symbol,
+        side: pos.direction,
+        signalId: pos.sourceObservationId,
+        openedAtMs: Date.parse(pos.openedAt),
+        entryPrice: pos.entryPrice,
+        entryPriceConfirmed: pos.entryPriceConfirmed,
+        riskUsd: Math.abs(pos.entryPrice - pos.stopPrice) * pos.qty,
+      });
+    } catch {
+      // Causal telemetry must never alter an exchange-protected position.
+    }
+  }
+
+  /**
+   * The incumbent P&L can deliberately leave the entry fee outside of its gate-facing total.
+   * Four-Brain must instead use the complete exchange economics, or mark the direct outcome
+   * unmeasured.  This keeps learning independent from the operator's risk-gate presentation.
+   */
+  private fourBrainActualNet(pos: SingleSymbolPosition): number | null {
+    if (this.useOwnLotPnlAttribution) {
+      const ownLot = this.ownLotPnl(pos);
+      return ownLot?.complete ? ownLot.netPnlUsd : null;
+    }
+    if (
+      pos.feeSource !== "EXCHANGE" ||
+      pos.entryPriceConfirmed !== true ||
+      pos.exitPriceConfirmed !== true ||
+      pos.actualFillSettlementComplete === false ||
+      typeof pos.netPnlUsd !== "number" ||
+      !Number.isFinite(pos.netPnlUsd)
+    ) return null;
+    if (pos.entryLegFoldedIntoPnl === true) return pos.netPnlUsd;
+    if (
+      typeof pos.entryCommissionUsd !== "number" ||
+      !Number.isFinite(pos.entryCommissionUsd) ||
+      typeof pos.entryRealizedPnlUsd !== "number" ||
+      !Number.isFinite(pos.entryRealizedPnlUsd)
+    ) return null;
+    return pos.netPnlUsd + pos.entryRealizedPnlUsd - pos.entryCommissionUsd;
+  }
+
+  private completeFourBrainActualFill(pos: SingleSymbolPosition, reason: string, pageSaturated: boolean): void {
+    try {
+      const netPnlUsd = !pageSaturated ? this.fourBrainActualNet(pos) : null;
+      this.fourBrainActualFillBindings?.completeActualFill({
+        bindingKey: this.positionPathKey(pos),
+        closedAtMs: Date.parse(pos.closedAt ?? this.nowIso()),
+        netPnlUsd,
+        settlementConfirmed: netPnlUsd !== null,
+        reason: netPnlUsd !== null ? reason : "EXCHANGE_SETTLEMENT_INCOMPLETE",
+      });
+    } catch {
+      // The durable exchange position record remains authoritative.
+    }
   }
 
   /** Dense R-path sample for one OPEN position (2026-07-22, report-only — see
@@ -952,6 +1506,20 @@ export class SingleSymbolLaneExecutor {
       });
     } catch {
       // report-only bookkeeping — a failure here must NEVER affect trading
+    }
+  }
+
+  /** Seed one factual entry observation (R=0) immediately after a confirmed position is persisted.
+   *  A short-lived position can otherwise close before the next monitor tick and lose the only
+   *  observation that is certain at open. This is telemetry only: it neither changes entry, stop,
+   *  order timing, nor any exit decision. */
+  private seedPositionPathAtEntry(pos: SingleSymbolPosition): void {
+    try {
+      const openedMs = Date.parse(pos.openedAt);
+      this.recordPositionPathTick(pos, pos.entryPrice, Number.isFinite(openedMs) ? openedMs : Date.now());
+      this.positionPathRecorder?.flush();
+    } catch {
+      // Dense-path telemetry must never affect an already-open exchange position.
     }
   }
 
@@ -986,8 +1554,9 @@ export class SingleSymbolLaneExecutor {
     const day = nowIso.slice(0, 10);
     let sum = 0;
     for (const p of this.store.getState().positions) {
-      if (p.status === "CLOSED" && p.closedAt && p.closedAt.slice(0, 10) === day && p.netPnlUsd !== null) {
-        sum += p.netPnlUsd;
+      const net = this.riskNetPnl(p);
+      if (p.status === "CLOSED" && p.closedAt && p.closedAt.slice(0, 10) === day && net !== null) {
+        sum += net;
       }
     }
     return sum;
@@ -1012,6 +1581,9 @@ export class SingleSymbolLaneExecutor {
     openPositions: SingleSymbolPosition[];
     closedCount: number;
     totalNetPnlUsd: number;
+    /** CLOSED records whose own-lot P&L cannot be reconstructed are deliberately
+     * omitted from totalNetPnlUsd instead of borrowing Binance's netted amount. */
+    unattributedClosedCount: number;
     lastError: string | null;
     recent: SingleSymbolPosition[];
     /** OPEN positions with a stop-placement failure streak in progress right now (stopAlgoOrderId
@@ -1042,7 +1614,8 @@ export class SingleSymbolLaneExecutor {
       entryBlockReason: this.isAllowedReasonFn(),
       openPositions: open,
       closedCount: closed.length,
-      totalNetPnlUsd: closed.reduce((s, p) => s + (p.netPnlUsd ?? 0), 0),
+      totalNetPnlUsd: closed.reduce((s, p) => s + (this.reportedNetPnl(p) ?? 0), 0),
+      unattributedClosedCount: closed.filter((p) => this.reportedNetPnl(p) === null).length,
       lastError: this.lastError,
       unprotectedPositions: open
         .filter((p) => p.stopAlgoOrderId === null && p.stopFailureCount > 0)
@@ -1050,8 +1623,43 @@ export class SingleSymbolLaneExecutor {
       stuckClosePositions: open
         .filter((p) => p.closeFailureCount > 0)
         .map((p) => ({ positionId: p.positionId, symbol: p.symbol, closeFailureCount: p.closeFailureCount, closeFailureSinceIso: p.closeFailureSinceIso })),
-      recent: st.positions.slice(-10),
+      recent: st.positions.slice(-10).map((p) => this.reportPosition(p)),
     };
+  }
+
+  /** 2026-08-05 (critical fix): non-recursive exposure surface -- laneId + OPEN positions only,
+   *  read directly from the store, WITHOUT calling isAllowed() the way getStatus() does. For
+   *  innovation executors, isAllowed is wired (app.ts) to innovationAllowed(laneId) ->
+   *  innovationCampaignAdmissionForLane -> computeInnovationExposure(), which needs to read every
+   *  sibling executor's open exposure. computeInnovationExposure used to call getStatus() for
+   *  that, which recomputes isAllowed(), which calls back into computeInnovationExposure() again
+   *  -- infinite mutual recursion, confirmed reproduced ("Maximum call stack size exceeded"),
+   *  silently breaking LiveExecutionEngine.reconcile()/manageLifecycle()/kill-switch-retry every
+   *  tick by default on testnet. Mirrors getOpenUnexitedLegs()'s identical rationale in
+   *  cross-sectional-executor.ts. Use this, never getStatus(), anywhere that only needs raw open
+   *  exposure and must not risk depending on isAllowed(). */
+  getExposureSnapshot(): { laneId: string; openPositions: SingleSymbolPosition[] } {
+    const open = this.store.getState().positions.filter((p) => p.status === "OPEN");
+    return { laneId: this.laneId, openPositions: open };
+  }
+
+  /**
+   * Post-only entry orders RESTING on the exchange right now, before any fill has been booked as a
+   * position. Signed like a position: LONG positive, SHORT negative.
+   *
+   * 2026-08-17. The cross-sectional lane force-disarmed the whole account for exactly this reason —
+   * a resting maker order that partially fills is REAL exchange exposure that nothing claims, so
+   * reconcile() reads it as an orphan "not opened by engine" and latches the engine off. This lane
+   * has the same shape, and a WIDER window: `CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY_WAIT_MS` is
+   * 120_000, so the order can sit on the book for two minutes filling in pieces.
+   *
+   * In-memory on purpose, and bounded by the wait: it exists to let reconcile TOLERATE a position
+   * it would otherwise call foreign, and a restart resolves that on its own (the order is gone from
+   * this map, and whatever filled is a real orphan that SHOULD be flagged). What a restart does NOT
+   * resolve is the order itself — see the class TODO on persisting it.
+   */
+  pendingMakerEntryQtyBySymbol(): Map<string, number> {
+    return signedMakerEntryQtyBySymbol(this.inflightMakerEntries.values());
   }
 
   /** Same rationale as CrossSectionalExecutor.getClosedSummary(): the engine's realized ledger
@@ -1074,9 +1682,14 @@ export class SingleSymbolLaneExecutor {
     let losses = 0;
     let lastClosedAt: string | null = null;
     for (const p of closed) {
-      const net = p.netPnlUsd ?? 0;
+      const net = this.reportedNetPnl(p);
+      if (net === null) {
+        symbols.add(p.symbol);
+        if (p.closedAt && (lastClosedAt === null || p.closedAt > lastClosedAt)) lastClosedAt = p.closedAt;
+        continue;
+      }
       realized += net;
-      fees += p.feeEstimateUsd ?? 0;
+      fees += this.reportedFee(p) ?? 0;
       if (net > 0) wins += 1;
       else losses += 1;
       symbols.add(p.symbol);
@@ -1086,7 +1699,9 @@ export class SingleSymbolLaneExecutor {
   }
 
   getClosedPositions(): SingleSymbolPosition[] {
-    return this.store.getState().positions.filter((p) => p.status === "CLOSED");
+    return this.store.getState().positions
+      .filter((p) => p.status === "CLOSED")
+      .map((p) => this.reportPosition(p));
   }
 
   /** Operator-triggered manual close (dashboard "Close now" button on the single-symbol-executor
@@ -1133,17 +1748,101 @@ export class SingleSymbolLaneExecutor {
       if (pos.status !== "CLOSED") {
         return { ok: false, reason: "close already in flight for this position — wait for it to settle", netPnlUsd: null };
       }
-      return { ok: true, reason: null, netPnlUsd: pos.netPnlUsd };
+      return { ok: true, reason: null, netPnlUsd: this.reportedNetPnl(pos) };
     } catch (error) {
       return { ok: false, reason: (error as Error).message, netPnlUsd: null };
     }
   }
 
   /** Single-flight tick: settle stop-triggered/policy-decided exits, then consider a new entry. */
+  /**
+   * Resolve every entry order that was sent but never booked — the crash-inside-the-maker-window
+   * case. Runs FIRST, before monitorOpenPositions, so an order that filled while the process was
+   * down becomes a tracked, stopped position before anything else reads the book.
+   *
+   * Deliberately mirrors cross-sectional-executor.ts's reconcilePlannedLeg: an ambiguous answer is
+   * never treated as "no order". Only Binance saying the order does not exist (-2013), or reporting
+   * it terminal with zero fill, drops the handle; anything else keeps it for the next tick.
+   */
+  private async reconcilePendingMakerEntries(): Promise<void> {
+    const pending = this.store.getState().pendingMakerEntries ?? [];
+    if (pending.length === 0 || !this.client.queryOrderByClientId) return;
+    for (const entry of [...pending]) {
+      let order: Awaited<ReturnType<NonNullable<SingleSymbolExecClient["queryOrderByClientId"]>>>;
+      try {
+        order = await this.client.queryOrderByClientId(entry.symbol, entry.clientOrderId);
+      } catch (error) {
+        // -2013 = order does not exist. That is PROOF it never reached the book, so the handle can
+        // go. Any other error leaves it pending rather than guessing.
+        if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -2013) {
+          this.store.clearPendingMakerEntry(entry.clientOrderId);
+        }
+        continue;
+      }
+      const executed = Number.isFinite(order.executedQty) ? order.executedQty : 0;
+      const status = (order.status ?? "").trim().toUpperCase();
+      if (executed > 0) {
+        // It filled while nobody was watching. Adopt it as a real position and stop it THIS tick —
+        // an unstopped live position is the whole reason this path exists.
+        const already = this.store.getState().positions.some((p) => p.entryOrderId === order.orderId);
+        if (!already) {
+          const position: SingleSymbolPosition = {
+            positionId: `ssle-recovered-${entry.clientOrderId}`,
+            sourceObservationId: entry.sourceObservationId,
+            symbol: entry.symbol,
+            direction: entry.direction,
+            qty: executed,
+            entryPrice: order.avgPrice,
+            entryOrderId: order.orderId,
+            entryPriceConfirmed: Number.isFinite(order.avgPrice) && order.avgPrice > 0,
+            stopPrice: entry.stopPrice,
+            targetPrice: entry.targetPrice ?? null,
+            maxHoldMs: entry.maxHoldMs ?? null,
+            stopAlgoOrderId: null,
+            stopFailureCount: 0,
+            stopUnprotectedSinceIso: null,
+            closeFailureCount: 0,
+            closeFailureSinceIso: null,
+            peakFavorableR: 0,
+            openedAt: entry.placedAt,
+            status: "OPEN",
+            closedAt: null,
+            closeReason: null,
+            exitPrice: null,
+            exitOrderId: null,
+            exitPriceConfirmed: null,
+            grossPnlUsd: null,
+            feeEstimateUsd: null,
+            netPnlUsd: null,
+          };
+          this.store.getState().positions.push(position);
+          this.store.save();
+          console.error(
+            `[${this.laneId}] RECOVERED a filled entry nobody was tracking: ${entry.symbol} ${entry.direction} ` +
+              `qty=${executed} order=${order.orderId} — placing its stop now.`,
+          );
+          try {
+            await this.ensureStopOrder(position);
+          } catch (error) {
+            this.lastError = `recovered position stop failed: ${(error as Error).message}`;
+          }
+        }
+        this.store.clearPendingMakerEntry(entry.clientOrderId);
+        continue;
+      }
+      // Terminal with nothing filled = it is over and created no exposure.
+      if (["CANCELED", "CANCELLED", "EXPIRED", "REJECTED"].includes(status)) {
+        this.store.clearPendingMakerEntry(entry.clientOrderId);
+      }
+      // Anything else (NEW / PARTIALLY_FILLED with 0 executed / unknown) stays pending.
+    }
+  }
+
   async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     try {
+      await this.reconcilePendingMakerEntries();
       await this.monitorOpenPositions();
       if (this.isAllowed()) await this.maybeOpenPosition();
       this.lastError = null;
@@ -1414,6 +2113,7 @@ export class SingleSymbolLaneExecutor {
     if (remainingQty > 1e-9) {
       pos.realizedPartialGrossUsd = (pos.realizedPartialGrossUsd ?? 0) + realized;
       pos.realizedPartialFeeUsd = (pos.realizedPartialFeeUsd ?? 0) + fees;
+      if (summed.pageSaturated) pos.actualFillSettlementComplete = false;
       pos.entryFeeRealized = true;
       // RECORDING-ONLY: capture the entry leg's own numbers on the ONE call that can still see them
       // (entryFeeRealized above makes every later call skip the entry rows). `summed.entryLegFolded`
@@ -1456,10 +2156,11 @@ export class SingleSymbolLaneExecutor {
     const netUsd = pos.grossPnlUsd - pos.feeEstimateUsd;
     pos.netPnlUsd = netUsd;
     this.store.save();
+    this.completeFourBrainActualFill(pos, "INITIAL_STOP", summed.pageSaturated);
     // 2026-07-19 real-money audit fix: feed the account-wide consecutive-loss kill-switch counter
     // (see onPositionClosed's doc comment) — every full close, stop-triggered or policy-decided,
     // must reach it, not just the legacy mirror pipeline's own applyRealizedToLedger.
-    this.notifyPositionClosed(pos, "INITIAL_STOP", netUsd);
+    this.notifyPositionClosed(pos, "INITIAL_STOP", this.riskNetPnl(pos) ?? netUsd);
     // CORTEX real-USDT attribution (2026-07-21, report-only, fail-safe — see its doc comment).
     this.recordCortexRealAttribution(pos);
     // Dense R-path close handoff (2026-07-22, report-only, fail-safe — see its doc comment).
@@ -1530,6 +2231,10 @@ export class SingleSymbolLaneExecutor {
       // Dense R-path tick (2026-07-22, report-only — see position-path-recorder.ts). Fail-safe:
       // wrapped inside; absent recorder = no-op, zero behavior change.
       this.recordPositionPathTick(pos, mark, new Date(this.nowIso()).getTime());
+      const observedR = favorableR(pos.direction, pos.entryPrice, pos.stopPrice, mark);
+      if (Number.isFinite(observedR)) {
+        pos.peakAdverseR = Math.max(0, Number.isFinite(pos.peakAdverseR) ? pos.peakAdverseR! : 0, -observedR);
+      }
 
       const msHeld = new Date(this.nowIso()).getTime() - new Date(pos.openedAt).getTime();
       const exitContext = {
@@ -1723,9 +2428,10 @@ export class SingleSymbolLaneExecutor {
       const netUsd = gross - fees;
       pos.netPnlUsd = netUsd;
       this.store.save();
+      this.completeFourBrainActualFill(pos, reason, settled?.pageSaturated ?? true);
       // 2026-07-19 real-money audit fix: see settleIfStopTriggered's identical call — this covers
       // every OTHER close path (policy exit, manual close, orderly kill-switch wind-down).
-      this.notifyPositionClosed(pos, reason, netUsd);
+      this.notifyPositionClosed(pos, reason, this.riskNetPnl(pos) ?? netUsd);
       // CORTEX real-USDT attribution (2026-07-21, report-only, fail-safe — see its doc comment).
       this.recordCortexRealAttribution(pos);
       // Dense R-path close handoff (2026-07-22, report-only, fail-safe — see its doc comment).
@@ -1782,9 +2488,27 @@ export class SingleSymbolLaneExecutor {
         break;
       }
 
-      if (exchangePositions.some((p) => p.symbol === signal.symbol && Math.abs(p.positionAmt) > 1e-9)) {
-        this.lastEntrySkipReason = `${signal.symbol}: exchange position already exists; refusing one-way-mode netting`;
+      if (
+        this.preventSameSymbolPyramiding &&
+        st.positions.some((p) => p.status === "OPEN" && p.symbol.toUpperCase() === signal.symbol.toUpperCase())
+      ) {
+        this.lastEntrySkipReason =
+          `${signal.symbol}: same-symbol directional position is already open; no pyramiding within this lane`;
         continue;
+      }
+
+      const existingPosition = exchangePositions.find((p) => p.symbol === signal.symbol && Math.abs(p.positionAmt) > 1e-9);
+      if (existingPosition) {
+        const sameDirection = this.direction === "LONG" ? existingPosition.positionAmt > 0 : existingPosition.positionAmt < 0;
+        if (!sameDirection || !this.allowSameDirectionExistingPosition) {
+          this.lastEntrySkipReason = `${signal.symbol}: exchange position already exists; refusing one-way-mode netting`;
+          continue;
+        }
+        const admission = await this.allowSameDirectionExistingPosition(signal.symbol, this.direction);
+        if (!admission.allowed) {
+          this.lastEntrySkipReason = admission.reason ?? `${signal.symbol}: existing same-direction position is not eligible for directional add-on`;
+          continue;
+        }
       }
 
       // The BTC/ETH/SOL timeline is deliberately evaluated before consuming the observation id.
@@ -1800,6 +2524,27 @@ export class SingleSymbolLaneExecutor {
           }
         } catch (error) {
           this.lastEntrySkipReason = `${signal.symbol}: timeline entry gate unavailable (${(error as Error).message})`;
+          continue;
+        }
+      }
+
+      // The bridge is intentionally downstream of incumbent directional/timeline guards and
+      // upstream of order placement. It only ever vetoes a new exact candidate on mature NEGATIVE
+      // actual-fill evidence; positive reinforcement remains a shadow-ranking signal in this
+      // rollout and cannot manufacture an entry.
+      if (this.fourBrainEntryGate) {
+        const bridge = this.fourBrainEntryGate({
+          laneId: this.laneId,
+          symbol: signal.symbol,
+          side: this.direction,
+          signalId: signal.observationId,
+          nowMs,
+          entryPrice: signal.entryPrice,
+          stopPrice: signal.stopPrice,
+          openedAtMs: nowMs,
+        });
+        if (!bridge.allowed) {
+          this.lastEntrySkipReason = bridge.reason ?? `${signal.symbol}: Four-Brain pilot veto`;
           continue;
         }
       }
@@ -1896,11 +2641,44 @@ export class SingleSymbolLaneExecutor {
         this.lastEntrySkipReason = `${signal.symbol}: another executor is admitting this netted symbol`;
         continue;
       }
+      // Hoisted from its previous call site further below (pure reorder — this formula depends only
+      // on this.laneId/signal.symbol/signal.openedAtMs, all already available here). Needed now so
+      // the exposure reservation below can carry the EXACT clientOrderId this entry will submit to
+      // placeOrder — account-exposure-coordinator.ts's reconciliation join key.
+      const positionId = `ssl-${this.laneId.slice(0, 4).toLowerCase()}-${signal.symbol.slice(0, 3).toLowerCase()}-${signal.openedAtMs.toString(36)}`;
+      const entryClientOrderId = `ssle-${positionId.slice(-18)}-e`;
+      // Account-exposure reservation (account-exposure-coordinator.ts). Synchronous, back-to-back
+      // with tryClaimEntrySymbol above — no `await` between the two, so together they form one
+      // atomic "claim symbol + reserve capacity" compound step; no concurrent reserve() call from a
+      // sibling executor can ever observe the state in between. Sized from effectiveLegUsd(), the
+      // SAME pre-fill notional estimate the per-symbol cap check above already uses.
+      const reservation = this.reserveExposureFn({
+        executorId: this.laneId,
+        symbol: signal.symbol,
+        direction: this.direction,
+        requestedNotionalUsd: this.effectiveLegUsd(),
+        clientOrderId: entryClientOrderId,
+        campaignCap: this.campaignCapFn(),
+      });
+      if (!reservation.ok) {
+        this.releaseEntrySymbol(signal.symbol);
+        this.lastEntrySkipReason = reservation.reason ?? `${signal.symbol}: exposure reservation rejected`;
+        continue;
+      }
+      const reservationId = reservation.reservationId;
       try {
         const freshPositions = await this.client.getPositions(signal.symbol);
-        if (freshPositions.some((p) => p.symbol === signal.symbol && Math.abs(p.positionAmt) > 1e-9)) {
-          this.lastEntrySkipReason = `${signal.symbol}: fresh exchange position already exists; refusing one-way-mode netting`;
-          continue;
+        const freshExistingPosition = freshPositions.find((p) => p.symbol === signal.symbol && Math.abs(p.positionAmt) > 1e-9);
+        if (freshExistingPosition) {
+          const sameDirection = this.direction === "LONG" ? freshExistingPosition.positionAmt > 0 : freshExistingPosition.positionAmt < 0;
+          const admission = sameDirection && this.allowSameDirectionExistingPosition
+            ? await this.allowSameDirectionExistingPosition(signal.symbol, this.direction)
+            : { allowed: false };
+          if (!admission.allowed) {
+            this.lastEntrySkipReason = admission.reason ?? `${signal.symbol}: fresh exchange position already exists; refusing one-way-mode netting`;
+            if (reservationId) this.releaseExposureReservationFn(reservationId, "FRESH_POSITION_EXISTS");
+            continue;
+          }
         }
 
       // Mark attempted BEFORE placing orders: a failed/rejected entry must not retry forever on
@@ -1920,10 +2698,14 @@ export class SingleSymbolLaneExecutor {
         // 2026-07-19 real-money audit fix: see the notional-cap skip's identical comment above —
         // this was another silent structural rejection.
         this.lastEntrySkipReason = `${signal.symbol}: invalid leg size (legUsd=${legUsd})`;
+        // No order will ever be placed for this reservation — release now rather than let it sit
+        // RESERVED until the periodic staleness sweep eventually reconciles it as never-reached.
+        if (reservationId) this.releaseExposureReservationFn(reservationId, "ENTRY_REJECTED:invalid_leg_size");
         continue;
       }
       if (!(signal.entryPrice > 0)) {
         this.lastEntrySkipReason = `${signal.symbol}: entry price unavailable`;
+        if (reservationId) this.releaseExposureReservationFn(reservationId, "ENTRY_REJECTED:no_entry_price");
         continue;
       }
 
@@ -1939,6 +2721,7 @@ export class SingleSymbolLaneExecutor {
         if (!f) {
           // 2026-07-19 real-money audit fix: see the notional-cap skip's comment above.
           this.lastEntrySkipReason = `${signal.symbol}: exchange filters unavailable`;
+          if (reservationId) this.releaseExposureReservationFn(reservationId, "ENTRY_REJECTED:no_exchange_filters");
           continue;
         }
         const rawQty = legUsd / signal.entryPrice;
@@ -1956,18 +2739,20 @@ export class SingleSymbolLaneExecutor {
         if (!(qty >= f.minQty)) {
           // 2026-07-19 real-money audit fix: see the notional-cap skip's comment above.
           this.lastEntrySkipReason = `${signal.symbol}: quantity ${qty} below exchange minQty ${f.minQty}`;
+          if (reservationId) this.releaseExposureReservationFn(reservationId, "ENTRY_REJECTED:below_min_qty");
           continue;
         }
         const notional = qty * signal.entryPrice;
         if (!(notional >= f.minNotional)) {
           // Binance rejects an order that clears minQty but misses MIN_NOTIONAL.
           this.lastEntrySkipReason = `${signal.symbol}: notional ${notional.toFixed(2)} below exchange minNotional ${f.minNotional}`;
+          if (reservationId) this.releaseExposureReservationFn(reservationId, "ENTRY_REJECTED:below_min_notional");
           continue;
         }
 
-        // Symbol fragment keeps this unique even when 2+ candidates share the identical openedAtMs
-        // (the exact scenario that exposed the dedup bug above).
-        const positionId = `ssl-${this.laneId.slice(0, 4).toLowerCase()}-${signal.symbol.slice(0, 3).toLowerCase()}-${signal.openedAtMs.toString(36)}`;
+        // positionId (and its unique-even-when-2+-candidates-share-openedAtMs symbol fragment) is
+        // computed earlier now — see the tryClaimEntrySymbol/reserveExposureFn block above; hoisted
+        // there so the exposure reservation could carry this entry's exact clientOrderId.
         // 2026-07-12 fix: leverage is a shared, symbol-scoped Binance account setting, not
         // per-strategy — this call used to run unconditionally on every entry with zero awareness
         // that a SIBLING executor (a different SingleSymbolLaneExecutor instance, or any other
@@ -1987,6 +2772,26 @@ export class SingleSymbolLaneExecutor {
         } catch {
           // best-effort (already set / position exists)
         }
+        // 2026-08-18: persist the handle BEFORE the order goes out. Placed ABOVE stampSubmitRef on
+        // purpose: addPendingMakerEntry does a SYNCHRONOUS store write, and the comment below is
+        // explicit that nothing may sit between that stamp and placeOrder — a disk write there
+        // would inflate ageAtSubmitMs and entryTradeWindowFromMs, the two numbers those stamps
+        // exist to keep honest. Being merely BEFORE placeOrder is all this handle requires. A post-only entry rests on the
+        // book for up to 120s; until this existed, a restart inside that window lost the only
+        // reference to a REAL resting order, and a later fill became a live position with no stop
+        // and no tracking. entryClientOrderId is deterministic and already computed above, so it
+        // stays searchable via queryOrderByClientId even if the response never arrives.
+        this.store.addPendingMakerEntry({
+          clientOrderId: entryClientOrderId,
+          symbol: signal.symbol,
+          direction: this.direction,
+          qty,
+          placedAt: this.nowIso(),
+          sourceObservationId: signal.observationId,
+          stopPrice: signal.stopPrice,
+          targetPrice: signal.targetPrice ?? null,
+          maxHoldMs: signal.maxHoldMs ?? null,
+        });
         // RECORDING-ONLY (2026-07-27). Freeze the reference's age at the LAST instant before the
         // real order goes out. Deliberately placed here and not in the position literal below:
         // that literal is built AFTER placeOrder AND after resolveFillPrice (which can burn
@@ -2003,14 +2808,33 @@ export class SingleSymbolLaneExecutor {
         // See entryTradeWindowFromMs's doc comment. Cost on the order path: ONE clock read — same
         // Date arithmetic as the line above, no await, no I/O, nothing between it and placeOrder.
         const entryTradeWindowFromMs = this.nowMs() - FEE_WINDOW_SLACK_MS;
-        const order = await this.client.placeOrder({
-          symbol: signal.symbol,
-          side: this.direction === "LONG" ? "BUY" : "SELL",
-          type: "MARKET",
-          quantity: qty,
-          newClientOrderId: `ssle-${positionId.slice(-18)}-e`,
-        });
+        // Maker-first only when THIS lane opted in; otherwise the unchanged MARKET path. submitRef
+        // already holds the submit-time book, so the post-only price comes from the SAME quote the
+        // execution record is audited against rather than a second, later read.
+        const order = this.makerEntryFn()
+          ? await this.placeEntryMakerFirst(
+              signal.symbol,
+              this.direction === "LONG" ? "BUY" : "SELL",
+              qty,
+              entryClientOrderId,
+              submitRef?.bid ?? null,
+              submitRef?.ask ?? null,
+            )
+          : await this.client.placeOrder({
+              symbol: signal.symbol,
+              side: this.direction === "LONG" ? "BUY" : "SELL",
+              type: "MARKET",
+              quantity: qty,
+              newClientOrderId: entryClientOrderId,
+            });
         const resolvedEntry = await this.resolveFillPrice(signal.symbol, order.orderId, order.avgPrice, signal.entryPrice);
+        // Commit the reservation from the ACTUAL fill — never the requested qty (order.executedQty
+        // can legitimately fall short of `qty` on a genuine partial MARKET fill; falls back to the
+        // requested qty only when the exchange never reports a usable executedQty, same convention
+        // as cross-sectional-executor.ts's own filledQty). Idempotent no-op when reservationId is
+        // null (reserveExposure not wired — the safe default).
+        const committedQty = Number.isFinite(order.executedQty) && order.executedQty > 0 ? order.executedQty : qty;
+        if (reservationId) this.commitExposureReservationFn(reservationId, { qty: committedQty, avgPrice: resolvedEntry.price });
         const position: SingleSymbolPosition = {
           positionId,
           sourceObservationId: signal.observationId,
@@ -2029,6 +2853,8 @@ export class SingleSymbolLaneExecutor {
           closeFailureCount: 0,
           closeFailureSinceIso: null,
           peakFavorableR: 0,
+          peakAdverseR: 0,
+          actualFillSettlementComplete: true,
           openedAt: this.nowIso(),
           entryTradeWindowFromMs,
           status: "OPEN",
@@ -2043,9 +2869,15 @@ export class SingleSymbolLaneExecutor {
           cortexAppliedWeightPct,
           cortexRawStaticWeightPct,
           submitRef,
+          ...("liquidity" in order ? { entryLiquidity: order.liquidity } : {}),
+          ...(this.exitGeometrySnapshotFn ? { exitGeometryAtOpen: this.exitGeometrySnapshotFn() } : {}),
         };
         st.positions.push(position);
         this.store.save();
+        // Outcome is booked as a real position — the handle is no longer needed.
+        this.store.clearPendingMakerEntry(entryClientOrderId);
+        this.bindFourBrainActualFill(position);
+        this.seedPositionPathAtEntry(position);
         // this comment used to claim the stop is placed on the VERY NEXT tick, contradicting this
         // file's own header comment ("places a REAL exchange-side STOP_MARKET algo order
         // immediately after entry") — tick() runs monitorOpenPositions() (which calls
@@ -2060,6 +2892,27 @@ export class SingleSymbolLaneExecutor {
         st.attemptedObservationIds = Array.from(attempted);
         this.lastEntrySkipReason = `${signal.symbol}: entry failed (${(error as Error).message}) — will retry next tick`;
         this.store.save();
+        // Idempotent no-op if already COMMITTED (e.g. this throw came from ensureStopOrder AFTER a
+        // real fill, not from placeOrder itself — commitExposureReservationFn above already ran for
+        // that case; see releaseReservation's idempotent-no-op contract).
+        //
+        // Only release on an UNAMBIGUOUS in-band rejection — Binance received the request and
+        // explicitly answered no, so no order was created. Every OTHER failure (timeout/429/network/
+        // http_error/invalid_response/clock_skew, or a non-Binance error) means we do NOT know
+        // whether the order actually reached the exchange; releasing capacity here would recreate
+        // the exact race this coordinator exists to close. Left RESERVED, it is picked up by the
+        // periodic staleness sweep, which resolves it against Binance directly via
+        // queryOrderByClientId (account-exposure-coordinator.ts's reconcileStaleReservations).
+        // Mirrors cross-sectional-executor.ts's basket-abort catch — same reasoning, same guard.
+        if (reservationId && error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error") {
+          this.releaseExposureReservationFn(reservationId, `ENTRY_FAILED:${(error as Error).message}`);
+        }
+        // Same split as the reservation above: only an UNAMBIGUOUS in-band rejection proves no order
+        // exists, so only then is the handle safe to drop. Every ambiguous failure keeps it, and the
+        // next tick's reconcilePendingMakerEntries resolves it against the exchange.
+        if (error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error") {
+          this.store.clearPendingMakerEntry(entryClientOrderId);
+        }
       }
       } finally {
         this.releaseEntrySymbol(signal.symbol);

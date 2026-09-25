@@ -1,0 +1,356 @@
+--- /root/kronos-testnet-releases/testnet-astra-final-gate-v1-20260909-r1/daily-trading-cockpit-v2/apps/api/src/lib/binance-futures-private.ts	2026-09-06 19:50:17.000000000 +0200
++++ /root/kronos-testnet-releases/testnet-dashboard-hang-fix-20260918-r1/daily-trading-cockpit-v2/apps/api/src/lib/binance-futures-private.ts	2026-09-18 16:14:11.613268236 +0200
+@@ -171,7 +171,28 @@
+  * retries (they can be a short-lived per-endpoint throttle), but surface 418 to the caller so
+  * the dashboard-level cooldown can serve its last verified snapshot instead.
+  */
++/**
++ * A GET that has not settled long after every queue bound, pacing wait and the fetch abort should
++ * have fired. 2026-09-18: one account read issued 2026-09-15 06:28Z was still pending three days
++ * later; the dashboard coalescer and the engine tick both awaited it, so /api/live/account hung
++ * forever and the engine disarmed itself as "tick stalled". Every stage in the path is nominally
++ * bounded, so a still-pending read means one bound failed — abandon it loudly instead of letting
++ * callers inherit an unbounded wait. Reads only: a mutation's outcome must never be guessed.
++ */
++export const GET_HARD_DEADLINE_MS = 10 * 60_000;
++/** Report (once) which stage a read is stuck in, well before the hard deadline abandons it. */
++export const GET_STALL_REPORT_MS = 2 * 60_000;
++
++export class BinanceReadDeadlineError extends BinanceFuturesPrivateError {
++  constructor(message: string) {
++    super("timeout", message);
++    this.name = "BinanceReadDeadlineError";
++  }
++}
++
+ function shouldRetryGet(error: unknown): boolean {
++  // Retrying an abandoned read would only multiply the wait it was abandoned for.
++  if (error instanceof BinanceReadDeadlineError) return false;
+   if (!(error instanceof BinanceFuturesPrivateError)) return true;
+   return RETRYABLE_GET_FAILURES.has(error.failureType) && error.httpStatus !== 418;
+ }
+@@ -800,8 +821,11 @@
+     provenance: BinanceTransportRequestProvenance,
+     onDispatch?: () => void,
+   ): Promise<unknown> {
++    // Where this request currently waits. Only read by the stall report / hard deadline below.
++    const stage = { name: "host read lane" };
+     const dispatch = async (): Promise<unknown> => {
+       if (method === "GET" && this.testnetReadCoordinator) {
++        stage.name = "dispatch budget";
+         const preview = new URL(typeof url === "function" ? url() : url);
+         await this.testnetReadCoordinator.acquireDispatchBudget({
+           method, endpoint: provenance.endpoint, requestCaller: provenance.requestCaller,
+@@ -810,6 +834,7 @@
+         this.assertRateLimitCircuitClosed();
+       }
+       // Mint the signed URL AFTER the final budget wait, preserving recvWindow.
++      stage.name = "network request";
+       return this.dispatchRawRequest(
+       method,
+       typeof url === "function" ? url() : url,
+@@ -823,10 +848,17 @@
+     // Never queue a risk-reducing POST/DELETE behind a slow read: it still respects an already-open
+     // 418 circuit, but an operator/engine close keeps its normal immediate dispatch priority.
+     if (method === "GET") {
+-      if (this.testnetReadCoordinator) {
+-        return this.withHostTestnetReadSlot(provenance, () => this.withTransportSlot(dispatch));
+-      }
+-      return this.withTransportSlot(dispatch);
++      const inTransportSlot = () => {
++        stage.name = "transport queue";
++        return this.withTransportSlot(dispatch, stage);
++      };
++      return this.withReadDeadline(
++        this.testnetReadCoordinator
++          ? this.withHostTestnetReadSlot(provenance, inTransportSlot, stage)
++          : inTransportSlot(),
++        provenance,
++        stage,
++      );
+     }
+     this.assertRateLimitCircuitClosed();
+     return dispatch();
+@@ -838,7 +870,7 @@
+    * learning that Binance has banned this IP. POST/DELETE intentionally bypass this queue so an
+    * exit never waits behind a slow observability read.
+    */
+-  private async withTransportSlot<T>(operation: () => Promise<T>): Promise<T> {
++  private async withTransportSlot<T>(operation: () => Promise<T>, stage?: { name: string }): Promise<T> {
+     const previous = this.transportTail;
+     let release = (): void => {};
+     this.transportTail = new Promise<void>((resolve) => {
+@@ -848,6 +880,7 @@
+       + (this.testnetReadCoordinator ? TESTNET_DISPATCH_BUDGET_WAIT_MS : 0), "transport queue");
+     try {
+       this.assertRateLimitCircuitClosed();
++      if (stage) stage.name = "local read pacing";
+       await this.paceQueuedRead();
+       // A priority exit may have learnt of an exchange cooldown while this queued read waited.
+       this.assertRateLimitCircuitClosed();
+@@ -867,6 +900,7 @@
+   private async withHostTestnetReadSlot<T>(
+     provenance: BinanceTransportRequestProvenance,
+     operation: () => Promise<T>,
++    stage?: { name: string },
+   ): Promise<T> {
+     const requestKind = provenance.requestKind;
+     const coordinator = this.testnetReadCoordinator;
+@@ -896,6 +930,7 @@
+     );
+     try {
+       this.assertRateLimitCircuitClosed();
++      if (stage) stage.name = "host dispatch reservation";
+       try {
+         await coordinator.reserveReadDispatch(
+           requestKind,
+@@ -958,6 +993,37 @@
+     }
+   }
+ 
++  /**
++   * Bound a queued GET end to end. The abandoned operation keeps running (it is a read, so
++   * nothing is left half-done); the caller simply stops inheriting its wait. The stall report
++   * names the stage so the next occurrence identifies which bound failed.
++   */
++  private withReadDeadline<T>(
++    run: Promise<T>,
++    provenance: BinanceTransportRequestProvenance,
++    stage: { name: string },
++  ): Promise<T> {
++    const label = `${provenance.requestKind} GET ${provenance.endpoint} (${provenance.requestCaller ?? "unattributed"})`;
++    return new Promise<T>((resolve, reject) => {
++      const report = setTimeout(() => {
++        console.warn(
++          `[binance-transport] ${label} still pending after ${GET_STALL_REPORT_MS}ms at stage "${stage.name}".`,
++        );
++      }, GET_STALL_REPORT_MS);
++      const deadline = setTimeout(() => {
++        const message = `${label} abandoned after ${GET_HARD_DEADLINE_MS}ms stuck at stage "${stage.name}"`;
++        console.error(`[binance-transport] ${message} — a bound in the read path failed to fire.`);
++        reject(new BinanceReadDeadlineError(message));
++      }, GET_HARD_DEADLINE_MS);
++      report.unref?.();
++      deadline.unref?.();
++      run.then(resolve, reject).finally(() => {
++        clearTimeout(report);
++        clearTimeout(deadline);
++      });
++    });
++  }
++
+   /** Pace queued GETs only; mutation paths retain immediate risk-reducing priority. */
+   private async paceQueuedRead(): Promise<void> {
+     const gapMs = this.readDispatchMinGapMs;
+--- /root/kronos-testnet-releases/testnet-astra-final-gate-v1-20260909-r1/daily-trading-cockpit-v2/apps/api/src/routes/live.ts	2026-09-06 15:55:46.000000000 +0200
++++ /root/kronos-testnet-releases/testnet-dashboard-hang-fix-20260918-r1/daily-trading-cockpit-v2/apps/api/src/routes/live.ts	2026-09-18 16:18:58.173470018 +0200
+@@ -266,6 +266,10 @@
+ // the dashboard's 15-second polling cadence from becoming its own exchange-rate-limit source.
+ const DASHBOARD_ACCOUNT_CACHE_TTL_MS = 30_000;
+ const DASHBOARD_ACCOUNT_RATE_LIMIT_BACKOFF_MS = 60_000;
++/** Longer than a normal queued refresh, shorter than a browser/proxy giving up on the route. */
++const DASHBOARD_ACCOUNT_SNAPSHOT_TIMEOUT_MS = 25_000;
++/** Past this, an outstanding refresh is presumed wedged and a fresh one is started beside it. */
++const DASHBOARD_ACCOUNT_OUTSTANDING_MAX_MS = 25 * 60_000;
+ 
+ /**
+  * Account data is observability-only here.  Never feed this cache into entry, exit, reconciliation,
+@@ -324,15 +328,18 @@
+     nowMs?: () => number;
+     cacheTtlMs?: number;
+     rateLimitBackoffMs?: number;
++    snapshotTimeoutMs?: number;
+   } = {},
+ ): () => Promise<DashboardAccountSnapshot> {
+   const nowMs = options.nowMs ?? (() => Date.now());
++  const snapshotTimeoutMs = options.snapshotTimeoutMs ?? DASHBOARD_ACCOUNT_SNAPSHOT_TIMEOUT_MS;
+   const cacheTtlMs = options.cacheTtlMs ?? DASHBOARD_ACCOUNT_CACHE_TTL_MS;
+   const rateLimitBackoffMs = options.rateLimitBackoffMs ?? DASHBOARD_ACCOUNT_RATE_LIMIT_BACKOFF_MS;
+   let cache: { snapshot: LiveAccountSnapshot; fetchedAtMs: number } | null = null;
+   let retryAfterMs = 0;
+   let lastFailure: string | null = null;
+   let inFlight: Promise<DashboardAccountSnapshot> | null = null;
++  let outstanding: { promise: Promise<LiveAccountSnapshot>; startedAtMs: number } | null = null;
+ 
+   const cached = (
+     source: DashboardAccountSnapshot["source"],
+@@ -367,7 +374,35 @@
+ 
+     inFlight = (async (): Promise<DashboardAccountSnapshot> => {
+       try {
+-        const snapshot = await engine.getAccountSnapshot();
++        // Bounded: 2026-09-18 one refresh stayed pending for three days, and because every
++        // request coalesces onto `inFlight`, the panel sat on "Loading…" the whole time. The
++        // route now waits at most `snapshotTimeoutMs`. A slow refresh keeps running and is
++        // re-joined by the next request instead of stacking a second exchange read on top of
++        // it; its late result still fills the cache.
++        let refresh = outstanding;
++        if (!refresh || nowMs() - refresh.startedAtMs > DASHBOARD_ACCOUNT_OUTSTANDING_MAX_MS) {
++          const started = { promise: engine.getAccountSnapshot(), startedAtMs: nowMs() };
++          outstanding = started;
++          started.promise.then((late) => {
++            if (!cache || cache.fetchedAtMs < started.startedAtMs) {
++              cache = { snapshot: late, fetchedAtMs: nowMs() };
++              lastFailure = null;
++            }
++          }, () => { /* surfaced by whichever request is still awaiting it */ })
++            .finally(() => { if (outstanding === started) outstanding = null; });
++          refresh = started;
++        }
++        let timer: ReturnType<typeof setTimeout> | undefined;
++        const snapshot = await Promise.race([
++          refresh.promise,
++          new Promise<never>((_resolve, reject) => {
++            timer = setTimeout(
++              () => reject(new Error(`account snapshot did not complete within ${snapshotTimeoutMs}ms`)),
++              snapshotTimeoutMs,
++            );
++            timer.unref?.();
++          }),
++        ]).finally(() => clearTimeout(timer));
+         cache = { snapshot, fetchedAtMs: nowMs() };
+         retryAfterMs = 0;
+         lastFailure = null;
+@@ -1513,6 +1548,7 @@
+       nowMs?: () => number;
+       cacheTtlMs?: number;
+       rateLimitBackoffMs?: number;
++      snapshotTimeoutMs?: number;
+     };
+     /** Test seam only. Production uses durable data-dir backed defaults. */
+     copySecurity?: {
+--- /root/kronos-testnet-releases/testnet-astra-final-gate-v1-20260909-r1/daily-trading-cockpit-v2/apps/api/test/binance-futures-private.test.ts	2026-09-06 19:52:15.000000000 +0200
++++ /root/kronos-testnet-releases/testnet-dashboard-hang-fix-20260918-r1/daily-trading-cockpit-v2/apps/api/test/binance-futures-private.test.ts	2026-09-18 16:16:47.183167526 +0200
+@@ -6,6 +6,9 @@
+ import {
+   BinanceFuturesPrivateClient,
+   BinanceFuturesPrivateError,
++  BinanceReadDeadlineError,
++  GET_HARD_DEADLINE_MS,
++  GET_STALL_REPORT_MS,
+   REQUEST_TIMEOUT_MS,
+   TRANSPORT_SLOT_MAX_WAIT_MS,
+   buildQueryString,
+@@ -1287,3 +1290,50 @@
+     await expect(client.getBalances()).rejects.toThrow(/simulated network failure/);
+   });
+ });
++
++describe("binance-futures-private read deadline", () => {
++  it("abandons a GET stuck past the hard deadline instead of pinning its caller forever", async () => {
++    // 2026-09-18: one account read issued 2026-09-15 was still pending three days later; the
++    // engine tick and the dashboard both awaited it. Whatever bound failed, the caller must not.
++    const directory = mkdtempSync(join(tmpdir(), "kronos-usdm-read-deadline-"));
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    const error = vi.spyOn(console, "error").mockImplementation(() => {});
++    try {
++      vi.useFakeTimers();
++      vi.setSystemTime(1_700_000_000_000);
++      let fetches = 0;
++      const fetchImpl = vi.fn(() => {
++        fetches += 1;
++        return new Promise<Response>(() => {}); // never settles, ignores the abort
++      }) as unknown as typeof fetch;
++      const client = new BinanceFuturesPrivateClient({
++        apiKey: "k",
++        apiSecret: "s",
++        env: "testnet",
++        fetchImpl,
++        nowMs: () => Date.now(),
++        testReadDispatchGapMs: 0,
++        testnetCoordinatorDir: directory,
++        testnetGlobalReadGapMs: 1_000,
++      });
++      const read = client.getKlines("SOLUSDT", "1m", { limit: 2 });
++      const outcome = read.then(() => "RESOLVED", (e: unknown) => e);
++
++      await vi.advanceTimersByTimeAsync(GET_STALL_REPORT_MS + 1);
++      expect(warn.mock.calls.flat().join("\n")).toMatch(/still pending .* at stage "network request"/);
++
++      await vi.advanceTimersByTimeAsync(GET_HARD_DEADLINE_MS);
++      const settled = await outcome;
++      expect(settled).toBeInstanceOf(BinanceReadDeadlineError);
++      expect((settled as BinanceReadDeadlineError).failureType).toBe("timeout");
++      expect((settled as Error).message).toMatch(/abandoned after 600000ms stuck at stage "network request"/);
++      // Not retried: a retry would only multiply the wait it was abandoned for.
++      expect(fetches).toBe(1);
++    } finally {
++      vi.useRealTimers();
++      warn.mockRestore();
++      error.mockRestore();
++      rmSync(directory, { recursive: true, force: true });
++    }
++  });
++});
+--- /root/kronos-testnet-releases/testnet-astra-final-gate-v1-20260909-r1/daily-trading-cockpit-v2/apps/api/test/live-account-route-wiring.test.ts	2026-09-01 21:20:20.000000000 +0200
++++ /root/kronos-testnet-releases/testnet-dashboard-hang-fix-20260918-r1/daily-trading-cockpit-v2/apps/api/test/live-account-route-wiring.test.ts	2026-09-18 16:16:47.179167579 +0200
+@@ -152,7 +152,7 @@
+ 
+ async function buildSnapshotApp(
+   engine: LiveExecutionEngine,
+-  dashboardAccountSnapshot?: { nowMs?: () => number; cacheTtlMs?: number; rateLimitBackoffMs?: number },
++  dashboardAccountSnapshot?: { nowMs?: () => number; cacheTtlMs?: number; rateLimitBackoffMs?: number; snapshotTimeoutMs?: number },
+ ): Promise<FastifyInstance> {
+   app = Fastify();
+   await registerLiveRoutes(app, engine, { dashboardAccountSnapshot });
+@@ -659,3 +659,60 @@
+     });
+   });
+ });
++
++describe("registerLiveRoutes — dashboard account snapshot never hangs the route", () => {
++  it("answers within the bound when the account read never settles, then serves its late result", async () => {
++    // 2026-09-18: one refresh stayed pending for three days and every /api/live/account request
++    // coalesced onto it, so the Exchange P&L panel sat on "Loading…" indefinitely.
++    let calls = 0;
++    let settle!: (value: ReturnType<typeof fakeAccountSnapshot>) => void;
++    const engine = {
++      getAccountSnapshot: () => {
++        calls += 1;
++        return new Promise((resolve) => { settle = resolve; });
++      },
++      getLanePerformanceSeries: () => fakeLaneSeries(),
++      laneSelectionWeightPctForLane: () => 0,
++    } as unknown as LiveExecutionEngine;
++    const a = await buildSnapshotApp(engine, { snapshotTimeoutMs: 30 });
++
++    const first = await a.inject({ method: "GET", url: "/api/live/account" });
++    expect(first.statusCode).toBe(502);
++    expect(first.json().reason).toMatch(/did not complete within 30ms/);
++
++    // A second request re-joins the outstanding read instead of stacking another exchange read.
++    const second = await a.inject({ method: "GET", url: "/api/live/account" });
++    expect(second.statusCode).toBe(502);
++    expect(calls).toBe(1);
++
++    settle(fakeAccountSnapshot());
++    await new Promise((resolve) => setTimeout(resolve, 0));
++    const third = await a.inject({ method: "GET", url: "/api/live/account" });
++    expect(third.statusCode).toBe(200);
++    expect(calls).toBe(1);
++  });
++
++  it("falls back to the explicitly stale last-good snapshot when a refresh overruns the bound", async () => {
++    let nowMs = 1_000;
++    let calls = 0;
++    const engine = {
++      getAccountSnapshot: () => {
++        calls += 1;
++        return calls === 1 ? Promise.resolve(fakeAccountSnapshot()) : new Promise(() => {});
++      },
++      getLanePerformanceSeries: () => fakeLaneSeries(),
++      laneSelectionWeightPctForLane: () => 0,
++    } as unknown as LiveExecutionEngine;
++    const a = await buildSnapshotApp(engine, { nowMs: () => nowMs, cacheTtlMs: 10, snapshotTimeoutMs: 30 });
++
++    expect((await a.inject({ method: "GET", url: "/api/live/account" })).statusCode).toBe(200);
++    nowMs += 11;
++    const stale = await a.inject({ method: "GET", url: "/api/live/account" });
++    expect(stale.statusCode).toBe(200);
++    expect(stale.json().accountSnapshot).toMatchObject({
++      source: "LAST_GOOD_USD_M_PRIVATE_CACHE",
++      stale: true,
++      lastFailure: "account snapshot did not complete within 30ms",
++    });
++  });
++});

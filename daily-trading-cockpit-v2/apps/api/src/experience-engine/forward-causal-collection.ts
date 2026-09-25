@@ -10,8 +10,9 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { resolveFourBrainInstanceId } from "../lib/four-brain-live-gather-bindings.js";
+import { resolveFourBrainInstanceId, resolveFourBrainLogicalRole, type FourBrainLogicalRole } from "../lib/four-brain-live-gather-bindings.js";
 import type { CortexDecisionSnapshot } from "../lib/cortex-decision-snapshot.js";
+import { CORTEX_FEATURE_DIM, CORTEX_FEATURE_SCHEMA_VERSION } from "../lib/cortex-brain.js";
 import {
   CURRENT_DECISION_POLICY_VERSION,
   CURRENT_EVIDENCE_ERA,
@@ -28,7 +29,16 @@ export interface CausalIdentity {
   decisionId: string;
   opportunityId: string;
   outcomeId: string | null;
+  /** ALWAYS the honest physical serving port (resolveFourBrainInstanceId) — never relabeled to claim
+   *  to be a different instance. A staging mirror physically on 3111/3112 persists "3111"/"3112" here,
+   *  never "3101"/"3102", even when logicalRole below authorizes it to act as RESEARCH/TESTNET. See
+   *  FourBrainLogicalRole's own doc comment for why this distinction is the identity-spoofing fix. */
   instanceId: string;
+  /** The role this instance was authorized under at mint time — RESEARCH/TESTNET, or `null` when
+   *  instanceId itself is directly in the allowlist (production 3101/3102, no explicit grant needed).
+   *  Persisted so provenance always shows BOTH who physically ran this AND what it was authorized to
+   *  validate, rather than collapsing the two into one (spoofable) field. */
+  logicalRole: FourBrainLogicalRole | null;
   laneId: string;
   symbolOrBasketId: string;
   direction: CausalDirection;
@@ -38,6 +48,8 @@ export interface CausalIdentity {
   /** Present only when an exact CORTEX decision snapshot was handed to admission. */
   cortexDecisionId: string | null;
   allocationSnapshotId: string | null;
+  /** CORTEX roster identity; laneId remains exact paper ownership. */
+  canonicalCortexLaneId: string | null;
   cortexFeatureSchemaVersion: number | null;
   decisionPolicyVersion: string;
   executionPolicyVersion: string;
@@ -49,6 +61,9 @@ export interface CausalIdentity {
 export interface CausalCollectionActivation {
   active: boolean;
   instanceId: string;
+  /** Non-null only when authorization came from an explicit role grant rather than instanceId itself
+   *  being in the allowlist — see CausalIdentity.logicalRole's own doc comment. */
+  logicalRole: FourBrainLogicalRole | null;
   reason: "shadow-active" | "mode-off" | "live-3103-blocked" | "unknown-instance-fail-closed";
 }
 
@@ -84,8 +99,15 @@ export interface ForwardPaperOrderLike {
   evidencePolicyVersion?: string | null;
   evidenceEra?: string | null;
   policyDeploymentAt?: string | null;
+  /** Scanner batch that owned this paper admission; required for CORTEX hand-off identity. */
+  scanBatchId?: string | null;
   causalIdentity?: CausalIdentity | null;
   cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
+  /** Producer-side immutable handoff IDs. Legacy/incomplete rows may retain a snapshot for audit,
+   * but cannot turn it into a CORTEX learning identity. */
+  cortexDecisionId?: string | null;
+  cortexAllocationSnapshotId?: string | null;
+  canonicalCortexLaneId?: string | null;
 }
 
 export interface DecisionSnapshotEvent {
@@ -106,6 +128,9 @@ export interface DecisionSnapshotEvent {
     decisionId: string | null;
     featureSchemaVersion: number | null;
     featureVector: number[] | null;
+    /** Original snapshot clock. `asOfMs` is the paper admission decision clock and must never
+     * overwrite this earlier source timestamp. */
+    snapshotAtMs: number | null;
     regimeFamily: string | null;
     eligible: boolean | null;
     finalPct: number | null;
@@ -152,6 +177,7 @@ export type ForwardEvent = DecisionSnapshotEvent | OpportunityOpenEvent | Outcom
 const hash = (parts: readonly (string | number)[]): string =>
   createHash("sha256").update(parts.join("\u001f")).digest("hex").slice(0, 32);
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const CORTEX_SNAPSHOT_MAX_HANDOFF_AGE_MS = 5 * 60_000;
 const openedAtMsOf = (order: ForwardPaperOrderLike): number | null => {
   const value = Date.parse(order.openedAt);
   return Number.isFinite(value) ? value : null;
@@ -163,22 +189,42 @@ const decisionTimeMsOf = (order: ForwardPaperOrderLike): number | null => {
 const originKeyOf = (order: ForwardPaperOrderLike): string => order.sourceCandidateId || order.sourceObservationId;
 const validCortexSnapshot = (order: ForwardPaperOrderLike, openedAtMs: number): CortexDecisionSnapshot | null => {
   const snapshot = order.cortexDecisionSnapshot ?? null;
-  if (!snapshot || snapshot.laneId !== order.selectedLaneId || snapshot.atMs > openedAtMs) return null;
-  if (!snapshot.decisionId || !snapshot.allocationSnapshotId || !Number.isInteger(snapshot.featureSchemaVersion)) return null;
-  if (!Array.isArray(snapshot.featureVector) || !snapshot.featureVector.length || !snapshot.featureVector.every(finite)) return null;
+  if (
+    !snapshot || order.cortexDecisionId !== snapshot.decisionId ||
+    order.cortexAllocationSnapshotId !== snapshot.allocationSnapshotId ||
+    !order.canonicalCortexLaneId || snapshot.laneId !== order.canonicalCortexLaneId || snapshot.direction !== order.direction ||
+    !order.scanBatchId || snapshot.scanBatchId !== order.scanBatchId || snapshot.sourceScanBatchId !== order.scanBatchId ||
+    snapshot.atMs > openedAtMs || snapshot.atMs < openedAtMs - CORTEX_SNAPSHOT_MAX_HANDOFF_AGE_MS
+  ) return null;
+  if (!snapshot.decisionId || !snapshot.allocationSnapshotId || snapshot.featureSchemaVersion !== CORTEX_FEATURE_SCHEMA_VERSION) return null;
+  if (!Array.isArray(snapshot.featureVector) || snapshot.featureVector.length !== CORTEX_FEATURE_DIM || !snapshot.featureVector.every(finite)) return null;
   return snapshot;
 };
 
-/** Strict gate owned by this feature. Unlike the older lane journal, it has no COLLECT_ONLY exception for 3103. */
+/**
+ * Strict gate owned by this feature. Unlike the older lane journal, it has no COLLECT_ONLY exception
+ * for 3103.
+ *
+ * 2026-08-05 (identity-spoofing fix): instanceId is ALWAYS the honest physical port — this function
+ * never relabels it. An instance whose own physical id is outside {3101,3102} (e.g. an isolated
+ * staging mirror on 3111/3102) is authorized ONLY via an explicit resolveFourBrainLogicalRole grant,
+ * never by lying to resolveFourBrainInstanceId about which instance it is. Before this fix, the ONLY
+ * way to validate this feature on a staging mirror was FOUR_BRAIN_INSTANCE_ID=3101/3102 — which meant
+ * instanceId itself became false, and every event this function's callers emitted persisted that false
+ * identity into the journal permanently. The 3103 hard-block is checked FIRST, unconditionally, against
+ * the PHYSICAL id/port only — a role grant can never reach it.
+ */
 export function resolveCausalCollectionActivation(env: NodeJS.ProcessEnv = process.env): CausalCollectionActivation {
   const instanceId = resolveFourBrainInstanceId(env);
   const rawPort = (env.PORT ?? "").toString().trim();
-  if (instanceId === "3103" || rawPort === "3103") return { active: false, instanceId: "3103", reason: "live-3103-blocked" };
+  if (instanceId === "3103" || rawPort === "3103") return { active: false, instanceId: "3103", logicalRole: null, reason: "live-3103-blocked" };
   if ((env.CAUSAL_EXPERIENCE_COLLECTION_MODE ?? "").toString().trim().toLowerCase() !== "shadow")
-    return { active: false, instanceId, reason: "mode-off" };
-  if (instanceId !== "3101" && instanceId !== "3102")
-    return { active: false, instanceId, reason: "unknown-instance-fail-closed" };
-  return { active: true, instanceId, reason: "shadow-active" };
+    return { active: false, instanceId, logicalRole: null, reason: "mode-off" };
+  if (instanceId === "3101" || instanceId === "3102")
+    return { active: true, instanceId, logicalRole: null, reason: "shadow-active" };
+  const logicalRole = resolveFourBrainLogicalRole(env);
+  if (logicalRole === null) return { active: false, instanceId, logicalRole: null, reason: "unknown-instance-fail-closed" };
+  return { active: true, instanceId, logicalRole, reason: "shadow-active" };
 }
 
 /**
@@ -222,6 +268,20 @@ export function isCausalIdentityCurrentlyValid(
 ): boolean {
   if (!activation.active || activation.instanceId === "3103") return false;
   if (identity.instanceId !== activation.instanceId) return false;
+  // A role grant can change (widened, narrowed, revoked) independently of the physical instance —
+  // an identity minted under a since-changed role is exactly as stale as one minted under a since-
+  // changed policy version, and must not be silently reused under the new role's authority.
+  //
+  // 2026-08-05 hotfix: `undefined` (every identity persisted before logicalRole existed — confirmed
+  // on active 3101/3102's real journals, which predate this field by days) is treated as exactly
+  // `null` here, never as a mismatch against a `null`-role activation. An identity that predates the
+  // field could ONLY have been minted on an instance directly in the 3101/3102 allowlist (the role
+  // system exists to authorize instances OUTSIDE that allowlist, which didn't exist yet when these
+  // were written) — so "field absent" and "field explicitly null" are the same fact, not two
+  // different ones. Without this, `undefined !== null` unconditionally staled every pre-existing
+  // identity the instant this field shipped, exactly mirroring openMaxHoldMs's own grandfather
+  // clause in current-guard-variant-matrix.ts for the identical reason.
+  if ((identity.logicalRole ?? null) !== activation.logicalRole) return false;
   if (identity.laneId !== order.selectedLaneId) return false;
   if (identity.symbolOrBasketId !== order.symbol) return false;
   if (identity.direction !== order.direction) return false;
@@ -281,6 +341,7 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
     opportunityId: `causal-opportunity-${hash([activation.instanceId, order.paperOrderId])}`,
     outcomeId: null,
     instanceId: activation.instanceId,
+    logicalRole: activation.logicalRole,
     laneId: order.selectedLaneId,
     symbolOrBasketId: order.symbol,
     direction: order.direction,
@@ -289,6 +350,7 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
     attributionRuleVersion: "direct-paper-order-link/1",
     cortexDecisionId: cortex?.decisionId ?? null,
     allocationSnapshotId: cortex?.allocationSnapshotId ?? null,
+    canonicalCortexLaneId: cortex?.laneId ?? null,
     cortexFeatureSchemaVersion: cortex?.featureSchemaVersion ?? null,
     decisionPolicyVersion: order.decisionPolicyVersion,
     executionPolicyVersion: order.executionPolicyVersion,
@@ -361,13 +423,14 @@ function openEvents(order: ForwardPaperOrderLike, env: NodeJS.ProcessEnv): Forwa
           decisionId: cortex.decisionId,
           featureSchemaVersion: cortex.featureSchemaVersion,
           featureVector: [...cortex.featureVector],
+          snapshotAtMs: cortex.atMs,
           regimeFamily: cortex.regimeFamily,
           eligible: cortex.eligible,
           finalPct: cortex.finalPct,
           evalFinalPct: cortex.evalFinalPct,
         }
       : {
-          status: "MISSING", decisionId: null, featureSchemaVersion: null, featureVector: null,
+          status: "MISSING", decisionId: null, featureSchemaVersion: null, featureVector: null, snapshotAtMs: null,
           regimeFamily: null, eligible: null, finalPct: null, evalFinalPct: null,
         },
     provenance: { originKey, sourceObservationId: order.sourceObservationId, missingFields: order.provenanceFieldMissing?.slice() ?? [] },
@@ -507,4 +570,123 @@ export function readForwardCausalEvents(file: string): ForwardEvent[] {
     }
   }
   return events;
+}
+
+export type ForwardCausalStrictStatus = "VALID" | "FORWARD_CAUSAL_JOURNAL_CORRUPTED" | "FORWARD_CAUSAL_DUPLICATE_CONFLICT" | "FORWARD_CAUSAL_SCHEMA_MISMATCH";
+export interface ForwardCausalStrictRead { status: ForwardCausalStrictStatus; events: readonly ForwardEvent[]; ignoredTornTail: boolean; malformed: number; duplicates: number; }
+const nonEmpty = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+const nullableString = (value: unknown): value is string | null => value === null || nonEmpty(value);
+const nullableFinite = (value: unknown): value is number | null => value === null || finite(value);
+/** 2026-08-05 hotfix: `undefined` treated as exactly `null` — for fields that predate a schema
+ *  addition, "key absent" and "key explicitly null" are the same fact on disk, never two different
+ *  ones. Scoped to the specific optional CORTEX-link fields below; every other nullableString/
+ *  nullableFinite caller keeps the original strict null-only contract. */
+const isNullish = (value: unknown): value is null | undefined => value === null || value === undefined;
+const nullableOptString = (value: unknown): value is string | null | undefined => isNullish(value) || nonEmpty(value);
+const nullableOptFinite = (value: unknown): value is number | null | undefined => isNullish(value) || finite(value);
+const validIdentity = (value: unknown, outcomeId: string | null): value is CausalIdentity => {
+  if (!value || typeof value !== "object") return false;
+  const identity = value as CausalIdentity;
+  return identity.lineageSchemaVersion === CAUSAL_LINEAGE_SCHEMA_VERSION &&
+    [identity.decisionId, identity.opportunityId, identity.instanceId, identity.laneId, identity.symbolOrBasketId,
+      identity.featureSchemaVersion, identity.decisionRuleVersion, identity.attributionRuleVersion,
+      identity.decisionPolicyVersion, identity.executionPolicyVersion, identity.evidencePolicyVersion,
+      identity.evidenceEra, identity.policyDeploymentAt].every(nonEmpty) &&
+    ["LONG", "SHORT", "NEUTRAL", "BOTH"].includes(identity.direction) &&
+    // 2026-08-05 hotfix: `undefined` (every identity persisted before this field existed) accepted
+    // exactly like explicit `null` — see isCausalIdentityCurrentlyValid's identical fix, same
+    // rationale. Without this, the strict reader rejected the ENTIRE pre-existing production causal
+    // journal (11,370 of 11,432 real events on active 3102 alone) as FORWARD_CAUSAL_SCHEMA_MISMATCH
+    // the instant this field shipped, which is an all-or-nothing gate: it blocks EVERY row in the
+    // file, not just the ones missing the field.
+    (identity.logicalRole === undefined || identity.logicalRole === null ||
+      identity.logicalRole === "RESEARCH" || identity.logicalRole === "TESTNET") &&
+    // 2026-08-05 hotfix (same class as logicalRole above, found immediately after it against the
+    // SAME real journal): a "no CORTEX link" identity from before these 4 fields were all
+    // consistently written together only set cortexDecisionId to explicit null and left
+    // allocationSnapshotId/canonicalCortexLaneId/cortexFeatureSchemaVersion absent rather than also
+    // null — confirmed on 3,666 real events on active 3102 (100% attributable to
+    // canonicalCortexLaneId specifically in that dataset, but all four are structurally parallel
+    // "present only when an exact CORTEX snapshot was handed to admission" fields per CausalIdentity's
+    // own doc comment, so all four get the same undefined-as-null treatment rather than patching only
+    // the one field that happened to surface first). `nullableOptString`/`isNullish` below subsume
+    // nullableString for exactly these 4 checks; nullableString itself is untouched for every other
+    // caller (event-level fields where the OLD null-only contract still holds and is correct).
+    nullableOptString(identity.cortexDecisionId) && nullableOptString(identity.allocationSnapshotId) && nullableOptString(identity.canonicalCortexLaneId) &&
+    (isNullish(identity.cortexFeatureSchemaVersion) || identity.cortexFeatureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
+    (isNullish(identity.cortexDecisionId)
+      ? isNullish(identity.allocationSnapshotId) && isNullish(identity.canonicalCortexLaneId) && isNullish(identity.cortexFeatureSchemaVersion)
+      : !isNullish(identity.allocationSnapshotId) && !isNullish(identity.canonicalCortexLaneId) && identity.cortexFeatureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
+    identity.outcomeId === outcomeId;
+};
+const validDecisionEvent = (event: unknown): event is DecisionSnapshotEvent => {
+  const value = event as DecisionSnapshotEvent;
+  const c = value?.cortexTraining;
+  return value?.eventType === "DECISION_SNAPSHOT" && nonEmpty(value.eventId) && validIdentity(value.identity, null) &&
+    finite(value.asOfMs) && value.reportOnly === true && value.entryDecision != null &&
+    [value.entryDecision.entryPrice, value.entryDecision.stopLoss, value.entryDecision.plannedStopDistanceBps].every(finite) &&
+    Array.isArray(value.entryDecision.takeProfitLevels) && value.entryDecision.takeProfitLevels.every(finite) &&
+    c != null && ["PRESENT", "MISSING"].includes(c.status) && nullableString(c.decisionId) &&
+    // 2026-08-05 hotfix (3rd instance of the same class, found immediately after the identity ones
+    // above against the SAME real 3102 journal): 1,404 real legacy DECISION_SNAPSHOT rows have
+    // cortexTraining.status === "MISSING" with every other field explicit `null` but snapshotAtMs
+    // simply absent — the MISSING-branch literal that writes this object predates snapshotAtMs being
+    // included in it. nullableOptFinite/isNullish accept that absence exactly like explicit `null`,
+    // matching every other field in the same MISSING literal; the PRESENT-branch `finite(c.snapshotAtMs)`
+    // below is untouched since a present snapshot's timestamp is a positive contract, not a
+    // predates-the-writer gap, and 0 real rows failed it.
+    nullableOptFinite(c.snapshotAtMs) && (c.featureSchemaVersion === null || c.featureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
+    (c.featureVector === null || (Array.isArray(c.featureVector) && c.featureVector.every(finite))) &&
+    ((c.status === "PRESENT" && (
+      nonEmpty(c.decisionId) && nonEmpty(value.identity.cortexDecisionId) && c.decisionId === value.identity.cortexDecisionId &&
+      nonEmpty(value.identity.allocationSnapshotId) && nonEmpty(value.identity.canonicalCortexLaneId) && c.featureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION &&
+      c.featureSchemaVersion === value.identity.cortexFeatureSchemaVersion && Array.isArray(c.featureVector) && c.featureVector.length > 0 &&
+      c.featureVector.length === CORTEX_FEATURE_DIM && finite(c.snapshotAtMs) && c.snapshotAtMs <= value.asOfMs &&
+      nonEmpty(c.regimeFamily) && c.regimeFamily.trim().toUpperCase() !== "UNKNOWN" &&
+      finite(c.finalPct) && finite(c.evalFinalPct) && typeof c.eligible === "boolean"
+    )) || (c.status === "MISSING" && c.decisionId === null && c.featureSchemaVersion === null && c.featureVector === null &&
+      isNullish(c.snapshotAtMs) && c.regimeFamily === null && c.eligible === null && c.finalPct === null && c.evalFinalPct === null));
+};
+const validOpenEvent = (event: unknown): event is OpportunityOpenEvent => {
+  const value = event as OpportunityOpenEvent;
+  return value?.eventType === "OPPORTUNITY_OPEN" && nonEmpty(value.eventId) && validIdentity(value.identity, null) &&
+    value.decisionId === value.identity.decisionId && value.eventId === value.identity.opportunityId && finite(value.openedAtMs) &&
+    [value.entryPrice, value.stopDistance].every(finite) && value.stopDistance > 0 && value.reportOnly === true &&
+    value.expectedCostAssumptions != null && [value.expectedCostAssumptions.costR, value.expectedCostAssumptions.feeSlippageR, value.expectedCostAssumptions.spreadR].every(nullableFinite);
+};
+const validOutcomeEvent = (event: unknown): event is OutcomeResolutionEvent => {
+  const value = event as OutcomeResolutionEvent;
+  return value?.eventType === "OUTCOME_RESOLUTION" && nonEmpty(value.eventId) && nonEmpty(value.outcomeId) &&
+    value.eventId === value.outcomeId && validIdentity(value.identity, value.outcomeId) &&
+    value.decisionId === value.identity.decisionId && value.opportunityId === value.identity.opportunityId &&
+    [value.openedAtMs, value.closedAtMs, value.resolvedAtMs, value.grossR, value.costR, value.netR].every(finite) &&
+    value.openedAtMs <= value.closedAtMs && value.closedAtMs <= value.resolvedAtMs && Math.abs((value.grossR + value.costR) - value.netR) <= 1e-9 &&
+    value.reportOnly === true;
+};
+const validForwardEvent = (event: unknown): event is ForwardEvent =>
+  validDecisionEvent(event) || validOpenEvent(event) || validOutcomeEvent(event);
+/** Strict operator-only reader. A single malformed unterminated final line is tolerated as a torn
+ * append tail; every other malformed/unknown row blocks learner input. */
+export function readForwardCausalEventsStrict(file: string): ForwardCausalStrictRead {
+  if (!existsSync(file)) return { status: "FORWARD_CAUSAL_JOURNAL_CORRUPTED", events: [], ignoredTornTail: false, malformed: 1, duplicates: 0 };
+  const raw = readFileSync(file, "utf8");
+  const newlineTerminated = raw.endsWith("\n");
+  const lines = raw.split("\n"); const events: ForwardEvent[] = []; const byId = new Map<string, string>();
+  let malformed = 0; let schemaMismatch = 0; let duplicates = 0; let ignoredTornTail = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!; if (!line.trim()) continue;
+    let event: ForwardEvent;
+    try { event = JSON.parse(line) as ForwardEvent; } catch {
+      if (i === lines.length - 1 && !newlineTerminated) { ignoredTornTail = true; continue; }
+      malformed += 1; continue;
+    }
+    if (!validForwardEvent(event)) { schemaMismatch += 1; continue; }
+    const canonical = JSON.stringify(event); const existing = byId.get(event.eventId);
+    if (existing && existing !== canonical) { duplicates += 1; continue; }
+    if (!existing) { byId.set(event.eventId, canonical); events.push(event); }
+  }
+  if (duplicates) return { status: "FORWARD_CAUSAL_DUPLICATE_CONFLICT", events: [], ignoredTornTail, malformed: malformed + schemaMismatch, duplicates };
+  if (malformed) return { status: "FORWARD_CAUSAL_JOURNAL_CORRUPTED", events: [], ignoredTornTail, malformed, duplicates };
+  if (schemaMismatch) return { status: "FORWARD_CAUSAL_SCHEMA_MISMATCH", events: [], ignoredTornTail, malformed: schemaMismatch, duplicates };
+  return { status: "VALID", events, ignoredTornTail, malformed, duplicates };
 }

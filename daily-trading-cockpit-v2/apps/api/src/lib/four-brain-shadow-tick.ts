@@ -10,10 +10,11 @@
  */
 import {
   fourBrainMode,
-  fourBrainDecisionId,
   type DirectionDecision,
   type ExecutiveDecision,
   type FourBrainMode,
+  type MarketBias,
+  type MarketStateAuthority,
   type MarketStateDecision,
 } from "./four-brain-types.js";
 import { decideMarketState } from "./market-state-brain.js";
@@ -21,6 +22,7 @@ import { decideDirection } from "./direction-brain.js";
 import { decideEntry } from "./entry-brain.js";
 import { decideExit } from "./exit-brain.js";
 import { buildExecutiveDecision, runBrainSafely } from "./executive-decision.js";
+import { rankFourBrainShadowEntries } from "./four-brain-shadow-ranking.js";
 import {
   checkEntryInvariants,
   checkExecutiveInvariants,
@@ -35,6 +37,7 @@ export interface FourBrainTickMetrics {
   skippedSingleFlight: number;
   gatherErrors: number;
   journalErrors: number;
+  reviewAttachmentErrors: number;
   /** 2026-07-22 fix: a single candidate's Direction/Entry/Exit/ExecutiveDecision call throwing used to
    *  abort the ENTIRE tick (the one top-level try/catch), losing the market snapshot + every OTHER
    *  candidate's decision too — disproportionate to one bad candidate. Each per-candidate brain call is
@@ -86,7 +89,7 @@ export interface FourBrainShadowTickDeps {
 
 function emptyMetrics(): FourBrainTickMetrics {
   return {
-    attempted: 0, completed: 0, skippedSingleFlight: 0, gatherErrors: 0, journalErrors: 0, brainErrors: 0, invariantFailures: 0,
+    attempted: 0, completed: 0, skippedSingleFlight: 0, gatherErrors: 0, journalErrors: 0, reviewAttachmentErrors: 0, brainErrors: 0, invariantFailures: 0,
     decisions: 0, duplicateDecisionIds: 0, byCandidateStatus: {}, byBrainAction: {}, unknownLanes: 0,
     duplicateIdentities: 0, laneCoverage: 0, positionCoverage: 0, staleOrMissingByClass: {}, gatherMs: 0, inferenceMs: 0, journalMs: 0,
   };
@@ -99,6 +102,108 @@ function safeEmit(deps: FourBrainShadowTickDeps, metrics: FourBrainTickMetrics):
     deps.emitMetrics?.(metrics);
   } catch {
     /* metrics are best-effort; never propagate */
+  }
+}
+
+/** The focussed testnet's canonical regime is the one actionable state. */
+function authoritativeBias(authority: MarketStateAuthority): MarketBias {
+  if (authority.canonicalRegimeFamily === "BULLISH") return "BULLISH";
+  if (authority.canonicalRegimeFamily === "BEARISH") return "BEARISH";
+  if (authority.canonicalRegimeFamily === "MIXED") return "MIXED";
+  return "NEUTRAL";
+}
+
+function applyMarketStateAuthority(
+  technical: MarketStateDecision,
+  authority: MarketStateAuthority | null,
+): MarketStateDecision {
+  if (!authority) return technical;
+  return {
+    ...technical,
+    // The independent technical family remains in the audit payload. Only its
+    // directional bias is overridden, so Direction Brain cannot treat a
+    // canonical MIXED market as BULLISH/BEARISH just from a saturated slope.
+    bias: authoritativeBias(authority),
+    authority,
+    reasons: [
+      ...technical.reasons,
+      `executor canonical=${authority.canonicalRegimeFamily}; scanner=${authority.scannerRegime ?? "UNKNOWN"}; technical family is diagnostic only`,
+    ],
+  };
+}
+
+/**
+ * Evaluate exactly one executor-owned candidate on the same pure Four-Brain path as the scheduled
+ * shadow tick, without touching its module-level single-flight latch, journal, metrics, or an
+ * executor. The caller supplies the exact lane/symbol/side/signal identity immediately before
+ * submit, so a later periodic scan cannot be mistaken for the decision that preceded an actual
+ * fill.
+ */
+export interface FourBrainPreEntryEvaluation {
+  executive: ExecutiveDecision;
+  identity: { signalId: string | null; positionId: null };
+  marketState: MarketStateDecision;
+  directions: DirectionDecision[];
+  invariantViolations: string[];
+}
+
+export function evaluateFourBrainPreEntryCandidate(
+  gathered: FourBrainGatheredTick,
+): FourBrainPreEntryEvaluation | null {
+  if (gathered.entryCandidates.length !== 1) return null;
+  try {
+    const candidate = gathered.entryCandidates[0]!;
+    const marketState = applyMarketStateAuthority(
+      decideMarketState(gathered.marketStateInput),
+      gathered.marketStateAuthority,
+    );
+    const directions: DirectionDecision[] = [];
+    const directionByHorizon = new Map<string, DirectionDecision>();
+    for (const row of gathered.directionInputs) {
+      const direction = runBrainSafely(() =>
+        decideDirection({ ...row.input, marketBias: marketState.bias, transitionRisk: marketState.transitionRisk }),
+      );
+      if (direction === null) continue;
+      directions.push(direction);
+      directionByHorizon.set(row.horizon, direction);
+    }
+    const entry = runBrainSafely(() => decideEntry(candidate.input));
+    if (entry === null) return null;
+    const signalFresh = candidate.readings.length === 0
+      ? undefined
+      : candidate.input.signalAgeMs != null && candidate.input.signalAgeMs <= candidate.input.maxSignalAgeMs;
+    const entryInvariants = checkEntryInvariants(entry, { signalFresh, side: candidate.input.side });
+    const executive = runBrainSafely(() =>
+      buildExecutiveDecision({
+        nowMs: gathered.asOfMs,
+        marketState,
+        direction: directionByHorizon.get(candidate.identity.horizon ?? "") ?? null,
+        entry,
+        exit: null,
+        allocationContext: candidate.exec.allocationContext,
+        marketContext: candidate.exec.marketContext,
+        laneId: candidate.identity.laneId,
+        symbolOrBasketId: candidate.identity.symbolOrBasketId,
+        laneEligibleIncumbent: candidate.exec.laneEligibleIncumbent,
+        directionHurdlePassed: candidate.exec.directionHurdlePassed,
+        executionReinforcement: candidate.exec.executionReinforcement,
+        killLatched: candidate.exec.killLatched,
+        riskBlockedReason: candidate.exec.riskBlockedReason,
+        identityDiscriminator: `entry:${candidate.identity.signalId ?? candidate.identity.symbolOrBasketId}`,
+      }),
+    );
+    if (executive === null) return null;
+    const ranked = rankFourBrainShadowEntries([executive])[0] ?? executive;
+    const executiveInvariants = checkExecutiveInvariants(ranked);
+    return {
+      executive: ranked,
+      identity: { signalId: candidate.identity.signalId, positionId: null },
+      marketState,
+      directions,
+      invariantViolations: [...entryInvariants.violations, ...executiveInvariants.violations],
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -148,30 +253,24 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
 
     // ── Inference: market state, direction per horizon, entry/exit per candidate. ─────────────────
     const i0 = perf();
-    const marketState = decideMarketState(gathered.marketStateInput);
+    const marketState = applyMarketStateAuthority(
+      decideMarketState(gathered.marketStateInput),
+      gathered.marketStateAuthority,
+    );
     const directionByHorizon = new Map<string, DirectionDecision>();
     const directions: DirectionDecision[] = [];
-    // All current horizons consume the same market-level inputs. Evaluate it ONCE, then stamp
-    // compatibility projections with different outcome windows; this is not three independent models.
-    const canonicalInput = gathered.directionInputs[0]?.input;
-    const canonical = canonicalInput
-      ? runBrainSafely(() => decideDirection({ ...canonicalInput, marketBias: marketState.bias, transitionRisk: marketState.transitionRisk }))
-      : null;
-    if (canonicalInput && canonical === null) metrics.brainErrors += 1;
     for (const d of gathered.directionInputs) {
-      if (canonical === null) continue;
-      const dec: DirectionDecision = {
-        ...canonical,
-        horizon: d.horizon,
-        evaluationHorizon: d.horizon,
-        decisionId: fourBrainDecisionId("dir", nowMs, `MARKET_LEVEL:${d.horizon}:${canonical.marketDirection}`),
-      };
+      // Each horizon has independent evidence and self-outcome state. A failure in one must not
+      // suppress the others, and no result is copied across horizons.
+      const dec = runBrainSafely(() => decideDirection({ ...d.input, marketBias: marketState.bias, transitionRisk: marketState.transitionRisk }));
+      if (dec === null) { metrics.brainErrors += 1; continue; }
       directionByHorizon.set(d.horizon, dec);
       directions.push(dec);
       metrics.byBrainAction[`dir:${dec.action}`] = (metrics.byBrainAction[`dir:${dec.action}`] ?? 0) + 1;
     }
 
     const executiveDecisions: ExecutiveDecision[] = [];
+    const entryExecutiveDecisions: ExecutiveDecision[] = [];
     const identityByExecutiveDecisionId = new Map<
       string,
       { signalId: string | null; positionId: string | null }
@@ -201,6 +300,7 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
           symbolOrBasketId: c.identity.symbolOrBasketId,
           laneEligibleIncumbent: c.exec.laneEligibleIncumbent,
           directionHurdlePassed: c.exec.directionHurdlePassed,
+          executionReinforcement: c.exec.executionReinforcement,
           killLatched: c.exec.killLatched,
           riskBlockedReason: c.exec.riskBlockedReason,
           identityDiscriminator: `entry:${c.identity.signalId ?? c.identity.symbolOrBasketId}`,
@@ -210,12 +310,17 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
         metrics.brainErrors += 1;
         continue;
       }
-      executiveDecisions.push(exec);
+      entryExecutiveDecisions.push(exec);
       identityByExecutiveDecisionId.set(exec.decisionId, {
         signalId: c.identity.signalId,
         positionId: c.identity.positionId,
       });
     }
+
+    // Positive exact-fill reinforcement now changes a deterministic, journaled SHADOW rank.  This
+    // is intentionally before the observer/journal handoff, so every downstream report sees the
+    // rank that was actually used for the shadow recommendation.
+    executiveDecisions.push(...rankFourBrainShadowEntries(entryExecutiveDecisions));
 
     for (const c of gathered.exitCandidates) {
       const exit = runBrainSafely(() => decideExit(c.input));
@@ -261,28 +366,31 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
     const ctx = deps.journalContext ? deps.journalContext(gathered) : {};
     for (const exec of executiveDecisions) {
       const invExec = checkExecutiveInvariants(exec);
+      if (!invExec.ok) metrics.invariantFailures += invExec.violations.length;
       if (!seenDecisionIds.has(exec.decisionId)) {
         seenDecisionIds.add(exec.decisionId);
         metrics.byCandidateStatus[exec.candidateStatus] = (metrics.byCandidateStatus[exec.candidateStatus] ?? 0) + 1;
         metrics.decisions += 1;
+        const identity = identityByExecutiveDecisionId.get(exec.decisionId);
         try {
-          const identity = identityByExecutiveDecisionId.get(exec.decisionId);
           deps.journalAppend(buildExecutiveDecisionRecord(exec, {
             ...ctx,
             invariantViolations: invExec.violations,
             signalId: identity?.signalId ?? null,
             positionId: identity?.positionId ?? null,
           }));
-          try {
-            deps.onExecutiveDecision?.(exec, {
-              signalId: identity?.signalId ?? null,
-              positionId: identity?.positionId ?? null,
-            });
-          } catch {
-            // Review attachment remains fail-open relative to the shadow tick.
-          }
         } catch {
           metrics.journalErrors += 1;
+        }
+        // A journal disk error must not suppress exact review attachment. This remains advisory
+        // and each observer failure is isolated from the next ExecutiveDecision.
+        try {
+          deps.onExecutiveDecision?.(exec, {
+            signalId: identity?.signalId ?? null,
+            positionId: identity?.positionId ?? null,
+          });
+        } catch {
+          metrics.reviewAttachmentErrors += 1;
         }
       } else {
         metrics.duplicateDecisionIds += 1;

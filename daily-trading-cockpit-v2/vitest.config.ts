@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 /**
  * ROOT vitest config — exists solely so that running vitest FROM THE REPO ROOT behaves like the
@@ -30,5 +30,6 @@ export default defineConfig({
   test: {
     testTimeout: 20000,
     hookTimeout: 20000,
+    exclude: [...configDefaults.exclude, "**/._*"],
   },
 });

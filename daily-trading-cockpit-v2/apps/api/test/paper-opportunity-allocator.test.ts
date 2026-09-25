@@ -58,6 +58,8 @@ import {
   MIXED_LONG_WIDE_LANE,
   type MixedRegimeReport,
 } from "../src/lib/mixed-regime-router.js";
+import { CORTEX_FEATURE_SCHEMA_VERSION } from "../src/lib/cortex-brain.js";
+import { cortexAllocationSnapshotId, cortexDecisionId } from "../src/lib/cortex-decision-snapshot.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -1371,6 +1373,77 @@ describe("paper-opportunity-allocator", () => {
     expect(order!.sourceType).toBe("SCAN_CANDIDATE_LANE_ALLOCATOR");
     expect(order!.paperEquity).toBe(DEFAULT_PAPER_EQUITY);
     expect(order!.plannedRiskAmount).toBe(DEFAULT_PAPER_EQUITY * 0.01);
+  });
+
+  it("[21b] carries an exact same-cycle CORTEX snapshot from allocator through the persisted causal identity", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const now = new Date();
+    const common = baseInputs({
+      vmReport,
+      candidates: [makeCandidate({ direction: "LONG", stopLoss: 97, tp1: 104 })],
+      now: now.toISOString(),
+      scanFinishedAt: now.toISOString(),
+      scanBatchId: "cortex-exact-batch",
+      marketRegime: "Bullish expansion",
+      routerReport: routerOf("Bullish expansion"),
+      testnetCollectAllLanes: true,
+    });
+    const unlabelled = buildPaperOpportunityAllocatorReport(common);
+    const selected = unlabelled.selectedOpportunities.find((opportunity) => opportunity.canonicalCortexLaneId !== null)!;
+    expect(selected).toBeDefined();
+    // Point 4 hardening (cortex-decision-snapshot.ts): validSnapshot() now requires decisionId/
+    // allocationSnapshotId to exactly match the canonical derivation from atMs/laneId/
+    // featureSchemaVersion — the same identity functions the one real producer (runCortexShadowTick)
+    // uses — so this hand-built fixture must derive them the same way rather than pick arbitrary
+    // strings, or exactCortexDecisionSnapshotForScan (called inside buildPaperOpportunityAllocatorReport)
+    // now refuses it as INVALID.
+    const snapshotAtMs = now.getTime() - 1_000;
+    const snapshotLaneId = selected.canonicalCortexLaneId!;
+    const snapshotDecisionId = cortexDecisionId(snapshotAtMs, snapshotLaneId, CORTEX_FEATURE_SCHEMA_VERSION);
+    const snapshot = {
+      decisionId: snapshotDecisionId,
+      allocationSnapshotId: cortexAllocationSnapshotId(snapshotDecisionId),
+      atMs: snapshotAtMs,
+      laneId: snapshotLaneId,
+      direction: selected.direction,
+      featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
+      featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      regimeFamily: "BEARISH",
+      eligible: true,
+      finalPct: 0,
+      evalFinalPct: 0,
+      scanBatchId: common.scanBatchId,
+      sourceScanBatchId: common.scanBatchId,
+    } as const;
+    const report = buildPaperOpportunityAllocatorReport({ ...common, cortexDecisionSnapshots: [snapshot] });
+    const opportunity = report.selectedOpportunities.find((candidate) => candidate.laneId === selected.laneId)!;
+    expect(opportunity.cortexDecisionSnapshot).toEqual(snapshot);
+    expect(opportunity.cortexDecisionId).toBe(snapshot.decisionId);
+    expect(opportunity.cortexAllocationSnapshotId).toBe(snapshot.allocationSnapshotId);
+
+    const previous = {
+      PORT: process.env.PORT,
+      INSTANCE_ID: process.env.INSTANCE_ID,
+      CAUSAL_EXPERIENCE_COLLECTION_MODE: process.env.CAUSAL_EXPERIENCE_COLLECTION_MODE,
+      END_TO_END_CORRECTNESS_DEPLOYED_AT: process.env.END_TO_END_CORRECTNESS_DEPLOYED_AT,
+    };
+    try {
+      process.env.PORT = "3102";
+      process.env.INSTANCE_ID = "3102";
+      process.env.CAUSAL_EXPERIENCE_COLLECTION_MODE = "shadow";
+      process.env.END_TO_END_CORRECTNESS_DEPLOYED_AT = new Date(now.getTime() - 60_000).toISOString();
+      const store = new PaperExecutionRouterStore(dir);
+      store.ensurePaperStartAt(new Date(now.getTime() - 60_000).toISOString());
+      expect(admitPaperOpportunities({ store, opportunities: [opportunity], routerReport: routerOf("Bullish expansion"), gateReport: emptyGate(), now: now.toISOString() }).admitted).toBe(1);
+      const order = store.all[0]!;
+      expect(order.cortexDecisionSnapshot).toEqual(snapshot);
+      expect(order.causalIdentity).toMatchObject({ cortexDecisionId: snapshot.decisionId, allocationSnapshotId: snapshot.allocationSnapshotId });
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
   });
 
   // [22]

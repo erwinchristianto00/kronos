@@ -7,6 +7,7 @@ import {
   emptyDailyIncomeSummary,
   parseWalletReconciliationConfig,
   resolveDayUtc,
+  summarizeDailyRangeClosedAccounting,
   summarizeIncomeByUtcDay,
   type LiveEngineReconciliationSource,
 } from "../src/lib/wallet-reconciliation.js";
@@ -29,6 +30,26 @@ const DAY1 = "2026-07-10";
 const DAY2 = "2026-07-11";
 const day1Ms = Date.parse(`${DAY1}T12:00:00.000Z`);
 const day2Ms = Date.parse(`${DAY2}T03:00:00.000Z`);
+
+describe("summarizeDailyRangeClosedAccounting", () => {
+  it("bridges only same-day completed closes as gross-minus-fees and excludes funding", () => {
+    const summary = summarizeDailyRangeClosedAccounting([
+      { status: "CLOSED", exitTimestamp: `${DAY1}T12:00:00.000Z`, grossPnlUsd: 1.2, feesUsd: 0.2 },
+      { status: "CLOSED", exitTimestamp: `${DAY2}T00:00:00.000Z`, grossPnlUsd: 3, feesUsd: 0.3 },
+      { status: "CLOSED", exitTimestamp: `${DAY1}T13:00:00.000Z`, grossPnlUsd: null, feesUsd: 0.1 },
+      { status: "PROTECTING", exitTimestamp: null, grossPnlUsd: null, feesUsd: null },
+    ], DAY1);
+
+    expect(summary).toEqual({
+      dayUtc: DAY1,
+      grossRealizedPnlUsd: 1.2,
+      netRealizedExcludingFundingUsd: 1,
+      closedFeesUsd: 0.2,
+      completedTrades: 1,
+      incompleteTrades: 1,
+    });
+  });
+});
 
 // ─── income summing ──────────────────────────────────────────────────────────
 
