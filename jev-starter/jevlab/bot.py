@@ -85,10 +85,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     mode_label = {"dry": "Binance prices · simulated fills", "demo": "Binance DEMO · fake money",
                   "testnet": "Binance TESTNET · fake money", "live": "LIVE · REAL MONEY"}[mode]
     venue = VENUES[mode]
-    use_claude = os.getenv("USE_CLAUDE", "true").strip().lower() != "false"  # false = Jev + strategy.py only
-    header("THE JEV BOT", f"{symbol} on Binance Futures · {mode_label} · "
-           + (f"Claude sets the bias every {brain_every:g} min · " if use_claude else "Claude off (USE_CLAUDE=false) · ")
-           + f"
+    header("THE JEV BOT", f"{symbol} on Binance Futures · {mode_label} · Claude sets the bias every {brain_every:g} min · "
            f"Jev calls as fast as the key allows · strategy: {strategy.DESCRIPTION} · "
            f"max position ${position_usd:,.0f} · daily loss limit ${max_loss:,.0f}")
     if mode == "live":
@@ -122,9 +119,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             console.print(f"  existing position adopted: {size:+g} {coin} @ {avg:g}")
 
     stop = threading.Event()
-    brain = Brain(symbol, brain_every, venue["data_rest"]) if use_claude else None
-    if brain:
-        brain.start(stop)
+    brain = Brain(symbol, brain_every, venue["data_rest"])
+    brain.start(stop)
 
     RESULTS.mkdir(exist_ok=True)
     out = RESULTS / "loop.json"
@@ -222,7 +218,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
                 "maker_fee_bps": MAKER_FEE * 1e4, "taker_fee_bps": TAKER_FEE * 1e4, "counts": dict(counts), "blocks": len(decisions),
                 "last_ms": latencies[-1] if latencies else None,
                 "avg_ms": round(statistics.mean(latencies[-200:])) if latencies else None,
-                "hits": st["hits"], "scored": st["scored"], "brain": brain.current() if brain else None,
+                "hits": st["hits"], "scored": st["scored"], "brain": brain.current(),
                 "order": ({"target": o["target"], "buying": o["buying"], "px": o["px"], "t": o["t"]} if o else None),
                 "decisions": decisions[-200:], "fills": fills[-100:],
                 "book": book.snap(time.time(), mid), "ticks": market.recent_ticks(),
@@ -235,12 +231,10 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
         """Jev's call + Claude's bias -> strategy.decide() -> a post-only limit order. Runs under the lock."""
         if st["halted"]:
             return f"hold · halted ({st['halted']})"
-        market_view = dict(rec["state"])
-        if brain:
-            bias = brain.current().get("bias")
-            if bias is None:
-                return "hold · waiting for Claude's first read"
-            market_view["claude_bias"] = bias
+        bias = brain.current().get("bias")
+        if bias is None:
+            return "hold · waiting for Claude's first read"
+        market_view = {**rec["state"], "claude_bias": bias}
         pos = 1 if book.qty > 0 else -1 if book.qty < 0 else 0
         try:
             choice = strategy.decide({"side": rec["side"], "conf": rec["conf"]}, market_view, pos, time.time() - st["last_trade_t"])
