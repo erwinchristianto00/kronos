@@ -76,6 +76,7 @@ def check() -> None:
 def check_binance() -> None:
     import os
 
+    from . import judges  # noqa: F401  (loads .env, so this also works when called on its own)
     from .core import console
     console.print("  [bold]5. Binance (only needed for the 24/7 bot)[/]")
     if not os.getenv("BINANCE_API_KEY", "").strip():
