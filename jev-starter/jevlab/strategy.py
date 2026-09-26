@@ -6,7 +6,9 @@ trade has a cost, so a bot that trades every call bleeds.
 
 decide() is called every time Jev answers, with:
 
-  call      Jev's answer, e.g. {"side": "buy", "conf": 0.91}
+  call      Jev's answer, e.g. {"side": "buy", "conf": 0.91}. On the 24/7 bot the call can also come
+            from the local signal model (jevlab/model.py): {"source": "model", "edge_bps": 7.2, ...},
+            handled by decide_model() below; or from the rules fallback when Jev is busy.
   market    the live numbers Jev was shown, for example:
               return_5s_bps, return_30s_bps     price change over 5s / 30s (1 bps = 0.01%)
               top_of_book_imbalance             -1 (all sellers) .. +1 (all buyers) at the best price
@@ -42,13 +44,41 @@ SETTINGS = {
     "cooldown": 60,         # seconds to wait after any trade before entering again
     "max_spread_bps": None, # skip entries when the spread is wider than this (None = off; the testnet's is always wide)
     "fallback_min_flow": 0.65,  # when Jev is busy: share of 30s volume needed on one side for a rules-only call
+    "model_min_edge_bps": None, # local model: predicted move needed to enter (None = the model's own tested value)
 }
 
 DESCRIPTION = (f"enter at ≥{SETTINGS['min_conf']:.0%} with a ≥{SETTINGS['min_move_bps']:g} bps 30s move and flow · "
                f"hold ≥{SETTINGS['min_hold'] // 60:g} min")
 
 
+def decide_model(call: dict, market: dict, position: int, seconds_since_trade: float) -> str:
+    """Calls from the local signal model (jevlab/model.py). call["edge_bps"] is its predicted move over
+    call["horizon_s"] seconds. This mirrors how the model was tested: enter when the predicted move is at
+    least min_edge_bps, hold for the horizon, then exit unless the model still predicts the same side."""
+    edge, horizon = call["edge_bps"], call["horizon_s"]
+    min_edge = SETTINGS.get("model_min_edge_bps") or call["min_edge_bps"]
+    want = (1 if edge > 0 else -1) if abs(edge) >= min_edge else 0
+    bias = market.get("claude_bias")
+    if bias == "flat":
+        return "flat" if position else "hold · Claude says stay out"
+    if (bias == "long" and position < 0) or (bias == "short" and position > 0):
+        return "flat"  # Claude changed its mind: get out of the old direction first
+    if position:
+        if seconds_since_trade < horizon:
+            return f"hold · in position ({horizon // 60} min hold)"
+        return "hold · model still agrees" if want == position else "flat"
+    if not want:
+        return f"hold · predicted move {edge:+.1f} bps, under {min_edge:g}"
+    if (bias == "long" and want < 0) or (bias == "short" and want > 0):
+        return f"hold · against Claude's {bias} bias"
+    if seconds_since_trade < SETTINGS["cooldown"]:
+        return "hold · cooling down"
+    return "buy" if want > 0 else "sell"
+
+
 def decide(call: dict, market: dict, position: int, seconds_since_trade: float) -> str:
+    if call.get("source") == "model":
+        return decide_model(call, market, position, seconds_since_trade)
     want = 1 if call["side"] == "buy" else -1
     strong = call["conf"] >= SETTINGS["min_conf"]
     bias = market.get("claude_bias")  # only set on the 24/7 bot, where Claude is the brain

@@ -35,7 +35,7 @@ Before trusting any strategy, ask three questions:
 
 ## Flags
 
-`--coin BTC` · `--minutes 0` (run until Ctrl+C) · `--taker` (market orders) · `--gap 4` (newsroom pace) · `--port 8766` (a second dashboard) · `--no-open`
+`--coin BTC` · `--days 45` (train) · `--minutes 0` (run until Ctrl+C) · `--taker` (market orders) · `--gap 4` (newsroom pace) · `--port 8766` (a second dashboard) · `--no-open`
 
 ## The 24/7 bot (Path 2): Claude + Jev on Binance Futures
 
@@ -45,6 +45,26 @@ Before trusting any strategy, ask three questions:
 - **`strategy.py`** only trades in Claude's direction
 
 It starts on **Binance Demo Trading** (fake money; `BINANCE_MODE=testnet` uses the older futures testnet instead). `--dry` runs it on Binance prices with simulated fills and needs no Binance key. The futures account must be in One-way position mode, and the server must be in a country Binance serves (not the US).
+
+### The local signal model (default)
+
+Instead of asking Jev, the bot can use its own small model, trained on SOL's real trade history:
+
+```
+uv run python -m jevlab train --coin SOL     # downloads 45 days of Binance trades, tests, writes models/SOLUSDT.json
+```
+
+- It predicts the price move over the next 15 minutes from the last 2 minutes of trade flow (returns,
+  aggressive buying vs selling, activity). It runs on the server in well under a millisecond, with no API.
+- The bot enters only when the predicted move is at least 6 bps and Claude's bias agrees, holds 15 minutes,
+  then exits unless the model still points the same way.
+- `train` tests it walk-forward (train on 25 days, test on the next 5 unseen days) and writes
+  `models/SOLUSDT-report.md`. Read it: the edge is small, uncertain, and assumes limit orders fill at the mid.
+- Retrain every week or two. The bot warns when the model's data is more than 14 days old.
+- `SIGNAL_SOURCE=jev` in `.env` switches back to Jev (with a rules-only fallback when Jev is busy).
+
+On the testnet, signals read the real Binance market (the testnet's own book is thin and unrealistic),
+while orders go to the testnet.
 
 Safety, always on:
 - post-only limit orders

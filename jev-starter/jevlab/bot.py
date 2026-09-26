@@ -33,12 +33,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import strategy
+from . import features, strategy
 from .brain import Brain
 from .binance import VENUES, BinanceError, BinanceMarket, BinanceTrader, binance_mode
 from .core import RESULTS, console, header
 from .judges import JevJudge, JudgeError
 from .loop import QUESTIONS
+from .model import MODELS as MODEL_DIR, SignalModel
 from .server import serve
 
 MAKER_FEE = 0.0002  # Binance base-tier maker fee on USDⓈ-M perps, used for --dry fills
@@ -96,16 +97,32 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     mode_label = {"dry": "Binance prices · simulated fills", "demo": "Binance DEMO · fake money",
                   "testnet": "Binance TESTNET · fake money", "live": "LIVE · REAL MONEY"}[mode]
     venue = VENUES[mode]
+    # Where the fast calls come from: the local model (default when models/<SYMBOL>.json exists) or Jev.
+    source = os.getenv("SIGNAL_SOURCE", "").strip().lower() or ("model" if (MODEL_DIR / f"{symbol}.json").exists() else "jev")
+    if source not in ("model", "jev"):
+        raise SystemExit(f"  SIGNAL_SOURCE must be 'model' or 'jev', not '{source}'")
+    model = jev = None
+    if source == "model":
+        try:
+            model = SignalModel(symbol)
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"  {exc}")
+        signal_txt = f"signal: {model.name}, enters at a predicted {model.horizon_s // 60}-min move ≥ {model.min_edge_bps:g} bps"
+        strategy_note = f"model: enter at |predicted {model.horizon_s // 60}m move| ≥ {model.min_edge_bps:g} bps, with Claude · hold {model.horizon_s // 60} min"
+    else:
+        try:
+            jev = JevJudge()
+        except JudgeError as exc:
+            raise SystemExit(f"  Jev key missing: {exc}. Add AI_GATEWAY_API_KEY to .env first.")
+        signal_txt = "signal: Jev, as fast as the key allows (rules when Jev is busy)"
+        strategy_note = strategy.DESCRIPTION
+    if model and model.age_days() > 14:
+        console.print(f"  [#f5b53d]the model's data is {model.age_days()} days old: retrain it with "
+                      f"`uv run python -m jevlab train --coin {coin}`[/]")
     header("THE JEV BOT", f"{symbol} on Binance Futures · {mode_label} · Claude sets the bias every {brain_every:g} min · "
-           f"Jev calls as fast as the key allows · strategy: {strategy.DESCRIPTION} · "
-           f"max position ${position_usd:,.0f} · daily loss limit ${max_loss:,.0f}")
+           f"{signal_txt} · max position ${position_usd:,.0f} · daily loss limit ${max_loss:,.0f}")
     if mode == "live":
         console.print("  [bold #ff5d6c]LIVE MODE: this bot is trading real money.[/] Kill switch: create a file named STOP.")
-
-    try:
-        jev = JevJudge()
-    except JudgeError as exc:
-        raise SystemExit(f"  Jev key missing: {exc}. Add AI_GATEWAY_API_KEY to .env first.")
     trader = None
     if mode != "dry":
         try:
@@ -117,10 +134,15 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
         except BinanceError as exc:
             raise SystemExit(f"  Binance problem: {exc}")
 
-    market = BinanceMarket(symbol, venue)
+    market = BinanceMarket(symbol, venue)  # the book the bot trades on: prices, fills, the dashboard chart
     market.start()
-    if not market.ready.wait(15):
-        raise SystemExit("  no price feed from Binance after 15s, check the connection")
+    # Signals always read the real market. On the testnet (its own thin book) that's a second feed.
+    signal_market = BinanceMarket(symbol, VENUES["live"]) if mode == "testnet" else market
+    if signal_market is not market:
+        signal_market.start()
+    for m in {id(market): market, id(signal_market): signal_market}.values():
+        if not m.ready.wait(15):
+            raise SystemExit("  no price feed from Binance after 15s, check the connection")
 
     book = Book()
     if trader:  # adopt any position already open, so the numbers are honest from the first second
@@ -130,7 +152,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             console.print(f"  existing position adopted: {size:+g} {coin} @ {avg:g}")
 
     stop = threading.Event()
-    brain = Brain(symbol, brain_every, venue["data_rest"])
+    # Claude reads the real market, also on the testnet; if this server can't reach it, the trading venue's data
+    brain = Brain(symbol, brain_every, list(dict.fromkeys([VENUES["live"]["data_rest"], venue["data_rest"]])))
     brain.start(stop)
 
     RESULTS.mkdir(exist_ok=True)
@@ -139,7 +162,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     decisions: list[dict] = []
     fills: list[dict] = []
     latencies: list[float] = []
-    counts = {"ok": 0, "late": 0, "throttled": 0, "error": 0}
+    counts = {"ok": 0, "late": 0, "throttled": 0, "error": 0, "warmup": 0}
     lock = threading.Lock()
     st = {"interval": pace_s, "streak": 0, "prev": None, "order": None, "last_trade_t": 0.0, "hits": 0, "scored": 0,
           "halted": None, "equity": None}
@@ -225,8 +248,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
                 "status": status, "venue": "binance", "ws_url": venue["ws_book"], "symbol": symbol, "coin": coin, "mode": mode,
                 "venue_label": f"{symbol} · Binance", "mode_label": mode_label + (f" · HALTED: {st['halted']}" if st["halted"] else ""),
                 "pace": pace_s, "interval": round(st["interval"], 3), "rate_per_s": round(len(recent) / 10, 2),
-                "late_ms": late_ms, "strategy_note": strategy.DESCRIPTION, "execution": "maker", "maker_wait": maker_wait,
-                "started": started, "updated": time.time(), "model": jev.model, "notional": position_usd,
+                "late_ms": late_ms, "strategy_note": strategy_note, "source": source, "execution": "maker", "maker_wait": maker_wait,
+                "started": started, "updated": time.time(), "model": model.name if model else jev.model, "notional": position_usd,
                 "maker_fee_bps": MAKER_FEE * 1e4, "taker_fee_bps": TAKER_FEE * 1e4, "counts": dict(counts), "blocks": len(decisions),
                 "last_ms": latencies[-1] if latencies else None,
                 "avg_ms": round(statistics.mean(latencies[-200:])) if latencies else None,
@@ -249,7 +272,9 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
         market_view = {**rec["state"], "claude_bias": bias}
         pos = 1 if book.qty > 0 else -1 if book.qty < 0 else 0
         try:
-            choice = strategy.decide({"side": rec["side"], "conf": rec["conf"]}, market_view, pos, time.time() - st["last_trade_t"])
+            call = {"side": rec["side"], "conf": rec["conf"]}
+            call.update({k: rec[k] for k in ("source", "edge_bps", "min_edge_bps", "horizon_s") if k in rec})
+            choice = strategy.decide(call, market_view, pos, time.time() - st["last_trade_t"])
         except Exception as exc:
             return f"hold · strategy error: {str(exc)[:60]}"
         if choice not in ("buy", "sell", "flat"):
@@ -281,16 +306,29 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
         st["order"] = order
         return f"limit {'buy' if buying else 'sell'} {qty:g} @ {px:g}"
 
-    def ask(seq: int) -> None:
-        snap = market.snapshot()
-        rec = {"block": seq, "t_ask": time.time(), "state": snap["state"]}
+    def ask_model(rec: dict) -> None:
+        t0 = time.time()
+        edge = model.edge_bps(signal_market.trades_since(t0 - features.HISTORY_S), t0)
+        ms = round((time.time() - t0) * 1000, 1)
+        if edge is None:
+            rec.update(side=None, conf=None, ms=None, status="warmup")
+            return
+        rec.update(side="buy" if edge >= 0 else "sell", conf=round(min(1.0, abs(edge) / model.min_edge_bps), 3), ms=ms,
+                   status="ok", source="model", edge_bps=round(edge, 2), min_edge_bps=model.min_edge_bps,
+                   horizon_s=model.horizon_s)
+
+    def ask_jev(rec: dict) -> None:
         try:
-            ans, meta = jev.ask(snap["state"], QUESTIONS, timeout=5.0, retries=0)
+            ans, meta = jev.ask(rec["state"], QUESTIONS, timeout=5.0, retries=0)
             side = ans["side"]["choice"]
             rec.update(side=side, conf=round(ans["side"]["probs"][side], 3), ms=meta["latency_ms"],
                        status="ok" if meta["latency_ms"] <= late_ms else "late")
         except JudgeError as exc:
             rec.update(side=None, conf=None, ms=None, status="throttled" if "429" in str(exc) else "error", error=str(exc)[:160])
+
+    def ask(seq: int) -> None:
+        rec = {"block": seq, "t_ask": time.time(), "state": signal_market.snapshot()["state"]}
+        (ask_model if model else ask_jev)(rec)
         now = market.snapshot()
         rec.update(t=time.time(), mid=now["mid"], micro=now["micro"])
         with lock:
@@ -312,10 +350,13 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
                 rec["action"] = decide(rec, now)
             elif rec["status"] == "late":
                 rec["action"] = "hold · late"
+            elif rec["status"] == "warmup":
+                rec["action"] = f"hold · model warming up (needs {max(features.RET_WINDOWS) // 60} min of trades)"
             else:  # Jev didn't answer: fall back to strategy.py's rules-only call
-                fb = strategy.fallback_call(now["state"]) if hasattr(strategy, "fallback_call") else None
+                state = signal_market.snapshot()["state"]
+                fb = strategy.fallback_call(state) if hasattr(strategy, "fallback_call") else None
                 if fb:
-                    rec.update(side=fb["side"], conf=fb["conf"], source="rules", state=now["state"])
+                    rec.update(side=fb["side"], conf=fb["conf"], source="rules", state=state)
                     rec["action"] = decide(rec, now)
                 else:
                     rec["action"] = f"{rec['status']} · no rules signal"
@@ -323,8 +364,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             log.write(json.dumps(rec) + "\n")
             log.flush()
         if rec["action"].startswith("limit") or rec["action"].startswith("hold · order"):
-            console.print(f"  {time.strftime('%H:%M:%S')}  #{rec['block']:<6} {'rules' if rec.get('source') else 'Jev'} {(rec['side'] or '-').upper():<4} "
-                          f"{(rec['conf'] or 0):.2f}  →  {rec['action']}")
+            sig = f"model {rec['edge_bps']:+.1f}bps" if rec.get("source") == "model" else f"{rec.get('source') or 'Jev'} {(rec['conf'] or 0):.2f}"
+            console.print(f"  {time.strftime('%H:%M:%S')}  #{rec['block']:<6} {(rec['side'] or '-').upper():<4} {sig}  →  {rec['action']}")
 
     def writer():
         last_eq = 0.0
@@ -361,4 +402,4 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     write("done")
     log.close()
     mid = market.snapshot()["mid"]
-    console.print(f"\n  {len(decisions)} Jev calls · {book.trades} fills · fees ${book.fees:.2f} · net ${book.net(mid):+.2f}")
+    console.print(f"\n  {len(decisions)} calls · {book.trades} fills · fees ${book.fees:.2f} · net ${book.net(mid):+.2f}")

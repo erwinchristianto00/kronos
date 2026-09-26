@@ -27,6 +27,7 @@ import requests
 import websocket
 from dotenv import load_dotenv
 
+from .features import HISTORY_S
 from .loop import Market
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -95,7 +96,7 @@ class BinanceMarket(Market):
             elif data.get("e") == "aggTrade":
                 # m = buyer is the maker, so the aggressor was a seller
                 self.trades.append((data["T"] / 1000, not data["m"], float(data["p"]), float(data["q"])))
-            for dq, keep in ((self.mids, 120), (self.trades, 120), (self.ticks, 300)):
+            for dq, keep in ((self.mids, 120), (self.trades, HISTORY_S), (self.ticks, 300)):
                 while dq and now - dq[0][0] > keep:
                     dq.popleft()
 

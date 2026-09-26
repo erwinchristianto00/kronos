@@ -5,6 +5,7 @@
   uv run python -m jevlab newsroom             # the news terminal: real headlines, Jev reading each one live
   uv run python -m jevlab bot --dry            # 24/7 bot on Binance prices with simulated fills (no Binance key)
   uv run python -m jevlab bot                  # 24/7 bot on Binance Demo Trading (fake money) · Claude sets the bias
+  uv run python -m jevlab train --coin SOL     # train + honestly test the local signal model (models/SOLUSDT.json)
 
 Useful flags:
   --coin BTC        loop/bot: which coin to trade (default HYPE)
@@ -22,11 +23,8 @@ import threading
 
 
 def check() -> None:
-    import time
-
     from . import hl
     from .core import console
-    from .judges import JevJudge, JudgeError
     from .news import fetch_headlines
 
     console.print("  [bold]1. Hyperliquid prices[/]")
@@ -35,11 +33,22 @@ def check() -> None:
     console.print("  [bold]2. News feeds[/]")
     n = len(fetch_headlines(24))
     console.print(f"     {n} headlines in the last 24h  [#3fd68a]ok[/]" if n else "     no headlines found  [#f5b53d]check your internet[/]")
-    console.print("  [bold]3. Jev[/]")
+    check_jev()
+    check_binance()
+    check_model()
+    console.print("\n  [#3fd68a]Done.[/] Next: [bold]uv run python -m jevlab loop[/] (needs Jev) or [bold]uv run python -m jevlab bot --dry[/]")
+
+
+def check_jev() -> None:
+    import time
+
+    from .core import console
+    from .judges import JevJudge, JudgeError
+    console.print("  [bold]3. Jev (the laptop loop, and the bot with SIGNAL_SOURCE=jev)[/]")
     try:
         jev = JevJudge()
     except JudgeError:
-        console.print("     [#f5b53d]no key yet[/]: paste your AI_GATEWAY_API_KEY into .env, save, and run this again")
+        console.print("     [#f5b53d]no key yet[/]: paste your AI_GATEWAY_API_KEY into .env to use Jev (the 24/7 bot's local model doesn't need it)")
         return
     q = {"side": {"type": "choice", "instructions": "Which side should a bot hold for the next few seconds?",
                   "criteria": {"buy": None, "sell": None}}}
@@ -50,7 +59,7 @@ def check() -> None:
         if "401" in msg or "403" in msg:
             console.print("     [#ff5d6c]key rejected[/]: check the key in .env, and that your Vercel team has a card or credits")
         elif "429" in msg:
-            console.print("     [#f5b53d]rate-limited[/]: the free tier is busy. Wait a minute, or add $5 of AI Gateway credits for full speed")
+            console.print("     [#f5b53d]rate-limited[/]: the free tier's limit, or Jev's servers are busy. Try again later")
         else:
             console.print(f"     [#ff5d6c]failed[/]: {msg[:160]}")
         return
@@ -68,9 +77,26 @@ def check() -> None:
             pass
         time.sleep(0.3)
     console.print(f"     {ok}/6 quick calls went through in {time.time() - t0:.1f}s · "
-                  + ("full speed" if ok == 6 else "you're on the free tier, so the loop will run slower (add $5 of credits for full speed)"))
-    check_binance()
-    console.print("\n  [#3fd68a]All set.[/] Next: [bold]uv run python -m jevlab loop[/]")
+                  + ("full speed" if ok == 6 else "some calls were turned away (free tier limit, or Jev is busy)"))
+
+
+def check_model() -> None:
+    import os
+
+    from .core import console
+    from .model import SignalModel
+    symbol = os.getenv("BOT_SYMBOL", "SOLUSDT")
+    console.print(f"  [bold]6. Local signal model ({symbol}, used by the 24/7 bot)[/]")
+    try:
+        m = SignalModel(symbol)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"     [#f5b53d]{exc}[/]")
+        return
+    wf = m.params.get("walk_forward", {})
+    console.print(f"     {m.name} · walk-forward test: {wf.get('trades')} trades, "
+                  f"{wf.get('net_maker_bps', 0):+.1f} bps/trade after maker fees (± {wf.get('stderr_bps')})  [#3fd68a]ok[/]")
+    if m.age_days() > 14:
+        console.print(f"     [#f5b53d]its data is {m.age_days()} days old: retrain with `uv run python -m jevlab train --coin {symbol[:-4]}`[/]")
 
 
 def check_binance() -> None:
@@ -85,7 +111,7 @@ def check_binance() -> None:
     from .binance import BinanceError, BinanceTrader, binance_mode
     try:
         mode = binance_mode()
-        trader = BinanceTrader(os.getenv("BOT_SYMBOL", "HYPEUSDT"), mode)
+        trader = BinanceTrader(os.getenv("BOT_SYMBOL", "SOLUSDT"), mode)
         eq = trader.equity_usdt()
         console.print(f"     connected to Binance Futures [bold]{mode.upper()}[/] · equity {eq:,.2f} USDT  [#3fd68a]ok[/]" if eq is not None
                       else f"     connected to Binance Futures {mode.upper()}  [#3fd68a]ok[/]")
@@ -117,7 +143,7 @@ def check_binance() -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="jevlab")
-    ap.add_argument("command", choices=["check", "loop", "newsroom", "bot"])
+    ap.add_argument("command", choices=["check", "loop", "newsroom", "bot", "train"])
     ap.add_argument("--coin", default="HYPE", help="loop/bot: the coin to trade")
     ap.add_argument("--minutes", type=float, default=10.0, help="loop/bot: how long to run (0 = until stopped)")
     ap.add_argument("--pace", type=float, default=0.3, help="loop: fastest seconds between Jev calls")
@@ -128,16 +154,22 @@ def main() -> None:
     ap.add_argument("--gap", type=float, default=6.0, help="newsroom: seconds between replayed headlines")
     ap.add_argument("--dry", action="store_true", help="bot: Binance prices but simulated fills, no Binance key needed")
     ap.add_argument("--brain-every", type=float, default=10.0, help="bot: minutes between Claude's big-picture reads")
+    ap.add_argument("--days", type=int, default=45, help="train: days of trade history to learn from")
     ap.add_argument("--port", type=int, default=8765, help="dashboard port")
     ap.add_argument("--no-open", action="store_true", help="don't open the dashboard in a browser")
     a = ap.parse_args()
 
     from .core import console
-    if a.command != "bot":  # the bot prints its own banner, with its trading mode
+    if a.command not in ("bot", "train"):  # the bot prints its own banner, with its trading mode
         console.print("[bold #8b7bff]jev-starter[/] [dim]· paper trading on live Hyperliquid data · no real orders are ever placed[/]")
 
     if a.command == "check":
         check()
+        return
+    if a.command == "train":
+        from .model import train
+        path = train(f"{a.coin.upper()}USDT", a.days)
+        console.print(f"  [#3fd68a]done[/] · read {path.with_name(path.stem + '-report.md')} before trusting it")
         return
     if a.command == "loop":
         from .loop import run_loop

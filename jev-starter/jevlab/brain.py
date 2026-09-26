@@ -95,7 +95,7 @@ Reply with ONLY a JSON object: {{"bias": "long" | "short" | "flat", "confidence"
 
 
 class Brain:
-    def __init__(self, symbol: str, every_min: float, rest: str = BINANCE_REST):
+    def __init__(self, symbol: str, every_min: float, rest: str | list[str] = BINANCE_REST):
         self.key = os.getenv("AI_GATEWAY_API_KEY", "").strip()
         self.backend = os.getenv("CLAUDE_BACKEND", "cli").strip().lower()
         if self.backend == "cli":
@@ -104,7 +104,8 @@ class Brain:
             self.claude_bin = find_claude()
         else:
             self.model = os.getenv("CLAUDE_MODEL", "anthropic/claude-sonnet-5").strip()
-        self.symbol, self.every, self.rest = symbol, every_min, rest
+        self.symbol, self.every = symbol, every_min
+        self.rests = [rest] if isinstance(rest, str) else list(rest)  # tried in order (e.g. live, then testnet)
         self.state = {"bias": None, "confidence": None, "reason": "waiting for Claude's first read", "t": None,
                       "model": self.model, "ms": None, "error": None}
         self.lock = threading.Lock()
@@ -128,10 +129,19 @@ class Brain:
             raise RuntimeError(f"claude CLI: {str(res.get('result') or res)[:160]}")
         return res["result"]
 
+    def _summary(self) -> dict:
+        err = None
+        for rest in self.rests:
+            try:
+                return market_summary(self.symbol, rest)
+            except Exception as exc:  # e.g. 451: Binance doesn't serve this server's country on that host
+                err = exc
+        raise err
+
     def think(self) -> None:
         t0 = time.time()
         try:
-            summary = market_summary(self.symbol, self.rest)
+            summary = self._summary()
             news = "\n".join(f"- {h}" for h in headlines()) or "- (none)"
             prompt = PROMPT.format(minutes=self.every, summary=json.dumps(summary, indent=1), news=news)
             text = self._ask_cli(prompt) if self.backend == "cli" else self._ask_gateway(prompt)
