@@ -9,6 +9,9 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=/root/jev-starter
+# so the bot finds the Claude Code CLI and its subscription login (~/.claude)
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/root/.local/bin/uv run python -m jevlab bot --minutes 0 --no-open
 Restart=on-failure
 RestartSec=15

@@ -5,9 +5,12 @@ volatility, funding, and the latest crypto headlines) and sets the bias for the
 next stretch: long, short, or flat. Jev and strategy.py still make the fast calls,
 but only in the direction Claude allows.
 
-Uses the same Vercel AI Gateway key as Jev. The model is CLAUDE_MODEL in .env
-(default anthropic/claude-sonnet-5). Claude on the gateway needs AI Gateway
-credits (the paid tier).
+Two ways to reach Claude, set with CLAUDE_BACKEND in .env:
+  cli      (default) The Claude Code CLI (`claude -p`), logged in with your own Claude
+           subscription on this machine. Model CLAUDE_CLI_MODEL (default claude-opus-5-5),
+           effort CLAUDE_EFFORT (default medium). No API credits needed.
+  gateway  The Vercel AI Gateway, with the same key as Jev. Model CLAUDE_MODEL
+           (default anthropic/claude-sonnet-5). Needs AI Gateway credits.
 """
 
 from __future__ import annotations
@@ -15,7 +18,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import threading
+from pathlib import Path
 import time
 
 import requests
@@ -63,6 +69,15 @@ def headlines(limit: int = 8) -> list[str]:
         return []
 
 
+def find_claude() -> str:
+    """The Claude Code CLI: CLAUDE_BIN, then PATH, then the installer's usual spots (systemd has a bare PATH)."""
+    for c in (os.getenv("CLAUDE_BIN", "").strip(), shutil.which("claude"),
+              str(Path.home() / ".local/bin/claude"), "/root/.local/bin/claude", "/usr/local/bin/claude"):
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return "claude"
+
+
 PROMPT = """You are the portfolio manager for a small, cautious crypto trading bot.
 A fast AI makes buy/sell calls every second, but it can only trade in the direction you allow.
 Decide the bias for the next {minutes} minutes: "long" (only buying allowed), "short" (only selling allowed),
@@ -82,23 +97,44 @@ Reply with ONLY a JSON object: {{"bias": "long" | "short" | "flat", "confidence"
 class Brain:
     def __init__(self, symbol: str, every_min: float, rest: str = BINANCE_REST):
         self.key = os.getenv("AI_GATEWAY_API_KEY", "").strip()
-        self.model = os.getenv("CLAUDE_MODEL", "anthropic/claude-sonnet-5").strip()
+        self.backend = os.getenv("CLAUDE_BACKEND", "cli").strip().lower()
+        if self.backend == "cli":
+            self.model = os.getenv("CLAUDE_CLI_MODEL", "claude-opus-5-5").strip()
+            self.effort = os.getenv("CLAUDE_EFFORT", "medium").strip()
+            self.claude_bin = find_claude()
+        else:
+            self.model = os.getenv("CLAUDE_MODEL", "anthropic/claude-sonnet-5").strip()
         self.symbol, self.every, self.rest = symbol, every_min, rest
         self.state = {"bias": None, "confidence": None, "reason": "waiting for Claude's first read", "t": None,
                       "model": self.model, "ms": None, "error": None}
         self.lock = threading.Lock()
+
+    def _ask_gateway(self, prompt: str) -> str:
+        body = {"model": self.model, "temperature": 0, "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]}
+        r = requests.post(CHAT_URL, headers={"Authorization": f"Bearer {self.key}"}, json=body, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
+        return r.json()["choices"][0]["message"]["content"]
+
+    def _ask_cli(self, prompt: str) -> str:
+        cmd = [self.claude_bin, "-p", prompt, "--model", self.model, "--effort", self.effort, "--output-format", "json",
+               "--tools", "", "--no-session-persistence"]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=os.path.dirname(__file__))
+        try:
+            res = json.loads(p.stdout)
+        except ValueError:
+            raise RuntimeError(f"claude CLI exit {p.returncode}: {(p.stderr or p.stdout)[:160]}")
+        if res.get("is_error") or p.returncode != 0:
+            raise RuntimeError(f"claude CLI: {str(res.get('result') or res)[:160]}")
+        return res["result"]
 
     def think(self) -> None:
         t0 = time.time()
         try:
             summary = market_summary(self.symbol, self.rest)
             news = "\n".join(f"- {h}" for h in headlines()) or "- (none)"
-            body = {"model": self.model, "temperature": 0, "max_tokens": 200, "messages": [
-                {"role": "user", "content": PROMPT.format(minutes=self.every, summary=json.dumps(summary, indent=1), news=news)}]}
-            r = requests.post(CHAT_URL, headers={"Authorization": f"Bearer {self.key}"}, json=body, timeout=60)
-            if r.status_code != 200:
-                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
-            text = r.json()["choices"][0]["message"]["content"]
+            prompt = PROMPT.format(minutes=self.every, summary=json.dumps(summary, indent=1), news=news)
+            text = self._ask_cli(prompt) if self.backend == "cli" else self._ask_gateway(prompt)
             out = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
             bias = out.get("bias") if out.get("bias") in ("long", "short", "flat") else "flat"
             with self.lock:

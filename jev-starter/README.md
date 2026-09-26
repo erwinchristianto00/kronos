@@ -40,7 +40,7 @@ Before trusting any strategy, ask three questions:
 ## The 24/7 bot (Path 2): Claude + Jev on Binance Futures
 
 `uv run python -m jevlab bot` runs the same loop against Binance USDⓈ-M Futures, with Claude as the big-picture brain:
-- **Claude** reads the market every 10 minutes and sets the bias: long, short or flat
+- **Claude** reads the market every 10 minutes and sets the bias: long, short or flat. By default it runs through the Claude Code CLI (`claude -p`) logged in with your own Claude subscription (`CLAUDE_BACKEND=cli`, model `CLAUDE_CLI_MODEL`, effort `CLAUDE_EFFORT`); `CLAUDE_BACKEND=gateway` uses the Vercel key instead
 - **Jev** makes the fast calls
 - **`strategy.py`** only trades in Claude's direction
 
