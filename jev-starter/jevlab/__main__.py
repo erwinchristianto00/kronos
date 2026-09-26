@@ -88,13 +88,14 @@ def check_model() -> None:
     symbol = os.getenv("BOT_SYMBOL", "SOLUSDT")
     console.print(f"  [bold]6. Local signal model ({symbol}, used by the 24/7 bot)[/]")
     try:
-        m = SignalModel(symbol)
+        m = SignalModel(symbol, enforce=False)
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"     [#f5b53d]{exc}[/]")
         return
     wf = m.params.get("walk_forward", {})
+    verdict = "[#3fd68a]passes[/]" if m.tested_ok else "[#f5b53d]did NOT pass: experiment on fake money only[/]"
     console.print(f"     {m.name} · walk-forward test: {wf.get('trades')} trades, "
-                  f"{wf.get('net_maker_bps', 0):+.1f} bps/trade after maker fees (± {wf.get('stderr_bps')})  [#3fd68a]ok[/]")
+                  f"{wf.get('net_maker_bps', 0):+.1f} bps/trade after maker fees (± {wf.get('stderr_bps')}) · {verdict}")
     if m.age_days() > 14:
         console.print(f"     [#f5b53d]its data is {m.age_days()} days old: retrain with `uv run python -m jevlab train --coin {symbol[:-4]}`[/]")
 

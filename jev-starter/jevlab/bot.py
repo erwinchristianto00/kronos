@@ -104,11 +104,11 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     model = jev = None
     if source == "model":
         try:
-            model = SignalModel(symbol)
+            model = SignalModel(symbol, enforce=(mode == "live"))  # fake money may run an untested model as an experiment
         except (FileNotFoundError, ValueError) as exc:
             raise SystemExit(f"  {exc}")
         signal_txt = f"signal: {model.name}, enters at a predicted {model.horizon_s // 60}-min move ≥ {model.min_edge_bps:g} bps"
-        strategy_note = f"model: enter at |predicted {model.horizon_s // 60}m move| ≥ {model.min_edge_bps:g} bps, with Claude · hold {model.horizon_s // 60} min"
+        strategy_note = f"model: enter at |predicted {model.horizon_s // 60}m move| ≥ {model.min_edge_bps:g} bps (Claude can veto) · hold {model.horizon_s // 60} min"
     else:
         try:
             jev = JevJudge()
@@ -116,6 +116,10 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             raise SystemExit(f"  Jev key missing: {exc}. Add AI_GATEWAY_API_KEY to .env first.")
         signal_txt = "signal: Jev, as fast as the key allows (rules when Jev is busy)"
         strategy_note = strategy.DESCRIPTION
+    if model and not model.tested_ok:
+        console.print(f"  [#f5b53d]EXPERIMENT: {symbol}'s model did not pass its walk-forward test "
+                      f"({model.params['walk_forward'].get('net_maker_bps')} bps/trade after fees). It runs here because this "
+                      f"is fake money; it will not run with real money.[/]")
     if model and model.age_days() > 14:
         console.print(f"  [#f5b53d]the model's data is {model.age_days()} days old: retrain it with "
                       f"`uv run python -m jevlab train --coin {coin}`[/]")
@@ -157,8 +161,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     brain.start(stop)
 
     RESULTS.mkdir(exist_ok=True)
-    out = RESULTS / "loop.json"
-    log = open(RESULTS / "bot_log.jsonl", "a")
+    out = RESULTS / f"bot_{symbol}.json"  # one set of files per coin, so several bots can run side by side
+    log = open(RESULTS / f"bot_log_{symbol}.jsonl", "a")
     decisions: list[dict] = []
     fills: list[dict] = []
     latencies: list[float] = []
@@ -167,7 +171,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     st = {"interval": pace_s, "streak": 0, "prev": None, "order": None, "last_trade_t": 0.0, "hits": 0, "scored": 0,
           "halted": None, "equity": None}
     started = time.time()
-    serve(port, open_browser, page="loop.html")
+    serve(port, open_browser, page="loop.html", data=out.name)
 
     def record_fill(dq: float, px: float, fee: float, kind: str, call, waited: float, new_order: bool = True) -> None:
         book.fill(dq, px, fee, new_order)

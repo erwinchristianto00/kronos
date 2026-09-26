@@ -14,6 +14,7 @@ The report is written next to the model (models/<SYMBOL>-report.md).
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -59,15 +60,26 @@ def dataset(trades: F.Trades, start: float, end: float, horizon: int = HORIZON_S
     return X[ok], np.clip(y[ok], -CLIP_BPS, CLIP_BPS), y[ok], q[ok]
 
 
-def simulate(q: np.ndarray, pred: np.ndarray, move: np.ndarray, min_edge: float, horizon: int) -> np.ndarray:
-    """Per-trade gross result (bps): enter when |prediction| >= min_edge, hold `horizon`, one position at a time."""
+def simulate(q: np.ndarray, pred: np.ndarray, move: np.ndarray, min_edge: float, horizon: int,
+             details: list | None = None) -> np.ndarray:
+    """Per-trade gross result (bps): enter when |prediction| >= min_edge, hold `horizon`, one position at a time.
+    If `details` is a list, each trade's (time, side, predicted bps, move bps) is appended to it."""
     side = np.where(pred >= min_edge, 1, np.where(pred <= -min_edge, -1, 0))
     out, free_at = [], -np.inf
     for j in np.flatnonzero(side):
         if q[j] >= free_at:
             out.append(side[j] * move[j])
             free_at = q[j] + horizon
+            if details is not None:
+                details.append((float(q[j]), int(side[j]), float(pred[j]), float(move[j])))
     return np.array(out)
+
+
+def passes(stats: dict) -> bool:
+    """The bar a model must clear before the bot trades it: positive after maker fees overall, in all
+    but at most one test period, with enough trades to mean something."""
+    return bool(stats.get("trades", 0) >= 20 and (stats.get("net_maker_bps") or 0) > 0
+                and stats.get("folds_positive_after_maker_fees", 0) >= stats.get("folds", 0) - 1)
 
 
 # ---------------------------------------------------------------- training + report
@@ -89,13 +101,13 @@ def train(symbol: str, days: int = 45, log=print) -> Path:
     log(f"  {len(q):,} samples over {n_days} days · walk-forward test …")
 
     # walk-forward: train on 25 days, test on the next 5, slide by 5
-    folds, all_g = [], []
+    folds, all_g, trade_rows = [], [], []
     train_len, test_len = min(25, n_days - 10), 5
     for k in range(train_len, n_days - test_len + 1, test_len):
         a = (day >= k - train_len) & (day < k)
         b = (day >= k) & (day < k + test_len)
         m = fit(X[a], y_fit[a])
-        g = simulate(q[b], predict(m, X[b]), y_real[b], MIN_EDGE_BPS, HORIZON_S)
+        g = simulate(q[b], predict(m, X[b]), y_real[b], MIN_EDGE_BPS, HORIZON_S, details=trade_rows)
         folds.append((str(hist[k][0]), str(hist[min(k + test_len, len(hist)) - 1][0]), g))
         all_g.extend(g)
     all_g = np.array(all_g)
@@ -115,10 +127,17 @@ def train(symbol: str, days: int = 45, log=print) -> Path:
         "folds_positive_after_maker_fees": sum(1 for *_, g in folds if len(g) and g.mean() > MAKER_COST_BPS),
         "folds": len(folds),
     }
+    stats["passes"] = passes(stats)
     blob = {"symbol": symbol, "kind": "ridge", "features": F.NAMES, "horizon_s": HORIZON_S,
             "min_edge_bps": MIN_EDGE_BPS, "trained_on": [str(hist[0][0]), str(hist[-1][0])],
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"), "walk_forward": stats, **final}
     path.write_text(json.dumps(blob, indent=1))
+    trades_df = pd.DataFrame(trade_rows, columns=["t", "side", "predicted_bps", "move_bps"])
+    trades_df.insert(0, "time_utc", pd.to_datetime(trades_df.pop("t"), unit="s", utc=True).dt.strftime("%Y-%m-%d %H:%M:%S"))
+    trades_df["side"] = trades_df["side"].map({1: "long", -1: "short"})
+    trades_df["net_after_maker_bps"] = (trades_df["move_bps"].where(trades_df["side"] == "long", -trades_df["move_bps"])
+                                        - MAKER_COST_BPS).round(2)
+    trades_df.round(2).to_csv(MODELS / f"{symbol}-trades.csv", index=False)
 
     lines = [f"# {symbol} signal model", "",
              f"Ridge regression predicting the move over the next {HORIZON_S // 60} minutes from trade flow.",
@@ -130,7 +149,12 @@ def train(symbol: str, days: int = 45, log=print) -> Path:
     for a, b, g in folds:
         lines.append(f"| {a} to {b} | {len(g)} | {np.mean(g > 0):.0%} | {g.mean():+.1f} | {g.mean() - MAKER_COST_BPS:+.1f} |"
                      if len(g) else f"| {a} to {b} | 0 | – | – | – |")
-    lines += ["", "## All test periods together", "",
+    lines += ["", "## Verdict", "",
+              ("**Passes** the bar" if stats["passes"] else "**Does not pass** the bar")
+              + ": positive after maker fees overall and in all but at most one test period, with at least 20 trades."
+              + ("" if stats["passes"] else " The bot won't run it with real money; on demo/testnet it runs as an experiment."),
+              "One window is not enough: rerunning this on a data window shifted by a day can change the verdict.",
+              "", "## All test periods together", "",
               f"- trades: {n} (about {stats['per_day']} a day)",
               f"- hit rate: {stats['hit_rate']:.1%}" if n else "- hit rate: –",
               f"- gross: {stats['gross_bps']:+.2f} bps per trade (± {stats['stderr_bps']} standard error)" if n > 1 else "- gross: –",
@@ -144,7 +168,9 @@ def train(symbol: str, days: int = 45, log=print) -> Path:
               "  a resting order tends to fill exactly when the price is moving against it.",
               "- Past results don't guarantee future ones. Retrain regularly and judge it on live demo results."]
     (MODELS / f"{symbol}-report.md").write_text("\n".join(lines) + "\n")
-    log(f"  wrote {path} and {symbol}-report.md")
+    verdict = ("PASSES the bar" if stats["passes"]
+               else "does NOT pass the bar (real money won't run it; fake money runs it as an experiment)")
+    log(f"  wrote {path}, {symbol}-report.md and {symbol}-trades.csv · walk-forward {verdict}")
     return path
 
 
@@ -153,17 +179,23 @@ def train(symbol: str, days: int = 45, log=print) -> Path:
 class SignalModel:
     """The trained model, loaded for the bot. edge_bps() gives the predicted move from the live trades."""
 
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, enforce: bool = True):
+        """enforce=True refuses a model that failed its walk-forward test (the bot does this for real money)."""
         path = MODELS / f"{symbol}.json"
         if not path.exists():
             raise FileNotFoundError(f"no model for {symbol}: run `uv run python -m jevlab train --coin {symbol[:-4]}`")
         self.params = json.loads(path.read_text())
         if self.params["features"] != F.NAMES:
             raise ValueError(f"{path.name} was trained on different features; retrain it")
+        wf = self.params.get("walk_forward", {})
+        self.tested_ok = bool(wf.get("passes", passes(wf)))
+        if not self.tested_ok and enforce and os.getenv("ALLOW_UNTESTED_MODEL", "").lower() != "true":
+            raise ValueError(f"{path.name} did not pass its walk-forward test ({wf.get('net_maker_bps')} bps/trade after "
+                             f"fees); the bot won't trade it with real money. Use another coin, or SIGNAL_SOURCE=jev")
         self.horizon_s = int(self.params["horizon_s"])
         self.min_edge_bps = float(self.params["min_edge_bps"])
         self.trained_to = self.params["trained_on"][1]
-        self.name = f"local model · {self.horizon_s // 60}m · data to {self.trained_to}"
+        self.name = f"local model · {self.horizon_s // 60}m · data to {self.trained_to}" + ("" if self.tested_ok else " · EXPERIMENT")
 
     def age_days(self) -> int:
         return (datetime.now(timezone.utc).date() - datetime.fromisoformat(self.trained_to).date()).days

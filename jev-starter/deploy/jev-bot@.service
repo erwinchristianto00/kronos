@@ -1,0 +1,24 @@
+# systemd template: one Jev bot per coin, 24/7, restarted if it crashes.
+# Each coin has its own settings in deploy/coins/<COIN>.env (dashboard port, Claude interval).
+# Install: cp deploy/jev-bot@.service /etc/systemd/system/ && systemctl daemon-reload
+#          systemctl enable --now jev-bot@SOL        (one per coin: jev-bot@ETH, ...)
+# Logs:    journalctl -u jev-bot@SOL -f             Stop: systemctl stop jev-bot@SOL
+[Unit]
+Description=Jev trading bot (%i, Binance Futures)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/jev-starter
+# so the bot finds the Claude Code CLI and its subscription login (~/.claude)
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/root/jev-starter/deploy/coins/%i.env
+ExecStart=/root/.local/bin/uv run python -m jevlab bot --minutes 0 --no-open --coin %i --pace 5 --port ${PORT} --brain-every ${BRAIN_EVERY}
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

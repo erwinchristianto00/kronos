@@ -45,6 +45,8 @@ SETTINGS = {
     "max_spread_bps": None, # skip entries when the spread is wider than this (None = off; the testnet's is always wide)
     "fallback_min_flow": 0.65,  # when Jev is busy: share of 30s volume needed on one side for a rules-only call
     "model_min_edge_bps": None, # local model: predicted move needed to enter (None = the model's own tested value)
+    "model_follow_claude": False,  # local model: True = only trade in Claude's direction (untested); False = Claude
+                                   # only vetoes, by saying "flat" (this matches how the model was tested)
 }
 
 DESCRIPTION = (f"enter at ≥{SETTINGS['min_conf']:.0%} with a ≥{SETTINGS['min_move_bps']:g} bps 30s move and flow · "
@@ -54,14 +56,16 @@ DESCRIPTION = (f"enter at ≥{SETTINGS['min_conf']:.0%} with a ≥{SETTINGS['min
 def decide_model(call: dict, market: dict, position: int, seconds_since_trade: float) -> str:
     """Calls from the local signal model (jevlab/model.py). call["edge_bps"] is its predicted move over
     call["horizon_s"] seconds. This mirrors how the model was tested: enter when the predicted move is at
-    least min_edge_bps, hold for the horizon, then exit unless the model still predicts the same side."""
+    least min_edge_bps, hold for the horizon, then exit unless the model still predicts the same side.
+    Claude can only veto (bias "flat"), unless SETTINGS["model_follow_claude"] is True."""
     edge, horizon = call["edge_bps"], call["horizon_s"]
     min_edge = SETTINGS.get("model_min_edge_bps") or call["min_edge_bps"]
     want = (1 if edge > 0 else -1) if abs(edge) >= min_edge else 0
     bias = market.get("claude_bias")
-    if bias == "flat":
+    follow = SETTINGS.get("model_follow_claude", False)
+    if bias == "flat":  # Claude's veto: the market looks too messy to trade
         return "flat" if position else "hold · Claude says stay out"
-    if (bias == "long" and position < 0) or (bias == "short" and position > 0):
+    if follow and ((bias == "long" and position < 0) or (bias == "short" and position > 0)):
         return "flat"  # Claude changed its mind: get out of the old direction first
     if position:
         if seconds_since_trade < horizon:
@@ -69,7 +73,7 @@ def decide_model(call: dict, market: dict, position: int, seconds_since_trade: f
         return "hold · model still agrees" if want == position else "flat"
     if not want:
         return f"hold · predicted move {edge:+.1f} bps, under {min_edge:g}"
-    if (bias == "long" and want < 0) or (bias == "short" and want > 0):
+    if follow and ((bias == "long" and want < 0) or (bias == "short" and want > 0)):
         return f"hold · against Claude's {bias} bias"
     if seconds_since_trade < SETTINGS["cooldown"]:
         return "hold · cooling down"

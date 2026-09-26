@@ -1,4 +1,4 @@
-# SOLUSDT signal model
+# HYPEUSDT signal model
 
 Ridge regression predicting the move over the next 15 minutes from trade flow.
 Trained on 2026-08-12 to 2026-09-25 (45 days, 1,943,400 samples).
@@ -8,10 +8,10 @@ Trades only when the predicted move is at least 6 bps, holds 15 minutes.
 
 | test period | trades | hit rate | gross bps/trade | net after maker fees (4 bps) |
 |---|---|---|---|---|
-| 2026-09-06 to 2026-09-10 | 19 | 42% | +2.0 | -2.0 |
-| 2026-09-11 to 2026-09-15 | 13 | 62% | -13.2 | -17.2 |
-| 2026-09-16 to 2026-09-20 | 11 | 73% | +22.1 | +18.1 |
-| 2026-09-21 to 2026-09-25 | 67 | 57% | +7.9 | +3.9 |
+| 2026-09-06 to 2026-09-10 | 10 | 40% | +1.2 | -2.8 |
+| 2026-09-11 to 2026-09-15 | 3 | 67% | +94.7 | +90.7 |
+| 2026-09-16 to 2026-09-20 | 5 | 80% | +84.4 | +80.4 |
+| 2026-09-21 to 2026-09-25 | 32 | 50% | +1.0 | -3.0 |
 
 ## Verdict
 
@@ -20,11 +20,11 @@ One window is not enough: rerunning this on a data window shifted by a day can c
 
 ## All test periods together
 
-- trades: 110 (about 5.5 a day)
-- hit rate: 56.4%
-- gross: +5.82 bps per trade (± 6.22 standard error)
-- after maker fees: +1.82 bps per trade
-- after taker fees: -4.18 bps per trade
+- trades: 50 (about 2.5 a day)
+- hit rate: 52.0%
+- gross: +14.99 bps per trade (± 10.71 standard error)
+- after maker fees: +10.99 bps per trade
+- after taker fees: +4.99 bps per trade
 
 ## How to read this
 

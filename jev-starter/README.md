@@ -74,4 +74,17 @@ Safety, always on:
 
 Real money needs `BINANCE_MODE=live` **and** the exact confirmation phrase in `JEV_LIVE_CONFIRM`. Set those yourself, after weeks of demo results.
 
-To run it 24/7, put it on an always-on server (a small Linux VPS) with `deploy/jev-bot.service`. The setup prompt walks through all of it. Not financial advice.
+### Running it 24/7, one bot per coin
+
+On an always-on Linux server, `deploy/jev-bot@.service` runs one bot per coin; each coin's dashboard port and
+Claude interval live in `deploy/coins/<COIN>.env`:
+
+```
+cp deploy/jev-bot@.service /etc/systemd/system/ && systemctl daemon-reload
+systemctl enable --now jev-bot@SOL          # and jev-bot@ETH etc. for every coin with a passing model
+journalctl -u jev-bot@SOL -f                # logs
+```
+
+Each coin writes its own `results/bot_<SYMBOL>.json` and `results/bot_log_<SYMBOL>.jsonl`, and has its own
+position size and daily loss limit (from `.env`), so three coins can lose up to three daily limits.
+The `STOP` kill switch halts every coin. Not financial advice.
