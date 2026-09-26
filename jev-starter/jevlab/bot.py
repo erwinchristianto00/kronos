@@ -107,8 +107,9 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             model = SignalModel(symbol, enforce=(mode == "live"))  # fake money may run an untested model as an experiment
         except (FileNotFoundError, ValueError) as exc:
             raise SystemExit(f"  {exc}")
-        signal_txt = f"signal: {model.name}, enters at a predicted {model.horizon_s // 60}-min move ≥ {model.min_edge_bps:g} bps"
-        strategy_note = f"model: enter at |predicted {model.horizon_s // 60}m move| ≥ {model.min_edge_bps:g} bps (Claude can veto) · hold {model.horizon_s // 60} min"
+        min_edge = strategy.SETTINGS.get("model_min_edge_bps") or model.min_edge_bps  # strategy.py can override it
+        signal_txt = f"signal: {model.name}, enters at a predicted {model.horizon_s // 60}-min move ≥ {min_edge:g} bps"
+        strategy_note = f"model: enter at |predicted {model.horizon_s // 60}m move| ≥ {min_edge:g} bps (Claude can veto) · hold {model.horizon_s // 60} min"
     else:
         try:
             jev = JevJudge()
@@ -317,8 +318,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
         if edge is None:
             rec.update(side=None, conf=None, ms=None, status="warmup")
             return
-        rec.update(side="buy" if edge >= 0 else "sell", conf=round(min(1.0, abs(edge) / model.min_edge_bps), 3), ms=ms,
-                   status="ok", source="model", edge_bps=round(edge, 2), min_edge_bps=model.min_edge_bps,
+        rec.update(side="buy" if edge >= 0 else "sell", conf=round(min(1.0, abs(edge) / min_edge), 3), ms=ms,
+                   status="ok", source="model", edge_bps=round(edge, 2), min_edge_bps=min_edge,
                    horizon_s=model.horizon_s)
 
     def ask_jev(rec: dict) -> None:
