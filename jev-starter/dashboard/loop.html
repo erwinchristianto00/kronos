@@ -169,22 +169,18 @@ function onQuote(bp, ap, bs, as) {
   if ($("spr")) $("spr").textContent = lastSpr;
 }
 
-// live price straight from the exchange the bot trades on: Hyperliquid (paper loop) or Bybit (24/7 bot)
+// live price straight from the exchange the bot trades on: Hyperliquid (paper loop) or Binance (24/7 bot)
 function connect(coin) {
   const venue = S.venue || "hyperliquid", key = venue + ":" + coin;
   if (wsCoin === key && ws && ws.readyState <= 1) return;
   wsCoin = key;
   try { ws && ws.close(); } catch (e) {}
-  if (venue === "bybit") {
-    ws = new WebSocket("wss://stream.bybit.com/v5/public/linear");
-    ws.onopen = () => {
-      ws.send(JSON.stringify({op: "subscribe", args: [`orderbook.1.${S.symbol}`]}));
-      clearInterval(ws._ping); ws._ping = setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({op: "ping"})), 18000);
-    };
+  if (venue === "binance") {
+    ws = new WebSocket(`${S.ws_url || "wss://fstream.binance.com/public"}/ws/${S.symbol.toLowerCase()}@bookTicker`);
     ws.onmessage = (ev) => {
-      const m = JSON.parse(ev.data), d = m.data;
-      if (!m.topic || !m.topic.startsWith("orderbook.1.") || !d || !d.b?.length || !d.a?.length) return;
-      onQuote(+d.b[0][0], +d.a[0][0], +d.b[0][1], +d.a[0][1]);
+      const d = JSON.parse(ev.data);
+      if (d.e !== "bookTicker" || +d.B + +d.A <= 0) return;
+      onQuote(+d.b, +d.a, +d.B, +d.A);
     };
   } else {
     ws = new WebSocket("wss://api.hyperliquid.xyz/ws");
@@ -256,8 +252,8 @@ function renderData() {
   const working = S.order ? `<span>limit ${(S.order.buying ?? S.order.target > 0) ? "buy" : "sell"} <b>${fmtPx(S.order.px)}</b> working</span>` : "";
   $("sub").innerHTML = `<span>${pos}</span>${working}<span class="pnl">balance <b class="${j.net > 0 ? "g" : ""}">$${(1000 + j.net).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</b></span><span>spread <b id="spr">${lastSpr}</b></span>`;
 
-  const acct = {demo: "Bybit demo account", live: "Bybit LIVE account"}[S.mode] || "Paper account";
-  $("balLabel").textContent = S.venue === "bybit" && S.mode !== "dry" ? "This session (from $1,000)" : "Paper balance";
+  const acct = {demo: "Binance demo account", testnet: "Binance testnet account", live: "Binance LIVE account"}[S.mode] || "Paper account";
+  $("balLabel").textContent = S.venue === "binance" && S.mode !== "dry" ? "This session (from $1,000)" : "Paper balance";
   $("moneyTitle").textContent = `${acct} · $${Math.round(S.notional || 1000).toLocaleString()} position · ${S.execution === "maker" ? `limit orders, ${S.maker_fee_bps.toFixed(1)} bps` : `market orders, ${S.taker_fee_bps.toFixed(1)} bps + spread`}`;
   const tone = (v) => (v > 0 ? "g" : "");  // gains in green, everything else neutral
   $("mBal").textContent = "$" + (1000 + j.net).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});

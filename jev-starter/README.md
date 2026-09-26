@@ -1,7 +1,7 @@
 # jev-starter
 
 A Jev trading bot you can watch, test, and plug your own strategy into.
-**The laptop version is paper trading only**: it reads live public market data and simulates fills, with no exchange account needed. The optional **24/7 bot** (Path 2) trades on Bybit, starting on Bybit Demo Trading (fake money).
+**The laptop version is paper trading only**: it reads live public market data and simulates fills, with no exchange account needed. The optional **24/7 bot** (Path 2) trades on Binance USDⓈ-M Futures, starting on Binance Demo Trading (fake money).
 
 ## What's inside
 
@@ -37,14 +37,14 @@ Before trusting any strategy, ask three questions:
 
 `--coin BTC` · `--minutes 0` (run until Ctrl+C) · `--taker` (market orders) · `--gap 4` (newsroom pace) · `--port 8766` (a second dashboard) · `--no-open`
 
-## The 24/7 bot (Path 2): Claude + Jev on Bybit
+## The 24/7 bot (Path 2): Claude + Jev on Binance Futures
 
-`uv run python -m jevlab bot` runs the same loop against Bybit, with Claude as the big-picture brain:
+`uv run python -m jevlab bot` runs the same loop against Binance USDⓈ-M Futures, with Claude as the big-picture brain:
 - **Claude** reads the market every 10 minutes and sets the bias: long, short or flat
 - **Jev** makes the fast calls
 - **`strategy.py`** only trades in Claude's direction
 
-It starts on **Bybit Demo Trading** (fake money). `--dry` runs it on Bybit prices with simulated fills and needs no Bybit key.
+It starts on **Binance Demo Trading** (fake money; `BINANCE_MODE=testnet` uses the older futures testnet instead). `--dry` runs it on Binance prices with simulated fills and needs no Binance key. The futures account must be in One-way position mode, and the server must be in a country Binance serves (not the US).
 
 Safety, always on:
 - post-only limit orders
@@ -52,6 +52,6 @@ Safety, always on:
 - a kill switch: create a file called `STOP` and it closes out and halts
 - on shutdown it cancels orders and closes the position
 
-Real money needs `BYBIT_MODE=live` **and** the exact confirmation phrase in `JEV_LIVE_CONFIRM`. Set those yourself, after weeks of demo results.
+Real money needs `BINANCE_MODE=live` **and** the exact confirmation phrase in `JEV_LIVE_CONFIRM`. Set those yourself, after weeks of demo results.
 
 To run it 24/7, put it on an always-on server (a small Linux VPS) with `deploy/jev-bot.service`. The setup prompt walks through all of it. Not financial advice.

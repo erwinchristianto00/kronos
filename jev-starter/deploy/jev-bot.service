@@ -3,7 +3,7 @@
 #          sudo systemctl enable --now jev-bot
 # Logs:    journalctl -u jev-bot -f        Stop: sudo systemctl stop jev-bot
 [Unit]
-Description=Jev trading bot (Bybit)
+Description=Jev trading bot (Binance Futures)
 After=network-online.target
 Wants=network-online.target
 

@@ -24,15 +24,22 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 CHAT_URL = "https://ai-gateway.vercel.sh/v1/chat/completions"
-BYBIT_REST = "https://api.bybit.com/v5/market"
+BINANCE_REST = "https://fapi.binance.com"
 
 
-def market_summary(symbol: str) -> dict:
-    """Plain numbers Claude can reason about, from Bybit's public market data."""
-    k = requests.get(f"{BYBIT_REST}/kline", params={"category": "linear", "symbol": symbol, "interval": "5", "limit": 49},
-                     timeout=10).json()["result"]["list"]
-    closes = [float(r[4]) for r in reversed(k)]  # oldest -> newest, 5-minute bars, last ~4 hours
-    t = requests.get(f"{BYBIT_REST}/tickers", params={"category": "linear", "symbol": symbol}, timeout=10).json()["result"]["list"][0]
+def _get(url: str, **params):
+    r = requests.get(url, params=params, timeout=10)
+    if r.status_code != 200:  # e.g. 451 = Binance doesn't serve this server's country
+        raise RuntimeError(f"Binance HTTP {r.status_code}: {r.text[:120]}")
+    return r.json()
+
+
+def market_summary(symbol: str, rest: str = BINANCE_REST) -> dict:
+    """Plain numbers Claude can reason about, from Binance's public futures market data."""
+    k = _get(f"{rest}/fapi/v1/klines", symbol=symbol, interval="5m", limit=49)
+    closes = [float(r[4]) for r in k]  # oldest -> newest, 5-minute bars, last ~4 hours
+    t = _get(f"{rest}/fapi/v1/ticker/24hr", symbol=symbol)
+    f = _get(f"{rest}/fapi/v1/premiumIndex", symbol=symbol)
     pct = lambda a, b: round(100 * (b / a - 1), 2)
     moves = [abs(pct(a, b)) for a, b in zip(closes, closes[1:])]
     return {
@@ -41,10 +48,10 @@ def market_summary(symbol: str) -> dict:
         "change_15m_pct": pct(closes[-4], closes[-1]),
         "change_1h_pct": pct(closes[-13], closes[-1]),
         "change_4h_pct": pct(closes[0], closes[-1]),
-        "change_24h_pct": round(100 * float(t["price24hPcnt"]), 2),
+        "change_24h_pct": round(float(t["priceChangePercent"]), 2),
         "avg_5m_move_pct": round(sum(moves) / len(moves), 3),
         "high_4h": max(closes), "low_4h": min(closes),
-        "funding_rate_pct": round(100 * float(t.get("fundingRate") or 0), 4),
+        "funding_rate_pct": round(100 * float(f.get("lastFundingRate") or 0), 4),
     }
 
 
@@ -73,10 +80,10 @@ Reply with ONLY a JSON object: {{"bias": "long" | "short" | "flat", "confidence"
 
 
 class Brain:
-    def __init__(self, symbol: str, every_min: float):
+    def __init__(self, symbol: str, every_min: float, rest: str = BINANCE_REST):
         self.key = os.getenv("AI_GATEWAY_API_KEY", "").strip()
         self.model = os.getenv("CLAUDE_MODEL", "anthropic/claude-sonnet-5").strip()
-        self.symbol, self.every = symbol, every_min
+        self.symbol, self.every, self.rest = symbol, every_min, rest
         self.state = {"bias": None, "confidence": None, "reason": "waiting for Claude's first read", "t": None,
                       "model": self.model, "ms": None, "error": None}
         self.lock = threading.Lock()
@@ -84,7 +91,7 @@ class Brain:
     def think(self) -> None:
         t0 = time.time()
         try:
-            summary = market_summary(self.symbol)
+            summary = market_summary(self.symbol, self.rest)
             news = "\n".join(f"- {h}" for h in headlines()) or "- (none)"
             body = {"model": self.model, "temperature": 0, "max_tokens": 200, "messages": [
                 {"role": "user", "content": PROMPT.format(minutes=self.every, summary=json.dumps(summary, indent=1), news=news)}]}

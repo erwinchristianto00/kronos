@@ -3,8 +3,8 @@
   uv run python -m jevlab check                # test the setup: live prices, headlines, and one real Jev call
   uv run python -m jevlab loop                 # the Jev Loop: live trading dashboard (paper), your strategy
   uv run python -m jevlab newsroom             # the news terminal: real headlines, Jev reading each one live
-  uv run python -m jevlab bot --dry            # 24/7 bot on Bybit prices with simulated fills (no Bybit key)
-  uv run python -m jevlab bot                  # 24/7 bot on Bybit Demo Trading (fake money) · Claude sets the bias
+  uv run python -m jevlab bot --dry            # 24/7 bot on Binance prices with simulated fills (no Binance key)
+  uv run python -m jevlab bot                  # 24/7 bot on Binance Demo Trading (fake money) · Claude sets the bias
 
 Useful flags:
   --coin BTC        loop/bot: which coin to trade (default HYPE)
@@ -69,44 +69,49 @@ def check() -> None:
         time.sleep(0.3)
     console.print(f"     {ok}/6 quick calls went through in {time.time() - t0:.1f}s · "
                   + ("full speed" if ok == 6 else "you're on the free tier, so the loop will run slower (add $5 of credits for full speed)"))
-    check_bybit()
+    check_binance()
     console.print("\n  [#3fd68a]All set.[/] Next: [bold]uv run python -m jevlab loop[/]")
 
 
-def check_bybit() -> None:
+def check_binance() -> None:
     import os
 
     from .core import console
-    console.print("  [bold]5. Bybit (only needed for the 24/7 bot)[/]")
-    if not os.getenv("BYBIT_API_KEY", "").strip():
+    console.print("  [bold]5. Binance (only needed for the 24/7 bot)[/]")
+    if not os.getenv("BINANCE_API_KEY", "").strip():
         console.print("     not set up yet (fine for the laptop version)")
         return
-    from .bybit import BybitError, BybitTrader, bybit_mode
+    from .binance import BinanceError, BinanceTrader, binance_mode
     try:
-        mode = bybit_mode()
-        trader = BybitTrader(os.getenv("BOT_SYMBOL", "HYPEUSDT"), mode)
+        mode = binance_mode()
+        trader = BinanceTrader(os.getenv("BOT_SYMBOL", "HYPEUSDT"), mode)
         eq = trader.equity_usdt()
-        console.print(f"     connected to Bybit [bold]{mode.upper()}[/] · equity {eq:,.2f} USDT  [#3fd68a]ok[/]" if eq is not None
-                      else f"     connected to Bybit {mode.upper()}  [#3fd68a]ok[/]")
-    except BybitError as exc:
+        console.print(f"     connected to Binance Futures [bold]{mode.upper()}[/] · equity {eq:,.2f} USDT  [#3fd68a]ok[/]" if eq is not None
+                      else f"     connected to Binance Futures {mode.upper()}  [#3fd68a]ok[/]")
+    except BinanceError as exc:
         msg = str(exc)
-        hint = (" (a demo key only works with BYBIT_MODE=demo, a live key only with live)" if "10003" in msg or "API key is invalid" in msg
-                else " (check the key and secret in .env)")
-        console.print(f"     [#ff5d6c]Bybit said no[/]: {msg[:140]}{hint}")
+        if "restricted location" in msg or "451" in msg:
+            hint = " (Binance blocks this server's country: use a server outside the US and other restricted regions)"
+        elif "-2015" in msg or "-2014" in msg or "-1022" in msg:
+            hint = (" (the key doesn't match this mode: a demo key only works with BINANCE_MODE=demo, a testnet key with "
+                    "testnet, a live key with live. Also check Futures is enabled on the key and the IP whitelist)")
+        else:
+            hint = " (check the key and secret in .env)"
+        console.print(f"     [#ff5d6c]Binance said no[/]: {msg[:140]}{hint}")
         return
-    try:  # safety checks on the key itself (not every account type exposes this)
-        info = trader._call(trader.http.get_api_key_information)
-        perms = info.get("permissions", {}) or {}
-        flat = {p for v in perms.values() for p in (v or [])}
-        if any("Withdraw" in p for p in flat):
-            console.print("     [#ff5d6c]this key can WITHDRAW funds[/]: make a new key without withdrawal permission")
+    if mode != "live":
+        console.print("     demo/testnet key: it can only move fake money  [#3fd68a]ok[/]")
+        return
+    try:  # safety checks on the live key itself
+        r = trader.key_restrictions()
+        if r.get("enableWithdrawals") or r.get("enableInternalTransfer") or r.get("permitsUniversalTransfer"):
+            console.print("     [#ff5d6c]this key can WITHDRAW or TRANSFER funds[/]: make a new key with only Futures trading enabled")
         else:
             console.print("     key can't withdraw  [#3fd68a]ok[/]")
-        ips = info.get("ips") or []
-        console.print("     key is locked to IP " + ", ".join(ips) + "  [#3fd68a]ok[/]" if ips and ips != ["*"]
-                      else "     key isn't locked to an IP yet (lock it to your server's IP once the server is set up)")
+        console.print("     key is locked to your server's IP  [#3fd68a]ok[/]" if r.get("ipRestrict")
+                      else "     key isn't locked to an IP yet (lock it to your server's IP)")
     except Exception:
-        console.print("     [dim](couldn't read the key's permissions here, so double-check them on Bybit: no withdrawals)[/]")
+        console.print("     [dim](couldn't read the key's permissions here, so double-check them on Binance: no withdrawals)[/]")
 
 
 def main() -> None:
@@ -120,7 +125,7 @@ def main() -> None:
     ap.add_argument("--maker-wait", type=float, default=10.0, help="loop: seconds a limit order rests before cancel")
     ap.add_argument("--hours", type=float, default=36.0, help="newsroom: how far back to replay headlines")
     ap.add_argument("--gap", type=float, default=6.0, help="newsroom: seconds between replayed headlines")
-    ap.add_argument("--dry", action="store_true", help="bot: Bybit prices but simulated fills, no Bybit key needed")
+    ap.add_argument("--dry", action="store_true", help="bot: Binance prices but simulated fills, no Binance key needed")
     ap.add_argument("--brain-every", type=float, default=10.0, help="bot: minutes between Claude's big-picture reads")
     ap.add_argument("--port", type=int, default=8765, help="dashboard port")
     ap.add_argument("--no-open", action="store_true", help="don't open the dashboard in a browser")

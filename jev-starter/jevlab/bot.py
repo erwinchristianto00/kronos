@@ -1,7 +1,7 @@
-"""The 24/7 bot (Path 2): Jev + Claude + your strategy, trading on Bybit.
+"""The 24/7 bot (Path 2): Jev + Claude + your strategy, trading on Binance USDⓈ-M Futures.
 
-  uv run python -m jevlab bot --dry        # Bybit prices, simulated fills. No Bybit key needed
-  uv run python -m jevlab bot              # Bybit Demo Trading (fake money), needs a demo API key
+  uv run python -m jevlab bot --dry        # Binance prices, simulated fills. No Binance key needed
+  uv run python -m jevlab bot              # Binance Demo Trading (fake money), needs a demo API key
   uv run python -m jevlab bot --minutes 0  # run until stopped (this is what the server runs)
 
 How it decides:
@@ -14,7 +14,7 @@ How it decides:
     cancelled if they don't fill within --maker-wait seconds.
 
 Safety, always on:
-  * Demo Trading unless BYBIT_MODE=live AND JEV_LIVE_CONFIRM is the exact phrase (see bybit.py).
+  * Demo Trading unless BINANCE_MODE=live AND JEV_LIVE_CONFIRM is the exact phrase (see binance.py).
   * MAX_POSITION_USD caps the position size (default $1,000).
   * MAX_DAILY_LOSS_USD: hit it and the bot cancels everything, closes the position and stops
     trading for the day (default $50).
@@ -35,13 +35,14 @@ from pathlib import Path
 
 from . import strategy
 from .brain import Brain
-from .bybit import BybitError, BybitMarket, BybitTrader, bybit_mode
+from .binance import VENUES, BinanceError, BinanceMarket, BinanceTrader, binance_mode
 from .core import RESULTS, console, header
 from .judges import JevJudge, JudgeError
 from .loop import QUESTIONS
 from .server import serve
 
-MAKER_FEE = 0.0002  # Bybit base-tier maker fee on USDT perps, used for --dry fills
+MAKER_FEE = 0.0002  # Binance base-tier maker fee on USDⓈ-M perps, used for --dry fills
+TAKER_FEE = 0.0005  # Binance base-tier taker fee, used for simulated close-outs
 STOP_FILE = Path(__file__).resolve().parent.parent / "STOP"
 
 
@@ -76,13 +77,15 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             maker_wait: float = 10.0, brain_every: float = 10.0, dry: bool = False) -> None:
     symbol = f"{coin}USDT"
     try:
-        mode = "dry" if dry else bybit_mode()
-    except BybitError as exc:
+        mode = "dry" if dry else binance_mode()
+    except BinanceError as exc:
         raise SystemExit(f"  {exc}")
     position_usd = float(os.getenv("MAX_POSITION_USD", "1000"))
     max_loss = float(os.getenv("MAX_DAILY_LOSS_USD", "50"))
-    mode_label = {"dry": "Bybit prices · simulated fills", "demo": "Bybit DEMO · fake money", "live": "LIVE · REAL MONEY"}[mode]
-    header("THE JEV BOT", f"{symbol} on Bybit · {mode_label} · Claude sets the bias every {brain_every:g} min · "
+    mode_label = {"dry": "Binance prices · simulated fills", "demo": "Binance DEMO · fake money",
+                  "testnet": "Binance TESTNET · fake money", "live": "LIVE · REAL MONEY"}[mode]
+    venue = VENUES[mode]
+    header("THE JEV BOT", f"{symbol} on Binance Futures · {mode_label} · Claude sets the bias every {brain_every:g} min · "
            f"Jev calls as fast as the key allows · strategy: {strategy.DESCRIPTION} · "
            f"max position ${position_usd:,.0f} · daily loss limit ${max_loss:,.0f}")
     if mode == "live":
@@ -95,18 +98,18 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     trader = None
     if mode != "dry":
         try:
-            trader = BybitTrader(symbol, mode)
+            trader = BinanceTrader(symbol, mode)
             trader.cancel_all()  # start clean: no stale orders from a previous run
             equity = trader.equity_usdt()
-            console.print(f"  Bybit {mode} account connected · equity {equity:,.2f} USDT" if equity is not None
-                          else f"  Bybit {mode} account connected")
-        except BybitError as exc:
-            raise SystemExit(f"  Bybit problem: {exc}")
+            console.print(f"  Binance {mode} account connected · equity {equity:,.2f} USDT" if equity is not None
+                          else f"  Binance {mode} account connected")
+        except BinanceError as exc:
+            raise SystemExit(f"  Binance problem: {exc}")
 
-    market = BybitMarket(symbol)
+    market = BinanceMarket(symbol, venue)
     market.start()
     if not market.ready.wait(15):
-        raise SystemExit("  no price feed from Bybit after 15s, check the connection")
+        raise SystemExit("  no price feed from Binance after 15s, check the connection")
 
     book = Book()
     if trader:  # adopt any position already open, so the numbers are honest from the first second
@@ -116,7 +119,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             console.print(f"  existing position adopted: {size:+g} {coin} @ {avg:g}")
 
     stop = threading.Event()
-    brain = Brain(symbol, brain_every)
+    brain = Brain(symbol, brain_every, venue["data_rest"])
     brain.start(stop)
 
     RESULTS.mkdir(exist_ok=True)
@@ -154,14 +157,14 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             return
         try:
             s = trader.order(o["id"])
-        except BybitError:
+        except BinanceError:
             return
         new = s["filled"] - o["seen_qty"]
         if new > 1e-12:  # count only the newly filled part, with its share of the fee
             px = s["avg_px"] or o["px"]
             record_fill(new if o["buying"] else -new, px, s["fee"] - o["seen_fee"], "limit", o["call"], now - o["t"])
             o["seen_qty"], o["seen_fee"] = s["filled"], s["fee"]
-        if s["status"] in ("Filled", "Cancelled", "Rejected", "Deactivated", "PartiallyFilledCanceled"):
+        if s["done"]:
             st["order"] = None
         elif now > o["expires"]:
             trader.cancel(o["id"])
@@ -170,8 +173,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     def close_out() -> None:
         try:
             f = trader.flatten()
-        except BybitError as exc:
-            console.print(f"  [#ff5d6c]couldn't close the position: {exc}. Close it on Bybit manually.[/]")
+        except BinanceError as exc:
+            console.print(f"  [#ff5d6c]couldn't close the position: {exc}. Close it on Binance manually.[/]")
             return
         if f and f["px"]:
             record_fill(f["dq"], f["px"], f["fee"], "market", None, 0)
@@ -186,7 +189,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
         else:
             mid = market.snapshot()["mid"]
             if book.qty:
-                record_fill(-book.qty, mid, abs(book.qty) * mid * 0.00055, "market", None, 0)
+                record_fill(-book.qty, mid, abs(book.qty) * mid * TAKER_FEE, "market", None, 0)
 
     def risk_check(mid: float) -> None:
         if st["halted"]:
@@ -207,12 +210,12 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             recent = [d["t"] for d in decisions if d["t"] >= time.time() - 10]
             o = st["order"]
             payload = {
-                "status": status, "venue": "bybit", "symbol": symbol, "coin": coin, "mode": mode,
-                "venue_label": f"{symbol} · Bybit", "mode_label": mode_label + (f" · HALTED: {st['halted']}" if st["halted"] else ""),
+                "status": status, "venue": "binance", "ws_url": venue["ws_book"], "symbol": symbol, "coin": coin, "mode": mode,
+                "venue_label": f"{symbol} · Binance", "mode_label": mode_label + (f" · HALTED: {st['halted']}" if st["halted"] else ""),
                 "pace": pace_s, "interval": round(st["interval"], 3), "rate_per_s": round(len(recent) / 10, 2),
                 "late_ms": late_ms, "strategy_note": strategy.DESCRIPTION, "execution": "maker", "maker_wait": maker_wait,
                 "started": started, "updated": time.time(), "model": jev.model, "notional": position_usd,
-                "maker_fee_bps": MAKER_FEE * 1e4, "taker_fee_bps": 5.5, "counts": dict(counts), "blocks": len(decisions),
+                "maker_fee_bps": MAKER_FEE * 1e4, "taker_fee_bps": TAKER_FEE * 1e4, "counts": dict(counts), "blocks": len(decisions),
                 "last_ms": latencies[-1] if latencies else None,
                 "avg_ms": round(statistics.mean(latencies[-200:])) if latencies else None,
                 "hits": st["hits"], "scored": st["scored"], "brain": brain.current(),
@@ -254,14 +257,14 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
         buying = dq > 0
         qty = trader.round_qty(abs(dq)) if trader else round(abs(dq), 6)
         if trader and (qty < trader.min_qty or qty * now["mid"] < trader.min_notional):
-            return "hold · order too small for Bybit"
+            return "hold · order too small for Binance"
         px = now["bid"] if buying else now["ask"]
         order = {"target": want, "buying": buying, "qty": qty, "px": px, "t": time.time(), "expires": time.time() + maker_wait,
                  "call": rec["block"], "seen_qty": 0.0, "seen_fee": 0.0, "id": None}
         if trader:
             try:
                 order["id"] = trader.place_post_only("buy" if buying else "sell", qty, px, reduce_only=(want == 0))
-            except BybitError as exc:
+            except BinanceError as exc:
                 return f"hold · order rejected: {str(exc)[:70]}"
         st["order"] = order
         return f"limit {'buy' if buying else 'sell'} {qty:g} @ {px:g}"
