@@ -106,7 +106,7 @@ body.clean .moneycard,body.clean .pnl{display:none!important}
       <div class="chart" id="chart"><div class="wait">connecting to Hyperliquid…</div></div>
       <div>
         <div class="dots" id="dots"></div>
-        <div class="foot"><span>one dot per decision · <span class="g">buy</span> · <span class="r">sell</span> · <span class="a">late</span> · ◆ = trade filled</span><span id="blockNote"></span></div>
+        <div class="foot"><span>one dot per decision · <span class="g">buy</span> · <span class="r">sell</span> · <span class="a">late</span> · <span class="d">grey = model lean, no trade</span> · ◆ = trade filled</span><span id="blockNote"></span></div>
       </div>
     </div>
 
@@ -156,7 +156,13 @@ function fmtPx(p) { const d = p >= 1000 ? 1 : p >= 10 ? 3 : 5; return p.toLocale
 const fmtEdge = (v) => (v > 0 ? "+" : "") + v.toFixed(1) + " bps";
 const fmtUsdt = (v) => v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + " USDT";
 const usd = (v) => (v >= 0 ? "+$" : "−$") + Math.abs(v).toFixed(2);
-function colorFor(d) { return d.status === "ok" || d.source ? (d.side === "buy" ? "var(--good)" : "var(--bad)") : "var(--late)"; }
+// a model call under its entry threshold is only a lean, not a trade signal: shown grey, never as BUY/SELL
+const weak = (d) => d.source === "model" && Math.abs(d.edge_bps) < d.min_edge_bps;
+const sideWord = (d) => weak(d) ? (d.side === "buy" ? "LEANS UP" : "LEANS DOWN") : d.side.toUpperCase();
+function colorFor(d) {
+  if (weak(d)) return "var(--dim)";
+  return d.status === "ok" || d.source ? (d.side === "buy" ? "var(--good)" : "var(--bad)") : "var(--late)";
+}
 function niceTicks(lo, hi, k) {
   const span = hi - lo || 1; let step = Math.pow(10, Math.floor(Math.log10(span / k)));
   for (const m of [1, 2, 5, 10]) { if (span / (step * m) <= k) { step *= m; break; } }
@@ -236,8 +242,9 @@ function renderData() {
     $("verb").textContent = fill.side === "buy" ? "Bought" : "Sold"; $("verb").style.color = fill.side === "buy" ? "var(--good)" : "var(--bad)";
     $("verbMeta").textContent = `${fill.kind} fill @ ${fmtPx(fill.px)}${fill.wait_s ? ` · rested ${fill.wait_s}s` : ""}`;
   } else if (d && d.side) {
-    $("verb").textContent = d.side === "buy" ? "BUY" : "SELL"; $("verb").style.color = d.side === "buy" ? "var(--good)" : "var(--bad)";
-    $("verbMeta").textContent = d.source === "model" ? `model · predicted ${fmtEdge(d.edge_bps)} · ${d.ms} ms`
+    $("verb").textContent = sideWord(d); $("verb").style.color = weak(d) ? "var(--muted)" : colorFor(d);
+    $("verbMeta").textContent = d.source === "model"
+      ? `model · predicted ${fmtEdge(d.edge_bps)}` + (weak(d) ? ` · under ${d.min_edge_bps} bps, no trade` : ` · ${d.action || ""}`)
       : d.source ? "rules signal · Jev busy" : `Jev · ${Math.round(100 * d.conf)}% · ${d.ms} ms`;
   }
   if (d) {
@@ -246,7 +253,7 @@ function renderData() {
       // the model predicts a move, not a probability: show how far it leans (full bar = twice the entry threshold)
       const pb = last.source === "model" ? Math.min(1, Math.max(0, 0.5 + last.edge_bps / (4 * last.min_edge_bps)))
         : last.side === "buy" ? last.conf : 1 - last.conf;
-      $("bigSide").textContent = last.side.toUpperCase(); $("bigSide").style.color = last.side === "buy" ? "var(--good)" : "var(--bad)";
+      $("bigSide").textContent = sideWord(last); $("bigSide").style.color = weak(last) ? "var(--muted)" : colorFor(last);
       $("bigConf").textContent = last.source === "model" ? fmtEdge(last.edge_bps) : last.source ? "rules" : Math.round(100 * last.conf) + "%";
       $("barBuy").style.width = (100 * pb) + "%"; $("barSell").style.width = (100 * (1 - pb)) + "%";
       $("pBuy").textContent = Math.round(100 * pb) + "%"; $("pSell").textContent = Math.round(100 * (1 - pb)) + "%";
@@ -316,8 +323,10 @@ function renderFeed() {
   const rows = answered().slice(-22).reverse();
   $("feed").innerHTML = rows.map((d, i) => {
     const fresh = !seenBlocks.has(d.block); seenBlocks.add(d.block);
-    const cls = d.status !== "ok" && !d.source ? "hold" : d.side;
-    const side = d.side ? `<b class="${d.status === "ok" || d.source ? (d.side === "buy" ? "g" : "r") : "a"}">${d.side.toUpperCase()}${d.source === "rules" ? " (rules)" : ""}</b>` : `<span class="a">—</span>`;
+    const cls = weak(d) ? "" : d.status !== "ok" && !d.source ? "hold" : d.side;
+    const side = !d.side ? `<span class="a">—</span>`
+      : weak(d) ? `<span class="d">${d.side === "buy" ? "up" : "down"}</span>`
+      : `<b class="${d.status === "ok" || d.source ? (d.side === "buy" ? "g" : "r") : "a"}">${d.side.toUpperCase()}${d.source === "rules" ? " (rules)" : ""}</b>`;
     const LABEL = {"hold · low conviction": "signal", "hold · limit order working": "order working", "hold · too soon to flip": "cooling down",
                    "hold · already long": "in position", "hold · already short": "in position", "hold · late": "late"};
     const act = LABEL[d.action] || d.action || d.status, trade = /^(limit|market)/.test(act);
