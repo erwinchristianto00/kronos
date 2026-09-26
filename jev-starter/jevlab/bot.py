@@ -51,15 +51,24 @@ class Book:
 
     def __init__(self):
         self.qty, self.cash, self.fees, self.trades = 0.0, 0.0, 0.0, 0
+        self.entry = 0.0  # average entry price of the open position
         self.equity: list[list[float]] = []
         self.day = datetime.now(timezone.utc).date()
         self.day_start_net = 0.0
 
-    def fill(self, dq: float, px: float, fee_usd: float) -> None:
+    def fill(self, dq: float, px: float, fee_usd: float, new_order: bool = True) -> None:
+        """new_order=False for the later parts of a partially filled order, so one order counts as one trade."""
+        old = self.qty
         self.cash -= dq * px
         self.qty += dq
         self.fees += fee_usd
-        self.trades += 1
+        self.trades += new_order
+        if abs(self.qty) < 1e-9:
+            self.qty, self.entry = 0.0, 0.0
+        elif old == 0 or (old > 0) != (self.qty > 0):  # opened, or flipped through zero: entry is this fill
+            self.entry = px
+        elif abs(self.qty) > abs(old):  # added to the position: average the entry
+            self.entry = (abs(old) * self.entry + abs(dq) * px) / abs(self.qty)
 
     def net(self, mid: float) -> float:
         return self.cash + self.qty * mid - self.fees
@@ -69,7 +78,9 @@ class Book:
         self.equity.append([round(t, 2), round(g, 3), round(g - self.fees, 3)])
         del self.equity[:-2400]
         pos = 1 if self.qty > 0 else -1 if self.qty < 0 else 0
-        return {"pos": pos, "qty": self.qty, "gross": round(g, 3), "fees": round(self.fees, 3),
+        unreal = self.qty * (mid - self.entry) if self.qty else 0.0
+        return {"pos": pos, "qty": round(self.qty, 8), "entry": self.entry, "unrealized": round(unreal, 3),
+                "realized": round(g - unreal, 3), "gross": round(g, 3), "fees": round(self.fees, 3),
                 "net": round(g - self.fees, 3), "trades": self.trades, "equity": self.equity}
 
 
@@ -115,7 +126,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     if trader:  # adopt any position already open, so the numbers are honest from the first second
         size, avg = trader.position()
         if size:
-            book.qty, book.cash = size, -size * avg
+            book.qty, book.cash, book.entry = size, -size * avg, avg
             console.print(f"  existing position adopted: {size:+g} {coin} @ {avg:g}")
 
     stop = threading.Event()
@@ -135,8 +146,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     started = time.time()
     serve(port, open_browser, page="loop.html")
 
-    def record_fill(dq: float, px: float, fee: float, kind: str, call, waited: float) -> None:
-        book.fill(dq, px, fee)
+    def record_fill(dq: float, px: float, fee: float, kind: str, call, waited: float, new_order: bool = True) -> None:
+        book.fill(dq, px, fee, new_order)
         fills.append({"t": time.time(), "side": "buy" if dq > 0 else "sell", "px": px, "qty": abs(dq), "kind": kind,
                       "call": call, "wait_s": round(waited, 1)})
         st["last_trade_t"] = time.time()
@@ -162,7 +173,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
         new = s["filled"] - o["seen_qty"]
         if new > 1e-12:  # count only the newly filled part, with its share of the fee
             px = s["avg_px"] or o["px"]
-            record_fill(new if o["buying"] else -new, px, s["fee"] - o["seen_fee"], "limit", o["call"], now - o["t"])
+            record_fill(new if o["buying"] else -new, px, s["fee"] - o["seen_fee"], "limit", o["call"], now - o["t"],
+                        new_order=o["seen_qty"] == 0)
             o["seen_qty"], o["seen_fee"] = s["filled"], s["fee"]
         if s["done"]:
             st["order"] = None

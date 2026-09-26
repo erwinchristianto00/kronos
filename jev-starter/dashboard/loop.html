@@ -125,6 +125,10 @@ body.clean .moneycard,body.clean .pnl{display:none!important}
         <div class="money">
           <span class="k" id="balLabel">Paper balance</span><span class="v net" id="mBal">$1,000.00</span>
           <hr>
+          <span class="k posrow">Open position</span><span class="v posrow" id="mOpen">–</span>
+          <span class="k posrow">Unrealized (open position)</span><span class="v posrow" id="mUnreal">–</span>
+          <span class="k posrow">Realized (closed trades)</span><span class="v posrow" id="mReal">–</span>
+          <hr class="posrow">
           <span class="k">This session, before fees</span><span class="v" id="mGross">–</span>
           <span class="k">Fees paid <span class="d" id="mTrades"></span></span><span class="v" id="mFees">–</span>
           <hr>
@@ -249,7 +253,17 @@ function renderData() {
     $("statebox").innerHTML = `<span class="lbl">what Jev saw · ${Object.keys(st).length} fields</span>` +
       Object.entries(lab).filter(([k]) => k in st).map(([k, l]) => `<span>${l} <b>${st[k]}</b></span>`).join("");
   }
-  const pos = j.pos > 0 ? `<b class="g">LONG $1,000</b>` : j.pos < 0 ? `<b class="r">SHORT $1,000</b>` : `<b>FLAT</b>`;
+  const hasEntry = j.entry != null;  // the 24/7 bot reports the open position; the paper loop doesn't
+  const openTxt = hasEntry && j.qty ? `${j.qty > 0 ? "LONG" : "SHORT"} ${Math.abs(j.qty).toLocaleString(undefined, {maximumFractionDigits: 6})} ${S.coin} @ ${fmtPx(j.entry)}` : "";
+  const pos = hasEntry
+    ? (j.qty ? `<b class="${j.qty > 0 ? "g" : "r"}">${openTxt}</b> · unrealized <b class="${j.unrealized > 0 ? "g" : ""}">${usd(j.unrealized)}</b>` : `<b>FLAT</b>`)
+    : j.pos > 0 ? `<b class="g">LONG $1,000</b>` : j.pos < 0 ? `<b class="r">SHORT $1,000</b>` : `<b>FLAT</b>`;
+  document.querySelectorAll(".posrow").forEach((el) => el.style.display = hasEntry ? "" : "none");
+  if (hasEntry) {
+    $("mOpen").textContent = j.qty ? openTxt : "none (flat)";
+    $("mUnreal").textContent = usd(j.unrealized); $("mUnreal").className = "v posrow " + (j.unrealized > 0 ? "g" : "");
+    $("mReal").textContent = usd(j.realized); $("mReal").className = "v posrow " + (j.realized > 0 ? "g" : "");
+  }
   const working = S.order ? `<span>limit ${(S.order.buying ?? S.order.target > 0) ? "buy" : "sell"} <b>${fmtPx(S.order.px)}</b> working</span>` : "";
   $("sub").innerHTML = `<span>${pos}</span>${working}<span class="pnl">balance <b class="${S.equity == null && j.net > 0 ? "g" : ""}">${S.equity != null ? fmtUsdt(S.equity) : "$" + (1000 + j.net).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</b></span><span>spread <b id="spr">${lastSpr}</b></span>`;
 
@@ -260,7 +274,7 @@ function renderData() {
   $("mBal").textContent = S.equity != null ? fmtUsdt(S.equity) : "$" + (1000 + j.net).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
   $("mBal").className = "v net " + (S.equity != null ? "" : tone(j.net));
   $("mGross").textContent = usd(j.gross); $("mGross").className = "v " + tone(j.gross);
-  $("mFees").textContent = "−$" + j.fees.toFixed(2); $("mTrades").textContent = `(${j.trades} trades)`;
+  $("mFees").textContent = "−$" + j.fees.toFixed(2); $("mTrades").textContent = `(${j.trades} ${j.trades === 1 ? "trade" : "trades"})`;
   $("mNet").textContent = usd(j.net); $("mNet").className = "v " + tone(j.net);
   $("mRatio").textContent = `${S.blocks} → ${j.trades}`;
   $("mHit").textContent = S.scored ? `${Math.round(100 * S.hits / S.scored)}% of ${S.scored}` : "–";
