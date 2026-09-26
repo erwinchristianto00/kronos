@@ -12,7 +12,7 @@ WorkingDirectory=/root/jev-starter
 # so the bot finds the Claude Code CLI and its subscription login (~/.claude)
 Environment=HOME=/root
 Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/root/.local/bin/uv run python -m jevlab bot --minutes 0 --no-open
+ExecStart=/root/.local/bin/uv run python -m jevlab bot --minutes 0 --no-open --coin SOL
 Restart=on-failure
 RestartSec=15
 KillSignal=SIGINT

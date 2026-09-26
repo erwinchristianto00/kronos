@@ -31,30 +31,55 @@ and ask it to rewrite decide(), e.g. "only buy when Jev is 90%+ sure AND
 buyers have been in control for the last 30 seconds".
 """
 
-# The defaults are the three rules from the video.
+# Slower, pickier strategy for liquid altcoins like SOL: fees are ~4 bps a round trip,
+# so only enter when the last 30 seconds already moved more than that in Jev's direction
+# (with buyers or sellers in control), then sit in the position for at least 5 minutes.
 SETTINGS = {
-    "min_conf": 0.85,  # only act when Jev is at least this sure
-    "min_hold": 15,    # seconds to sit still after a trade (no flip-flopping)
+    "min_conf": 0.85,       # only act when Jev is at least this sure
+    "min_move_bps": 4.0,    # the last 30s must have moved at least this far in Jev's direction (≈ fees)
+    "min_flow": 0.55,       # share of 30s trade volume on Jev's side (buyers for a buy, sellers for a sell)
+    "min_hold": 300,        # seconds to stay in a position before exiting or flipping (5 minutes)
+    "cooldown": 60,         # seconds to wait after any trade before entering again
+    "max_spread_bps": None, # skip entries when the spread is wider than this (None = off; the testnet's is always wide)
 }
 
-DESCRIPTION = f"trade only at ≥{SETTINGS['min_conf']:.0%} conviction · ≥{SETTINGS['min_hold']}s between flips"
+DESCRIPTION = (f"enter at ≥{SETTINGS['min_conf']:.0%} with a ≥{SETTINGS['min_move_bps']:g} bps 30s move and flow · "
+               f"hold ≥{SETTINGS['min_hold'] // 60:g} min")
 
 
 def decide(call: dict, market: dict, position: int, seconds_since_trade: float) -> str:
     want = 1 if call["side"] == "buy" else -1
+    strong = call["conf"] >= SETTINGS["min_conf"]
     bias = market.get("claude_bias")  # only set on the 24/7 bot, where Claude is the brain
+
+    # 1. Claude's big picture always wins
     if bias == "flat":
         return "flat" if position else "hold · Claude says stay out"
     if (bias == "long" and position < 0) or (bias == "short" and position > 0):
         return "flat"  # Claude changed its mind: get out of the old direction first
-    if (bias == "long" and want < 0) or (bias == "short" and want > 0):
-        return f"hold · against Claude's {bias} bias"
-    if call["conf"] < SETTINGS["min_conf"]:
-        return "hold · low conviction"
+
+    # 2. In a position: sit tight for the minimum hold, then exit on a strong call against it
+    if position and seconds_since_trade < SETTINGS["min_hold"]:
+        return "hold · in position (min hold)"
+    if position and want != position and strong:
+        return "flat"
     if want == position:
         return "hold · already " + ("long" if want > 0 else "short")
-    if seconds_since_trade < SETTINGS["min_hold"]:
-        return "hold · too soon to flip"
+
+    # 3. Entering: Jev, Claude, the recent move and the order flow must all agree
+    if (bias == "long" and want < 0) or (bias == "short" and want > 0):
+        return f"hold · against Claude's {bias} bias"
+    if not strong:
+        return "hold · low conviction"
+    if seconds_since_trade < SETTINGS["cooldown"]:
+        return "hold · cooling down"
+    if SETTINGS["max_spread_bps"] is not None and market.get("spread_bps", 0) > SETTINGS["max_spread_bps"]:
+        return "hold · spread too wide"
+    if want * market.get("return_30s_bps", 0) < SETTINGS["min_move_bps"]:
+        return "hold · move too small"
+    flow = market.get("aggressor_buy_share_30s", 0.5)
+    if (flow if want > 0 else 1 - flow) < SETTINGS["min_flow"]:
+        return "hold · flow disagrees"
     return call["side"]
 
 
