@@ -285,8 +285,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             counts[rec["status"]] += 1
             if rec["ms"]:
                 latencies.append(rec["ms"])
-            if rec["status"] == "throttled":
-                st["interval"], st["streak"] = min(4.0, st["interval"] * 1.6), 0
+            if rec["status"] == "throttled":  # back off up to 6x the pace (30s at --pace 5)
+                st["interval"], st["streak"] = min(max(4.0, 6 * pace_s), st["interval"] * 1.6), 0
             elif rec["status"] == "ok":
                 st["streak"] += 1
                 if st["streak"] >= 3:
