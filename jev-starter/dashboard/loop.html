@@ -125,10 +125,10 @@ body.clean .moneycard,body.clean .pnl{display:none!important}
         <div class="money">
           <span class="k" id="balLabel">Paper balance</span><span class="v net" id="mBal">$1,000.00</span>
           <hr>
-          <span class="k">Before fees</span><span class="v" id="mGross">–</span>
+          <span class="k">This session, before fees</span><span class="v" id="mGross">–</span>
           <span class="k">Fees paid <span class="d" id="mTrades"></span></span><span class="v" id="mFees">–</span>
           <hr>
-          <span class="k">After fees</span><span class="v" id="mNet">–</span>
+          <span class="k">This session, after fees</span><span class="v" id="mNet">–</span>
           <span class="k">Jev calls → trades</span><span class="v" id="mRatio">–</span>
           <span class="k">Direction right</span><span class="v" id="mHit">–</span>
         </div>
@@ -149,6 +149,7 @@ let S = null, ticks = [], ws = null, wsCoin = null, lastPx = null, lastSpr = "�
 
 const pad2 = (n) => String(n).padStart(2, "0");
 function fmtPx(p) { const d = p >= 1000 ? 1 : p >= 10 ? 3 : 5; return p.toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d}); }
+const fmtUsdt = (v) => v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + " USDT";
 const usd = (v) => (v >= 0 ? "+$" : "−$") + Math.abs(v).toFixed(2);
 function colorFor(d) { return d.status === "ok" ? (d.side === "buy" ? "var(--good)" : "var(--bad)") : "var(--late)"; }
 function niceTicks(lo, hi, k) {
@@ -250,14 +251,14 @@ function renderData() {
   }
   const pos = j.pos > 0 ? `<b class="g">LONG $1,000</b>` : j.pos < 0 ? `<b class="r">SHORT $1,000</b>` : `<b>FLAT</b>`;
   const working = S.order ? `<span>limit ${(S.order.buying ?? S.order.target > 0) ? "buy" : "sell"} <b>${fmtPx(S.order.px)}</b> working</span>` : "";
-  $("sub").innerHTML = `<span>${pos}</span>${working}<span class="pnl">balance <b class="${j.net > 0 ? "g" : ""}">$${(1000 + j.net).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</b></span><span>spread <b id="spr">${lastSpr}</b></span>`;
+  $("sub").innerHTML = `<span>${pos}</span>${working}<span class="pnl">balance <b class="${S.equity == null && j.net > 0 ? "g" : ""}">${S.equity != null ? fmtUsdt(S.equity) : "$" + (1000 + j.net).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</b></span><span>spread <b id="spr">${lastSpr}</b></span>`;
 
   const acct = {demo: "Binance demo account", testnet: "Binance testnet account", live: "Binance LIVE account"}[S.mode] || "Paper account";
-  $("balLabel").textContent = S.venue === "binance" && S.mode !== "dry" ? "This session (from $1,000)" : "Paper balance";
+  $("balLabel").textContent = S.equity != null ? "Binance balance" : S.venue === "binance" && S.mode !== "dry" ? "This session (from $1,000)" : "Paper balance";
   $("moneyTitle").textContent = `${acct} · $${Math.round(S.notional || 1000).toLocaleString()} position · ${S.execution === "maker" ? `limit orders, ${S.maker_fee_bps.toFixed(1)} bps` : `market orders, ${S.taker_fee_bps.toFixed(1)} bps + spread`}`;
   const tone = (v) => (v > 0 ? "g" : "");  // gains in green, everything else neutral
-  $("mBal").textContent = "$" + (1000 + j.net).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-  $("mBal").className = "v net " + tone(j.net);
+  $("mBal").textContent = S.equity != null ? fmtUsdt(S.equity) : "$" + (1000 + j.net).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  $("mBal").className = "v net " + (S.equity != null ? "" : tone(j.net));
   $("mGross").textContent = usd(j.gross); $("mGross").className = "v " + tone(j.gross);
   $("mFees").textContent = "−$" + j.fees.toFixed(2); $("mTrades").textContent = `(${j.trades} trades)`;
   $("mNet").textContent = usd(j.net); $("mNet").className = "v " + tone(j.net);

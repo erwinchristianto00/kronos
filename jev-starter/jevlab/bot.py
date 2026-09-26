@@ -131,7 +131,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     counts = {"ok": 0, "late": 0, "throttled": 0, "error": 0}
     lock = threading.Lock()
     st = {"interval": pace_s, "streak": 0, "prev": None, "order": None, "last_trade_t": 0.0, "hits": 0, "scored": 0,
-          "halted": None}
+          "halted": None, "equity": None}
     started = time.time()
     serve(port, open_browser, page="loop.html")
 
@@ -218,7 +218,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
                 "maker_fee_bps": MAKER_FEE * 1e4, "taker_fee_bps": TAKER_FEE * 1e4, "counts": dict(counts), "blocks": len(decisions),
                 "last_ms": latencies[-1] if latencies else None,
                 "avg_ms": round(statistics.mean(latencies[-200:])) if latencies else None,
-                "hits": st["hits"], "scored": st["scored"], "brain": brain.current(),
+                "hits": st["hits"], "scored": st["scored"], "brain": brain.current(), "equity": st.get("equity"),
                 "order": ({"target": o["target"], "buying": o["buying"], "px": o["px"], "t": o["t"]} if o else None),
                 "decisions": decisions[-200:], "fills": fills[-100:],
                 "book": book.snap(time.time(), mid), "ticks": market.recent_ticks(),
@@ -308,7 +308,14 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
                           f"{(rec['conf'] or 0):.2f}  →  {rec['action']}")
 
     def writer():
+        last_eq = 0.0
         while not stop.is_set():
+            if trader and time.time() - last_eq > 30:  # the real account balance, for the dashboard
+                last_eq = time.time()
+                try:
+                    st["equity"] = trader.equity_usdt()
+                except BinanceError:
+                    pass
             try:
                 write("running")
             except Exception as exc:  # a hiccup reading the exchange shouldn't stop the bot
