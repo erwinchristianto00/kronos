@@ -151,7 +151,7 @@ const pad2 = (n) => String(n).padStart(2, "0");
 function fmtPx(p) { const d = p >= 1000 ? 1 : p >= 10 ? 3 : 5; return p.toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d}); }
 const fmtUsdt = (v) => v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + " USDT";
 const usd = (v) => (v >= 0 ? "+$" : "−$") + Math.abs(v).toFixed(2);
-function colorFor(d) { return d.status === "ok" ? (d.side === "buy" ? "var(--good)" : "var(--bad)") : "var(--late)"; }
+function colorFor(d) { return d.status === "ok" || d.source ? (d.side === "buy" ? "var(--good)" : "var(--bad)") : "var(--late)"; }
 function niceTicks(lo, hi, k) {
   const span = hi - lo || 1; let step = Math.pow(10, Math.floor(Math.log10(span / k)));
   for (const m of [1, 2, 5, 10]) { if (span / (step * m) <= k) { step *= m; break; } }
@@ -210,7 +210,7 @@ async function poll() {
 const CLEAN = new URLSearchParams(location.search).has("clean");
 if (CLEAN) document.body.classList.add("clean");
 
-const answered = () => S.decisions.filter((d) => d.status === "ok" || d.status === "late");
+const answered = () => S.decisions.filter((d) => d.status === "ok" || d.status === "late" || d.source === "rules");
 
 function renderData() {
   const c = S.counts, j = S.book;
@@ -231,14 +231,14 @@ function renderData() {
     $("verbMeta").textContent = `${fill.kind} fill @ ${fmtPx(fill.px)}${fill.wait_s ? ` · rested ${fill.wait_s}s` : ""}`;
   } else if (d && d.side) {
     $("verb").textContent = d.side === "buy" ? "BUY" : "SELL"; $("verb").style.color = d.side === "buy" ? "var(--good)" : "var(--bad)";
-    $("verbMeta").textContent = `Jev · ${Math.round(100 * d.conf)}% · ${d.ms} ms`;
+    $("verbMeta").textContent = d.source ? "rules signal · Jev busy" : `Jev · ${Math.round(100 * d.conf)}% · ${d.ms} ms`;
   }
   if (d) {
     const last = S.decisions.slice().reverse().find((x) => x.side);
     if (last) {
       const pb = last.side === "buy" ? last.conf : 1 - last.conf;
       $("bigSide").textContent = last.side.toUpperCase(); $("bigSide").style.color = last.side === "buy" ? "var(--good)" : "var(--bad)";
-      $("bigConf").textContent = Math.round(100 * last.conf) + "%";
+      $("bigConf").textContent = last.source ? "rules" : Math.round(100 * last.conf) + "%";
       $("barBuy").style.width = (100 * pb) + "%"; $("barSell").style.width = (100 * (1 - pb)) + "%";
       $("pBuy").textContent = Math.round(100 * pb) + "%"; $("pSell").textContent = Math.round(100 * (1 - pb)) + "%";
     }
@@ -297,14 +297,14 @@ function renderFeed() {
   const rows = answered().slice(-22).reverse();
   $("feed").innerHTML = rows.map((d, i) => {
     const fresh = !seenBlocks.has(d.block); seenBlocks.add(d.block);
-    const cls = d.status !== "ok" ? "hold" : d.side;
-    const side = d.side ? `<b class="${d.status === "ok" ? (d.side === "buy" ? "g" : "r") : "a"}">${d.side.toUpperCase()}</b>` : `<span class="a">—</span>`;
+    const cls = d.status !== "ok" && !d.source ? "hold" : d.side;
+    const side = d.side ? `<b class="${d.status === "ok" || d.source ? (d.side === "buy" ? "g" : "r") : "a"}">${d.side.toUpperCase()}${d.source ? " (rules)" : ""}</b>` : `<span class="a">—</span>`;
     const LABEL = {"hold · low conviction": "signal", "hold · limit order working": "order working", "hold · too soon to flip": "cooling down",
                    "hold · already long": "in position", "hold · already short": "in position", "hold · late": "late"};
     const act = LABEL[d.action] || d.action || d.status, trade = /^(limit|market)/.test(act);
     return `<tr class="${cls} ${fresh && i === 0 && seenBlocks.size > 1 ? "fresh" : ""}"><td>${d.block.toLocaleString()}</td><td>${side}</td>` +
       `<td>${d.conf != null ? d.conf.toFixed(2) : "–"}</td><td class="r">${d.ms ?? "–"}</td>` +
-      `<td class="r ${trade ? "act-trade" : d.status === "ok" ? "act-hold" : "a"}">${act}</td></tr>`;
+      `<td class="r ${trade ? "act-trade" : d.status === "ok" || d.source ? "act-hold" : "a"}">${act}</td></tr>`;
   }).join("");
 }
 

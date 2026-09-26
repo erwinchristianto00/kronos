@@ -298,13 +298,20 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             if rec["status"] == "ok":
                 st["prev"] = rec
                 rec["action"] = decide(rec, now)
-            else:
-                rec["action"] = "hold · late" if rec["status"] == "late" else rec["status"]
+            elif rec["status"] == "late":
+                rec["action"] = "hold · late"
+            else:  # Jev didn't answer: fall back to strategy.py's rules-only call
+                fb = strategy.fallback_call(now["state"]) if hasattr(strategy, "fallback_call") else None
+                if fb:
+                    rec.update(side=fb["side"], conf=fb["conf"], source="rules", state=now["state"])
+                    rec["action"] = decide(rec, now)
+                else:
+                    rec["action"] = f"{rec['status']} · no rules signal"
             decisions.append(rec)
             log.write(json.dumps(rec) + "\n")
             log.flush()
         if rec["action"].startswith("limit") or rec["action"].startswith("hold · order"):
-            console.print(f"  {time.strftime('%H:%M:%S')}  #{rec['block']:<6} Jev {(rec['side'] or '-').upper():<4} "
+            console.print(f"  {time.strftime('%H:%M:%S')}  #{rec['block']:<6} {'rules' if rec.get('source') else 'Jev'} {(rec['side'] or '-').upper():<4} "
                           f"{(rec['conf'] or 0):.2f}  →  {rec['action']}")
 
     def writer():

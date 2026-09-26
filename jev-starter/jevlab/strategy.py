@@ -41,6 +41,7 @@ SETTINGS = {
     "min_hold": 300,        # seconds to stay in a position before exiting or flipping (5 minutes)
     "cooldown": 60,         # seconds to wait after any trade before entering again
     "max_spread_bps": None, # skip entries when the spread is wider than this (None = off; the testnet's is always wide)
+    "fallback_min_flow": 0.65,  # when Jev is busy: share of 30s volume needed on one side for a rules-only call
 }
 
 DESCRIPTION = (f"enter at ≥{SETTINGS['min_conf']:.0%} with a ≥{SETTINGS['min_move_bps']:g} bps 30s move and flow · "
@@ -81,6 +82,20 @@ def decide(call: dict, market: dict, position: int, seconds_since_trade: float) 
     if (flow if want > 0 else 1 - flow) < SETTINGS["min_flow"]:
         return "hold · flow disagrees"
     return call["side"]
+
+
+def fallback_call(market: dict) -> dict | None:
+    """When Jev doesn't answer (busy or down), make the call from the market numbers alone:
+    the last 30s moved at least min_move_bps and one side clearly controlled the trading.
+    The result goes through decide() like a Jev call. None = no clear signal, do nothing."""
+    ret = market.get("return_30s_bps", 0)
+    if abs(ret) < SETTINGS["min_move_bps"]:
+        return None
+    side = "buy" if ret > 0 else "sell"
+    flow = market.get("aggressor_buy_share_30s", 0.5)
+    if (flow if side == "buy" else 1 - flow) < SETTINGS["fallback_min_flow"]:
+        return None
+    return {"side": side, "conf": 1.0}
 
 
 # ---------------------------------------------------------------------------
