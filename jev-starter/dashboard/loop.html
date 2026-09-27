@@ -135,6 +135,12 @@ body.clean .moneycard,body.clean .pnl{display:none!important}
           <span class="k">This session, after fees</span><span class="v" id="mNet">–</span>
           <span class="k">Calls → trades</span><span class="v" id="mRatio">–</span>
           <span class="k">Direction right</span><span class="v" id="mHit">–</span>
+          <hr class="execrow">
+          <span class="k execrow">Execution check <span class="d" id="xTrips"></span></span><span class="v execrow" id="xFill">–</span>
+          <span class="k execrow">Model predicted</span><span class="v execrow" id="xPred">–</span>
+          <span class="k execrow">Backtest-style (mid at signal)</span><span class="v execrow" id="xPaper">–</span>
+          <span class="k execrow">Real market, at our fill times</span><span class="v execrow" id="xFills">–</span>
+          <span class="k execrow">Actual, this account</span><span class="v execrow" id="xActual">–</span>
         </div>
         <div class="spark" id="spark"></div>
       </div>
@@ -290,6 +296,17 @@ function renderData() {
   $("mNet").textContent = usd(j.net); $("mNet").className = "v " + tone(j.net);
   $("mRatio").textContent = `${S.blocks} → ${j.trades}`;
   $("mHit").textContent = S.scored ? `${Math.round(100 * S.hits / S.scored)}% of ${S.scored}` : "–";
+  const X = S.exec;
+  document.querySelectorAll(".execrow").forEach(e => e.style.display = X ? "" : "none");
+  if (X) {
+    const b = v => v == null ? "–" : `${v > 0 ? "+" : ""}${v.toFixed(1)} bps/trade`;
+    $("xTrips").textContent = `· ${X.trips} round trip${X.trips === 1 ? "" : "s"}`;
+    $("xFill").textContent = X.orders ? `${X.orders - X.missed}/${X.orders} orders filled` : "no orders yet";
+    $("xPred").textContent = X.predicted == null ? "–" : `${X.predicted > 0 ? "+" : ""}${X.predicted.toFixed(1)} bps`;
+    for (const [id, v] of [["xPaper", X.paper], ["xFills", X.at_fills], ["xActual", X.actual]]) {
+      $(id).textContent = b(v); $(id).className = "v execrow " + tone(v || 0);
+    }
+  }
   if (S.brain) {
     const b = S.brain, ago = b.t ? Math.round((Date.now() / 1000 - b.t) / 60) + " min ago" : "thinking…";
     $("brainLine").style.display = "block";

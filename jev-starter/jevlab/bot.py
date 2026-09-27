@@ -170,15 +170,89 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     counts = {"ok": 0, "late": 0, "throttled": 0, "error": 0, "warmup": 0}
     lock = threading.Lock()
     st = {"interval": pace_s, "streak": 0, "prev": None, "order": None, "last_trade_t": 0.0, "hits": 0, "scored": 0,
-          "halted": None, "equity": None}
+          "halted": None, "equity": None, "sig_entry": None, "sig_exit": None, "rt": None, "orders": 0, "missed": 0}
+    # Execution journal: one line per round trip, comparing what the backtest assumes with what really happened
+    exec_path = RESULTS / f"exec_{symbol}.jsonl"
+    trips: list[dict] = [json.loads(line) for line in exec_path.read_text().splitlines() if line.strip()] if exec_path.exists() else []
+    exec_log = open(exec_path, "a")
     started = time.time()
     serve(port, open_browser, page="loop.html", data=out.name)
 
     def record_fill(dq: float, px: float, fee: float, kind: str, call, waited: float, new_order: bool = True) -> None:
+        before = book.qty
         book.fill(dq, px, fee, new_order)
+        journal(before, dq, px, fee, kind)
         fills.append({"t": time.time(), "side": "buy" if dq > 0 else "sell", "px": px, "qty": abs(dq), "kind": kind,
                       "call": call, "wait_s": round(waited, 1)})
         st["last_trade_t"] = time.time()
+
+    def journal(before: float, dq: float, px: float, fee: float, kind: str) -> None:
+        """Follow each round trip (flat -> position -> flat) through its fills; write it out when it closes."""
+        now, live, venue_mid = time.time(), signal_market.snapshot()["mid"], market.snapshot()["mid"]
+        side = 1 if dq > 0 else -1
+        rt = st["rt"]
+
+        def open_trip(q: float, f: float) -> None:
+            st["rt"] = {"side": side, "t_in": now, "q_in": q, "v_in": q * px, "fee": f, "live_in": live,
+                        "venue_in": venue_mid, "sig_in": st["sig_entry"], "q_out": 0.0, "v_out": 0.0}
+            st["sig_exit"] = None  # an exit signal from an earlier trip must not be reused for this one
+
+        if rt is None:
+            if abs(before) < 1e-9 and abs(before + dq) > 1e-9:
+                open_trip(abs(dq), fee)
+            return  # (a position adopted at startup has no entry signal, so it isn't journaled)
+        if side == rt["side"]:  # another part of the entry order
+            rt["q_in"] += abs(dq); rt["v_in"] += abs(dq) * px; rt["fee"] += fee
+            return
+        closing = min(abs(dq), rt["q_in"] - rt["q_out"])
+        rt["q_out"] += closing; rt["v_out"] += closing * px; rt["fee"] += fee * closing / abs(dq)
+        rt.update(t_out=now, live_out=live, venue_out=venue_mid, sig_out=st["sig_exit"], kind_out=kind)
+        after = before + dq
+        if abs(after) > 1e-9 and (after > 0) == (rt["side"] > 0):
+            return  # partly closed
+        finish_trip(rt)
+        st["rt"] = None
+        if abs(dq) - closing > 1e-9:  # flipped through zero: the rest opens the next trip
+            open_trip(abs(dq) - closing, fee * (abs(dq) - closing) / abs(dq))
+
+    def finish_trip(rt: dict) -> None:
+        s, cost = rt["side"], MAKER_FEE * 2e4
+        px_in, px_out = rt["v_in"] / rt["q_in"], rt["v_out"] / max(rt["q_out"], 1e-12)
+        si, so = rt["sig_in"] or {}, rt.get("sig_out") or {}
+
+        def bps(a, b):
+            return round(1e4 * (a / b - 1), 2) if a and b else None
+
+        paper = bps(so.get("live_mid"), si.get("live_mid"))
+        row = {
+            "t_in": round(rt["t_in"], 1), "t_out": round(rt["t_out"], 1), "side": "long" if s > 0 else "short",
+            "hold_min": round((rt["t_out"] - rt["t_in"]) / 60, 1), "exit": rt.get("kind_out"),
+            "predicted_bps": si.get("edge_bps"),
+            # what the backtest assumes: in and out at the real market's mid the moment each signal fired, maker fees
+            "paper_bps": round(s * paper - cost, 2) if paper is not None else None,
+            # the real market's move between the times our orders actually filled, maker fees
+            "at_fills_bps": round(s * bps(rt["live_out"], rt["live_in"]) - cost, 2),
+            # what this account really made, fees included, at this venue's prices
+            "actual_bps": round(1e4 * (s * (px_out - px_in) * rt["q_out"] - rt["fee"]) / (px_in * rt["q_out"]), 2),
+            "entry_cost_bps": round(s * bps(px_in, si["venue_mid"]), 2) if si.get("venue_mid") else None,
+            "exit_cost_bps": round(-s * bps(px_out, so["venue_mid"]), 2) if so.get("venue_mid") else None,
+            "entry_wait_s": round(rt["t_in"] - si["t"], 1) if si.get("t") else None,
+            "exit_wait_s": round(rt["t_out"] - so["t"], 1) if so.get("t") else None,
+            "usd": round(s * (px_out - px_in) * rt["q_out"] - rt["fee"], 3), "mode": mode,
+        }
+        trips.append(row)
+        del trips[:-5000]
+        exec_log.write(json.dumps(row) + "\n")
+        exec_log.flush()
+
+    def exec_summary() -> dict:
+        def avg(k):
+            v = [t[k] for t in trips if t.get(k) is not None]
+            return round(statistics.mean(v), 2) if v else None
+        return {"trips": len(trips), "predicted": avg("predicted_bps"), "paper": avg("paper_bps"),
+                "at_fills": avg("at_fills_bps"), "actual": avg("actual_bps"), "entry_cost": avg("entry_cost_bps"),
+                "exit_cost": avg("exit_cost_bps"), "entry_wait": avg("entry_wait_s"), "orders": st["orders"],
+                "missed": st["missed"], "recent": trips[-20:]}
 
     def check_order() -> None:
         o = st["order"]
@@ -193,6 +267,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
                 st["order"] = None
             elif now > o["expires"]:
                 st["order"] = None
+                st["missed"] += 1
             return
         try:
             s = trader.order(o["id"])
@@ -206,6 +281,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             o["seen_qty"], o["seen_fee"] = s["filled"], s["fee"]
         if s["done"]:
             st["order"] = None
+            st["missed"] += o["seen_qty"] == 0
         elif now > o["expires"]:
             trader.cancel(o["id"])
             o["expires"] = now + 3  # look once more for fills that raced the cancel, then let go
@@ -260,7 +336,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
                 "avg_ms": round(statistics.mean(latencies[-200:])) if latencies else None,
                 "hits": st["hits"], "scored": st["scored"], "brain": brain.current(), "equity": st.get("equity"),
                 "order": ({"target": o["target"], "buying": o["buying"], "px": o["px"], "t": o["t"]} if o else None),
-                "decisions": decisions[-200:], "fills": fills[-100:],
+                "decisions": decisions[-200:], "fills": fills[-100:], "exec": exec_summary(),
                 "book": book.snap(time.time(), mid), "ticks": market.recent_ticks(),
             }
         tmp = out.with_suffix(".tmp")
@@ -292,6 +368,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
                 return "hold · limit order working"
             if trader:
                 trader.cancel(st["order"]["id"])
+            st["missed"] += st["order"]["seen_qty"] == 0
             st["order"] = None
         size = position_usd / now["mid"]
         size = trader.round_qty(size) if trader else round(size, 6)
@@ -309,6 +386,12 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             except BinanceError as exc:
                 return f"hold · order rejected: {str(exc)[:70]}"
         st["order"] = order
+        st["orders"] += 1
+        sig = {"t": order["t"], "live_mid": signal_market.snapshot()["mid"], "venue_mid": now["mid"], "edge_bps": rec.get("edge_bps")}
+        if pos:  # closing (or flipping): the exit signal
+            st["sig_exit"] = sig
+        if want:
+            st["sig_entry"] = sig
         return f"limit {'buy' if buying else 'sell'} {qty:g} @ {px:g}"
 
     def ask_model(rec: dict) -> None:
@@ -406,5 +489,6 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
                 close_out()
     write("done")
     log.close()
+    exec_log.close()
     mid = market.snapshot()["mid"]
     console.print(f"\n  {len(decisions)} calls · {book.trades} fills · fees ${book.fees:.2f} · net ${book.net(mid):+.2f}")

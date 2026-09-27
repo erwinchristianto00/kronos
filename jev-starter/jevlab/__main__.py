@@ -6,6 +6,7 @@
   uv run python -m jevlab bot --dry            # 24/7 bot on Binance prices with simulated fills (no Binance key)
   uv run python -m jevlab bot                  # 24/7 bot on Binance Demo Trading (fake money) · Claude sets the bias
   uv run python -m jevlab train --coin SOL     # train + honestly test the local signal model (models/SOLUSDT.json)
+  uv run python -m jevlab report               # the bots' round trips so far: backtest-style vs real fills, per coin
 
 Useful flags:
   --coin BTC        loop/bot: which coin to trade (default HYPE)
@@ -142,9 +143,53 @@ def check_binance() -> None:
         console.print("     [dim](couldn't read the key's permissions here, so double-check them on Binance: no withdrawals)[/]")
 
 
+def report() -> None:
+    """Every coin's journaled round trips: what the backtest assumes vs what the fills really gave."""
+    import json
+    import statistics
+
+    from .core import RESULTS, console
+    files = sorted(RESULTS.glob("exec_*.jsonl"))
+    if not files:
+        console.print("  no round trips journaled yet (results/exec_<SYMBOL>.jsonl appears after the first closed trade)")
+        return
+    console.print("  [bold]coin      trips  predicted    backtest   real fills      actual  verdict[/]")
+    for f in files:
+        rows = [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+        if not rows:
+            continue
+        def col(k):
+            v = [r[k] for r in rows if r.get(k) is not None]
+            return v
+
+        def fmt(v):
+            if not v:
+                return "–"
+            m = statistics.mean(v)
+            se = statistics.stdev(v) / len(v) ** 0.5 if len(v) > 1 else 0
+            return f"{m:+.1f} ±{2 * se:.1f}"
+        mode = rows[-1].get("mode", "")
+        # on the testnet its own book sets the fill prices, so the real market at our fill times is the honest measure
+        key = "at_fills_bps" if mode in ("testnet", "dry") else "actual_bps"
+        judged = col(key)
+        n = len(rows)
+        if n < 50:
+            verdict = f"keep collecting ({n}/50)"
+        else:
+            verdict = "[#ff5d6c]switch off: negative after fees[/]" if statistics.mean(judged) < 0 else "[#3fd68a]positive: keep running[/]"
+        pred = col("predicted_bps")
+        console.print(f"  {f.stem[5:-4]:<8} {n:>6}  {(f'{statistics.mean(pred):+6.1f}' if pred else '–'):>9}  "
+                      f"{fmt(col('paper_bps')):>10}  {fmt(col('at_fills_bps')):>11}  {fmt(col('actual_bps')):>10}  {verdict}")
+    console.print("  [dim]bps per round trip after fees, ± about a 95% range.\n"
+                  "  backtest = in/out at the real mid when each signal fired (what the tests assume)\n"
+                  "  real fills = the real market's move between the moments our orders actually filled\n"
+                  "  actual = this account's P&L (on the testnet, at the testnet's own prices)\n"
+                  "  verdict after 50 trips: 'real fills' on the testnet, 'actual' on demo/live. Not financial advice.[/]")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="jevlab")
-    ap.add_argument("command", choices=["check", "loop", "newsroom", "bot", "train"])
+    ap.add_argument("command", choices=["check", "loop", "newsroom", "bot", "train", "report"])
     ap.add_argument("--coin", default="HYPE", help="loop/bot: the coin to trade")
     ap.add_argument("--minutes", type=float, default=10.0, help="loop/bot: how long to run (0 = until stopped)")
     ap.add_argument("--pace", type=float, default=0.3, help="loop: fastest seconds between Jev calls")
@@ -161,6 +206,9 @@ def main() -> None:
     a = ap.parse_args()
 
     from .core import console
+    if a.command == "report":
+        report()
+        return
     if a.command not in ("bot", "train"):  # the bot prints its own banner, with its trading mode
         console.print("[bold #8b7bff]jev-starter[/] [dim]· paper trading on live Hyperliquid data · no real orders are ever placed[/]")
 

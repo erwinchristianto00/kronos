@@ -61,6 +61,10 @@ uv run python -m jevlab train --coin SOL     # downloads 45 days of Binance trad
 - `train` tests it walk-forward (train on 25 days, test on the next 5 unseen days) and writes
   `models/SOLUSDT-report.md`. Read it: the edge is small, uncertain, and assumes limit orders fill at the mid.
 - Retrain every week or two. The bot warns when the model's data is more than 14 days old.
+- Every closed round trip is journaled in `results/exec_<SYMBOL>.jsonl`, and `uv run python -m jevlab report`
+  compares, per coin, what the backtest assumes (in and out at the mid when each signal fired) with the real
+  market's move between the moments the orders actually filled. The gap between the two is what waiting for
+  limit fills costs. The dashboard shows the same numbers under "Execution check".
 - `SIGNAL_SOURCE=jev` in `.env` switches back to Jev (with a rules-only fallback when Jev is busy).
 
 On the testnet, signals read the real Binance market (the testnet's own book is thin and unrealistic),
