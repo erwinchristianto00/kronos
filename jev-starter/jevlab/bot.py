@@ -33,6 +33,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
+
 from . import features, strategy
 from .brain import Brain
 from .binance import VENUES, BinanceError, BinanceMarket, BinanceTrader, binance_mode
@@ -93,6 +95,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     except BinanceError as exc:
         raise SystemExit(f"  {exc}")
     position_usd = float(os.getenv("MAX_POSITION_USD", "1000"))
+    # per coin (deploy/coins/<COIN>.env): only enter in the direction of the last N hours' move; 0 = off
+    trend_hours = float(os.getenv("TREND_FILTER_HOURS", "0") or 0)
     max_loss = float(os.getenv("MAX_DAILY_LOSS_USD", "50"))
     mode_label = {"dry": "Binance prices · simulated fills", "demo": "Binance DEMO · fake money",
                   "testnet": "Binance TESTNET · fake money", "live": "LIVE · REAL MONEY"}[mode]
@@ -110,6 +114,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
         min_edge = strategy.SETTINGS.get("model_min_edge_bps") or model.min_edge_bps  # strategy.py can override it
         signal_txt = f"signal: {model.name}, enters at a predicted {model.horizon_s // 60}-min move ≥ {min_edge:g} bps"
         strategy_note = f"model: enter at |predicted {model.horizon_s // 60}m move| ≥ {min_edge:g} bps (Claude can veto) · hold {model.horizon_s // 60} min"
+        if trend_hours:
+            strategy_note += f" · only with the {trend_hours:g}h trend"
     else:
         try:
             jev = JevJudge()
@@ -170,7 +176,7 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
     counts = {"ok": 0, "late": 0, "throttled": 0, "error": 0, "warmup": 0}
     lock = threading.Lock()
     st = {"interval": pace_s, "streak": 0, "prev": None, "order": None, "last_trade_t": 0.0, "hits": 0, "scored": 0,
-          "halted": None, "equity": None, "sig_entry": None, "sig_exit": None, "rt": None, "orders": 0, "missed": 0}
+          "halted": None, "equity": None, "trend": None, "trend_t": 0.0, "sig_entry": None, "sig_exit": None, "rt": None, "orders": 0, "missed": 0}
     # Execution journal: one line per round trip, comparing what the backtest assumes with what really happened
     exec_path = RESULTS / f"exec_{symbol}.jsonl"
     trips: list[dict] = [json.loads(line) for line in exec_path.read_text().splitlines() if line.strip()] if exec_path.exists() else []
@@ -351,6 +357,8 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
         if bias is None:
             return "hold · waiting for Claude's first read"
         market_view = {**rec["state"], "claude_bias": bias}
+        if trend_hours:  # a trend older than 10 minutes counts as unknown, and unknown means no new entries
+            market_view.update(trend=st["trend"] if time.time() - st["trend_t"] < 600 else None, trend_hours=trend_hours)
         pos = 1 if book.qty > 0 else -1 if book.qty < 0 else 0
         try:
             call = {"side": rec["side"], "conf": rec["conf"]}
@@ -455,9 +463,26 @@ def run_bot(coin: str, pace_s: float, minutes: float, port: int, open_browser: b
             sig = f"model {rec['edge_bps']:+.1f}bps" if rec.get("source") == "model" else f"{rec.get('source') or 'Jev'} {(rec['conf'] or 0):.2f}"
             console.print(f"  {time.strftime('%H:%M:%S')}  #{rec['block']:<6} {(rec['side'] or '-').upper():<4} {sig}  →  {rec['action']}")
 
+    def refresh_trend() -> None:
+        """Direction of the real market over the last TREND_FILTER_HOURS, from 1-minute klines."""
+        n = int(trend_hours * 60)
+        for rest in dict.fromkeys([VENUES["live"]["data_rest"], venue["data_rest"]]):
+            try:
+                r = requests.get(f"{rest}/fapi/v1/klines", params={"symbol": symbol, "interval": "1m", "limit": n + 1}, timeout=10)
+                k = r.json() if r.status_code == 200 else None
+            except requests.RequestException:
+                k = None
+            if k and len(k) > n // 2:
+                first, last = float(k[0][4]), float(k[-1][4])
+                st["trend"], st["trend_t"] = (1 if last > first else -1 if last < first else 0), time.time()
+                return
+
     def writer():
-        last_eq = 0.0
+        last_eq = last_trend = 0.0
         while not stop.is_set():
+            if trend_hours and time.time() - last_trend > 60:
+                last_trend = time.time()
+                refresh_trend()
             if trader and time.time() - last_eq > 30:  # the real account balance, for the dashboard
                 last_eq = time.time()
                 try:

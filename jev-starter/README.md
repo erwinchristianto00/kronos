@@ -61,6 +61,9 @@ uv run python -m jevlab train --coin SOL     # downloads 45 days of Binance trad
 - `train` tests it walk-forward (train on 25 days, test on the next 5 unseen days) and writes
   `models/SOLUSDT-report.md`. Read it: the edge is small, uncertain, and assumes limit orders fill at the mid.
 - Retrain every week or two. The bot warns when the model's data is more than 14 days old.
+- `TREND_FILTER_HOURS=4` in a coin's `deploy/coins/<COIN>.env` makes that bot enter only in the direction of the
+  real market's last 4 hours (from 1-minute klines; if the trend can't be read, it makes no new entries). In
+  testing it helped SOL in both periods but not UNI or LINK, so only SOL has it on.
 - Every closed round trip is journaled in `results/exec_<SYMBOL>.jsonl`, and `uv run python -m jevlab report`
   compares, per coin, what the backtest assumes (in and out at the mid when each signal fired) with the real
   market's move between the moments the orders actually filled. The gap between the two is what waiting for

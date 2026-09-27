@@ -74,6 +74,12 @@ def decide_model(call: dict, market: dict, position: int, seconds_since_trade: f
         return "hold · model still agrees" if want == position else "flat"
     if not want:
         return f"hold · predicted move {edge:+.1f} bps, under {min_edge:g}"
+    if market.get("trend_hours"):  # per-coin trend filter (TREND_FILTER_HOURS): enter only with the trend
+        trend, hours = market.get("trend"), market["trend_hours"]
+        if trend is None:
+            return f"hold · {hours:g}h trend unknown"
+        if trend != want:
+            return f"hold · against the {hours:g}h trend"
     if follow and ((bias == "long" and want < 0) or (bias == "short" and want > 0)):
         return f"hold · against Claude's {bias} bias"
     if seconds_since_trade < SETTINGS["cooldown"]:
