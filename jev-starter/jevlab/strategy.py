@@ -44,8 +44,8 @@ SETTINGS = {
     "cooldown": 60,         # seconds to wait after any trade before entering again
     "max_spread_bps": None, # skip entries when the spread is wider than this (None = off; the testnet's is always wide)
     "fallback_min_flow": 0.65,  # when Jev is busy: share of 30s volume needed on one side for a rules-only call
-    "model_min_edge_bps": 4.0,  # local model: predicted move needed to enter (None = the model's own tested 6 bps;
-                                # 4 trades ~3x as often but tested slightly negative after fees)
+    "model_min_edge_bps": None,  # local model: predicted move needed to enter (None = the model's own tested 6 bps;
+                                 # 4 trades ~3x as often but tested slightly negative after fees)
     "model_follow_claude": False,  # local model: True = only trade in Claude's direction (untested); False = Claude
                                    # only vetoes, by saying "flat" (this matches how the model was tested)
 }
